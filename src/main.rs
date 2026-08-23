@@ -10,7 +10,10 @@ use async_openai::{
 };
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
@@ -170,9 +173,7 @@ async fn run(cli: Cli) -> Result<()> {
 
 fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
     if name.is_empty() || name.len() > 64 {
-        bail!(
-            "JSON schema name must be between 1 and 64 characters: {name:?}"
-        );
+        bail!("JSON schema name must be between 1 and 64 characters: {name:?}");
     }
     if !name
         .chars()
@@ -198,9 +199,7 @@ fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
     })
 }
 
-fn response_content(
-    response: &ChatCompletionResponse,
-) -> std::result::Result<&str, &'static str> {
+fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&str, &'static str> {
     let choice = response
         .choices
         .first()
@@ -286,7 +285,10 @@ mod tests {
         ])
         .expect("valid JSON schema arguments should parse");
 
-        assert_eq!(cli.json_schema.as_deref().and_then(|path| path.to_str()), Some("schema.json"));
+        assert_eq!(
+            cli.json_schema.as_deref().and_then(|path| path.to_str()),
+            Some("schema.json")
+        );
         assert_eq!(cli.schema_name, "structured_output");
     }
 

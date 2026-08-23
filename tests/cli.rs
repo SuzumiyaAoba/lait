@@ -331,7 +331,10 @@ fn reports_invalid_json_schema_file_with_path_context() {
     let schema = JsonSchemaFile::new("{not valid JSON");
     let output = run_lait_with_json_schema(None, None, "hello", &schema.path, None);
 
-    assert!(!output.status.success(), "lait unexpectedly succeeded: {output:?}");
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to parse JSON schema file"));
     assert!(stderr.contains(schema.path.to_string_lossy().as_ref()));
@@ -347,11 +350,17 @@ fn reports_missing_json_schema_file_with_path_context() {
             .expect("system clock should be after Unix epoch")
             .as_nanos()
     ));
-    assert!(!path.exists(), "test schema path unexpectedly exists: {path:?}");
+    assert!(
+        !path.exists(),
+        "test schema path unexpectedly exists: {path:?}"
+    );
 
     let output = run_lait_with_json_schema(None, None, "hello", &path, None);
 
-    assert!(!output.status.success(), "lait unexpectedly succeeded: {output:?}");
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to read JSON schema file"));
     assert!(stderr.contains(path.to_string_lossy().as_ref()));
