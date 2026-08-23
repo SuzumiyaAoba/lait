@@ -25,6 +25,10 @@ struct JsonSchemaFile {
     path: PathBuf,
 }
 
+struct ConfigDirectory {
+    path: PathBuf,
+}
+
 impl JsonSchemaFile {
     fn new(contents: &str) -> Self {
         let unique_id = SystemTime::now()
@@ -44,6 +48,54 @@ impl Drop for JsonSchemaFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+impl ConfigDirectory {
+    fn empty() -> Self {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lait-test-config-{}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("failed to create test config directory");
+        Self { path }
+    }
+
+    fn new(contents: &str) -> Self {
+        let directory = Self::empty();
+        fs::write(directory.config_path(), contents).expect("failed to write test YAML config");
+        directory
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.path.join("lait.config.yml")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ConfigDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn test_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
+    for variable in [
+        "LLM_MODEL",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+        "LLM_REASONING_EFFORT",
+    ] {
+        command.env_remove(variable);
+    }
+    command
 }
 
 impl MockServer {
@@ -168,7 +220,7 @@ fn run_lait_with_options(
 }
 
 fn run_lait_with_json(base_url: Option<&str>, api_key: Option<&str>, prompt: &str) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
+    let mut command = test_command();
     command.args(["--model", "test-model", "--json"]);
     command.env_remove("LLM_REASONING_EFFORT");
     if let Some(base_url) = base_url {
@@ -188,7 +240,7 @@ fn run_lait_with_json_schema(
     schema_path: &Path,
     schema_name: Option<&str>,
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
+    let mut command = test_command();
     command.args(["--model", "test-model"]);
     command.env_remove("LLM_REASONING_EFFORT");
     if let Some(base_url) = base_url {
@@ -213,7 +265,7 @@ fn run_lait_with_request_options(
     cli_reasoning_effort: Option<&str>,
     env_reasoning_effort: Option<&str>,
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
+    let mut command = test_command();
     command.args(["--model", "test-model"]);
     command.env_remove("LLM_REASONING_EFFORT");
     if let Some(base_url) = base_url {
@@ -368,7 +420,7 @@ fn reports_missing_json_schema_file_with_path_context() {
 
 #[test]
 fn rejects_schema_name_without_json_schema_file() {
-    let output = Command::new(env!("CARGO_BIN_EXE_lait"))
+    let output = test_command()
         .args([
             "--model",
             "test-model",
@@ -617,12 +669,209 @@ fn reports_openai_api_errors() {
 }
 
 #[test]
+fn loads_options_from_cwd_config_when_cli_and_environment_are_unset() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"config-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "model: config-model\nbase_url: \"{}\"\napi_key: config-key\nreasoning_effort: high\n",
+        server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.target, "/v1/chat/completions");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer config-key")
+    );
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"config-model""#),
+        "request body: {body}"
+    );
+    assert!(
+        body.contains(r#""reasoning_effort":"high""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn config_completes_an_omitted_base_url_when_model_is_given_on_cli() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "model: config-model\nbase_url: \"{}\"\n",
+        server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["--model", "cli-model", "hello"])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(request.target, "/v1/chat/completions");
+    let body = without_json_whitespace(&request.body);
+    assert!(body.contains(r#""model":"cli-model""#), "request body: {body}");
+}
+
+#[test]
+fn cli_options_override_values_from_config() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(
+        "model: config-model\nbase_url: http://127.0.0.1:65535/v1\napi_key: config-key\nreasoning_effort: high\n",
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--model",
+            "cli-model",
+            "--base-url",
+            server.base_url.as_str(),
+            "--api-key",
+            "cli-key",
+            "--reasoning-effort",
+            "none",
+            "hello",
+        ])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cli-key")
+    );
+    let body = without_json_whitespace(&request.body);
+    assert!(body.contains(r#""model":"cli-model""#), "request body: {body}");
+    assert!(
+        body.contains(r#""reasoning_effort":"none""#),
+        "request body: {body}"
+    );
+    assert!(
+        !body.contains(r#""reasoning_effort":"high""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn environment_options_override_values_from_config() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"env-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(
+        "model: config-model\nbase_url: http://127.0.0.1:65535/v1\napi_key: config-key\nreasoning_effort: high\n",
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .env("LLM_MODEL", "env-model")
+        .env("OPENAI_BASE_URL", server.base_url.as_str())
+        .env("OPENAI_API_KEY", "env-key")
+        .env("LLM_REASONING_EFFORT", "minimal")
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer env-key")
+    );
+    let body = without_json_whitespace(&request.body);
+    assert!(body.contains(r#""model":"env-model""#), "request body: {body}");
+    assert!(
+        body.contains(r#""reasoning_effort":"minimal""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn no_config_option_skips_a_malformed_config_file() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new("model: [\n");
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--no-config",
+            "--model",
+            "cli-model",
+            "--base-url",
+            server.base_url.as_str(),
+            "--api-key",
+            "cli-key",
+            "hello",
+        ])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(request.target, "/v1/chat/completions");
+    let body = without_json_whitespace(&request.body);
+    assert!(body.contains(r#""model":"cli-model""#), "request body: {body}");
+}
+
+#[test]
+fn reports_malformed_config_with_its_path() {
+    let config = ConfigDirectory::new("model: [\n");
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(config.config_path().to_string_lossy().as_ref()),
+        "stderr should contain config path: {stderr}"
+    );
+}
+
+#[test]
 fn requires_model_option() {
-    let output = Command::new(env!("CARGO_BIN_EXE_lait"))
-        .env_remove("LLM_MODEL")
-        .env_remove("OPENAI_BASE_URL")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("LLM_REASONING_EFFORT")
+    let directory = ConfigDirectory::empty();
+    let output = test_command()
+        .current_dir(directory.path())
         .args(["hello"])
         .output()
         .expect("failed to execute lait");

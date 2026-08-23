@@ -42,7 +42,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | CLI 引数 | 環境変数 | 説明 |
 | --- | --- | --- |
 | `--base-url <URL>` | `OPENAI_BASE_URL` | OpenAI Compatible API のベース URL。既定値は `http://localhost:1234/v1`。 |
-| `--model <MODEL_ID>` | `LLM_MODEL` | LM Studio でロードしたモデル ID。CLI 引数または環境変数のいずれかが必要です。 |
+| `--model <MODEL_ID>` | `LLM_MODEL` | LM Studio でロードしたモデル ID。CLI 引数、環境変数、または設定ファイルで指定できます。 |
 | `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
 | `--show-reasoning` | — | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` にも対応）を回答前に表示します。既定では非表示です。 |
 | `--json` | — | CLI の応答を JSON 形式で出力します。API の Structured Outputs を指定する `--json-schema` とは別の機能です。 |
@@ -51,7 +51,24 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--reasoning-effort <EFFORT>` | `LLM_REASONING_EFFORT` | 推論の実行レベル。`none`、`minimal`、`low`、`medium`、`high`、`xhigh` のいずれかを指定します。未指定時は API リクエストにフィールドを追加しません。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。 |
 
-同じ項目を両方で指定した場合は CLI 引数が優先されます。詳細なオプションは次のコマンドで確認できます。
+### 設定ファイル
+
+CLI 引数や環境変数で指定していない値は、コマンドを実行したディレクトリの
+`lait.config.yml` からデフォルトとして読み込まれます。設定できる基本項目は次のとおりです。
+
+```yaml
+# lait.config.yml
+base_url: http://localhost:1234/v1
+model: local-model
+api_key: lm-studio
+reasoning_effort: medium
+```
+
+値の優先順位は `CLI 引数 > 環境変数 > lait.config.yml > 既定値` です。設定ファイルの自動読込を
+無効にする場合は `--no-config` を指定してください。この場合は設定ファイルを読み込まず、CLI
+引数、環境変数、既定値だけが使用されます。
+
+詳細なオプションは次のコマンドで確認できます。
 
 ```sh
 cargo run -- --help
