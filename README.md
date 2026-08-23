@@ -15,6 +15,16 @@ Lightweight AI Tool (lait) は、YAML で定義したハーネス、Agent Loop�
 cargo run -- --model <MODEL_ID> "プロンプト"
 ```
 
+`makers`（cargo-make）を使う場合は、CLI の引数を `run` タスクの後ろに渡します。
+
+```sh
+makers run -- --model <MODEL_ID> "プロンプト"
+```
+
+`makers run` は macOS では Apple Clang（`/usr/bin/clang`、`/usr/bin/clang++`）と
+`xcrun --sdk macosx --show-sdk-path` の SDK を自動的に設定してから `cargo run` を実行します。
+Nix など別の `cc` が PATH にあっても、`aws-lc-sys` のリンクに必要な macOS SDK が使われます。
+
 `lait` は `async-openai` を使って OpenAI Compatible API に接続し、単体のプロンプトをチャット補完として送信する CLI です。LM Studio のローカルサーバーを利用した動作確認や、LLM API 接続のサンプルとして使えます。
 
 ### LM Studio の準備
@@ -41,6 +51,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 ```sh
 cargo run -- --help
 cargo run -- --version
+makers --list-all-steps
 ```
 
 ### ビルドと実行
@@ -49,6 +60,22 @@ cargo run -- --version
 
 ```sh
 cargo run -- --model "モデル ID" "Rustについて一文で説明してください。"
+```
+
+同じリクエストを `makers` から実行する場合は次のようにします。`--` より後ろの引数は
+そのまま `lait` に転送されるため、プロンプト中の空白や日本語も保持されます。
+
+```sh
+makers run -- --model "モデル ID" "Rustについて一文で説明してください。"
+```
+
+ビルド、テスト、フォーマット確認、Clippy も `makers` のタスクとして実行できます。
+
+```sh
+makers build
+makers test
+makers fmt-check
+makers clippy
 ```
 
 モデル ID に空白が含まれる場合は、上の例のように引用符で囲んでください。環境変数を使う場合は、次のように設定してからプロンプトだけを指定できます。
@@ -80,10 +107,23 @@ export OPENAI_API_KEY="your-api-key"
 cargo run -- --model "モデル ID" "認証付きでリクエストしてください。"
 ```
 
+`makers` で実行する場合も同じ環境変数を利用できます。
+
+```sh
+export OPENAI_API_KEY="your-api-key"
+makers run -- --model "モデル ID" "認証付きでリクエストしてください。"
+```
+
 一時的に CLI 引数で指定することもできます。
 
 ```sh
 cargo run -- --api-key "your-api-key" --model "モデル ID" "こんにちは。"
+```
+
+一時的な指定は `makers` でも可能です。
+
+```sh
+makers run -- --api-key "your-api-key" --model "モデル ID" "こんにちは。"
 ```
 
 ### 出力例
@@ -119,5 +159,9 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --locked
 ```
+
+`makers` で同じ検証を行う場合は `makers test`、`makers fmt-check`、`makers clippy`、
+`makers build` を使用できます。macOS arm64 で発生する `ld: library not found for -liconv`
+には、`makers` の cargo ラッパーが Apple Clang と Xcode SDK を設定して対応します。
 
 GitHub Actions でも同じチェックを実行します。
