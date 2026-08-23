@@ -1,0 +1,42 @@
+[config]
+skip_core_tasks = true
+
+[tasks.run]
+description = "Run lait and forward all arguments to the CLI"
+command = "sh"
+args = ["scripts/makers-cargo.sh", "run", "--locked", "${@}"]
+
+[tasks.build]
+description = "Build lait with the platform toolchain"
+command = "sh"
+args = ["scripts/makers-cargo.sh", "build", "--locked", "${@}"]
+
+[tasks.check]
+description = "Check lait with the platform toolchain"
+command = "sh"
+args = ["scripts/makers-cargo.sh", "check", "--locked", "${@}"]
+
+[tasks.test]
+description = "Run lait tests with the platform toolchain"
+command = "sh"
+args = ["scripts/makers-cargo.sh", "test", "--locked", "${@}"]
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+command = "sh"
+args = ["scripts/makers-cargo.sh", "fmt", "--all", "--", "--check", "${@}"]
+
+[tasks.clippy]
+description = "Run Clippy with warnings denied"
+command = "sh"
+args = [
+    "scripts/makers-cargo.sh",
+    "clippy",
+    "--all-targets",
+    "--all-features",
+    "--locked",
+    "--",
+    "-D",
+    "warnings",
+    "${@}",
+]
