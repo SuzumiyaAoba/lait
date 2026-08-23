@@ -3,10 +3,10 @@ use async_openai::{
     config::OpenAIConfig,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs,
+        CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort,
     },
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
 /// Lightweight AI Tool command-line interface.
@@ -33,9 +33,42 @@ struct Cli {
     #[arg(long)]
     show_reasoning: bool,
 
+    /// The reasoning effort to request from the model.
+    #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
+    reasoning_effort: Option<ReasoningEffort>,
+
     /// A single prompt to send as a user message.
     #[arg(value_name = "PROMPT")]
     prompt: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReasoningEffort {
+    #[value(name = "none")]
+    None,
+    #[value(name = "minimal")]
+    Minimal,
+    #[value(name = "low")]
+    Low,
+    #[value(name = "medium")]
+    Medium,
+    #[value(name = "high")]
+    High,
+    #[value(name = "xhigh")]
+    Xhigh,
+}
+
+impl From<ReasoningEffort> for OpenAiReasoningEffort {
+    fn from(effort: ReasoningEffort) -> Self {
+        match effort {
+            ReasoningEffort::None => Self::None,
+            ReasoningEffort::Minimal => Self::Minimal,
+            ReasoningEffort::Low => Self::Low,
+            ReasoningEffort::Medium => Self::Medium,
+            ReasoningEffort::High => Self::High,
+            ReasoningEffort::Xhigh => Self::Xhigh,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,11 +116,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_message = ChatCompletionRequestUserMessageArgs::default()
         .content(cli.prompt)
         .build()?;
-    let request = CreateChatCompletionRequestArgs::default()
-        .model(cli.model)
-        .messages(vec![ChatCompletionRequestMessage::from(user_message)])
-        .stream(false)
-        .build()?;
+    let mut request = CreateChatCompletionRequestArgs::default();
+    request.model(cli.model);
+    request.messages(vec![ChatCompletionRequestMessage::from(user_message)]);
+    request.stream(false);
+    if let Some(reasoning_effort) = cli.reasoning_effort {
+        request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
+    }
+    let request = request.build()?;
 
     let response: ChatCompletionResponse = client.chat().create_byot(request).await?;
     let content = response_content(&response)?;
@@ -127,7 +163,7 @@ fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool)
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionResponse, Cli, format_response, response_content};
+    use super::{ChatCompletionResponse, Cli, ReasoningEffort, format_response, response_content};
     use clap::Parser;
 
     #[test]
@@ -141,6 +177,8 @@ mod tests {
             "--api-key",
             "test-key",
             "--show-reasoning",
+            "--reasoning-effort",
+            "high",
             "hello",
         ])
         .expect("valid CLI arguments should parse");
@@ -149,6 +187,7 @@ mod tests {
         assert_eq!(cli.base_url, "http://localhost:1234/v1");
         assert_eq!(cli.api_key.as_deref(), Some("test-key"));
         assert!(cli.show_reasoning);
+        assert_eq!(cli.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(cli.prompt, "hello");
     }
 
@@ -158,6 +197,50 @@ mod tests {
             .expect("valid CLI arguments should parse");
 
         assert!(!cli.show_reasoning);
+        assert_eq!(cli.reasoning_effort, None);
+    }
+
+    #[test]
+    fn accepts_all_reasoning_effort_values() {
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+            let cli = Cli::try_parse_from([
+                "lait",
+                "--model",
+                "local-model",
+                "--reasoning-effort",
+                effort,
+                "hello",
+            ])
+            .expect("reasoning effort should be accepted");
+
+            assert_eq!(
+                cli.reasoning_effort,
+                Some(match effort {
+                    "none" => ReasoningEffort::None,
+                    "minimal" => ReasoningEffort::Minimal,
+                    "low" => ReasoningEffort::Low,
+                    "medium" => ReasoningEffort::Medium,
+                    "high" => ReasoningEffort::High,
+                    "xhigh" => ReasoningEffort::Xhigh,
+                    _ => unreachable!(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_reasoning_effort_value() {
+        assert!(
+            Cli::try_parse_from([
+                "lait",
+                "--model",
+                "local-model",
+                "--reasoning-effort",
+                "extreme",
+                "hello",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

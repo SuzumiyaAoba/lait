@@ -128,7 +128,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn run_lait(base_url: Option<&str>, api_key: Option<&str>, prompt: &str) -> Output {
-    run_lait_with_options(base_url, api_key, prompt, false)
+    run_lait_with_request_options(base_url, api_key, prompt, false, None, None)
 }
 
 fn run_lait_with_options(
@@ -137,8 +137,20 @@ fn run_lait_with_options(
     prompt: &str,
     show_reasoning: bool,
 ) -> Output {
+    run_lait_with_request_options(base_url, api_key, prompt, show_reasoning, None, None)
+}
+
+fn run_lait_with_request_options(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    prompt: &str,
+    show_reasoning: bool,
+    cli_reasoning_effort: Option<&str>,
+    env_reasoning_effort: Option<&str>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
     command.args(["--model", "test-model"]);
+    command.env_remove("LLM_REASONING_EFFORT");
     if let Some(base_url) = base_url {
         command.args(["--base-url", base_url]);
     }
@@ -147,6 +159,12 @@ fn run_lait_with_options(
     }
     if show_reasoning {
         command.arg("--show-reasoning");
+    }
+    if let Some(reasoning_effort) = cli_reasoning_effort {
+        command.args(["--reasoning-effort", reasoning_effort]);
+    }
+    if let Some(reasoning_effort) = env_reasoning_effort {
+        command.env("LLM_REASONING_EFFORT", reasoning_effort);
     }
     command.arg(prompt);
     command.output().expect("failed to execute lait")
@@ -189,9 +207,88 @@ fn sends_prompt_to_openai_compatible_chat_completions() {
         "request body: {body}"
     );
     assert!(body.contains(r#""stream":false"#), "request body: {body}");
+    assert!(
+        !body.contains(r#""reasoning_effort""#),
+        "request body should omit reasoning_effort when unspecified: {body}"
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "mock response"
+    );
+}
+
+#[test]
+fn cli_reasoning_effort_overrides_environment() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait_with_request_options(
+        Some(&server.base_url),
+        None,
+        "hello",
+        false,
+        Some("high"),
+        Some("none"),
+    );
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""reasoning_effort":"high"#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn sends_none_reasoning_effort_when_explicitly_requested() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait_with_request_options(
+        Some(&server.base_url),
+        None,
+        "hello",
+        false,
+        Some("none"),
+        None,
+    );
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""reasoning_effort":"none"#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn sends_reasoning_effort_from_environment() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait_with_request_options(
+        Some(&server.base_url),
+        None,
+        "hello",
+        false,
+        None,
+        Some("minimal"),
+    );
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""reasoning_effort":"minimal"#),
+        "request body: {body}"
     );
 }
 
@@ -272,6 +369,7 @@ fn requires_model_option() {
         .env_remove("LLM_MODEL")
         .env_remove("OPENAI_BASE_URL")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("LLM_REASONING_EFFORT")
         .args(["hello"])
         .output()
         .expect("failed to execute lait");
