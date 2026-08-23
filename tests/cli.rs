@@ -729,7 +729,10 @@ fn config_completes_an_omitted_base_url_when_model_is_given_on_cli() {
     assert!(output.status.success(), "lait failed: {output:?}");
     assert_eq!(request.target, "/v1/chat/completions");
     let body = without_json_whitespace(&request.body);
-    assert!(body.contains(r#""model":"cli-model""#), "request body: {body}");
+    assert!(
+        body.contains(r#""model":"cli-model""#),
+        "request body: {body}"
+    );
 }
 
 #[test]
@@ -768,7 +771,10 @@ fn cli_options_override_values_from_config() {
             .contains("authorization: bearer cli-key")
     );
     let body = without_json_whitespace(&request.body);
-    assert!(body.contains(r#""model":"cli-model""#), "request body: {body}");
+    assert!(
+        body.contains(r#""model":"cli-model""#),
+        "request body: {body}"
+    );
     assert!(
         body.contains(r#""reasoning_effort":"none""#),
         "request body: {body}"
@@ -809,7 +815,10 @@ fn environment_options_override_values_from_config() {
             .contains("authorization: bearer env-key")
     );
     let body = without_json_whitespace(&request.body);
-    assert!(body.contains(r#""model":"env-model""#), "request body: {body}");
+    assert!(
+        body.contains(r#""model":"env-model""#),
+        "request body: {body}"
+    );
     assert!(
         body.contains(r#""reasoning_effort":"minimal""#),
         "request body: {body}"
@@ -844,7 +853,10 @@ fn no_config_option_skips_a_malformed_config_file() {
     assert!(output.status.success(), "lait failed: {output:?}");
     assert_eq!(request.target, "/v1/chat/completions");
     let body = without_json_whitespace(&request.body);
-    assert!(body.contains(r#""model":"cli-model""#), "request body: {body}");
+    assert!(
+        body.contains(r#""model":"cli-model""#),
+        "request body: {body}"
+    );
 }
 
 #[test]

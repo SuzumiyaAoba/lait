@@ -218,7 +218,10 @@ fn load_config(no_config: bool) -> Result<ConfigFile> {
         }
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("failed to read YAML configuration file '{}'", path.display())
+                format!(
+                    "failed to read YAML configuration file '{}'",
+                    path.display()
+                )
             });
         }
     };
@@ -324,10 +327,7 @@ mod tests {
         .expect("valid CLI arguments should parse");
 
         assert_eq!(cli.model.as_deref(), Some("local-model"));
-        assert_eq!(
-            cli.base_url.as_deref(),
-            Some("http://localhost:1234/v1")
-        );
+        assert_eq!(cli.base_url.as_deref(), Some("http://localhost:1234/v1"));
         assert_eq!(cli.api_key.as_deref(), Some("test-key"));
         assert!(cli.show_reasoning);
         assert_eq!(cli.reasoning_effort, Some(ReasoningEffort::High));
