@@ -1,0 +1,9 @@
+name: lait
+version: 0.1.0
+description: Agent configuration for lait development
+targets:
+  - codex
+includes:
+  - .apm/hooks/
+scripts:
+  format: cargo fmt --all

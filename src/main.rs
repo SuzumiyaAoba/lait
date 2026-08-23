@@ -147,23 +147,20 @@ fn response_content(response: &ChatCompletionResponse) -> Result<&str, &'static 
 }
 
 fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
-    response
-        .choices
-        .first()
-        .and_then(|choice| {
-            choice
-                .message
-                .reasoning
-                .as_deref()
-                .filter(|reasoning| !reasoning.trim().is_empty())
-                .or_else(|| {
-                    choice
-                        .message
-                        .reasoning_content
-                        .as_deref()
-                        .filter(|reasoning| !reasoning.trim().is_empty())
-                })
-        })
+    response.choices.first().and_then(|choice| {
+        choice
+            .message
+            .reasoning
+            .as_deref()
+            .filter(|reasoning| !reasoning.trim().is_empty())
+            .or_else(|| {
+                choice
+                    .message
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|reasoning| !reasoning.trim().is_empty())
+            })
+    })
 }
 
 fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool) -> String {
@@ -314,17 +311,19 @@ mod tests {
         .expect("response fixture should deserialize");
         assert_eq!(response_reasoning(&current), Some("current reasoning"));
 
-        let legacy_fallback =
-            serde_json::from_value::<ChatCompletionResponse>(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "answer",
-                        "reasoning": "  ",
-                        "reasoning_content": "legacy reasoning"
-                    }
-                }]
-            }))
-            .expect("response fixture should deserialize");
-        assert_eq!(response_reasoning(&legacy_fallback), Some("legacy reasoning"));
+        let legacy_fallback = serde_json::from_value::<ChatCompletionResponse>(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "answer",
+                    "reasoning": "  ",
+                    "reasoning_content": "legacy reasoning"
+                }
+            }]
+        }))
+        .expect("response fixture should deserialize");
+        assert_eq!(
+            response_reasoning(&legacy_fallback),
+            Some("legacy reasoning")
+        );
     }
 }

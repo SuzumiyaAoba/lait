@@ -1,0 +1,14 @@
+{
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "cargo fmt --all",
+          "timeout": 60
+        }
+      ],
+      "_apm_source": "_local/lait"
+    }
+  ]
+}
