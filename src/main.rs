@@ -213,29 +213,34 @@ mod tests {
             ])
             .expect("reasoning effort should be accepted");
 
-            assert_eq!(cli.reasoning_effort, Some(match effort {
-                "none" => ReasoningEffort::None,
-                "minimal" => ReasoningEffort::Minimal,
-                "low" => ReasoningEffort::Low,
-                "medium" => ReasoningEffort::Medium,
-                "high" => ReasoningEffort::High,
-                "xhigh" => ReasoningEffort::Xhigh,
-                _ => unreachable!(),
-            }));
+            assert_eq!(
+                cli.reasoning_effort,
+                Some(match effort {
+                    "none" => ReasoningEffort::None,
+                    "minimal" => ReasoningEffort::Minimal,
+                    "low" => ReasoningEffort::Low,
+                    "medium" => ReasoningEffort::Medium,
+                    "high" => ReasoningEffort::High,
+                    "xhigh" => ReasoningEffort::Xhigh,
+                    _ => unreachable!(),
+                })
+            );
         }
     }
 
     #[test]
     fn rejects_unknown_reasoning_effort_value() {
-        assert!(Cli::try_parse_from([
-            "lait",
-            "--model",
-            "local-model",
-            "--reasoning-effort",
-            "extreme",
-            "hello",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "lait",
+                "--model",
+                "local-model",
+                "--reasoning-effort",
+                "extreme",
+                "hello",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
