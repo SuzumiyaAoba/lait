@@ -45,7 +45,9 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--model <MODEL_ID>` | `LLM_MODEL` | LM Studio でロードしたモデル ID。CLI 引数または環境変数のいずれかが必要です。 |
 | `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
 | `--show-reasoning` | — | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` にも対応）を回答前に表示します。既定では非表示です。 |
-| `--json` | — | 応答を JSON 形式で出力します。`content` と `reasoning` のキーを常に含み、推論がない場合の `reasoning` は `null` です。 |
+| `--json` | — | CLI の応答を JSON 形式で出力します。API の Structured Outputs を指定する `--json-schema` とは別の機能です。 |
+| `--json-schema <FILE>` | — | API の Structured Outputs に使用する JSON Schema ファイル。指定時は `response_format` の `type` を `json_schema`、`strict` を `true` として送信します。 |
+| `--schema-name <NAME>` | — | Structured Outputs のスキーマ名。既定値は `structured_output` です。`--json-schema` と組み合わせて使用します。 |
 | `--reasoning-effort <EFFORT>` | `LLM_REASONING_EFFORT` | 推論の実行レベル。`none`、`minimal`、`low`、`medium`、`high`、`xhigh` のいずれかを指定します。未指定時は API リクエストにフィールドを追加しません。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。 |
 
@@ -159,7 +161,26 @@ makers run -- --api-key "your-api-key" --model "モデル ID" "こんにちは�
 こんにちは。今日はどのようなお手伝いができますか？
 ```
 
-`--json` を指定すると、次のスキーマを持つ JSON オブジェクトが標準出力に表示されます。`content` と `reasoning` のキーは常に含まれます。
+`--json-schema` を指定すると、API の Structured Outputs に JSON Schema を渡せます。`--json-schema` はモデルの応答形式を指定するオプションで、CLI の標準出力形式は変更しません。スキーマは JSON ファイルに記述します。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "answer": { "type": "string" }
+  },
+  "required": ["answer"],
+  "additionalProperties": false
+}
+```
+
+```sh
+cargo run -- --model "モデル ID" --json-schema response.schema.json --schema-name answer_response "JSON Schema に従って回答してください。"
+```
+
+`--schema-name` を省略した場合の名前は `structured_output` です。Structured Outputs は常に strict モード（`strict: true`）でリクエストされます。
+
+`--json` を指定すると、API の応答を CLI 用の JSON オブジェクトとして標準出力に表示します。これは `--json-schema` とは別の機能で、`content` と `reasoning` のキーを常に含みます。
 
 | キー | 型 | 説明 |
 | --- | --- | --- |
