@@ -45,6 +45,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--model <MODEL_ID>` | `LLM_MODEL` | LM Studio でロードしたモデル ID。CLI 引数または環境変数のいずれかが必要です。 |
 | `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
 | `--show-reasoning` | — | 対応サーバーが返す `reasoning_content` を回答前に表示します。既定では非表示です。 |
+| `--reasoning-effort <EFFORT>` | `LLM_REASONING_EFFORT` | 推論の実行レベル。`none`、`minimal`、`low`、`medium`、`high`、`xhigh` のいずれかを指定します。未指定時は API リクエストにフィールドを追加しません。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。 |
 
 同じ項目を両方で指定した場合は CLI 引数が優先されます。詳細なオプションは次のコマンドで確認できます。
@@ -68,6 +69,22 @@ cargo run -- --model "モデル ID" "Rustについて一文で説明してくだ
 
 ```sh
 makers run -- --model "モデル ID" "Rustについて一文で説明してください。"
+```
+
+推論モデルに推論の実行レベルを指定する場合は、`--reasoning-effort` に
+`none`、`minimal`、`low`、`medium`、`high`、`xhigh` のいずれかを渡します。
+`none` は推論を行わない指定です（サーバーとモデルが対応している場合）。未指定時は
+`reasoning_effort` フィールドを送信せず、サーバー側の既定値を使用します。
+
+```sh
+cargo run -- --model "モデル ID" --reasoning-effort high "複雑な問題を解いてください。"
+```
+
+環境変数でも指定できます。CLI 引数と環境変数の両方を指定した場合は CLI 引数が優先されます。
+
+```sh
+export LLM_REASONING_EFFORT="medium"
+cargo run -- --model "モデル ID" "複雑な問題を解いてください。"
 ```
 
 ビルド、テスト、フォーマット確認、Clippy も `makers` のタスクとして実行できます。
