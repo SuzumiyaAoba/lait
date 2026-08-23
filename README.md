@@ -45,6 +45,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--model <MODEL_ID>` | `LLM_MODEL` | LM Studio でロードしたモデル ID。CLI 引数または環境変数のいずれかが必要です。 |
 | `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
 | `--show-reasoning` | — | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` にも対応）を回答前に表示します。既定では非表示です。 |
+| `--json` | — | 応答を JSON 形式で出力します。`content` と `reasoning` のキーを常に含み、推論がない場合の `reasoning` は `null` です。 |
 | `--reasoning-effort <EFFORT>` | `LLM_REASONING_EFFORT` | 推論の実行レベル。`none`、`minimal`、`low`、`medium`、`high`、`xhigh` のいずれかを指定します。未指定時は API リクエストにフィールドを追加しません。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。 |
 
@@ -156,6 +157,24 @@ makers run -- --api-key "your-api-key" --model "モデル ID" "こんにちは�
 
 ```text
 こんにちは。今日はどのようなお手伝いができますか？
+```
+
+`--json` を指定すると、次のスキーマを持つ JSON オブジェクトが標準出力に表示されます。`content` と `reasoning` のキーは常に含まれます。
+
+| キー | 型 | 説明 |
+| --- | --- | --- |
+| `content` | `string` | 回答テキスト。 |
+| `reasoning` | `string` または `null` | 推論テキスト。推論がない場合は `null`。 |
+
+```sh
+cargo run -- --json --model "モデル ID" "Rustについて一文で説明してください。"
+```
+
+```json
+{
+  "content": "Rustは安全性と性能を両立したシステムプログラミング言語です。",
+  "reasoning": null
+}
 ```
 
 ### トラブルシュート
