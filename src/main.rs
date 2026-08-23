@@ -15,21 +15,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+const CONFIG_FILE_NAME: &str = "lait.config.yml";
+
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "lait", version, about = "Lightweight AI Tool")]
 struct Cli {
     /// The model identifier accepted by the OpenAI-compatible server.
     #[arg(long, env = "LLM_MODEL")]
-    model: String,
+    model: Option<String>,
 
     /// The OpenAI-compatible API base URL.
-    #[arg(
-        long,
-        env = "OPENAI_BASE_URL",
-        default_value = "http://localhost:1234/v1"
-    )]
-    base_url: String,
+    #[arg(long, env = "OPENAI_BASE_URL")]
+    base_url: Option<String>,
 
     /// The API key. LM Studio does not require one.
     #[arg(long, env = "OPENAI_API_KEY")]
@@ -55,25 +54,44 @@ struct Cli {
     #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
     reasoning_effort: Option<ReasoningEffort>,
 
+    /// Do not read lait.config.yml from the current directory.
+    #[arg(long)]
+    no_config: bool,
+
     /// A single prompt to send as a user message.
     #[arg(value_name = "PROMPT")]
     prompt: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
 enum ReasoningEffort {
     #[value(name = "none")]
+    #[serde(rename = "none")]
     None,
     #[value(name = "minimal")]
+    #[serde(rename = "minimal")]
     Minimal,
     #[value(name = "low")]
+    #[serde(rename = "low")]
     Low,
     #[value(name = "medium")]
+    #[serde(rename = "medium")]
     Medium,
     #[value(name = "high")]
+    #[serde(rename = "high")]
     High,
     #[value(name = "xhigh")]
+    #[serde(rename = "xhigh")]
     Xhigh,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl From<ReasoningEffort> for OpenAiReasoningEffort {
@@ -121,12 +139,26 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let base_url = cli.base_url.trim_end_matches('/');
+    let file_config = load_config(cli.no_config)?;
+    let model = cli
+        .model
+        .or(file_config.model)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "model is required; provide --model, set LLM_MODEL, or specify model in {CONFIG_FILE_NAME}"
+            )
+        })?;
+    let base_url = cli
+        .base_url
+        .or(file_config.base_url)
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let base_url = base_url.trim_end_matches('/');
     if base_url.is_empty() {
         return Err(anyhow!("base URL must not be empty"));
     }
 
-    let api_key = cli.api_key.unwrap_or_else(|| {
+    let api_key = cli.api_key.or(file_config.api_key).unwrap_or_else(|| {
         // async-openai always builds an Authorization header from its config.
         // LM Studio ignores the value, so use a non-empty dummy key when no
         // key was supplied instead of making local requests fail on an empty
@@ -148,10 +180,10 @@ async fn run(cli: Cli) -> Result<()> {
         .content(cli.prompt)
         .build()?;
     let mut request = CreateChatCompletionRequestArgs::default();
-    request.model(cli.model);
+    request.model(model);
     request.messages(vec![ChatCompletionRequestMessage::from(user_message)]);
     request.stream(false);
-    if let Some(reasoning_effort) = cli.reasoning_effort {
+    if let Some(reasoning_effort) = cli.reasoning_effort.or(file_config.reasoning_effort) {
         request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
     }
     if let Some(response_format) = response_format {
@@ -169,6 +201,37 @@ async fn run(cli: Cli) -> Result<()> {
     };
     println!("{output}");
     Ok(())
+}
+
+fn load_config(no_config: bool) -> Result<ConfigFile> {
+    if no_config {
+        return Ok(ConfigFile::default());
+    }
+
+    let path = std::env::current_dir()
+        .context("failed to determine the current directory for configuration")?
+        .join(CONFIG_FILE_NAME);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfigFile::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read YAML configuration file '{}'",
+                    path.display()
+                )
+            });
+        }
+    };
+
+    serde_yaml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse YAML configuration file '{}'",
+            path.display()
+        )
+    })
 }
 
 fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
@@ -263,8 +326,8 @@ mod tests {
         ])
         .expect("valid CLI arguments should parse");
 
-        assert_eq!(cli.model, "local-model");
-        assert_eq!(cli.base_url, "http://localhost:1234/v1");
+        assert_eq!(cli.model.as_deref(), Some("local-model"));
+        assert_eq!(cli.base_url.as_deref(), Some("http://localhost:1234/v1"));
         assert_eq!(cli.api_key.as_deref(), Some("test-key"));
         assert!(cli.show_reasoning);
         assert_eq!(cli.reasoning_effort, Some(ReasoningEffort::High));
@@ -345,8 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn requires_model_and_prompt() {
-        assert!(Cli::try_parse_from(["lait", "hello"]).is_err());
+    fn requires_prompt_but_allows_model_from_config() {
+        assert!(Cli::try_parse_from(["lait", "hello"]).is_ok());
         assert!(Cli::try_parse_from(["lait", "--model", "local-model"]).is_err());
     }
 
