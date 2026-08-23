@@ -44,6 +44,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--base-url <URL>` | `OPENAI_BASE_URL` | OpenAI Compatible API のベース URL。既定値は `http://localhost:1234/v1`。 |
 | `--model <MODEL_ID>` | `LLM_MODEL` | LM Studio でロードしたモデル ID。CLI 引数または環境変数のいずれかが必要です。 |
 | `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
+| `--show-reasoning` | — | 対応サーバーが返す `reasoning_content` を回答前に表示します。既定では非表示です。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。 |
 
 同じ項目を両方で指定した場合は CLI 引数が優先されます。詳細なオプションは次のコマンドで確認できます。
@@ -76,6 +77,12 @@ makers build
 makers test
 makers fmt-check
 makers clippy
+```
+
+対応サーバーから返された推論内容を回答前に表示する場合は、`--show-reasoning` を指定します。推論内容が返されない場合は、従来どおり回答のみが表示されます。
+
+```sh
+cargo run -- --show-reasoning --model "モデル ID" "Rustについて一文で説明してください。"
 ```
 
 モデル ID に空白が含まれる場合は、上の例のように引用符で囲んでください。環境変数を使う場合は、次のように設定してからプロンプトだけを指定できます。

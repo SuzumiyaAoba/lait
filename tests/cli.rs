@@ -128,6 +128,15 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn run_lait(base_url: Option<&str>, api_key: Option<&str>, prompt: &str) -> Output {
+    run_lait_with_options(base_url, api_key, prompt, false)
+}
+
+fn run_lait_with_options(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    prompt: &str,
+    show_reasoning: bool,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
     command.args(["--model", "test-model"]);
     if let Some(base_url) = base_url {
@@ -135,6 +144,9 @@ fn run_lait(base_url: Option<&str>, api_key: Option<&str>, prompt: &str) -> Outp
     }
     if let Some(api_key) = api_key {
         command.args(["--api-key", api_key]);
+    }
+    if show_reasoning {
+        command.arg("--show-reasoning");
     }
     command.arg(prompt);
     command.output().expect("failed to execute lait")
@@ -181,6 +193,54 @@ fn sends_prompt_to_openai_compatible_chat_completions() {
         String::from_utf8_lossy(&output.stdout).trim(),
         "mock response"
     );
+}
+
+#[test]
+fn hides_reasoning_content_without_show_reasoning_option() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response","reasoning_content":"internal reasoning"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait(Some(&server.base_url), None, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    assert_eq!(request.target, "/v1/chat/completions");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "mock response\n");
+}
+
+#[test]
+fn shows_reasoning_content_with_show_reasoning_option() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response","reasoning_content":"internal reasoning"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait_with_options(Some(&server.base_url), None, "hello", true);
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    assert_eq!(request.target, "/v1/chat/completions");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Reasoning:\ninternal reasoning\n\nmock response\n"
+    );
+}
+
+#[test]
+fn shows_only_final_content_when_reasoning_content_is_missing() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait_with_options(Some(&server.base_url), None, "hello", true);
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    assert_eq!(request.target, "/v1/chat/completions");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "mock response\n");
 }
 
 #[test]
