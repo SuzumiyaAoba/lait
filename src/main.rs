@@ -84,6 +84,7 @@ struct ChatCompletionChoice {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponseMessage {
     content: Option<String>,
+    reasoning: Option<String>,
     reasoning_content: Option<String>,
 }
 
@@ -149,7 +150,20 @@ fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
     response
         .choices
         .first()
-        .and_then(|choice| choice.message.reasoning_content.as_deref())
+        .and_then(|choice| {
+            choice
+                .message
+                .reasoning
+                .as_deref()
+                .filter(|reasoning| !reasoning.trim().is_empty())
+                .or_else(|| {
+                    choice
+                        .message
+                        .reasoning_content
+                        .as_deref()
+                        .filter(|reasoning| !reasoning.trim().is_empty())
+                })
+        })
 }
 
 fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool) -> String {
@@ -163,7 +177,10 @@ fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool)
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionResponse, Cli, ReasoningEffort, format_response, response_content};
+    use super::{
+        ChatCompletionResponse, Cli, ReasoningEffort, format_response, response_content,
+        response_reasoning,
+    };
     use clap::Parser;
 
     #[test]
@@ -281,5 +298,33 @@ mod tests {
         assert_eq!(format_response("answer", Some("  \n"), true), "answer");
         assert_eq!(format_response("answer", Some("step one"), false), "answer");
         assert_eq!(format_response("answer", None, true), "answer");
+    }
+
+    #[test]
+    fn reads_current_and_legacy_reasoning_fields() {
+        let current = serde_json::from_value::<ChatCompletionResponse>(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "answer",
+                    "reasoning": "current reasoning",
+                    "reasoning_content": "legacy reasoning"
+                }
+            }]
+        }))
+        .expect("response fixture should deserialize");
+        assert_eq!(response_reasoning(&current), Some("current reasoning"));
+
+        let legacy_fallback =
+            serde_json::from_value::<ChatCompletionResponse>(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "answer",
+                        "reasoning": "  ",
+                        "reasoning_content": "legacy reasoning"
+                    }
+                }]
+            }))
+            .expect("response fixture should deserialize");
+        assert_eq!(response_reasoning(&legacy_fallback), Some("legacy reasoning"));
     }
 }
