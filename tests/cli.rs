@@ -1,9 +1,11 @@
+use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 struct HttpRequest {
@@ -17,6 +19,31 @@ struct MockServer {
     base_url: String,
     requests: Receiver<HttpRequest>,
     thread: JoinHandle<io::Result<()>>,
+}
+
+struct JsonSchemaFile {
+    path: PathBuf,
+}
+
+impl JsonSchemaFile {
+    fn new(contents: &str) -> Self {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lait-test-schema-{}-{unique_id}.json",
+            std::process::id()
+        ));
+        fs::write(&path, contents).expect("failed to write test JSON schema");
+        Self { path }
+    }
+}
+
+impl Drop for JsonSchemaFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 impl MockServer {
@@ -154,6 +181,30 @@ fn run_lait_with_json(base_url: Option<&str>, api_key: Option<&str>, prompt: &st
     command.output().expect("failed to execute lait")
 }
 
+fn run_lait_with_json_schema(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    prompt: &str,
+    schema_path: &Path,
+    schema_name: Option<&str>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
+    command.args(["--model", "test-model"]);
+    command.env_remove("LLM_REASONING_EFFORT");
+    if let Some(base_url) = base_url {
+        command.args(["--base-url", base_url]);
+    }
+    if let Some(api_key) = api_key {
+        command.args(["--api-key", api_key]);
+    }
+    command.arg("--json-schema").arg(schema_path);
+    if let Some(schema_name) = schema_name {
+        command.args(["--schema-name", schema_name]);
+    }
+    command.arg(prompt);
+    command.output().expect("failed to execute lait")
+}
+
 fn run_lait_with_request_options(
     base_url: Option<&str>,
     api_key: Option<&str>,
@@ -225,10 +276,111 @@ fn sends_prompt_to_openai_compatible_chat_completions() {
         !body.contains(r#""reasoning_effort""#),
         "request body should omit reasoning_effort when unspecified: {body}"
     );
+    assert!(
+        !body.contains(r#""response_format""#),
+        "request body should omit response_format when unspecified: {body}"
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "mock response"
     );
+}
+
+#[test]
+fn sends_strict_json_schema_response_format() {
+    let schema = JsonSchemaFile::new(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,
+    );
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"mock response\"}"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait_with_json_schema(
+        Some(&server.base_url),
+        None,
+        "hello",
+        &schema.path,
+        Some("answer_schema"),
+    );
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["response_format"],
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false,
+                },
+                "strict": true,
+            },
+        })
+    );
+}
+
+#[test]
+fn reports_invalid_json_schema_file_with_path_context() {
+    let schema = JsonSchemaFile::new("{not valid JSON");
+    let output = run_lait_with_json_schema(None, None, "hello", &schema.path, None);
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to parse JSON schema file"));
+    assert!(stderr.contains(schema.path.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn reports_missing_json_schema_file_with_path_context() {
+    let path = std::env::temp_dir().join(format!(
+        "lait-missing-schema-{}-{}.json",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    ));
+    assert!(
+        !path.exists(),
+        "test schema path unexpectedly exists: {path:?}"
+    );
+
+    let output = run_lait_with_json_schema(None, None, "hello", &path, None);
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to read JSON schema file"));
+    assert!(stderr.contains(path.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn rejects_schema_name_without_json_schema_file() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lait"))
+        .args([
+            "--model",
+            "test-model",
+            "--schema-name",
+            "custom_schema",
+            "hello",
+        ])
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("json-schema"));
 }
 
 #[test]

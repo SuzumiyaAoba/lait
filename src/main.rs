@@ -1,13 +1,19 @@
+use anyhow::{Context, Result, anyhow, bail};
 use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort,
+        CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
+        ResponseFormatJsonSchema,
     },
 };
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
@@ -36,6 +42,14 @@ struct Cli {
     /// Print the response as JSON.
     #[arg(long)]
     json: bool,
+
+    /// Request a structured JSON response using the schema in FILE.
+    #[arg(long, value_name = "FILE")]
+    json_schema: Option<PathBuf>,
+
+    /// The name of the structured output schema.
+    #[arg(long, default_value = "structured_output", requires = "json_schema")]
+    schema_name: String,
 
     /// The reasoning effort to request from the model.
     #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
@@ -106,10 +120,10 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run(cli: Cli) -> Result<()> {
     let base_url = cli.base_url.trim_end_matches('/');
     if base_url.is_empty() {
-        return Err("base URL must not be empty".into());
+        return Err(anyhow!("base URL must not be empty"));
     }
 
     let api_key = cli.api_key.unwrap_or_else(|| {
@@ -124,6 +138,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_api_key(api_key);
     let client = Client::with_config(config);
 
+    let response_format = cli
+        .json_schema
+        .as_deref()
+        .map(|path| load_json_schema(path, &cli.schema_name))
+        .transpose()?;
+
     let user_message = ChatCompletionRequestUserMessageArgs::default()
         .content(cli.prompt)
         .build()?;
@@ -134,10 +154,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(reasoning_effort) = cli.reasoning_effort {
         request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
     }
+    if let Some(response_format) = response_format {
+        request.response_format(response_format);
+    }
     let request = request.build()?;
 
     let response: ChatCompletionResponse = client.chat().create_byot(request).await?;
-    let content = response_content(&response)?;
+    let content = response_content(&response).map_err(anyhow::Error::msg)?;
     let reasoning = response_reasoning(&response);
     let output = if cli.json {
         serde_json::to_string(&JsonOutput { content, reasoning })?
@@ -148,7 +171,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-fn response_content(response: &ChatCompletionResponse) -> Result<&str, &'static str> {
+fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
+    if name.is_empty() || name.len() > 64 {
+        bail!("JSON schema name must be between 1 and 64 characters: {name:?}");
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        bail!(
+            "JSON schema name must contain only ASCII letters, digits, underscores, or hyphens: {name:?}"
+        );
+    }
+
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
+    let schema = serde_json::from_str::<serde_json::Value>(&contents)
+        .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))?;
+
+    Ok(ResponseFormat::JsonSchema {
+        json_schema: ResponseFormatJsonSchema {
+            description: None,
+            name: name.to_owned(),
+            schema,
+            strict: Some(true),
+        },
+    })
+}
+
+fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&str, &'static str> {
     let choice = response
         .choices
         .first()
@@ -218,6 +269,27 @@ mod tests {
         assert!(cli.show_reasoning);
         assert_eq!(cli.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(cli.prompt, "hello");
+        assert!(cli.json_schema.is_none());
+        assert_eq!(cli.schema_name, "structured_output");
+    }
+
+    #[test]
+    fn parses_json_schema_options_with_default_name() {
+        let cli = Cli::try_parse_from([
+            "lait",
+            "--model",
+            "local-model",
+            "--json-schema",
+            "schema.json",
+            "hello",
+        ])
+        .expect("valid JSON schema arguments should parse");
+
+        assert_eq!(
+            cli.json_schema.as_deref().and_then(|path| path.to_str()),
+            Some("schema.json")
+        );
+        assert_eq!(cli.schema_name, "structured_output");
     }
 
     #[test]
