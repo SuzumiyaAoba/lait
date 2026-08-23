@@ -3,10 +3,11 @@ use async_openai::{
     config::OpenAIConfig,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionRequestArgs,
     },
 };
 use clap::Parser;
+use serde::Deserialize;
 
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
@@ -28,9 +29,29 @@ struct Cli {
     #[arg(long, env = "OPENAI_API_KEY")]
     api_key: Option<String>,
 
+    /// Display the model's reasoning content when the server provides it.
+    #[arg(long)]
+    show_reasoning: bool,
+
     /// A single prompt to send as a user message.
     #[arg(value_name = "PROMPT")]
     prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ChatCompletionChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionChoice {
+    message: ChatCompletionResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponseMessage {
+    content: Option<String>,
+    reasoning_content: Option<String>,
 }
 
 #[tokio::main]
@@ -68,13 +89,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .stream(false)
         .build()?;
 
-    let response = client.chat().create(request).await?;
+    let response: ChatCompletionResponse = client.chat().create_byot(request).await?;
     let content = response_content(&response)?;
-    println!("{content}");
+    let output = format_response(content, response_reasoning(&response), cli.show_reasoning);
+    println!("{output}");
     Ok(())
 }
 
-fn response_content(response: &CreateChatCompletionResponse) -> Result<&str, &'static str> {
+fn response_content(response: &ChatCompletionResponse) -> Result<&str, &'static str> {
     let choice = response
         .choices
         .first()
@@ -87,10 +109,25 @@ fn response_content(response: &CreateChatCompletionResponse) -> Result<&str, &'s
         .ok_or("API response contained no content in its first choice")
 }
 
+fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
+    response
+        .choices
+        .first()
+        .and_then(|choice| choice.message.reasoning_content.as_deref())
+}
+
+fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool) -> String {
+    match (show_reasoning, reasoning) {
+        (true, Some(reasoning)) if !reasoning.trim().is_empty() => {
+            format!("Reasoning:\n{reasoning}\n\n{content}")
+        }
+        _ => content.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, response_content};
-    use async_openai::types::chat::CreateChatCompletionResponse;
+    use super::{ChatCompletionResponse, Cli, format_response, response_content};
     use clap::Parser;
 
     #[test]
@@ -103,6 +140,7 @@ mod tests {
             "http://localhost:1234/v1",
             "--api-key",
             "test-key",
+            "--show-reasoning",
             "hello",
         ])
         .expect("valid CLI arguments should parse");
@@ -110,7 +148,16 @@ mod tests {
         assert_eq!(cli.model, "local-model");
         assert_eq!(cli.base_url, "http://localhost:1234/v1");
         assert_eq!(cli.api_key.as_deref(), Some("test-key"));
+        assert!(cli.show_reasoning);
         assert_eq!(cli.prompt, "hello");
+    }
+
+    #[test]
+    fn hides_reasoning_by_default() {
+        let cli = Cli::try_parse_from(["lait", "--model", "local-model", "hello"])
+            .expect("valid CLI arguments should parse");
+
+        assert!(!cli.show_reasoning);
     }
 
     #[test]
@@ -121,35 +168,35 @@ mod tests {
 
     #[test]
     fn rejects_empty_choices_or_content() {
-        let no_choices =
-            serde_json::from_value::<CreateChatCompletionResponse>(serde_json::json!({
-                "id": "completion",
-                "object": "chat.completion",
-                "choices": [],
-                "created": 0,
-                "model": "local-model"
-            }))
-            .expect("response fixture should deserialize");
+        let no_choices = serde_json::from_value::<ChatCompletionResponse>(serde_json::json!({
+            "choices": []
+        }))
+        .expect("response fixture should deserialize");
         assert_eq!(
             response_content(&no_choices),
             Err("API response contained no choices")
         );
 
-        let no_content =
-            serde_json::from_value::<CreateChatCompletionResponse>(serde_json::json!({
-                "id": "completion",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": null}
-                }],
-                "created": 0,
-                "model": "local-model"
-            }))
-            .expect("response fixture should deserialize");
+        let no_content = serde_json::from_value::<ChatCompletionResponse>(serde_json::json!({
+            "choices": [{
+                "message": {"content": null}
+            }]
+        }))
+        .expect("response fixture should deserialize");
         assert_eq!(
             response_content(&no_content),
             Err("API response contained no content in its first choice")
         );
+    }
+
+    #[test]
+    fn formats_reasoning_when_requested() {
+        assert_eq!(
+            format_response("answer", Some("step one"), true),
+            "Reasoning:\nstep one\n\nanswer"
+        );
+        assert_eq!(format_response("answer", Some("  \n"), true), "answer");
+        assert_eq!(format_response("answer", Some("step one"), false), "answer");
+        assert_eq!(format_response("answer", None, true), "answer");
     }
 }
