@@ -7,7 +7,7 @@ use async_openai::{
     },
 };
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
@@ -32,6 +32,10 @@ struct Cli {
     /// Display the model's reasoning content when the server provides it.
     #[arg(long)]
     show_reasoning: bool,
+
+    /// Print the response as JSON.
+    #[arg(long)]
+    json: bool,
 
     /// The reasoning effort to request from the model.
     #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
@@ -88,6 +92,12 @@ struct ChatCompletionResponseMessage {
     reasoning_content: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct JsonOutput<'a> {
+    content: &'a str,
+    reasoning: Option<&'a str>,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run(Cli::parse()).await {
@@ -128,7 +138,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let response: ChatCompletionResponse = client.chat().create_byot(request).await?;
     let content = response_content(&response)?;
-    let output = format_response(content, response_reasoning(&response), cli.show_reasoning);
+    let reasoning = response_reasoning(&response);
+    let output = if cli.json {
+        serde_json::to_string(&JsonOutput { content, reasoning })?
+    } else {
+        format_response(content, reasoning, cli.show_reasoning)
+    };
     println!("{output}");
     Ok(())
 }
