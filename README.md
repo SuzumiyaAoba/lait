@@ -209,8 +209,8 @@ step の `{{ input }}` になります。
 
 `json_schema` に指定した値は、まずワークフロー直下の `json_schemas:` のキーとして解決を
 試み、一致するキーがなければ（CLI と同じく）JSON Schema ファイルへのパスとして扱われます。
-`json_schemas:` にスキーマ本体を直接書いておけば、外部ファイルを用意せずワークフロー単体で
-完結させたり、複数の step から同じスキーマを名前で参照したりできます。
+`json_schemas:` の各エントリは、スキーマ本体を直接書く `schema:` と、外部ファイルを指す
+`file_path:` のどちらか一方を指定します。
 
 ```yaml
 # run.yml
@@ -218,12 +218,15 @@ default:
   model: local
 json_schemas:
   city_fact:
-    type: object
-    properties:
-      city: { type: string }
-      population: { type: integer }
-    required: [city, population]
-    additionalProperties: false
+    schema:
+      type: object
+      properties:
+        city: { type: string }
+        population: { type: integer }
+      required: [city, population]
+      additionalProperties: false
+  weather_fact:
+    file_path: weather.schema.json
 steps:
   - id: extract
     prompt: |
@@ -239,8 +242,13 @@ steps:
       {{ input }}
 ```
 
-外部ファイルを使いたい場合は、これまでどおり `json_schema: city.schema.json` のように
-ファイルパスを指定できます（`json_schemas:` に同名のキーがある場合はそちらが優先されます）。
+- `schema:` はスキーマ本体を直接書くので、外部ファイルを用意せずワークフロー単体で完結
+  させたり、複数の step から同じスキーマを名前で参照したりできます。
+- `file_path:` は（`json_schemas:` を使わない場合の `json_schema: city.schema.json` と
+  同じく）JSON Schema ファイルへのパスです。
+- `json_schemas:` を使わず、これまでどおり `json_schema: city.schema.json` のように
+  直接ファイルパスを指定することもできます（`json_schemas:` に同名のキーがある場合は
+  そちらが優先されます）。
 
 - `json_schema` を指定するには `prompt` が必須です（`prompt` のない step には適用先がありません）。
 - `schema_name` は `json_schema` とセットで指定します（既定値は `structured_output`）。

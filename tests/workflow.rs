@@ -173,7 +173,7 @@ steps:
 }
 
 #[test]
-fn step_requests_structured_output_using_a_schema_from_the_workflows_json_schemas_map() {
+fn step_requests_structured_output_using_an_inline_schema_from_the_workflows_json_schemas_map() {
     let server = MockServer::start(
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"42\"}"},"finish_reason":"stop"}]}"#,
@@ -189,18 +189,74 @@ models:
       model_id: workflow-model
 json_schemas:
   answer:
-    type: object
-    properties:
-      answer:
-        type: string
-    required: [answer]
-    additionalProperties: false
+    schema:
+      type: object
+      properties:
+        answer:
+          type: string
+      required: [answer]
+      additionalProperties: false
 steps:
   - prompt: "{{{{ input }}}}"
     json_schema: answer
     schema_name: answer_schema
 "#,
         server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["response_format"],
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false,
+                },
+                "strict": true,
+            },
+        })
+    );
+}
+
+#[test]
+fn step_requests_structured_output_using_a_file_path_schema_from_the_workflows_json_schemas_map() {
+    let schema = JsonSchemaFile::new(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,
+    );
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"42\"}"},"finish_reason":"stop"}]}"#,
+    );
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+json_schemas:
+  answer:
+    file_path: "{}"
+steps:
+  - prompt: "{{{{ input }}}}"
+    json_schema: answer
+    schema_name: answer_schema
+"#,
+        server.base_url,
+        schema.path.display()
     ));
 
     let output = run_lait_workflow(&workflow.path, "hello");

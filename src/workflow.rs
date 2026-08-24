@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -8,9 +12,19 @@ use crate::{
     config::{DefaultSettings, ModelMap},
 };
 
-/// A map of schema name to its JSON Schema body, as used by a workflow file's
+/// A map of schema name to its definition, as used by a workflow file's
 /// top-level `json_schemas:`.
-pub(crate) type JsonSchemaMap = HashMap<String, serde_json::Value>;
+pub(crate) type JsonSchemaMap = HashMap<String, JsonSchemaEntry>;
+
+/// A single entry under `json_schemas:`: either a path to a JSON schema file,
+/// or the schema body written directly in the workflow file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(untagged)]
+pub(crate) enum JsonSchemaEntry {
+    FilePath { file_path: PathBuf },
+    Inline { schema: serde_json::Value },
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,7 +38,8 @@ pub(crate) struct WorkflowFile {
     /// the same name defined in `lait.config.yml`.
     #[serde(default)]
     pub(crate) models: ModelMap,
-    /// JSON Schema bodies usable by `steps[].json_schema`, keyed by name.
+    /// Named schema definitions usable by `steps[].json_schema`, each either a
+    /// `file_path:` to a JSON schema file or an inline `schema:` body.
     #[serde(default)]
     pub(crate) json_schemas: JsonSchemaMap,
     pub(crate) steps: Vec<StepDefinition>,
@@ -114,7 +129,7 @@ pub(crate) fn render_prompt(template: &str, input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_workflow, render_prompt};
+    use super::{JsonSchemaEntry, parse_workflow, render_prompt};
 
     #[test]
     fn renders_input_placeholder_with_and_without_spaces() {
@@ -232,11 +247,12 @@ steps:
             r#"
 json_schemas:
   answer:
-    type: object
-    properties:
-      answer:
-        type: string
-    required: [answer]
+    schema:
+      type: object
+      properties:
+        answer:
+          type: string
+      required: [answer]
 steps:
   - prompt: "{{ input }}"
     json_schema: answer
@@ -245,11 +261,66 @@ steps:
         .expect("workflow with inline json_schemas should parse");
 
         assert_eq!(workflow.json_schemas.len(), 1);
-        assert_eq!(
-            workflow.json_schemas["answer"]["properties"]["answer"]["type"],
-            "string"
-        );
+        match &workflow.json_schemas["answer"] {
+            JsonSchemaEntry::Inline { schema } => {
+                assert_eq!(schema["properties"]["answer"]["type"], "string");
+            }
+            JsonSchemaEntry::FilePath { .. } => panic!("expected an inline schema entry"),
+        }
         assert_eq!(workflow.steps[0].json_schema.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn parses_a_workflow_with_file_path_json_schemas() {
+        let workflow = parse_workflow(
+            r#"
+json_schemas:
+  answer:
+    file_path: schema.json
+steps:
+  - prompt: "{{ input }}"
+    json_schema: answer
+"#,
+        )
+        .expect("workflow with file_path json_schemas should parse");
+
+        match &workflow.json_schemas["answer"] {
+            JsonSchemaEntry::FilePath { file_path } => {
+                assert_eq!(file_path.to_str(), Some("schema.json"));
+            }
+            JsonSchemaEntry::Inline { .. } => panic!("expected a file_path schema entry"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_json_schemas_entry_with_both_schema_and_file_path() {
+        let result = parse_workflow(
+            r#"
+json_schemas:
+  answer:
+    schema:
+      type: object
+    file_path: schema.json
+steps:
+  - prompt: "{{ input }}"
+    json_schema: answer
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_json_schemas_entry_with_neither_schema_nor_file_path() {
+        let result = parse_workflow(
+            r#"
+json_schemas:
+  answer: {}
+steps:
+  - prompt: "{{ input }}"
+    json_schema: answer
+"#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

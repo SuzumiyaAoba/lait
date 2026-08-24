@@ -139,8 +139,11 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
                 .map(|name_or_path| {
                     let schema_name = step.schema_name.as_deref().unwrap_or("structured_output");
                     match wf.json_schemas.get(name_or_path) {
-                        Some(inline_schema) => {
-                            schema::build_json_schema(inline_schema.clone(), schema_name)
+                        Some(workflow::JsonSchemaEntry::Inline { schema }) => {
+                            schema::build_json_schema(schema.clone(), schema_name)
+                        }
+                        Some(workflow::JsonSchemaEntry::FilePath { file_path }) => {
+                            schema::load_json_schema(file_path, schema_name)
                         }
                         None => schema::load_json_schema(Path::new(name_or_path), schema_name),
                     }
