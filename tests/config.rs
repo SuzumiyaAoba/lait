@@ -9,7 +9,7 @@ fn loads_options_from_cwd_config_when_cli_and_environment_are_unset() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"config-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: config-model\nbase_url: \"{}\"\napi_key: config-key\nreasoning_effort: high\n",
+        "default_model: config-model\nbase_url: \"{}\"\napi_key: config-key\nreasoning_effort: high\n",
         server.base_url
     ));
 
@@ -48,7 +48,7 @@ fn config_completes_an_omitted_base_url_when_model_is_given_on_cli() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: config-model\nbase_url: \"{}\"\n",
+        "default_model: config-model\nbase_url: \"{}\"\n",
         server.base_url
     ));
 
@@ -76,7 +76,7 @@ fn cli_options_override_values_from_config() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(
-        "model: config-model\nbase_url: http://127.0.0.1:65535/v1\napi_key: config-key\nreasoning_effort: high\n",
+        "default_model: config-model\nbase_url: http://127.0.0.1:65535/v1\napi_key: config-key\nreasoning_effort: high\n",
     );
 
     let output = test_command()
@@ -126,7 +126,7 @@ fn environment_options_override_values_from_config() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"env-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(
-        "model: config-model\nbase_url: http://127.0.0.1:65535/v1\napi_key: config-key\nreasoning_effort: high\n",
+        "default_model: config-model\nbase_url: http://127.0.0.1:65535/v1\napi_key: config-key\nreasoning_effort: high\n",
     );
 
     let output = test_command()
@@ -166,7 +166,7 @@ fn resolves_the_first_model_definition_for_a_top_level_alias() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"resolved-first","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: local-alias\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: low\nmodels:\n  local-alias:\n    - provider:\n        base_url: \"{}\"\n        api_key: model-key\n      model_id: resolved-first\n      default_reasoning_effort: high\n    - provider:\n        base_url: \"{}\"\n        api_key: second-key\n      model_id: resolved-second\n      default_reasoning_effort: none\n",
+        "default_model: local-alias\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: low\nmodels:\n  local-alias:\n    - provider:\n        base_url: \"{}\"\n        api_key: model-key\n      model_id: resolved-first\n      default_reasoning_effort: high\n    - provider:\n        base_url: \"{}\"\n        api_key: second-key\n      model_id: resolved-second\n      default_reasoning_effort: none\n",
         server.base_url, server.base_url, server.base_url
     ));
 
@@ -208,7 +208,7 @@ fn cli_options_override_a_model_definition_for_an_alias() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-resolved-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: config-model\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: low\nmodels:\n  cli-alias:\n    - provider:\n        base_url: \"{}/definition\"\n        api_key: model-key\n      model_id: cli-resolved-model\n      default_reasoning_effort: high\n",
+        "default_model: config-model\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: low\nmodels:\n  cli-alias:\n    - provider:\n        base_url: \"{}/definition\"\n        api_key: model-key\n      model_id: cli-resolved-model\n      default_reasoning_effort: high\n",
         server.base_url, server.base_url
     ));
 
@@ -256,7 +256,7 @@ fn environment_options_override_a_model_definition_for_an_alias() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"env-resolved-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: config-model\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: low\nmodels:\n  env-alias:\n    - provider:\n        base_url: \"{}/definition\"\n        api_key: model-key\n      model_id: env-resolved-model\n      default_reasoning_effort: high\n",
+        "default_model: config-model\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: low\nmodels:\n  env-alias:\n    - provider:\n        base_url: \"{}/definition\"\n        api_key: model-key\n      model_id: env-resolved-model\n      default_reasoning_effort: high\n",
         server.base_url, server.base_url
     ));
 
@@ -298,7 +298,7 @@ fn falls_back_to_legacy_top_level_values_when_model_definition_fields_are_missin
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"fallback-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: fallback-alias\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: medium\nmodels:\n  fallback-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: fallback-model\n",
+        "default_model: fallback-alias\nbase_url: \"{}/legacy\"\napi_key: legacy-key\nreasoning_effort: medium\nmodels:\n  fallback-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: fallback-model\n",
         server.base_url, server.base_url
     ));
 
@@ -336,7 +336,7 @@ fn uses_the_default_api_key_when_no_provider_or_legacy_key_is_configured() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"default-key-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: default-key-alias\nmodels:\n  default-key-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: default-key-model\n",
+        "default_model: default-key-alias\nmodels:\n  default-key-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: default-key-model\n",
         server.base_url
     ));
 
@@ -364,7 +364,7 @@ fn sends_an_unknown_top_level_alias_to_the_api_unchanged() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"unknown-alias","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
     let config = ConfigDirectory::new(&format!(
-        "model: unknown-alias\nbase_url: \"{}\"\nmodels:\n  known-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: known-model\n",
+        "default_model: unknown-alias\nbase_url: \"{}\"\nmodels:\n  known-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: known-model\n",
         server.base_url, server.base_url
     ));
 
@@ -427,7 +427,7 @@ fn no_config_option_skips_a_malformed_config_file() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let config = ConfigDirectory::new("model: [\n");
+    let config = ConfigDirectory::new("default_model: [\n");
 
     let output = test_command()
         .current_dir(config.path())

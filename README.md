@@ -59,7 +59,7 @@ CLI 引数や環境変数で指定していない値は、コマンドを実行�
 ```yaml
 # lait.config.yml
 base_url: http://localhost:1234/v1
-model: local-model
+default_model: local-model
 api_key: lm-studio
 reasoning_effort: medium
 ```
@@ -86,11 +86,11 @@ models:
       model_id: cloud-model
       default_reasoning_effort: high
 
-# alias はトップレベルの `model`、CLI、環境変数から参照できます。
-model: local
+# alias はトップレベルの `default_model`、CLI、環境変数から参照できます。
+default_model: local
 ```
 
-`model`、`--model`、`LLM_MODEL` には alias または生のモデル ID を指定できます。alias を指定した
+`default_model`、`--model`、`LLM_MODEL` には alias または生のモデル ID を指定できます。alias を指定した
 場合は、対応する配列の先頭要素が使用され、その要素の `model_id` とプロバイダー設定が
 リクエストに適用されます。生のモデル ID を指定した場合は、従来どおりトップレベル設定の
 `base_url` などが使用されます。
@@ -104,7 +104,7 @@ model: local
 上書きします。`provider.api_key` と `default_reasoning_effort` を省略した場合は、対応する
 トップレベルの `api_key`、`reasoning_effort` がフォールバックとして使用されます。
 
-`base_url`、`model`、`api_key`、`reasoning_effort` の既存トップレベル形式も互換性のため引き続き
+`base_url`、`default_model`、`api_key`、`reasoning_effort` の既存トップレベル形式も互換性のため引き続き
 使用できます。設定ファイルの自動読込を
 無効にする場合は `--no-config` を指定してください。この場合は設定ファイルを読み込まず、CLI
 引数、環境変数、既定値だけが使用されます。
@@ -129,7 +129,7 @@ name: example-flow
 description: 要約 → 翻訳 → 整形
 
 # ワークフロー全体の既定値。省略時は lait.config.yml のトップレベル設定にフォールバック
-model: local
+default_model: local
 reasoning_effort: medium
 
 steps:
@@ -165,7 +165,7 @@ cargo run -- run run.yml "要約・翻訳したい文章..."
 
 #### ワークフロー内でのモデル定義
 
-`run.yml` にも `lait.config.yml` と同じ形式の `models` を書けます。`model` /
+`run.yml` にも `lait.config.yml` と同じ形式の `models` を書けます。`default_model` /
 `steps[].model` で参照するエイリアスをワークフローファイル内に閉じて定義でき、
 `lait.config.yml` を用意しなくてもワークフロー単体で完結させられます。
 
@@ -183,7 +183,7 @@ models:
       model_id: cloud-model
       default_reasoning_effort: high
 
-model: local
+default_model: local
 
 steps:
   - prompt: "次の文章を要約してください。\n{{ input }}"
@@ -205,7 +205,7 @@ step の `{{ input }}` になります。
 
 ```yaml
 # run.yml
-model: local
+default_model: local
 steps:
   - id: extract
     prompt: |

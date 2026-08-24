@@ -13,9 +13,9 @@ use crate::{cli::ReasoningEffort, config::ModelMap};
 pub(crate) struct WorkflowFile {
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
-    pub(crate) model: Option<String>,
+    pub(crate) default_model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
-    /// Model aliases usable by `model`/`steps[].model`, in the same shape as
+    /// Model aliases usable by `default_model`/`steps[].model`, in the same shape as
     /// `lait.config.yml`'s top-level `models:`. Takes precedence over an alias of
     /// the same name defined in `lait.config.yml`.
     #[serde(default)]
@@ -143,7 +143,7 @@ mod tests {
             r#"
 name: example
 description: summarize then translate
-model: local
+default_model: local
 steps:
   - id: summarize
     prompt: "summarize: {{ input }}"
@@ -156,7 +156,7 @@ steps:
         .expect("workflow should parse");
 
         assert_eq!(workflow.name.as_deref(), Some("example"));
-        assert_eq!(workflow.model.as_deref(), Some("local"));
+        assert_eq!(workflow.default_model.as_deref(), Some("local"));
         assert_eq!(workflow.steps.len(), 2);
         assert_eq!(workflow.steps[0].id.as_deref(), Some("summarize"));
         assert_eq!(workflow.steps[1].model.as_deref(), Some("cloud"));
@@ -166,7 +166,7 @@ steps:
     fn parses_workflow_with_embedded_models() {
         let workflow = parse_workflow(
             r#"
-model: local
+default_model: local
 models:
   local:
     - provider:

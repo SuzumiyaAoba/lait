@@ -63,7 +63,7 @@ fn rejects_schema_name_without_json_schema_file() {
 
 #[test]
 fn rejects_an_empty_model_alias_definition_with_context() {
-    let config = ConfigDirectory::new("model: empty-alias\nmodels:\n  empty-alias: []\n");
+    let config = ConfigDirectory::new("default_model: empty-alias\nmodels:\n  empty-alias: []\n");
     let output = test_command()
         .current_dir(config.path())
         .arg("hello")
@@ -90,7 +90,7 @@ fn rejects_an_empty_model_alias_definition_with_context() {
 #[test]
 fn rejects_an_empty_model_id_with_context() {
     let config = ConfigDirectory::new(
-        "model: empty-id-alias\nmodels:\n  empty-id-alias:\n    - provider:\n        base_url: http://127.0.0.1:1/v1\n      model_id: \"\"\n",
+        "default_model: empty-id-alias\nmodels:\n  empty-id-alias:\n    - provider:\n        base_url: http://127.0.0.1:1/v1\n      model_id: \"\"\n",
     );
     let output = test_command()
         .current_dir(config.path())
@@ -116,7 +116,7 @@ fn rejects_an_empty_model_id_with_context() {
 
 #[test]
 fn reports_malformed_config_with_its_path() {
-    let config = ConfigDirectory::new("model: [\n");
+    let config = ConfigDirectory::new("default_model: [\n");
     let output = test_command()
         .current_dir(config.path())
         .arg("hello")

@@ -22,11 +22,11 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let file_config = config::load_config(no_config)?;
     let model_name = chat
         .model
-        .or_else(|| file_config.model.clone())
+        .or_else(|| file_config.default_model.clone())
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "model is required; provide --model, set LLM_MODEL, or specify model in {}",
+                "model is required; provide --model, set LLM_MODEL, or specify default_model in {}",
                 config::CONFIG_FILE_NAME
             )
         })?;
@@ -103,10 +103,10 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
             let model_name = step
                 .model
                 .clone()
-                .or_else(|| wf.model.clone())
+                .or_else(|| wf.default_model.clone())
                 .ok_or_else(|| {
                     anyhow!(
-                        "model is required for step '{label}'; set it on the step, the workflow, or in {}",
+                        "model is required for step '{label}'; set it on the step, the workflow's default_model, or in {}",
                         config::CONFIG_FILE_NAME
                     )
                 })?;

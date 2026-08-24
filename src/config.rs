@@ -10,7 +10,7 @@ pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigFile {
-    pub(crate) model: Option<String>,
+    pub(crate) default_model: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
