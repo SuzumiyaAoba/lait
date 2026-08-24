@@ -3,6 +3,7 @@ use clap::Parser;
 mod app;
 mod cli;
 mod config;
+mod jq;
 mod llm;
 mod response;
 mod schema;
