@@ -59,9 +59,10 @@ CLI 引数や環境変数で指定していない値は、コマンドを実行�
 ```yaml
 # lait.config.yml
 base_url: http://localhost:1234/v1
-default_model: local-model
 api_key: lm-studio
-reasoning_effort: medium
+default:
+  model: local-model
+  reasoning_effort: medium
 ```
 
 #### モデル定義と alias
@@ -86,11 +87,12 @@ models:
       model_id: cloud-model
       default_reasoning_effort: high
 
-# alias はトップレベルの `default_model`、CLI、環境変数から参照できます。
-default_model: local
+# alias は `default.model`、CLI、環境変数から参照できます。
+default:
+  model: local
 ```
 
-`default_model`、`--model`、`LLM_MODEL` には alias または生のモデル ID を指定できます。alias を指定した
+`default.model`、`--model`、`LLM_MODEL` には alias または生のモデル ID を指定できます。alias を指定した
 場合は、対応する配列の先頭要素が使用され、その要素の `model_id` とプロバイダー設定が
 リクエストに適用されます。生のモデル ID を指定した場合は、従来どおりトップレベル設定の
 `base_url` などが使用されます。
@@ -102,10 +104,10 @@ default_model: local
 たとえば alias のモデル定義が `provider.base_url` を持つ場合、その値はトップレベルの `base_url`
 より優先されます。CLI の `--base-url` や `OPENAI_BASE_URL` を指定した場合は、それらがモデル定義を
 上書きします。`provider.api_key` と `default_reasoning_effort` を省略した場合は、対応する
-トップレベルの `api_key`、`reasoning_effort` がフォールバックとして使用されます。
+トップレベルの `api_key`、`default.reasoning_effort` がフォールバックとして使用されます。
 
-`base_url`、`default_model`、`api_key`、`reasoning_effort` の既存トップレベル形式も互換性のため引き続き
-使用できます。設定ファイルの自動読込を
+`base_url`、`api_key` はトップレベルの項目として、フォールバック用の `model`、`reasoning_effort`
+は `default:` の配下にまとめて指定します。設定ファイルの自動読込を
 無効にする場合は `--no-config` を指定してください。この場合は設定ファイルを読み込まず、CLI
 引数、環境変数、既定値だけが使用されます。
 
@@ -128,9 +130,10 @@ makers --list-all-steps
 name: example-flow
 description: 要約 → 翻訳 → 整形
 
-# ワークフロー全体の既定値。省略時は lait.config.yml のトップレベル設定にフォールバック
-default_model: local
-reasoning_effort: medium
+# ワークフロー全体の既定値。省略時は lait.config.yml の default: にフォールバック
+default:
+  model: local
+  reasoning_effort: medium
 
 steps:
   - id: summarize
@@ -156,7 +159,7 @@ cargo run -- run run.yml "要約・翻訳したい文章..."
 
 - `steps` は配列の先頭から逐次実行し、分岐・並列は行いません。
 - `model` / `reasoning_effort` は step 単位で省略可能。省略時は
-  ワークフロー直下の値 → `lait.config.yml` のトップレベル設定、の順にフォールバックします。
+  ワークフロー直下の `default:` → `lait.config.yml` の `default:`、の順にフォールバックします。
 - `id` は進捗表示（標準エラー出力）用のラベルで、省略した場合は `step-1`、`step-2`… になります。
 - `prompt` を省略した step はモデルを呼び出さず、`jq` によるデータ変換のみを行います（後述）。
   この場合 `model` は不要です。
@@ -165,7 +168,7 @@ cargo run -- run run.yml "要約・翻訳したい文章..."
 
 #### ワークフロー内でのモデル定義
 
-`run.yml` にも `lait.config.yml` と同じ形式の `models` を書けます。`default_model` /
+`run.yml` にも `lait.config.yml` と同じ形式の `models` を書けます。`default.model` /
 `steps[].model` で参照するエイリアスをワークフローファイル内に閉じて定義でき、
 `lait.config.yml` を用意しなくてもワークフロー単体で完結させられます。
 
@@ -183,7 +186,8 @@ models:
       model_id: cloud-model
       default_reasoning_effort: high
 
-default_model: local
+default:
+  model: local
 
 steps:
   - prompt: "次の文章を要約してください。\n{{ input }}"
@@ -205,7 +209,8 @@ step の `{{ input }}` になります。
 
 ```yaml
 # run.yml
-default_model: local
+default:
+  model: local
 steps:
   - id: extract
     prompt: |

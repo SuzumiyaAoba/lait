@@ -12,7 +12,8 @@ fn resolves_model_and_base_url_from_models_embedded_in_the_workflow_file() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let workflow = WorkflowFile::new(&format!(
         r#"
-default_model: local
+default:
+  model: local
 models:
   local:
     - provider:
@@ -52,7 +53,8 @@ fn workflow_level_alias_takes_precedence_over_a_config_file_alias_of_the_same_na
     );
     let workflow = WorkflowFile::new(&format!(
         r#"
-default_model: shared
+default:
+  model: shared
 models:
   shared:
     - provider:
@@ -91,7 +93,8 @@ fn step_falls_back_to_a_config_file_alias_when_not_defined_in_the_workflow() {
     ));
     let workflow = WorkflowFile::new(
         r#"
-default_model: from-config
+default:
+  model: from-config
 steps:
   - prompt: "{{ input }}"
 "#,
@@ -126,7 +129,8 @@ fn step_requests_structured_output_and_extracts_a_field_with_jq() {
     );
     let workflow = WorkflowFile::new(&format!(
         r#"
-default_model: local
+default:
+  model: local
 models:
   local:
     - provider:
