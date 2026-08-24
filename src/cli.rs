@@ -23,6 +23,8 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Run a YAML-defined workflow (see run.yml).
     Run(RunArgs),
+    /// Work with agent Markdown files (frontmatter + system prompt template).
+    Agent(AgentCommand),
 }
 
 #[derive(Debug, Args)]
@@ -34,6 +36,31 @@ pub(crate) struct RunArgs {
     /// The initial input passed to the first step's `{{ input }}` placeholder.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AgentCommand {
+    #[command(subcommand)]
+    pub(crate) action: AgentAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AgentAction {
+    /// Run an agent Markdown file with the given input.
+    Run(AgentRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AgentRunArgs {
+    /// Path to the agent Markdown file (frontmatter + system prompt template).
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// The input passed to the agent. Parsed as JSON when possible, so the
+    /// system prompt template can access `{{ input.field }}`; otherwise used
+    /// as-is for a plain `{{ input }}`.
+    #[arg(value_name = "INPUT")]
+    pub(crate) input: String,
 }
 
 #[derive(Debug, Args)]
@@ -99,7 +126,7 @@ pub(crate) enum ReasoningEffort {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ReasoningEffort};
+    use super::{AgentAction, AgentCommand, Cli, Command, ReasoningEffort};
     use clap::Parser;
 
     #[test]
@@ -227,8 +254,30 @@ mod tests {
                 assert_eq!(run_args.file.to_str(), Some("run.yml"));
                 assert_eq!(run_args.prompt, "hello world");
             }
-            None => panic!("expected the run subcommand to be selected"),
+            _ => panic!("expected the run subcommand to be selected"),
         }
+    }
+
+    #[test]
+    fn parses_agent_run_subcommand() {
+        let cli = Cli::try_parse_from(["lait", "agent", "run", "agent.md", "hello"])
+            .expect("valid agent run subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Agent(AgentCommand {
+                action: AgentAction::Run(run_args),
+            })) => {
+                assert_eq!(run_args.file.to_str(), Some("agent.md"));
+                assert_eq!(run_args.input, "hello");
+            }
+            _ => panic!("expected the agent run subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn agent_run_subcommand_requires_file_and_input() {
+        assert!(Cli::try_parse_from(["lait", "agent", "run"]).is_err());
+        assert!(Cli::try_parse_from(["lait", "agent", "run", "agent.md"]).is_err());
     }
 
     #[test]
