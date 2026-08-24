@@ -11,6 +11,7 @@ use async_openai::{
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -22,7 +23,7 @@ const CONFIG_FILE_NAME: &str = "lait.config.yml";
 #[derive(Debug, Parser)]
 #[command(name = "lait", version, about = "Lightweight AI Tool")]
 struct Cli {
-    /// The model identifier accepted by the OpenAI-compatible server.
+    /// A configured model name or model identifier accepted by the server.
     #[arg(long, env = "LLM_MODEL")]
     model: Option<String>,
 
@@ -92,6 +93,31 @@ struct ConfigFile {
     base_url: Option<String>,
     api_key: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    models: HashMap<String, Vec<ModelDefinition>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelDefinition {
+    provider: ProviderConfig,
+    model_id: String,
+    default_reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderConfig {
+    base_url: String,
+    api_key: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedModel {
+    model_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl From<ReasoningEffort> for OpenAiReasoningEffort {
@@ -140,17 +166,19 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     let file_config = load_config(cli.no_config)?;
-    let model = cli
+    let model_name = cli
         .model
-        .or(file_config.model)
+        .or_else(|| file_config.model.clone())
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| {
             anyhow!(
                 "model is required; provide --model, set LLM_MODEL, or specify model in {CONFIG_FILE_NAME}"
             )
         })?;
+    let resolved_model = resolve_model(model_name, &file_config)?;
     let base_url = cli
         .base_url
+        .or(resolved_model.base_url)
         .or(file_config.base_url)
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
     let base_url = base_url.trim_end_matches('/');
@@ -158,13 +186,17 @@ async fn run(cli: Cli) -> Result<()> {
         return Err(anyhow!("base URL must not be empty"));
     }
 
-    let api_key = cli.api_key.or(file_config.api_key).unwrap_or_else(|| {
-        // async-openai always builds an Authorization header from its config.
-        // LM Studio ignores the value, so use a non-empty dummy key when no
-        // key was supplied instead of making local requests fail on an empty
-        // header value.
-        "lm-studio".to_owned()
-    });
+    let api_key = cli
+        .api_key
+        .or(resolved_model.api_key)
+        .or(file_config.api_key)
+        .unwrap_or_else(|| {
+            // async-openai always builds an Authorization header from its config.
+            // LM Studio ignores the value, so use a non-empty dummy key when no
+            // key was supplied instead of making local requests fail on an empty
+            // header value.
+            "lm-studio".to_owned()
+        });
     let config = OpenAIConfig::new()
         .with_api_base(base_url)
         .with_api_key(api_key);
@@ -180,10 +212,14 @@ async fn run(cli: Cli) -> Result<()> {
         .content(cli.prompt)
         .build()?;
     let mut request = CreateChatCompletionRequestArgs::default();
-    request.model(model);
+    request.model(resolved_model.model_id);
     request.messages(vec![ChatCompletionRequestMessage::from(user_message)]);
     request.stream(false);
-    if let Some(reasoning_effort) = cli.reasoning_effort.or(file_config.reasoning_effort) {
+    if let Some(reasoning_effort) = cli
+        .reasoning_effort
+        .or(resolved_model.reasoning_effort)
+        .or(file_config.reasoning_effort)
+    {
         request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
     }
     if let Some(response_format) = response_format {
@@ -201,6 +237,30 @@ async fn run(cli: Cli) -> Result<()> {
     };
     println!("{output}");
     Ok(())
+}
+
+fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
+    let Some(definitions) = config.models.get(&model_name) else {
+        return Ok(ResolvedModel {
+            model_id: model_name,
+            base_url: None,
+            api_key: None,
+            reasoning_effort: None,
+        });
+    };
+    let definition = definitions.first().ok_or_else(|| {
+        anyhow!("model definition {model_name:?} must contain at least one entry")
+    })?;
+    if definition.model_id.trim().is_empty() {
+        bail!("model_id in model definition {model_name:?} must not be empty");
+    }
+
+    Ok(ResolvedModel {
+        model_id: definition.model_id.clone(),
+        base_url: Some(definition.provider.base_url.clone()),
+        api_key: definition.provider.api_key.clone(),
+        reasoning_effort: definition.default_reasoning_effort,
+    })
 }
 
 fn load_config(no_config: bool) -> Result<ConfigFile> {

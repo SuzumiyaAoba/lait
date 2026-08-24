@@ -1,0 +1,8 @@
+models:
+  gemma-4-12b:
+    - provider:
+        base_url: http://localhost:1234/v1
+      model_id: google/gemma-4-12b
+      default_reasoning_effort: high
+
+model: gemma-4-12b

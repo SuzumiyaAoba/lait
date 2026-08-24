@@ -12,7 +12,7 @@ Lightweight AI Tool (lait) は、YAML で定義したハーネス、Agent Loop�
 リポジトリのルートで次のコマンドを実行します。
 
 ```sh
-cargo run -- --model <MODEL_ID> "プロンプト"
+cargo run -- --model <MODEL_ID_OR_ALIAS> "プロンプト"
 ```
 
 `makers`（cargo-make）を使う場合は、CLI の引数を `run` タスクの後ろに渡します。
@@ -42,7 +42,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | CLI 引数 | 環境変数 | 説明 |
 | --- | --- | --- |
 | `--base-url <URL>` | `OPENAI_BASE_URL` | OpenAI Compatible API のベース URL。既定値は `http://localhost:1234/v1`。 |
-| `--model <MODEL_ID>` | `LLM_MODEL` | LM Studio でロードしたモデル ID。CLI 引数、環境変数、または設定ファイルで指定できます。 |
+| `--model <MODEL_ID_OR_ALIAS>` | `LLM_MODEL` | モデル ID または設定ファイルの alias。CLI 引数、環境変数、または設定ファイルで指定できます。 |
 | `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
 | `--show-reasoning` | — | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` にも対応）を回答前に表示します。既定では非表示です。 |
 | `--json` | — | CLI の応答を JSON 形式で出力します。API の Structured Outputs を指定する `--json-schema` とは別の機能です。 |
@@ -64,7 +64,48 @@ api_key: lm-studio
 reasoning_effort: medium
 ```
 
-値の優先順位は `CLI 引数 > 環境変数 > lait.config.yml > 既定値` です。設定ファイルの自動読込を
+#### モデル定義と alias
+
+複数の呼び出しモデルを設定ファイルに定義し、alias で使い回せます。`models` は alias をキー、
+モデル定義の配列を値にするマップです。各要素には `provider.base_url` と `model_id` を指定し、
+`provider.api_key` と `default_reasoning_effort` は任意で指定できます。プロバイダーのキーは
+正式名称の `provider` を使用してください。
+
+```yaml
+# lait.config.yml
+models:
+  local:
+    - provider:
+        base_url: http://localhost:1234/v1
+      model_id: local-model
+      default_reasoning_effort: medium
+  cloud:
+    - provider:
+        base_url: https://api.example.com/v1
+        api_key: your-api-key
+      model_id: cloud-model
+      default_reasoning_effort: high
+
+# alias はトップレベルの `model`、CLI、環境変数から参照できます。
+model: local
+```
+
+`model`、`--model`、`LLM_MODEL` には alias または生のモデル ID を指定できます。alias を指定した
+場合は、対応する配列の先頭要素が使用され、その要素の `model_id` とプロバイダー設定が
+リクエストに適用されます。生のモデル ID を指定した場合は、従来どおりトップレベル設定の
+`base_url` などが使用されます。
+
+設定値は項目ごとに、次の優先順位で解決されます。CLI 引数と環境変数の間では CLI 引数が優先されます。
+
+`CLI 引数 > 環境変数 > モデル定義 > 既存トップレベル設定 > 組み込み既定値`
+
+たとえば alias のモデル定義が `provider.base_url` を持つ場合、その値はトップレベルの `base_url`
+より優先されます。CLI の `--base-url` や `OPENAI_BASE_URL` を指定した場合は、それらがモデル定義を
+上書きします。`provider.api_key` と `default_reasoning_effort` を省略した場合は、対応する
+トップレベルの `api_key`、`reasoning_effort` がフォールバックとして使用されます。
+
+`base_url`、`model`、`api_key`、`reasoning_effort` の既存トップレベル形式も互換性のため引き続き
+使用できます。設定ファイルの自動読込を
 無効にする場合は `--no-config` を指定してください。この場合は設定ファイルを読み込まず、CLI
 引数、環境変数、既定値だけが使用されます。
 
