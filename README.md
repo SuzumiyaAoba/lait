@@ -117,6 +117,50 @@ cargo run -- --version
 makers --list-all-steps
 ```
 
+### ワークフロー（`run.yml`）
+
+`lait run <FILE> <PROMPT>` サブコマンドで、複数の LLM 呼び出しを YAML で逐次実行できます。
+各 step は前の step の応答テキストを `{{ input }}` プレースホルダーで受け取り、次の step の
+プロンプトに埋め込みます。最初の step の `{{ input }}` には `<PROMPT>`（CLI 引数）が使われます。
+
+```yaml
+# run.yml
+name: example-flow
+description: 要約 → 翻訳 → 整形
+
+# ワークフロー全体の既定値。省略時は lait.config.yml のトップレベル設定にフォールバック
+model: local
+reasoning_effort: medium
+
+steps:
+  - id: summarize
+    prompt: |
+      次の文章を3行で要約してください。
+      {{ input }}
+
+  - id: translate
+    model: cloud          # step ごとに上書き可能
+    prompt: |
+      次の要約を英訳してください。
+      {{ input }}
+
+  - id: format
+    prompt: |
+      次の英訳を Markdown の箇条書きにしてください。
+      {{ input }}
+```
+
+```sh
+cargo run -- run run.yml "要約・翻訳したい文章..."
+```
+
+- `steps` は配列の先頭から逐次実行し、分岐・並列は行いません。
+- `model` / `reasoning_effort` は step 単位で省略可能。省略時は
+  ワークフロー直下の値 → `lait.config.yml` のトップレベル設定、の順にフォールバックします。
+- `id` は進捗表示（標準エラー出力）用のラベルで、省略した場合は `step-1`、`step-2`… になります。
+- 最後の step の応答テキストのみを標準出力に出します。
+- `run` サブコマンドでも `--no-config` は利用できます（例: `lait run run.yml "..." --no-config`）。
+
 ### ビルドと実行
 
 開発中は `cargo run` で実行できます。
