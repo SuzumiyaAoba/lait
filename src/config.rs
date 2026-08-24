@@ -10,12 +10,22 @@ pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigFile {
-    pub(crate) model: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
-    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub(crate) default: DefaultSettings,
     #[serde(default)]
     models: ModelMap,
+}
+
+/// The `default:` block shared by `lait.config.yml` and a workflow file: a
+/// fallback model/reasoning effort used when a step (or, for the config file,
+/// the CLI/env) doesn't specify its own.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DefaultSettings {
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// A map of model alias to its candidate definitions, as used by both

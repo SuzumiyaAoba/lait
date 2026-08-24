@@ -5,4 +5,5 @@ models:
       model_id: google/gemma-4-12b
       default_reasoning_effort: high
 
-model: gemma-4-12b
+default:
+  model: gemma-4-12b

@@ -6,16 +6,19 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::{cli::ReasoningEffort, config::ModelMap};
+use crate::{
+    cli::ReasoningEffort,
+    config::{DefaultSettings, ModelMap},
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowFile {
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
-    pub(crate) model: Option<String>,
-    pub(crate) reasoning_effort: Option<ReasoningEffort>,
-    /// Model aliases usable by `model`/`steps[].model`, in the same shape as
+    #[serde(default)]
+    pub(crate) default: DefaultSettings,
+    /// Model aliases usable by `default.model`/`steps[].model`, in the same shape as
     /// `lait.config.yml`'s top-level `models:`. Takes precedence over an alias of
     /// the same name defined in `lait.config.yml`.
     #[serde(default)]
@@ -143,7 +146,8 @@ mod tests {
             r#"
 name: example
 description: summarize then translate
-model: local
+default:
+  model: local
 steps:
   - id: summarize
     prompt: "summarize: {{ input }}"
@@ -156,7 +160,7 @@ steps:
         .expect("workflow should parse");
 
         assert_eq!(workflow.name.as_deref(), Some("example"));
-        assert_eq!(workflow.model.as_deref(), Some("local"));
+        assert_eq!(workflow.default.model.as_deref(), Some("local"));
         assert_eq!(workflow.steps.len(), 2);
         assert_eq!(workflow.steps[0].id.as_deref(), Some("summarize"));
         assert_eq!(workflow.steps[1].model.as_deref(), Some("cloud"));
@@ -166,7 +170,8 @@ steps:
     fn parses_workflow_with_embedded_models() {
         let workflow = parse_workflow(
             r#"
-model: local
+default:
+  model: local
 models:
   local:
     - provider:

@@ -22,11 +22,11 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let file_config = config::load_config(no_config)?;
     let model_name = chat
         .model
-        .or_else(|| file_config.model.clone())
+        .or_else(|| file_config.default.model.clone())
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "model is required; provide --model, set LLM_MODEL, or specify model in {}",
+                "model is required; provide --model, set LLM_MODEL, or specify default.model in {}",
                 config::CONFIG_FILE_NAME
             )
         })?;
@@ -62,7 +62,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let reasoning_effort = chat
         .reasoning_effort
         .or(resolved_model.reasoning_effort)
-        .or(file_config.reasoning_effort);
+        .or(file_config.default.reasoning_effort);
 
     let response = llm::complete(llm::CompletionRequest {
         base_url,
@@ -103,10 +103,10 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
             let model_name = step
                 .model
                 .clone()
-                .or_else(|| wf.model.clone())
+                .or_else(|| wf.default.model.clone())
                 .ok_or_else(|| {
                     anyhow!(
-                        "model is required for step '{label}'; set it on the step, the workflow, or in {}",
+                        "model is required for step '{label}'; set it on the step, the workflow's default.model, or in {}",
                         config::CONFIG_FILE_NAME
                     )
                 })?;
@@ -128,9 +128,9 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
                 .unwrap_or_else(|| "lm-studio".to_owned());
             let reasoning_effort = step
                 .reasoning_effort
-                .or(wf.reasoning_effort)
+                .or(wf.default.reasoning_effort)
                 .or(resolved_model.reasoning_effort)
-                .or(file_config.reasoning_effort);
+                .or(file_config.default.reasoning_effort);
             let response_format = step
                 .json_schema
                 .as_deref()
