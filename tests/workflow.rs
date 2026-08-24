@@ -1,7 +1,7 @@
 mod support;
 
 use support::{
-    ConfigDirectory, MockServer, WorkflowFile, run_lait_workflow, test_command,
+    ConfigDirectory, JsonSchemaFile, MockServer, WorkflowFile, run_lait_workflow, test_command,
     without_json_whitespace,
 };
 
@@ -113,4 +113,72 @@ steps:
         body.contains(r#""model":"config-model""#),
         "request body: {body}"
     );
+}
+
+#[test]
+fn step_requests_structured_output_and_extracts_a_field_with_jq() {
+    let schema = JsonSchemaFile::new(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,
+    );
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"42\"}"},"finish_reason":"stop"}]}"#,
+    );
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{{{ input }}}}"
+    json_schema: "{}"
+    schema_name: answer_schema
+    jq: ".answer"
+"#,
+        server.base_url,
+        schema.path.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["response_format"],
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false,
+                },
+                "strict": true,
+            },
+        })
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[test]
+fn transform_only_step_reshapes_input_without_calling_the_model() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - jq: ".name"
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"name":"Alice","age":30}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Alice");
 }

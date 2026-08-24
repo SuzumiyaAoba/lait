@@ -158,7 +158,9 @@ cargo run -- run run.yml "要約・翻訳したい文章..."
 - `model` / `reasoning_effort` は step 単位で省略可能。省略時は
   ワークフロー直下の値 → `lait.config.yml` のトップレベル設定、の順にフォールバックします。
 - `id` は進捗表示（標準エラー出力）用のラベルで、省略した場合は `step-1`、`step-2`… になります。
-- 最後の step の応答テキストのみを標準出力に出します。
+- `prompt` を省略した step はモデルを呼び出さず、`jq` によるデータ変換のみを行います（後述）。
+  この場合 `model` は不要です。
+- 最後の step の出力のみを標準出力に出します。
 - `run` サブコマンドでも `--no-config` は利用できます（例: `lait run run.yml "..." --no-config`）。
 
 #### ワークフロー内でのモデル定義
@@ -192,6 +194,41 @@ steps:
 同じ名前のエイリアスがワークフローと `lait.config.yml` の両方にある場合は、ワークフロー内の
 定義が優先されます。ワークフローに定義がないエイリアスは、これまでどおり `lait.config.yml`
 の `models` から解決されます。
+
+#### JSON 出力の指定と jq による加工
+
+step に `json_schema`（と任意で `schema_name`）を指定すると、CLI の `--json-schema` /
+`--schema-name` と同じく Structured Outputs を要求し、モデルの応答を JSON にできます。
+さらに `jq` を指定すると、その step の出力（モデルの応答、または `prompt` を省略した場合は
+そのときの `{{ input }}`）に [jq](https://jqlang.org/) フィルターを適用し、その結果が次の
+step の `{{ input }}` になります。
+
+```yaml
+# run.yml
+model: local
+steps:
+  - id: extract
+    prompt: |
+      次の文章から都市名と人口を JSON で抽出してください。
+      {{ input }}
+    json_schema: city.schema.json
+    schema_name: city_fact
+    jq: ".city"
+
+  - id: introduce
+    prompt: |
+      次の都市名を使って一文で紹介してください。
+      {{ input }}
+```
+
+- `json_schema` を指定するには `prompt` が必須です（`prompt` のない step には適用先がありません）。
+- `schema_name` は `json_schema` とセットで指定します（既定値は `structured_output`）。
+- `jq` の出力が文字列の場合は `jq -r` のように引用符なしのテキストとして展開されます。それ以外
+  （オブジェクト・配列・数値など）はコンパクトな JSON テキストとして展開されます。
+- `jq` フィルターが複数の値を出力した場合は改行区切りで連結します。
+- `jq` のみを指定して `prompt` を省略すると、モデルを呼び出さずにその時点の `{{ input }}` を
+  変換するだけの step になります（`model` の指定は不要です）。この場合、入力は有効な JSON で
+  ある必要があります。
 
 ### ビルドと実行
 
