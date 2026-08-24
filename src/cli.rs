@@ -1,12 +1,43 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "lait", version, about = "Lightweight AI Tool")]
+#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Cli {
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
+
+    #[command(flatten)]
+    pub(crate) chat: ChatArgs,
+
+    /// Do not read lait.config.yml from the current directory.
+    #[arg(long, global = true)]
+    pub(crate) no_config: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum Command {
+    /// Run a YAML-defined workflow (see run.yml).
+    Run(RunArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RunArgs {
+    /// Path to the workflow YAML file (e.g. run.yml).
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// The initial input passed to the first step's `{{ input }}` placeholder.
+    #[arg(value_name = "PROMPT")]
+    pub(crate) prompt: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ChatArgs {
     /// A configured model name or model identifier accepted by the server.
     #[arg(long, env = "LLM_MODEL")]
     pub(crate) model: Option<String>,
@@ -39,13 +70,9 @@ pub(crate) struct Cli {
     #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
 
-    /// Do not read lait.config.yml from the current directory.
-    #[arg(long)]
-    pub(crate) no_config: bool,
-
     /// A single prompt to send as a user message.
     #[arg(value_name = "PROMPT")]
-    pub(crate) prompt: String,
+    pub(crate) prompt: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -72,7 +99,7 @@ pub(crate) enum ReasoningEffort {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, ReasoningEffort};
+    use super::{Cli, Command, ReasoningEffort};
     use clap::Parser;
 
     #[test]
@@ -92,14 +119,18 @@ mod tests {
         ])
         .expect("valid CLI arguments should parse");
 
-        assert_eq!(cli.model.as_deref(), Some("local-model"));
-        assert_eq!(cli.base_url.as_deref(), Some("http://localhost:1234/v1"));
-        assert_eq!(cli.api_key.as_deref(), Some("test-key"));
-        assert!(cli.show_reasoning);
-        assert_eq!(cli.reasoning_effort, Some(ReasoningEffort::High));
-        assert_eq!(cli.prompt, "hello");
-        assert!(cli.json_schema.is_none());
-        assert_eq!(cli.schema_name, "structured_output");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.chat.model.as_deref(), Some("local-model"));
+        assert_eq!(
+            cli.chat.base_url.as_deref(),
+            Some("http://localhost:1234/v1")
+        );
+        assert_eq!(cli.chat.api_key.as_deref(), Some("test-key"));
+        assert!(cli.chat.show_reasoning);
+        assert_eq!(cli.chat.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(cli.chat.prompt.as_deref(), Some("hello"));
+        assert!(cli.chat.json_schema.is_none());
+        assert_eq!(cli.chat.schema_name, "structured_output");
     }
 
     #[test]
@@ -115,10 +146,13 @@ mod tests {
         .expect("valid JSON schema arguments should parse");
 
         assert_eq!(
-            cli.json_schema.as_deref().and_then(|path| path.to_str()),
+            cli.chat
+                .json_schema
+                .as_deref()
+                .and_then(|path| path.to_str()),
             Some("schema.json")
         );
-        assert_eq!(cli.schema_name, "structured_output");
+        assert_eq!(cli.chat.schema_name, "structured_output");
     }
 
     #[test]
@@ -126,8 +160,8 @@ mod tests {
         let cli = Cli::try_parse_from(["lait", "--model", "local-model", "hello"])
             .expect("valid CLI arguments should parse");
 
-        assert!(!cli.show_reasoning);
-        assert_eq!(cli.reasoning_effort, None);
+        assert!(!cli.chat.show_reasoning);
+        assert_eq!(cli.chat.reasoning_effort, None);
     }
 
     #[test]
@@ -144,7 +178,7 @@ mod tests {
             .expect("reasoning effort should be accepted");
 
             assert_eq!(
-                cli.reasoning_effort,
+                cli.chat.reasoning_effort,
                 Some(match effort {
                     "none" => ReasoningEffort::None,
                     "minimal" => ReasoningEffort::Minimal,
@@ -174,8 +208,40 @@ mod tests {
     }
 
     #[test]
-    fn requires_prompt_but_allows_model_from_config() {
+    fn allows_model_from_config_and_leaves_prompt_optional_for_app_level_validation() {
+        // PROMPT is optional at the clap level so that a subcommand (e.g. `run`) can be
+        // used instead; app-level code enforces that chat mode requires it.
         assert!(Cli::try_parse_from(["lait", "hello"]).is_ok());
-        assert!(Cli::try_parse_from(["lait", "--model", "local-model"]).is_err());
+        let cli = Cli::try_parse_from(["lait", "--model", "local-model"])
+            .expect("prompt-less invocation should still parse");
+        assert!(cli.chat.prompt.is_none());
+    }
+
+    #[test]
+    fn parses_run_subcommand() {
+        let cli = Cli::try_parse_from(["lait", "run", "run.yml", "hello world"])
+            .expect("valid run subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Run(run_args)) => {
+                assert_eq!(run_args.file.to_str(), Some("run.yml"));
+                assert_eq!(run_args.prompt, "hello world");
+            }
+            None => panic!("expected the run subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn run_subcommand_accepts_global_no_config_after_its_args() {
+        let cli = Cli::try_parse_from(["lait", "run", "run.yml", "hello", "--no-config"])
+            .expect("global flags should be accepted after subcommand arguments");
+
+        assert!(cli.no_config);
+    }
+
+    #[test]
+    fn run_subcommand_requires_file_and_prompt() {
+        assert!(Cli::try_parse_from(["lait", "run"]).is_err());
+        assert!(Cli::try_parse_from(["lait", "run", "run.yml"]).is_err());
     }
 }

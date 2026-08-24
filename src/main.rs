@@ -3,8 +3,10 @@ use clap::Parser;
 mod app;
 mod cli;
 mod config;
+mod llm;
 mod response;
 mod schema;
+mod workflow;
 
 #[tokio::main]
 async fn main() {
