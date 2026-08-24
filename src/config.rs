@@ -15,12 +15,16 @@ pub(crate) struct ConfigFile {
     pub(crate) api_key: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
-    models: HashMap<String, Vec<ModelDefinition>>,
+    models: ModelMap,
 }
+
+/// A map of model alias to its candidate definitions, as used by both
+/// `lait.config.yml`'s top-level `models:` and a workflow file's `models:`.
+pub(crate) type ModelMap = HashMap<String, Vec<ModelDefinition>>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModelDefinition {
+pub(crate) struct ModelDefinition {
     provider: ProviderConfig,
     model_id: String,
     default_reasoning_effort: Option<ReasoningEffort>,
@@ -41,14 +45,15 @@ pub(crate) struct ResolvedModel {
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
-pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
-    let Some(definitions) = config.models.get(&model_name) else {
-        return Ok(ResolvedModel {
-            model_id: model_name,
-            base_url: None,
-            api_key: None,
-            reasoning_effort: None,
-        });
+/// Resolves `model_name` against a single alias map, returning `Ok(None)` when the
+/// map has no entry for it (as opposed to the map having an invalid entry, which
+/// is an error).
+pub(crate) fn resolve_model_alias(
+    model_name: &str,
+    models: &ModelMap,
+) -> Result<Option<ResolvedModel>> {
+    let Some(definitions) = models.get(model_name) else {
+        return Ok(None);
     };
     let definition = definitions.first().ok_or_else(|| {
         anyhow!("model definition {model_name:?} must contain at least one entry")
@@ -57,11 +62,23 @@ pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<R
         bail!("model_id in model definition {model_name:?} must not be empty");
     }
 
-    Ok(ResolvedModel {
+    Ok(Some(ResolvedModel {
         model_id: definition.model_id.clone(),
         base_url: Some(definition.provider.base_url.clone()),
         api_key: definition.provider.api_key.clone(),
         reasoning_effort: definition.default_reasoning_effort,
+    }))
+}
+
+pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
+    if let Some(resolved) = resolve_model_alias(&model_name, &config.models)? {
+        return Ok(resolved);
+    }
+    Ok(ResolvedModel {
+        model_id: model_name,
+        base_url: None,
+        api_key: None,
+        reasoning_effort: None,
     })
 }
 

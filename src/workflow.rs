@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::cli::ReasoningEffort;
+use crate::{cli::ReasoningEffort, config::ModelMap};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -12,6 +12,11 @@ pub(crate) struct WorkflowFile {
     pub(crate) description: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Model aliases usable by `model`/`steps[].model`, in the same shape as
+    /// `lait.config.yml`'s top-level `models:`. Takes precedence over an alias of
+    /// the same name defined in `lait.config.yml`.
+    #[serde(default)]
+    pub(crate) models: ModelMap,
     pub(crate) steps: Vec<StepDefinition>,
 }
 
@@ -117,6 +122,35 @@ steps:
         assert_eq!(workflow.steps.len(), 2);
         assert_eq!(workflow.steps[0].id.as_deref(), Some("summarize"));
         assert_eq!(workflow.steps[1].model.as_deref(), Some("cloud"));
+    }
+
+    #[test]
+    fn parses_workflow_with_embedded_models() {
+        let workflow = parse_workflow(
+            r#"
+model: local
+models:
+  local:
+    - provider:
+        base_url: http://localhost:1234/v1
+      model_id: local-model
+      default_reasoning_effort: medium
+  cloud:
+    - provider:
+        base_url: https://api.example.com/v1
+        api_key: secret
+      model_id: cloud-model
+steps:
+  - prompt: "{{ input }}"
+  - model: cloud
+    prompt: "{{ input }}"
+"#,
+        )
+        .expect("workflow with embedded models should parse");
+
+        assert_eq!(workflow.models.len(), 2);
+        assert!(workflow.models.contains_key("local"));
+        assert!(workflow.models.contains_key("cloud"));
     }
 
     #[test]

@@ -31,6 +31,10 @@ pub(crate) struct JsonSchemaFile {
     pub(crate) path: PathBuf,
 }
 
+pub(crate) struct WorkflowFile {
+    pub(crate) path: PathBuf,
+}
+
 pub(crate) struct ConfigDirectory {
     path: PathBuf,
 }
@@ -64,6 +68,40 @@ impl JsonSchemaFile {
 }
 
 impl Drop for JsonSchemaFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl WorkflowFile {
+    pub(crate) fn new(contents: &str) -> Self {
+        let mut path = None;
+        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
+            let candidate = next_temp_path("lait-test-workflow", ".yml");
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to write test workflow file: {error}"),
+            };
+            file.write_all(contents.as_bytes())
+                .expect("failed to write test workflow file");
+            path = Some(candidate);
+            break;
+        }
+        let path = path.unwrap_or_else(|| {
+            panic!(
+                "failed to create a unique test workflow path after {MAX_TEMP_PATH_ATTEMPTS} attempts"
+            )
+        });
+        Self { path }
+    }
+}
+
+impl Drop for WorkflowFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
@@ -328,6 +366,15 @@ pub(crate) fn run_lait_with_request_options(
     }
     command.arg(prompt);
     command.output().expect("failed to execute lait")
+}
+
+pub(crate) fn run_lait_workflow(workflow_path: &Path, prompt: &str) -> Output {
+    test_command()
+        .arg("run")
+        .arg(workflow_path)
+        .arg(prompt)
+        .output()
+        .expect("failed to execute lait run")
 }
 
 pub(crate) fn without_json_whitespace(value: &str) -> String {
