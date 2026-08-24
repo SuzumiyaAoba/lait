@@ -109,7 +109,10 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
                     config::CONFIG_FILE_NAME
                 )
             })?;
-        let resolved_model = config::resolve_model(model_name, &file_config)?;
+        let resolved_model = match config::resolve_model_alias(&model_name, &wf.models)? {
+            Some(resolved) => resolved,
+            None => config::resolve_model(model_name, &file_config)?,
+        };
         let base_url = resolved_model
             .base_url
             .or_else(|| file_config.base_url.clone())

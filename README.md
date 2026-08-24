@@ -161,6 +161,38 @@ cargo run -- run run.yml "要約・翻訳したい文章..."
 - 最後の step の応答テキストのみを標準出力に出します。
 - `run` サブコマンドでも `--no-config` は利用できます（例: `lait run run.yml "..." --no-config`）。
 
+#### ワークフロー内でのモデル定義
+
+`run.yml` にも `lait.config.yml` と同じ形式の `models` を書けます。`model` /
+`steps[].model` で参照するエイリアスをワークフローファイル内に閉じて定義でき、
+`lait.config.yml` を用意しなくてもワークフロー単体で完結させられます。
+
+```yaml
+# run.yml
+models:
+  local:
+    - provider:
+        base_url: http://localhost:1234/v1
+      model_id: local-model
+  cloud:
+    - provider:
+        base_url: https://api.example.com/v1
+        api_key: your-api-key
+      model_id: cloud-model
+      default_reasoning_effort: high
+
+model: local
+
+steps:
+  - prompt: "次の文章を要約してください。\n{{ input }}"
+  - model: cloud
+    prompt: "次の要約を英訳してください。\n{{ input }}"
+```
+
+同じ名前のエイリアスがワークフローと `lait.config.yml` の両方にある場合は、ワークフロー内の
+定義が優先されます。ワークフローに定義がないエイリアスは、これまでどおり `lait.config.yml`
+の `models` から解決されます。
+
 ### ビルドと実行
 
 開発中は `cargo run` で実行できます。
