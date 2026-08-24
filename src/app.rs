@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result, anyhow};
 
 use crate::{
@@ -134,11 +136,14 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
             let response_format = step
                 .json_schema
                 .as_deref()
-                .map(|path| {
-                    schema::load_json_schema(
-                        path,
-                        step.schema_name.as_deref().unwrap_or("structured_output"),
-                    )
+                .map(|name_or_path| {
+                    let schema_name = step.schema_name.as_deref().unwrap_or("structured_output");
+                    match wf.json_schemas.get(name_or_path) {
+                        Some(inline_schema) => {
+                            schema::build_json_schema(inline_schema.clone(), schema_name)
+                        }
+                        None => schema::load_json_schema(Path::new(name_or_path), schema_name),
+                    }
                 })
                 .transpose()
                 .with_context(|| format!("step '{label}'"))?;

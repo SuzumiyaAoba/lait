@@ -207,16 +207,29 @@ step に `json_schema`（と任意で `schema_name`）を指定すると、CLI �
 そのときの `{{ input }}`）に [jq](https://jqlang.org/) フィルターを適用し、その結果が次の
 step の `{{ input }}` になります。
 
+`json_schema` に指定した値は、まずワークフロー直下の `json_schemas:` のキーとして解決を
+試み、一致するキーがなければ（CLI と同じく）JSON Schema ファイルへのパスとして扱われます。
+`json_schemas:` にスキーマ本体を直接書いておけば、外部ファイルを用意せずワークフロー単体で
+完結させたり、複数の step から同じスキーマを名前で参照したりできます。
+
 ```yaml
 # run.yml
 default:
   model: local
+json_schemas:
+  city_fact:
+    type: object
+    properties:
+      city: { type: string }
+      population: { type: integer }
+    required: [city, population]
+    additionalProperties: false
 steps:
   - id: extract
     prompt: |
       次の文章から都市名と人口を JSON で抽出してください。
       {{ input }}
-    json_schema: city.schema.json
+    json_schema: city_fact
     schema_name: city_fact
     jq: ".city"
 
@@ -225,6 +238,9 @@ steps:
       次の都市名を使って一文で紹介してください。
       {{ input }}
 ```
+
+外部ファイルを使いたい場合は、これまでどおり `json_schema: city.schema.json` のように
+ファイルパスを指定できます（`json_schemas:` に同名のキーがある場合はそちらが優先されます）。
 
 - `json_schema` を指定するには `prompt` が必須です（`prompt` のない step には適用先がありません）。
 - `schema_name` は `json_schema` とセットで指定します（既定値は `structured_output`）。

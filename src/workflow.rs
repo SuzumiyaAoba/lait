@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -10,6 +7,10 @@ use crate::{
     cli::ReasoningEffort,
     config::{DefaultSettings, ModelMap},
 };
+
+/// A map of schema name to its JSON Schema body, as used by a workflow file's
+/// top-level `json_schemas:`.
+pub(crate) type JsonSchemaMap = HashMap<String, serde_json::Value>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +24,9 @@ pub(crate) struct WorkflowFile {
     /// the same name defined in `lait.config.yml`.
     #[serde(default)]
     pub(crate) models: ModelMap,
+    /// JSON Schema bodies usable by `steps[].json_schema`, keyed by name.
+    #[serde(default)]
+    pub(crate) json_schemas: JsonSchemaMap,
     pub(crate) steps: Vec<StepDefinition>,
 }
 
@@ -36,9 +40,11 @@ pub(crate) struct StepDefinition {
     /// call the model at all; it must then have a `jq` filter, making it a
     /// data-only transformation step.
     pub(crate) prompt: Option<String>,
-    /// Request a structured JSON response using the schema in this file, like the
-    /// CLI's `--json-schema`. Requires `prompt`.
-    pub(crate) json_schema: Option<PathBuf>,
+    /// Request a structured JSON response using the named schema, like the CLI's
+    /// `--json-schema`. Resolved against the workflow's top-level `json_schemas:`
+    /// first; if no such key exists, treated as a path to a JSON schema file
+    /// instead. Requires `prompt`.
+    pub(crate) json_schema: Option<String>,
     /// The name of the structured output schema. Defaults to `structured_output`,
     /// like the CLI's `--schema-name`. Only used together with `json_schema`.
     pub(crate) schema_name: Option<String>,
@@ -215,12 +221,35 @@ steps:
         .expect("workflow with json_schema and jq should parse");
 
         let step = &workflow.steps[0];
-        assert_eq!(
-            step.json_schema.as_deref().and_then(|p| p.to_str()),
-            Some("schema.json")
-        );
+        assert_eq!(step.json_schema.as_deref(), Some("schema.json"));
         assert_eq!(step.schema_name.as_deref(), Some("answer"));
         assert_eq!(step.jq.as_deref(), Some(".answer"));
+    }
+
+    #[test]
+    fn parses_a_workflow_with_inline_json_schemas() {
+        let workflow = parse_workflow(
+            r#"
+json_schemas:
+  answer:
+    type: object
+    properties:
+      answer:
+        type: string
+    required: [answer]
+steps:
+  - prompt: "{{ input }}"
+    json_schema: answer
+"#,
+        )
+        .expect("workflow with inline json_schemas should parse");
+
+        assert_eq!(workflow.json_schemas.len(), 1);
+        assert_eq!(
+            workflow.json_schemas["answer"]["properties"]["answer"]["type"],
+            "string"
+        );
+        assert_eq!(workflow.steps[0].json_schema.as_deref(), Some("answer"));
     }
 
     #[test]
