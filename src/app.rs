@@ -2,6 +2,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::ResponseFormat;
+use futures_util::{StreamExt, TryStreamExt};
 
 use crate::{
     agent::{self, AgentFile},
@@ -550,53 +551,110 @@ fn run_steps<'a>(
                 let items = items_value.as_array().cloned().ok_or_else(|| {
                     anyhow!("step '{label}': 'for_each.items' must produce a JSON array")
                 })?;
-                eprintln!(
-                    "{progress_prefix}    -> iterating over {} item(s)",
-                    items.len()
-                );
 
-                let mut results = Vec::with_capacity(items.len());
-                // Threaded continuously across items, like `loop` (see its comment
-                // above): `for_each` runs sequentially, not concurrently like
-                // `parallel`, so a single growing counter matches real execution order.
-                let mut for_each_counter = counter;
-                for (item_index, item) in items.iter().enumerate() {
+                let max_concurrency = for_each.max_concurrency.unwrap_or(1);
+                let results: Vec<serde_json::Value> = if max_concurrency <= 1 {
                     eprintln!(
-                        "{progress_prefix}    -> item {}/{}",
-                        item_index + 1,
+                        "{progress_prefix}    -> iterating over {} item(s)",
                         items.len()
                     );
-                    // A string item is passed through raw (like `parallel`'s
-                    // `current_input`, and the inverse of `template::parse_input`
-                    // used below for results), not re-quoted as JSON, so
-                    // `{{ input }}` sees the same unquoted text everywhere else
-                    // in the pipeline does.
-                    let item_input = match item {
-                        serde_json::Value::String(text) => text.clone(),
-                        other => serde_json::to_string(other)
-                            .context("failed to serialize a 'for_each' item")?,
-                    };
-                    let (result, new_counter, flow, new_steps_outputs) = run_steps(
-                        &for_each.steps,
-                        item_input,
-                        wf,
-                        file_config,
-                        for_each_counter,
-                        progress_prefix,
-                        steps_outputs.clone(),
-                    )
-                    .await?;
-                    for_each_counter = new_counter;
-                    steps_outputs = new_steps_outputs;
-                    if flow == Flow::Stop {
-                        return Ok((result, for_each_counter, Flow::Stop, steps_outputs));
+                    let mut results = Vec::with_capacity(items.len());
+                    // Threaded continuously across items, like `loop` (see its
+                    // comment above): a sequential `for_each` (the default)
+                    // runs its body one item at a time, so a single growing
+                    // counter matches real execution order.
+                    let mut for_each_counter = counter;
+                    let mut stop_result = None;
+                    for (item_index, item) in items.iter().enumerate() {
+                        eprintln!(
+                            "{progress_prefix}    -> item {}/{}",
+                            item_index + 1,
+                            items.len()
+                        );
+                        // A string item is passed through raw (like `parallel`'s
+                        // `current_input`, and the inverse of `template::parse_input`
+                        // used below for results), not re-quoted as JSON, so
+                        // `{{ input }}` sees the same unquoted text everywhere else
+                        // in the pipeline does.
+                        let item_input = match item {
+                            serde_json::Value::String(text) => text.clone(),
+                            other => serde_json::to_string(other)
+                                .context("failed to serialize a 'for_each' item")?,
+                        };
+                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                            &for_each.steps,
+                            item_input,
+                            wf,
+                            file_config,
+                            for_each_counter,
+                            progress_prefix,
+                            steps_outputs.clone(),
+                        )
+                        .await?;
+                        for_each_counter = new_counter;
+                        steps_outputs = new_steps_outputs;
+                        if flow == Flow::Stop {
+                            stop_result = Some(result);
+                            break;
+                        }
+                        results.push(template::parse_input(&result));
+                        if flow == Flow::Break {
+                            break;
+                        }
                     }
-                    results.push(template::parse_input(&result));
-                    if flow == Flow::Break {
-                        break;
+                    counter = for_each_counter;
+                    if let Some(result) = stop_result {
+                        return Ok((result, counter, Flow::Stop, steps_outputs));
                     }
-                }
-                counter = for_each_counter;
+                    results
+                } else {
+                    eprintln!(
+                        "{progress_prefix}    -> iterating over {} item(s), up to {max_concurrency} concurrently",
+                        items.len()
+                    );
+                    let item_inputs: Vec<String> = items
+                        .iter()
+                        .map(|item| match item {
+                            serde_json::Value::String(text) => Ok(text.clone()),
+                            other => serde_json::to_string(other)
+                                .context("failed to serialize a 'for_each' item"),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let item_prefixes: Vec<String> = (0..item_inputs.len())
+                        .map(|index| format!("{progress_prefix}[item-{}] ", index + 1))
+                        .collect();
+                    let item_futures = item_inputs.into_iter().zip(&item_prefixes).map(
+                        |(item_input, item_prefix)| {
+                            run_steps(
+                                &for_each.steps,
+                                item_input,
+                                wf,
+                                file_config,
+                                0,
+                                item_prefix,
+                                steps_outputs.clone(),
+                            )
+                        },
+                    );
+                    // `validate_steps` rejects `stop`/`break` inside a
+                    // `for_each` body whose `max_concurrency` is above 1, for
+                    // the same reason as a `parallel` branch: concurrently
+                    // running items can't share a single well-defined "break
+                    // this loop"/"stop the workflow" target. Each item also
+                    // got its own clone of `steps_outputs` (see this
+                    // function's doc comment), so nothing it records leaks
+                    // back here.
+                    let item_results: Vec<(String, usize, Flow, workflow::StepOutputs)> =
+                        futures_util::stream::iter(item_futures)
+                            .buffered(max_concurrency)
+                            .try_collect()
+                            .await?;
+                    item_results
+                        .into_iter()
+                        .map(|(output, _, _, _)| template::parse_input(&output))
+                        .collect()
+                };
+
                 let results_json = serde_json::to_string(&serde_json::Value::Array(results))
                     .context("failed to serialize 'for_each' results")?;
 

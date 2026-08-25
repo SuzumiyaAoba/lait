@@ -251,6 +251,13 @@ pub(crate) struct ForEachDefinition {
     /// the id-keyed object from a `parallel` step. If omitted, the array
     /// itself (serialized as JSON) becomes `{{ input }}` for the next step.
     pub(crate) join: Option<String>,
+    /// The maximum number of items processed concurrently. Defaults to `1`
+    /// (fully sequential, the original behavior); when greater than `1`,
+    /// `steps` runs like a `parallel` branch per item (its own
+    /// `{{ steps.* }}`/`$steps` recordings stay item-local, and `stop`/
+    /// `break` are rejected inside it) rather than like a sequential `loop`
+    /// iteration. Must be at least `1`.
+    pub(crate) max_concurrency: Option<usize>,
 }
 
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
@@ -480,7 +487,24 @@ fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Result<()> {
                     label()
                 );
             }
-            validate_steps(&for_each.steps, ctx.in_loop_body())?;
+            let max_concurrency = match for_each.max_concurrency {
+                Some(0) => bail!(
+                    "step '{}' has 'for_each' with 'max_concurrency: 0'; it must be at least 1",
+                    label()
+                ),
+                Some(n) => n,
+                None => 1,
+            };
+            // A concurrent `for_each` (`max_concurrency > 1`) runs its body
+            // like a `parallel` branch per item; a sequential one (the
+            // default) runs it like a `loop` iteration. See
+            // `FlowContext`'s doc comment.
+            let item_ctx = if max_concurrency > 1 {
+                ctx.in_parallel_branch()
+            } else {
+                ctx.in_loop_body()
+            };
+            validate_steps(&for_each.steps, item_ctx)?;
             continue;
         }
 
@@ -1411,6 +1435,89 @@ steps:
 "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_for_each_with_max_concurrency() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 4
+      steps:
+        - jq: '.'
+"#,
+        )
+        .expect("workflow with a for_each max_concurrency should parse");
+
+        assert_eq!(
+            workflow.steps[0].for_each.as_ref().unwrap().max_concurrency,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn rejects_a_for_each_with_max_concurrency_zero() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 0
+      steps:
+        - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_break_inside_a_for_each_with_max_concurrency_above_one() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 2
+      steps:
+        - break: true
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_stop_inside_a_for_each_with_max_concurrency_above_one() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 2
+      steps:
+        - stop: true
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allows_break_inside_a_sequential_for_each_nested_in_a_concurrent_one() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.outer'
+      max_concurrency: 2
+      steps:
+        - for_each:
+            items: '.inner'
+            steps:
+              - break: true
+"#,
+        );
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -1332,3 +1332,94 @@ steps:
         "expected the parallel-branch-local step id 'inner' not to be visible outside the branch"
     );
 }
+
+#[test]
+fn concurrent_for_each_preserves_item_order_in_its_results_regardless_of_completion_order() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 3
+      steps:
+        - jq: '. * 10'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"items":[1,2,3]}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[10,20,30]");
+}
+
+#[test]
+fn concurrent_for_each_calls_the_model_once_per_item() {
+    let server = MockServer::start_sequence(&[
+        ("200 OK", CHAT_COMPLETION_BODY),
+        ("200 OK", CHAT_COMPLETION_BODY),
+        ("200 OK", CHAT_COMPLETION_BODY),
+    ]);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 3
+      steps:
+        - prompt: "{{{{ input }}}}"
+      join: 'length'
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, r#"{"items":["a","b","c"]}"#);
+    server.receive_request();
+    server.receive_request();
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+}
+
+#[test]
+fn concurrent_for_each_rejects_break_and_stop_in_its_steps_at_parse_time() {
+    let break_workflow = WorkflowFile::new(
+        r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 2
+      steps:
+        - break: true
+"#,
+    );
+    let output = run_lait_workflow(&break_workflow.path, r#"{"items":[1]}"#);
+    assert!(
+        !output.status.success(),
+        "expected 'break' inside a concurrent for_each to be rejected"
+    );
+
+    let stop_workflow = WorkflowFile::new(
+        r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 2
+      steps:
+        - stop: true
+"#,
+    );
+    let output = run_lait_workflow(&stop_workflow.path, r#"{"items":[1]}"#);
+    assert!(
+        !output.status.success(),
+        "expected 'stop' inside a concurrent for_each to be rejected"
+    );
+}

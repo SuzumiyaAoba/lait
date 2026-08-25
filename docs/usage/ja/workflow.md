@@ -473,6 +473,35 @@ steps:
 - 進捗表示は `loop` と同様、`switch` と同じ通し番号方式（要素をまたいで連続）に加えて、
   `-> item k/n` の行で現在の要素の位置を出力します。
 
+### 並行実行（`max_concurrency`）
+
+`max_concurrency` を指定すると、要素の処理を最大その数まで同時に実行します。省略時は `1`
+（これまでどおりの完全な逐次実行）です。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 4
+      steps:
+        - prompt: "この項目を要約してください: {{ input }}"
+      join: 'map(select(. != null))'
+```
+
+- 結果は完了順ではなく、常に `items` の並び順で集約されます（`join` に渡される配列の順序は
+  `max_concurrency: 1` のときと変わりません）。
+- `max_concurrency` が2以上のとき、`for_each` の本体は `parallel` の branch と同じ扱いになります。
+  すなわち、本体の中で記録した `{{ steps.<id> }}`/`$steps` はその要素の処理の中だけで有効で
+  （他の要素や `for_each` の外からは見えません）、本体の中で `stop`/`break` を使うことはできません
+  （複数の要素が同時に走っているときに「このループを打ち切る」「ワークフローを止める」対象を
+  一意に決められないためです）。`max_concurrency: 1`（既定）のときは、これまでどおり `loop` の
+  イテレーションと同じ扱い（`{{ steps.* }}` は要素をまたいで引き継がれ、`break` も使えます）です。
+- 進捗表示も `parallel` と同様になり、要素ごとに `[item-n]` を付けた行が入り交じって出力されます。
+- 値は1以上である必要があります。
+
 ## 早期終了（`stop` / `break`）
 
 step に `stop: true` または `break: true` を指定すると、その step自身のアクション
