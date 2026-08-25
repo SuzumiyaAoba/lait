@@ -463,7 +463,7 @@ async fn execute_step(
         .with_context(|| format!("step '{label}'"))?;
 
         let response_format = step
-            .json_schema
+            .output_schema
             .as_deref()
             .map(|name_or_path| {
                 let schema_name = step.schema_name.as_deref().unwrap_or("structured_output");

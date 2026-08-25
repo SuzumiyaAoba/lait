@@ -26,7 +26,7 @@ pub(crate) struct WorkflowFile {
     /// the same name defined in `lait.config.yml`.
     #[serde(default)]
     pub(crate) models: ModelMap,
-    /// Named schema definitions usable by `steps[].json_schema` and
+    /// Named schema definitions usable by `steps[].output_schema` and
     /// `steps[].input_schema`, each either a `file_path:` to a JSON schema
     /// file or an inline `schema:` body.
     #[serde(default)]
@@ -53,8 +53,8 @@ pub(crate) struct StepDefinition {
     pub(crate) prompt: Option<String>,
     /// Path to an agent Markdown file (see `agent::load_agent`) whose system
     /// prompt, model/reasoning defaults, and input/output schema drive this
-    /// step instead of `prompt`/`input_schema`/`json_schema`/`schema_name`.
-    /// Mutually exclusive with `prompt`, `input_schema`, `json_schema`, and
+    /// step instead of `prompt`/`input_schema`/`output_schema`/`schema_name`.
+    /// Mutually exclusive with `prompt`, `input_schema`, `output_schema`, and
     /// `schema_name`.
     pub(crate) agent: Option<PathBuf>,
     /// Validates this step's input before it runs (before rendering `prompt`,
@@ -67,9 +67,9 @@ pub(crate) struct StepDefinition {
     /// `--json-schema`. Resolved against the workflow's top-level `json_schemas:`
     /// first; if no such key exists, treated as a path to a JSON schema file
     /// instead. Requires `prompt`.
-    pub(crate) json_schema: Option<String>,
+    pub(crate) output_schema: Option<String>,
     /// The name of the structured output schema. Defaults to `structured_output`,
-    /// like the CLI's `--schema-name`. Only used together with `json_schema`.
+    /// like the CLI's `--schema-name`. Only used together with `output_schema`.
     pub(crate) schema_name: Option<String>,
     /// A jq filter applied to this step's output (the model's response, or the
     /// running input if there is no `prompt`) before it becomes `{{ input }}` for
@@ -183,13 +183,13 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                 || step.prompt.is_some()
                 || step.agent.is_some()
                 || step.input_schema.is_some()
-                || step.json_schema.is_some()
+                || step.output_schema.is_some()
                 || step.schema_name.is_some()
                 || step.jq.is_some();
             if has_action_fields {
                 bail!(
                     "step '{}' has 'switch' set; it cannot also have 'when', 'model', \
-                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'json_schema', \
+                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'output_schema', \
                      'schema_name', or 'jq'",
                     label()
                 );
@@ -225,13 +225,13 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                 || step.prompt.is_some()
                 || step.agent.is_some()
                 || step.input_schema.is_some()
-                || step.json_schema.is_some()
+                || step.output_schema.is_some()
                 || step.schema_name.is_some()
                 || step.jq.is_some();
             if has_action_fields {
                 bail!(
                     "step '{}' has 'parallel' set; it cannot also have 'when', 'model', \
-                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'json_schema', \
+                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'output_schema', \
                      'schema_name', or 'jq'",
                     label()
                 );
@@ -275,22 +275,25 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         }
         if step.agent.is_some()
             && (step.input_schema.is_some()
-                || step.json_schema.is_some()
+                || step.output_schema.is_some()
                 || step.schema_name.is_some())
         {
             bail!(
-                "step '{}' has 'agent' set; 'input_schema'/'json_schema'/'schema_name' come from the agent file and must not be set on the step",
+                "step '{}' has 'agent' set; 'input_schema'/'output_schema'/'schema_name' come from the agent file and must not be set on the step",
                 label()
             );
         }
-        if !calls_model && step.json_schema.is_some() {
+        if !calls_model && step.output_schema.is_some() {
             bail!(
-                "step '{}' has 'json_schema' but no 'prompt'/'agent' to apply it to",
+                "step '{}' has 'output_schema' but no 'prompt'/'agent' to apply it to",
                 label()
             );
         }
-        if step.json_schema.is_none() && step.schema_name.is_some() {
-            bail!("step '{}' has 'schema_name' but no 'json_schema'", label());
+        if step.output_schema.is_none() && step.schema_name.is_some() {
+            bail!(
+                "step '{}' has 'schema_name' but no 'output_schema'",
+                label()
+            );
         }
     }
     Ok(())
@@ -425,20 +428,20 @@ steps:
     }
 
     #[test]
-    fn parses_a_step_with_json_schema_and_jq() {
+    fn parses_a_step_with_output_schema_and_jq() {
         let workflow = parse_workflow(
             r#"
 steps:
   - prompt: "{{ input }}"
-    json_schema: schema.json
+    output_schema: schema.json
     schema_name: answer
     jq: ".answer"
 "#,
         )
-        .expect("workflow with json_schema and jq should parse");
+        .expect("workflow with output_schema and jq should parse");
 
         let step = &workflow.steps[0];
-        assert_eq!(step.json_schema.as_deref(), Some("schema.json"));
+        assert_eq!(step.output_schema.as_deref(), Some("schema.json"));
         assert_eq!(step.schema_name.as_deref(), Some("answer"));
         assert_eq!(step.jq.as_deref(), Some(".answer"));
     }
@@ -457,7 +460,7 @@ json_schemas:
       required: [answer]
 steps:
   - prompt: "{{ input }}"
-    json_schema: answer
+    output_schema: answer
 "#,
         )
         .expect("workflow with inline json_schemas should parse");
@@ -469,7 +472,7 @@ steps:
             }
             JsonSchemaEntry::FilePath { .. } => panic!("expected an inline schema entry"),
         }
-        assert_eq!(workflow.steps[0].json_schema.as_deref(), Some("answer"));
+        assert_eq!(workflow.steps[0].output_schema.as_deref(), Some("answer"));
     }
 
     #[test]
@@ -481,7 +484,7 @@ json_schemas:
     file_path: schema.json
 steps:
   - prompt: "{{ input }}"
-    json_schema: answer
+    output_schema: answer
 "#,
         )
         .expect("workflow with file_path json_schemas should parse");
@@ -505,7 +508,7 @@ json_schemas:
     file_path: schema.json
 steps:
   - prompt: "{{ input }}"
-    json_schema: answer
+    output_schema: answer
 "#,
         );
         assert!(result.is_err());
@@ -519,7 +522,7 @@ json_schemas:
   answer: {}
 steps:
   - prompt: "{{ input }}"
-    json_schema: answer
+    output_schema: answer
 "#,
         );
         assert!(result.is_err());
@@ -545,13 +548,13 @@ steps:
     }
 
     #[test]
-    fn rejects_json_schema_without_a_prompt() {
-        let result = parse_workflow("steps:\n  - jq: \".\"\n    json_schema: schema.json\n");
+    fn rejects_output_schema_without_a_prompt() {
+        let result = parse_workflow("steps:\n  - jq: \".\"\n    output_schema: schema.json\n");
         assert!(result.is_err());
     }
 
     #[test]
-    fn rejects_schema_name_without_json_schema() {
+    fn rejects_schema_name_without_output_schema() {
         let result =
             parse_workflow("steps:\n  - prompt: \"{{ input }}\"\n    schema_name: answer\n");
         assert!(result.is_err());
@@ -606,9 +609,10 @@ steps:
     }
 
     #[test]
-    fn rejects_a_step_with_agent_and_json_schema() {
-        let result =
-            parse_workflow("steps:\n  - agent: agents/extract.md\n    json_schema: schema.json\n");
+    fn rejects_a_step_with_agent_and_output_schema() {
+        let result = parse_workflow(
+            "steps:\n  - agent: agents/extract.md\n    output_schema: schema.json\n",
+        );
         assert!(result.is_err());
     }
 
@@ -628,6 +632,13 @@ steps:
   - prompt: "{{ input }}"
 "#,
         );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_the_old_json_schema_field_name() {
+        let result =
+            parse_workflow("steps:\n  - prompt: \"{{ input }}\"\n    json_schema: schema.json\n");
         assert!(result.is_err());
     }
 

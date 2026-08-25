@@ -83,13 +83,13 @@ steps:
 
 ## JSON 出力の指定と jq による加工
 
-step に `json_schema`（と任意で `schema_name`）を指定すると、CLI の `--json-schema` /
+step に `output_schema`（と任意で `schema_name`）を指定すると、CLI の `--json-schema` /
 `--schema-name` と同じく Structured Outputs を要求し、モデルの応答を JSON にできます。
 さらに `jq` を指定すると、その step の出力（モデルの応答、または `prompt` を省略した場合は
 そのときの `{{ input }}`）に [jq](https://jqlang.org/) フィルターを適用し、その結果が次の
 step の `{{ input }}` になります。
 
-`json_schema` に指定した値は、まずワークフロー直下の `json_schemas:` のキーとして解決を
+`output_schema` に指定した値は、まずワークフロー直下の `json_schemas:` のキーとして解決を
 試み、一致するキーがなければ（CLI と同じく）JSON Schema ファイルへのパスとして扱われます。
 `json_schemas:` の各エントリは、スキーマ本体を直接書く `schema:` と、外部ファイルを指す
 `file_path:` のどちらか一方を指定します。
@@ -114,7 +114,7 @@ steps:
     prompt: |
       次の文章から都市名と人口を JSON で抽出してください。
       {{ input }}
-    json_schema: city_fact
+    output_schema: city_fact
     schema_name: city_fact
     jq: ".city"
 
@@ -126,13 +126,13 @@ steps:
 
 - `schema:` はスキーマ本体を直接書くので、外部ファイルを用意せずワークフロー単体で完結
   させたり、複数の step から同じスキーマを名前で参照したりできます。
-- `file_path:` は（`json_schemas:` を使わない場合の `json_schema: city.schema.json` と
+- `file_path:` は（`json_schemas:` を使わない場合の `output_schema: city.schema.json` と
   同じく）JSON Schema ファイルへのパスです。
-- `json_schemas:` を使わず、これまでどおり `json_schema: city.schema.json` のように
+- `json_schemas:` を使わず、これまでどおり `output_schema: city.schema.json` のように
   直接ファイルパスを指定することもできます（`json_schemas:` に同名のキーがある場合は
   そちらが優先されます）。
-- `json_schema` を指定するには `prompt` が必須です（`prompt` のない step には適用先がありません）。
-- `schema_name` は `json_schema` とセットで指定します（既定値は `structured_output`）。
+- `output_schema` を指定するには `prompt` が必須です（`prompt` のない step には適用先がありません）。
+- `schema_name` は `output_schema` とセットで指定します（既定値は `structured_output`）。
 - `jq` の出力が文字列の場合は `jq -r` のように引用符なしのテキストとして展開されます。それ以外
   （オブジェクト・配列・数値など）はコンパクトな JSON テキストとして展開されます。
 - `jq` フィルターが複数の値を出力した場合は改行区切りで連結します。
@@ -142,9 +142,9 @@ steps:
 
 ### 入力の検証（`input_schema`）
 
-`json_schema` が出力（モデルの応答）を検証するのに対して、`input_schema` は step が実行される
+`output_schema` が出力（モデルの応答）を検証するのに対して、`input_schema` は step が実行される
 前の入力（`prompt` をレンダリングする前、あるいは `prompt` のない step では `jq` を適用する前
-の `{{ input }}`）を検証します。指定した値は `json_schema` と同じく、まず `json_schemas:` の
+の `{{ input }}`）を検証します。指定した値は `output_schema` と同じく、まず `json_schemas:` の
 キーとして解決を試み、一致するキーがなければ JSON Schema ファイルへのパスとして扱われます。
 
 ```yaml
@@ -206,7 +206,7 @@ steps:
     prompt: |
       次の問い合わせを分類してください。
       {{ input }}
-    json_schema: triage
+    output_schema: triage
     schema_name: triage
 
   - id: route

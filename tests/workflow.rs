@@ -138,7 +138,7 @@ models:
       model_id: workflow-model
 steps:
   - prompt: "{{{{ input }}}}"
-    json_schema: "{}"
+    output_schema: "{}"
     schema_name: answer_schema
     jq: ".answer"
 "#,
@@ -198,7 +198,7 @@ json_schemas:
       additionalProperties: false
 steps:
   - prompt: "{{{{ input }}}}"
-    json_schema: answer
+    output_schema: answer
     schema_name: answer_schema
 "#,
         server.base_url
@@ -252,7 +252,7 @@ json_schemas:
     file_path: "{}"
 steps:
   - prompt: "{{{{ input }}}}"
-    json_schema: answer
+    output_schema: answer
     schema_name: answer_schema
 "#,
         server.base_url,
@@ -487,7 +487,7 @@ models:
 steps:
   - id: extract
     prompt: "{{{{ input }}}}"
-    json_schema: "{}"
+    output_schema: "{}"
   - id: summarize
     agent: "{}"
 "#,
