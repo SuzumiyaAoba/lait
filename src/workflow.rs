@@ -217,11 +217,14 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
     Ok(workflow)
 }
 
+/// A named predicate over a `StepDefinition`, used by `ACTION_FIELDS`.
+type ActionField = (&'static str, fn(&StepDefinition) -> bool);
+
 /// The fields that drive a model call or data transform (as opposed to just
 /// `id`), each paired with its name for use in an error message. Kept as a
 /// single list so `has_action_fields` and `action_fields_desc` can't drift
 /// out of sync when a field is added or removed.
-const ACTION_FIELDS: &[(&str, fn(&StepDefinition) -> bool)] = &[
+const ACTION_FIELDS: &[ActionField] = &[
     ("when", |step| step.when.is_some()),
     ("model", |step| step.model.is_some()),
     ("reasoning_effort", |step| step.reasoning_effort.is_some()),
