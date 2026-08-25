@@ -1,4 +1,4 @@
-# ワークフロー（run.yml）
+# ワークフロー（workflow.yml）
 
 [ドキュメント目次に戻る](./README.md)
 
@@ -7,7 +7,7 @@
 プロンプトに埋め込みます。最初の step の `{{ input }}` には `<PROMPT>`（CLI 引数）が使われます。
 
 ```yaml
-# run.yml
+# workflow.yml
 name: example-flow
 description: 要約 → 翻訳 → 整形
 
@@ -35,27 +35,28 @@ steps:
 ```
 
 ```sh
-cargo run -- run run.yml "要約・翻訳したい文章..."
+cargo run -- run workflow.yml "要約・翻訳したい文章..."
 ```
 
-- `steps` は配列の先頭から逐次実行するのが基本です。`when`/`switch` による分岐（後述）に加え、
-  `parallel` で複数の step 列を同時実行するファンアウト/ファンインも可能です（後述）。
+- `steps` は配列の先頭から逐次実行するのが基本です。`when`/`switch` による分岐（後述）、
+  `parallel` による複数の step 列の同時実行（ファンアウト/ファンイン）、`loop` による
+  条件ループ、`for_each` による配列反復も可能です（いずれも後述）。
 - `model` / `reasoning_effort` は step 単位で省略可能。省略時は
   ワークフロー直下の `default:` → `lait.config.yml` の `default:`、の順にフォールバックします。
 - `id` は進捗表示（標準エラー出力）用のラベルで、省略した場合は `step-1`、`step-2`… になります。
 - `prompt` も `agent` も `switch` も省略した step はモデルを呼び出さず、`jq` によるデータ変換
   のみを行います（後述）。この場合 `model` は不要です。
 - 最後の step の出力のみを標準出力に出します。
-- `run` サブコマンドでも `--no-config` は利用できます（例: `lait run run.yml "..." --no-config`）。
+- `run` サブコマンドでも `--no-config` は利用できます（例: `lait run workflow.yml "..." --no-config`）。
 
 ## ワークフロー内でのモデル定義
 
-`run.yml` にも `lait.config.yml` と同じ形式の `models` を書けます。`default.model` /
+`workflow.yml` にも `lait.config.yml` と同じ形式の `models` を書けます。`default.model` /
 `steps[].model` で参照するエイリアスをワークフローファイル内に閉じて定義でき、
 `lait.config.yml` を用意しなくてもワークフロー単体で完結させられます。
 
 ```yaml
-# run.yml
+# workflow.yml
 models:
   local:
     - provider:
@@ -95,7 +96,7 @@ step の `{{ input }}` になります。
 `file_path:` のどちらか一方を指定します。
 
 ```yaml
-# run.yml
+# workflow.yml
 default:
   model: local
 json_schemas:
@@ -182,7 +183,7 @@ step には [jq](https://jqlang.org/) フィルターを条件式として使う
 step 全体（モデル呼び出しや `jq` を含む）をスキップし、入力を無変換のまま次の step に渡します。
 
 ```yaml
-# run.yml
+# workflow.yml
 steps:
   - id: maybe-translate
     when: '.lang != "en"'
@@ -200,7 +201,7 @@ step に `switch:` を指定すると、その step は他の全フィールド�
 分岐後は `switch` step の続き（親の `steps` の次の要素）にそのまま戻ります。
 
 ```yaml
-# run.yml
+# workflow.yml
 steps:
   - id: triage
     prompt: |
@@ -246,7 +247,7 @@ step に `parallel:` を指定すると、その step は他の全フィール�
 `{{ input }}` を同じスナップショットとして受け取り、独立した step 列として並列に実行されます。
 
 ```yaml
-# run.yml
+# workflow.yml
 default:
   model: local
 steps:
@@ -291,9 +292,94 @@ steps:
   `case.id`＝ラベルのみ、とは異なります）。
 - branch のどれか1つでもエラーになった場合、その時点で `parallel` step 全体が失敗します
   （他の branch の結果を待たずに停止する場合があります）。
-- `parallel` は `switch` と同時に指定できません。
+- `parallel` は `switch`/`loop`/`for_each` と同時に指定できません（1 step につき、これら
+  ルーター系フィールドはどれか1つだけ）。
 - 分岐中は進捗表示（標準エラー出力）が branch ごとに `[branch-id] [n] id` の形式でインター
   リーブされます（`n` は branch 内だけで完結するローカルな通し番号で、0から数え直します）。
   親の `steps` 側の通し番号は `parallel` step 自体で1つ進むだけで、`switch` と異なり
   branch 内の step 数だけ連続して進むことはありません（複数 branch が同時に進行するため、
   単一の通し番号では実行順を正しく表せないからです）。
+
+## 条件ループ（`loop`）
+
+step に `loop:` を指定すると、その step は他の全フィールド（`prompt`/`agent`/`jq`/`when`/
+`switch`/`parallel`/`for_each` 等、`id` を除く）を持てない代わりに、`steps`（ループ本体）を
+[jq](https://jqlang.org/) 条件が満たされるまで**逐次**繰り返し実行するループになります。各
+イテレーションの最終出力が、次のイテレーションの `{{ input }}` になります（1回目は `loop`
+step 自身に入ってきた入力）。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+steps:
+  - id: retry-until-valid
+    loop:
+      until: '.valid == true'
+      max_iterations: 5
+      steps:
+        - prompt: |
+            前回の失敗理由を踏まえて、もう一度やり直してください。
+            {{ input }}
+          output_schema: validation_result
+          schema_name: validation_result
+```
+
+- `while:` は各イテレーションの実行**前**（1回目を含む）に、その時点の入力に対して評価され
+  ます。偽ならその時点で1回も実行せず終了するので、0回実行されることもあります。1回目の
+  評価対象は `loop` step 自身に入ってきた入力です。`loop` がワークフローの先頭stepの場合、
+  これは `<PROMPT>`（CLI引数）そのもの——多くの場合プレーンテキスト——なので、`while` を
+  先頭stepに置く場合は特に、条件式が上記のJSON文字列ラップの影響を受けないか注意してください。
+- `until:` は各イテレーションの実行**後**に、その出力に対して評価されます。真になった時点で
+  停止するため、`steps` は必ず1回以上実行されます。
+- `while`/`until` はどちらか一方が必須です（両方、またはどちらもない場合はエラー）。
+- `max_iterations` は必須で、1以上である必要があります。この上限に達しても条件を満たさな
+  かった場合は**エラーで停止**します（黙って打ち切って処理を続けることはありません）。上限は
+  安全弁というより「N回以内に条件を満たすべき」というアサーションです。
+- `steps` は空配列にできません。
+- `while`/`until` の条件式は `when`/`switch` の `when` と同じ実装（`eval_when`）で評価される
+  ため、直前の出力がJSONとしてパースできないプレーンテキストであれば、JSON文字列としてラップ
+  された上で評価されます。したがって `until: '.valid == true'` のようにオブジェクトのフィー
+  ルドを参照する条件を書く場合は、`steps` の最後のstepで `output_schema` か `jq` を使って
+  JSONの値に整形しておく必要があります。
+- 進捗表示（標準エラー出力）は `switch` と同様、実行された経路上の通し番号 `[n] id` が
+  イテレーションをまたいで連続します（`loop` は並列実行される `parallel` と違い、本質的に
+  逐次実行だからです）。加えて `-> iteration k/max` の行で現在のイテレーション回数が出力
+  されます。
+
+## 配列反復（`for_each`）
+
+step に `for_each:` を指定すると、その step は他の全フィールド（`loop` と同じく `id` を除く
+全フィールド）を持てない代わりに、jqフィルターで選んだ配列の**各要素**に対して `steps` を
+1回ずつ（配列の順序どおり、**逐次**）実行し、結果を配列として集約するマップ処理になります。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+steps:
+  - id: process-items
+    for_each:
+      items: '.items'
+      steps:
+        - prompt: "この項目を要約してください: {{ input }}"
+      join: 'map(select(. != null))'
+```
+
+- `items:` は、その時点の入力に対して評価するjqフィルターで、**単一のJSON配列を1つだけ**返す
+  必要があります（`.items` のように配列そのものを返してください。`.items[]` のような
+  ストリーム展開ではありません。要素数はゼロでも構いません）。それ以外の値（オブジェクトや
+  文字列など）を返した場合や、出力が0個・複数個の場合はエラーになります。
+- 配列の各要素が、そのイテレーションの `{{ input }}` になります。`parallel` の branch と
+  異なり、`for_each` の本体は要素そのもの以外——周辺のフィールドを含む入力全体——には
+  アクセスできません。周辺情報が必要な場合は、`for_each` の手前に `jq` stepを置いて、
+  各要素にあらかじめ文脈を埋め込んでおいてください。
+- 各イテレーションの最終出力を、`items` の並び順で配列に集約します。`join`（任意）は、その
+  配列に適用する jq フィルターで、`parallel` の `join` と同じ役割です。省略した場合は、
+  集約した配列そのもの（JSONテキスト）が次のstepの `{{ input }}` になります。
+- 配列の要素が0件の場合は0回実行され、出力は空配列（`join` があればそれを適用した結果）に
+  なります。これはエラーではありません。
+- `max_iterations` は持ちません。配列の長さで自然に有界なため、`for_each` では不要と判断
+  しています。
+- 進捗表示は `loop` と同様、`switch` と同じ通し番号方式（要素をまたいで連続）に加えて、
+  `-> item k/n` の行で現在の要素の位置を出力します。

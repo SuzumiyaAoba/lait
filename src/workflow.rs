@@ -84,6 +84,16 @@ pub(crate) struct StepDefinition {
     /// against the same input and joins their outputs. Mutually exclusive
     /// with every other field except `id` (including `switch`).
     pub(crate) parallel: Option<ParallelDefinition>,
+    /// Turns this step into a conditional loop: re-runs `steps` while/until a
+    /// jq condition holds, threading each iteration's output into the next
+    /// iteration's `{{ input }}`. Mutually exclusive with every other field
+    /// except `id` (including `switch`/`parallel`/`for_each`).
+    pub(crate) r#loop: Option<LoopDefinition>,
+    /// Turns this step into an array map: runs `steps` once per element of a
+    /// jq-selected array, collecting the results (in array order) into a
+    /// JSON array. Mutually exclusive with every other field except `id`
+    /// (including `switch`/`parallel`/`loop`).
+    pub(crate) for_each: Option<ForEachDefinition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +155,52 @@ impl BranchDefinition {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LoopDefinition {
+    /// Checked before each iteration (including the first), against the
+    /// current input; the loop runs while this is truthy, so it may run zero
+    /// times. Mutually exclusive with `until`; exactly one of them is
+    /// required.
+    pub(crate) r#while: Option<String>,
+    /// Checked after each iteration, against that iteration's output; the
+    /// loop stops once this becomes truthy, so `steps` always runs at least
+    /// once. Mutually exclusive with `while`; exactly one of them is
+    /// required. Note the condition runs through the same JSON-or-string
+    /// coercion as `when` (see `eval_when`), so the last step in `steps`
+    /// must produce a value it can be evaluated against (via
+    /// `output_schema` or `jq`) for anything beyond a plain truthy/falsy
+    /// text check.
+    pub(crate) until: Option<String>,
+    /// Safety cap on the number of iterations. Required (and must be at
+    /// least 1): reaching it without `while`/`until` being satisfied is a
+    /// runtime error rather than a silent stop, so this is an assertion
+    /// ("must finish within N iterations"), not just a safety valve.
+    pub(crate) max_iterations: Option<usize>,
+    /// The loop body, re-run each iteration. Each iteration's final output
+    /// becomes `{{ input }}` for the next iteration (or, for the first
+    /// iteration, this is the `loop` step's own incoming input).
+    pub(crate) steps: Vec<StepDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ForEachDefinition {
+    /// A jq filter evaluated once against the current input; must produce
+    /// exactly one output value, which must be a JSON array (e.g. `.items`,
+    /// not a stream-producing filter like `.items[]`). Each element becomes
+    /// one iteration's `{{ input }}`; unlike a `parallel` branch, the body
+    /// cannot see anything of the surrounding input beyond that element.
+    pub(crate) items: String,
+    /// The loop body, run once per element of `items`, in array order.
+    pub(crate) steps: Vec<StepDefinition>,
+    /// A jq filter applied to the JSON array of per-element outputs (in
+    /// `items` order), the same way `ParallelDefinition::join` applies to
+    /// the id-keyed object from a `parallel` step. If omitted, the array
+    /// itself (serialized as JSON) becomes `{{ input }}` for the next step.
+    pub(crate) join: Option<String>,
+}
+
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read workflow file '{}'", path.display()))?;
@@ -162,9 +218,9 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
 }
 
 /// Whether `step` has any field that drives a model call or data transform
-/// (as opposed to just `id`), used to reject a `switch`/`parallel` step that
-/// also sets one of these — they route to nested steps instead of acting
-/// directly.
+/// (as opposed to just `id`), used to reject a `switch`/`parallel`/`loop`/
+/// `for_each` step that also sets one of these — they route to nested steps
+/// instead of acting directly.
 fn has_action_fields(step: &StepDefinition) -> bool {
     step.when.is_some()
         || step.model.is_some()
@@ -188,9 +244,18 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                 .unwrap_or_else(|| format!("step-{}", index + 1))
         };
 
-        if step.switch.is_some() && step.parallel.is_some() {
+        let router_count = [
+            step.switch.is_some(),
+            step.parallel.is_some(),
+            step.r#loop.is_some(),
+            step.for_each.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+        if router_count > 1 {
             bail!(
-                "step '{}' cannot have both 'switch' and 'parallel'",
+                "step '{}' can have at most one of 'switch', 'parallel', 'loop', or 'for_each'",
                 label()
             );
         }
@@ -260,10 +325,64 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
             continue;
         }
 
+        if let Some(loop_def) = &step.r#loop {
+            if has_action_fields(step) {
+                bail!(
+                    "step '{}' has 'loop' set; it cannot also have {ACTION_FIELDS_DESC}",
+                    label()
+                );
+            }
+            match (&loop_def.r#while, &loop_def.until) {
+                (Some(_), Some(_)) => bail!(
+                    "step '{}' has 'loop' with both 'while' and 'until'; exactly one is required",
+                    label()
+                ),
+                (None, None) => bail!(
+                    "step '{}' has 'loop' with neither 'while' nor 'until'; exactly one is required",
+                    label()
+                ),
+                _ => {}
+            }
+            match loop_def.max_iterations {
+                None => bail!(
+                    "step '{}' has 'loop' with no 'max_iterations' (required)",
+                    label()
+                ),
+                Some(0) => bail!(
+                    "step '{}' has 'loop' with 'max_iterations: 0'; it must be at least 1",
+                    label()
+                ),
+                Some(_) => {}
+            }
+            if loop_def.steps.is_empty() {
+                bail!("step '{}' has 'loop' with an empty 'steps' list", label());
+            }
+            validate_steps(&loop_def.steps)?;
+            continue;
+        }
+
+        if let Some(for_each) = &step.for_each {
+            if has_action_fields(step) {
+                bail!(
+                    "step '{}' has 'for_each' set; it cannot also have {ACTION_FIELDS_DESC}",
+                    label()
+                );
+            }
+            if for_each.steps.is_empty() {
+                bail!(
+                    "step '{}' has 'for_each' with an empty 'steps' list",
+                    label()
+                );
+            }
+            validate_steps(&for_each.steps)?;
+            continue;
+        }
+
         let calls_model = step.prompt.is_some() || step.agent.is_some();
         if !calls_model && step.jq.is_none() {
             bail!(
-                "step '{}' must have a 'prompt', an 'agent', a 'jq' filter, a 'switch', or a combination",
+                "step '{}' must have a 'prompt', an 'agent', a 'jq' filter, a 'switch', a \
+                 'parallel', a 'loop', a 'for_each', or a combination",
                 label()
             );
         }
@@ -976,6 +1095,255 @@ steps:
         - steps:
             - prompt: "{{ input }}"
               agent: agents/extract.md
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_loop_with_while_and_max_iterations() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: refine
+    loop:
+      while: '.score < 3'
+      max_iterations: 5
+      steps:
+        - jq: '.score += 1'
+"#,
+        )
+        .expect("workflow with a while loop should parse");
+
+        let loop_def = workflow.steps[0]
+            .r#loop
+            .as_ref()
+            .expect("step should have a loop");
+        assert_eq!(loop_def.r#while.as_deref(), Some(".score < 3"));
+        assert!(loop_def.until.is_none());
+        assert_eq!(loop_def.max_iterations, Some(5));
+    }
+
+    #[test]
+    fn parses_a_loop_with_until() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: '.valid == true'
+      max_iterations: 3
+      steps:
+        - jq: '.'
+"#,
+        )
+        .expect("workflow with an until loop should parse");
+
+        let loop_def = workflow.steps[0].r#loop.as_ref().unwrap();
+        assert_eq!(loop_def.until.as_deref(), Some(".valid == true"));
+        assert!(loop_def.r#while.is_none());
+    }
+
+    #[test]
+    fn rejects_a_loop_with_both_while_and_until() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      while: 'true'
+      until: 'true'
+      max_iterations: 3
+      steps:
+        - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_loop_with_neither_while_nor_until() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      max_iterations: 3
+      steps:
+        - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_loop_with_no_max_iterations() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      steps:
+        - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_loop_with_max_iterations_zero() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 0
+      steps:
+        - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_loop_with_empty_steps() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 3
+      steps: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_loop_combined_with_prompt() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    loop:
+      until: 'true'
+      max_iterations: 3
+      steps:
+        - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validates_steps_nested_inside_a_loop() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 3
+      steps:
+        - prompt: "{{ input }}"
+          agent: agents/extract.md
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_for_each_with_items_and_join() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: process
+    for_each:
+      items: '.items'
+      steps:
+        - jq: '. + 1'
+      join: 'map(. * 2)'
+"#,
+        )
+        .expect("workflow with a for_each should parse");
+
+        let for_each = workflow.steps[0]
+            .for_each
+            .as_ref()
+            .expect("step should have a for_each");
+        assert_eq!(for_each.items, ".items");
+        assert_eq!(for_each.join.as_deref(), Some("map(. * 2)"));
+    }
+
+    #[test]
+    fn parses_a_for_each_without_join() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      steps:
+        - jq: '.'
+"#,
+        )
+        .expect("workflow with a for_each without join should parse");
+
+        assert!(workflow.steps[0].for_each.as_ref().unwrap().join.is_none());
+    }
+
+    #[test]
+    fn rejects_a_for_each_with_empty_steps() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      steps: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_for_each_combined_with_when() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - when: 'true'
+    for_each:
+      items: '.items'
+      steps:
+        - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validates_steps_nested_inside_a_for_each() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      steps:
+        - prompt: "{{ input }}"
+          agent: agents/extract.md
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_step_with_both_loop_and_for_each() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 3
+      steps:
+        - jq: '.'
+    for_each:
+      items: '.items'
+      steps:
+        - jq: '.'
 "#,
         );
         assert!(result.is_err());

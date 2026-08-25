@@ -361,6 +361,150 @@ fn run_steps<'a>(
                 continue;
             }
 
+            if let Some(loop_def) = &step.r#loop {
+                eprintln!("{progress_prefix}[{counter}] {label}");
+                // Validated by `workflow::validate_steps`: exactly one of
+                // `while`/`until` is set, and `max_iterations` is `Some(n)` with n >= 1.
+                let max_iterations = loop_def
+                    .max_iterations
+                    .expect("loop.max_iterations is required by validate_steps");
+
+                let mut iteration_input = current_input.clone();
+                // Threaded continuously across iterations (like `switch`, unlike
+                // `parallel`'s per-branch reset): the loop body genuinely runs
+                // sequentially, so a single growing counter reflects real execution
+                // order.
+                let mut loop_counter = counter;
+                if let Some(while_cond) = &loop_def.r#while {
+                    let mut iterations_run = 0usize;
+                    loop {
+                        let should_continue = workflow::eval_when(while_cond, &iteration_input)
+                            .with_context(|| format!("step '{label}'"))?;
+                        if !should_continue {
+                            break;
+                        }
+                        if iterations_run >= max_iterations {
+                            bail!(
+                                "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'while'"
+                            );
+                        }
+                        iterations_run += 1;
+                        eprintln!(
+                            "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
+                        );
+                        let (result, new_counter) = run_steps(
+                            &loop_def.steps,
+                            iteration_input.clone(),
+                            wf,
+                            file_config,
+                            loop_counter,
+                            progress_prefix,
+                        )
+                        .await?;
+                        iteration_input = result;
+                        loop_counter = new_counter;
+                    }
+                } else {
+                    let until_cond = loop_def
+                        .until
+                        .as_ref()
+                        .expect("loop.until is required by validate_steps when 'while' is unset");
+                    let mut iterations_run = 0usize;
+                    let mut satisfied = false;
+                    while iterations_run < max_iterations {
+                        iterations_run += 1;
+                        eprintln!(
+                            "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
+                        );
+                        let (result, new_counter) = run_steps(
+                            &loop_def.steps,
+                            iteration_input.clone(),
+                            wf,
+                            file_config,
+                            loop_counter,
+                            progress_prefix,
+                        )
+                        .await?;
+                        iteration_input = result;
+                        loop_counter = new_counter;
+                        satisfied = workflow::eval_when(until_cond, &iteration_input)
+                            .with_context(|| format!("step '{label}'"))?;
+                        if satisfied {
+                            break;
+                        }
+                    }
+                    if !satisfied {
+                        bail!(
+                            "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'until'"
+                        );
+                    }
+                }
+                current_input = iteration_input;
+                counter = loop_counter;
+                continue;
+            }
+
+            if let Some(for_each) = &step.for_each {
+                eprintln!("{progress_prefix}[{counter}] {label}");
+                let items_json = jq::apply_one(&for_each.items, &current_input)
+                    .with_context(|| format!("step '{label}'"))?;
+                let items_value: serde_json::Value = serde_json::from_str(&items_json)
+                    .with_context(|| {
+                        format!("step '{label}': failed to parse 'for_each.items' output as JSON")
+                    })?;
+                let items = items_value.as_array().cloned().ok_or_else(|| {
+                    anyhow!("step '{label}': 'for_each.items' must produce a JSON array")
+                })?;
+                eprintln!(
+                    "{progress_prefix}    -> iterating over {} item(s)",
+                    items.len()
+                );
+
+                let mut results = Vec::with_capacity(items.len());
+                // Threaded continuously across items, like `loop` (see its comment
+                // above): `for_each` runs sequentially, not concurrently like
+                // `parallel`, so a single growing counter matches real execution order.
+                let mut for_each_counter = counter;
+                for (item_index, item) in items.iter().enumerate() {
+                    eprintln!(
+                        "{progress_prefix}    -> item {}/{}",
+                        item_index + 1,
+                        items.len()
+                    );
+                    // A string item is passed through raw (like `parallel`'s
+                    // `current_input`, and the inverse of `template::parse_input`
+                    // used below for results), not re-quoted as JSON, so
+                    // `{{ input }}` sees the same unquoted text everywhere else
+                    // in the pipeline does.
+                    let item_input = match item {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => serde_json::to_string(other)
+                            .context("failed to serialize a 'for_each' item")?,
+                    };
+                    let (result, new_counter) = run_steps(
+                        &for_each.steps,
+                        item_input,
+                        wf,
+                        file_config,
+                        for_each_counter,
+                        progress_prefix,
+                    )
+                    .await?;
+                    for_each_counter = new_counter;
+                    results.push(template::parse_input(&result));
+                }
+                counter = for_each_counter;
+                let results_json = serde_json::to_string(&serde_json::Value::Array(results))
+                    .context("failed to serialize 'for_each' results")?;
+
+                current_input = match &for_each.join {
+                    Some(filter) => jq::apply(filter, &results_json)
+                        .with_context(|| format!("step '{label}'"))?,
+                    None => results_json,
+                };
+                continue;
+            }
+
             if let Some(when) = &step.when {
                 let truthy = workflow::eval_when(when, &current_input)
                     .with_context(|| format!("step '{label}'"))?;

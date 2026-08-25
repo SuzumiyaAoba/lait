@@ -43,7 +43,7 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 - `agent:`（step）や `file_path:`（`json_schemas:`/`input_schema:`/`output_schema:`）に書く
   パスは、既存の `--json-schema <FILE>` や `lait.config.yml` の探索と同じく、常にコマンドを
   実行したディレクトリ（カレントディレクトリ）からの相対パスとして解決されます。エージェント
-  ファイルや `run.yml` 自体の場所からの相対パスではないため、`run.yml` を別ディレクトリから
+  ファイルや `workflow.yml` 自体の場所からの相対パスではないため、`workflow.yml` を別ディレクトリから
   実行する場合は注意してください。
 - `model` / `reasoning_effort` は省略可能で、`lait.config.yml` の `default:` にフォールバック
   します。CLI から `--model` 等で上書きすることはできません。
@@ -69,14 +69,14 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 
 ## ワークフローからエージェントファイルを使う
 
-`run.yml` の step で `prompt`/`input_schema`/`output_schema`/`schema_name` の代わりに `agent:` を
+`workflow.yml` の step で `prompt`/`input_schema`/`output_schema`/`schema_name` の代わりに `agent:` を
 指定すると、その step はエージェント Markdown ファイルのシステムプロンプト・入出力スキーマ・
 `model`/`reasoning_effort` を使って実行されます。`agent:` は `prompt` と同時には指定できず、
 `input_schema`/`output_schema`/`schema_name` はエージェントファイル側で決まるため step には
 書けません。
 
 ```yaml
-# run.yml
+# workflow.yml
 default:
   model: local
 steps:
@@ -92,4 +92,4 @@ steps:
 なお、通常の `prompt:` を使う step のテンプレート構文（`{{ input }}` のみ）はこれまでどおりで、
 `{{ input.field }}` のようなフィールドアクセスはエージェントファイルの本文でのみ使えます。
 
-関連: [ワークフロー（run.yml）](./workflow.md)
+関連: [ワークフロー（workflow.yml）](./workflow.md)
