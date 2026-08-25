@@ -161,6 +161,25 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
     Ok(workflow)
 }
 
+/// Whether `step` has any field that drives a model call or data transform
+/// (as opposed to just `id`), used to reject a `switch`/`parallel` step that
+/// also sets one of these — they route to nested steps instead of acting
+/// directly.
+fn has_action_fields(step: &StepDefinition) -> bool {
+    step.when.is_some()
+        || step.model.is_some()
+        || step.reasoning_effort.is_some()
+        || step.prompt.is_some()
+        || step.agent.is_some()
+        || step.input_schema.is_some()
+        || step.output_schema.is_some()
+        || step.schema_name.is_some()
+        || step.jq.is_some()
+}
+
+const ACTION_FIELDS_DESC: &str = "'when', 'model', 'reasoning_effort', 'prompt', 'agent', \
+    'input_schema', 'output_schema', 'schema_name', or 'jq'";
+
 fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
         let label = || {
@@ -177,20 +196,9 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         }
 
         if let Some(switch) = &step.switch {
-            let has_action_fields = step.when.is_some()
-                || step.model.is_some()
-                || step.reasoning_effort.is_some()
-                || step.prompt.is_some()
-                || step.agent.is_some()
-                || step.input_schema.is_some()
-                || step.output_schema.is_some()
-                || step.schema_name.is_some()
-                || step.jq.is_some();
-            if has_action_fields {
+            if has_action_fields(step) {
                 bail!(
-                    "step '{}' has 'switch' set; it cannot also have 'when', 'model', \
-                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'output_schema', \
-                     'schema_name', or 'jq'",
+                    "step '{}' has 'switch' set; it cannot also have {ACTION_FIELDS_DESC}",
                     label()
                 );
             }
@@ -219,20 +227,9 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         }
 
         if let Some(parallel) = &step.parallel {
-            let has_action_fields = step.when.is_some()
-                || step.model.is_some()
-                || step.reasoning_effort.is_some()
-                || step.prompt.is_some()
-                || step.agent.is_some()
-                || step.input_schema.is_some()
-                || step.output_schema.is_some()
-                || step.schema_name.is_some()
-                || step.jq.is_some();
-            if has_action_fields {
+            if has_action_fields(step) {
                 bail!(
-                    "step '{}' has 'parallel' set; it cannot also have 'when', 'model', \
-                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'output_schema', \
-                     'schema_name', or 'jq'",
+                    "step '{}' has 'parallel' set; it cannot also have {ACTION_FIELDS_DESC}",
                     label()
                 );
             }
