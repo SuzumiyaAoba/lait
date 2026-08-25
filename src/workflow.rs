@@ -69,8 +69,13 @@ pub(crate) struct StepDefinition {
     pub(crate) jq: Option<String>,
     /// Turns this step into a branch router: evaluates `cases` in order and
     /// runs the first one whose `when` is truthy (or `else`, if none match).
-    /// Mutually exclusive with every other field except `id`.
+    /// Mutually exclusive with every other field except `id` (including
+    /// `parallel`).
     pub(crate) switch: Option<SwitchDefinition>,
+    /// Turns this step into a fan-out/fan-in: runs every branch concurrently
+    /// against the same input and joins their outputs. Mutually exclusive
+    /// with every other field except `id` (including `switch`).
+    pub(crate) parallel: Option<ParallelDefinition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +98,43 @@ pub(crate) struct CaseDefinition {
     /// A jq filter evaluated against the current input; see `StepDefinition::when`.
     pub(crate) when: String,
     pub(crate) steps: Vec<StepDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParallelDefinition {
+    /// Every branch runs concurrently against the same input (a snapshot of
+    /// `{{ input }}` as it stood when the `parallel` step started). Their
+    /// outputs are collected, in `branches` declaration order (not
+    /// completion order, so the join is deterministic), into a JSON object
+    /// keyed by each branch's `id` (or its default label; see
+    /// `BranchDefinition::label`).
+    pub(crate) branches: Vec<BranchDefinition>,
+    /// A jq filter applied to that id-keyed object, the same way
+    /// `StepDefinition::jq` applies to a single step's output. If omitted,
+    /// the object itself (serialized as JSON) becomes `{{ input }}` for the
+    /// next step.
+    pub(crate) join: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BranchDefinition {
+    /// Defaults to `branch-{n}` (1-based), like `StepDefinition::id`. Unlike
+    /// a step or case id, this also becomes the branch's key in the joined
+    /// JSON object, so it must be unique within its `parallel`.
+    pub(crate) id: Option<String>,
+    pub(crate) steps: Vec<StepDefinition>,
+}
+
+impl BranchDefinition {
+    /// The label used both for progress output and as the branch's key in
+    /// the joined JSON object. `index` is 0-based.
+    pub(crate) fn label(&self, index: usize) -> String {
+        self.id
+            .clone()
+            .unwrap_or_else(|| format!("branch-{}", index + 1))
+    }
 }
 
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
@@ -118,6 +160,13 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| format!("step-{}", index + 1))
         };
+
+        if step.switch.is_some() && step.parallel.is_some() {
+            bail!(
+                "step '{}' cannot have both 'switch' and 'parallel'",
+                label()
+            );
+        }
 
         if let Some(switch) = &step.switch {
             let has_action_fields = step.when.is_some()
@@ -155,6 +204,49 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                     );
                 }
                 validate_steps(else_steps)?;
+            }
+            continue;
+        }
+
+        if let Some(parallel) = &step.parallel {
+            let has_action_fields = step.when.is_some()
+                || step.model.is_some()
+                || step.reasoning_effort.is_some()
+                || step.prompt.is_some()
+                || step.agent.is_some()
+                || step.json_schema.is_some()
+                || step.schema_name.is_some()
+                || step.jq.is_some();
+            if has_action_fields {
+                bail!(
+                    "step '{}' has 'parallel' set; it cannot also have 'when', 'model', \
+                     'reasoning_effort', 'prompt', 'agent', 'json_schema', 'schema_name', or 'jq'",
+                    label()
+                );
+            }
+            if parallel.branches.is_empty() {
+                bail!(
+                    "step '{}' has 'parallel' with an empty 'branches' list",
+                    label()
+                );
+            }
+            let mut seen_branch_ids = std::collections::HashSet::new();
+            for (branch_index, branch) in parallel.branches.iter().enumerate() {
+                if branch.steps.is_empty() {
+                    bail!(
+                        "step '{}' has a 'parallel' branch with an empty 'steps' list",
+                        label()
+                    );
+                }
+                let branch_label = branch.label(branch_index);
+                if !seen_branch_ids.insert(branch_label.clone()) {
+                    bail!(
+                        "step '{}' has 'parallel' branches with a duplicate id '{}'",
+                        label(),
+                        branch_label
+                    );
+                }
+                validate_steps(&branch.steps)?;
             }
             continue;
         }
@@ -651,6 +743,165 @@ steps:
       cases:
         - when: 'true'
           steps:
+            - prompt: "{{ input }}"
+              agent: agents/extract.md
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_parallel_with_branches_and_join() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: fan-out
+    parallel:
+      branches:
+        - id: a
+          steps:
+            - prompt: "a: {{ input }}"
+        - id: b
+          steps:
+            - prompt: "b: {{ input }}"
+      join: '.a + .b'
+"#,
+        )
+        .expect("workflow with a parallel step should parse");
+
+        let parallel = workflow.steps[0]
+            .parallel
+            .as_ref()
+            .expect("step should have a parallel");
+        assert_eq!(parallel.branches.len(), 2);
+        assert_eq!(parallel.branches[0].id.as_deref(), Some("a"));
+        assert_eq!(parallel.join.as_deref(), Some(".a + .b"));
+    }
+
+    #[test]
+    fn parses_a_parallel_without_join() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps:
+            - jq: "."
+        - steps:
+            - jq: "."
+"#,
+        )
+        .expect("workflow with a parallel step without join should parse");
+
+        assert!(workflow.steps[0].parallel.as_ref().unwrap().join.is_none());
+    }
+
+    #[test]
+    fn parallel_branch_label_defaults_to_branch_n() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps:
+            - jq: "."
+        - id: named
+          steps:
+            - jq: "."
+"#,
+        )
+        .expect("workflow with a parallel step should parse");
+
+        let branches = &workflow.steps[0].parallel.as_ref().unwrap().branches;
+        assert_eq!(branches[0].label(0), "branch-1");
+        assert_eq!(branches[1].label(1), "named");
+    }
+
+    #[test]
+    fn rejects_a_parallel_with_empty_branches() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_parallel_branch_with_empty_steps() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_parallel_with_duplicate_branch_ids() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - id: same
+          steps:
+            - jq: "."
+        - id: same
+          steps:
+            - jq: "."
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_parallel_combined_with_prompt() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    parallel:
+      branches:
+        - steps:
+            - jq: "."
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_step_with_both_switch_and_parallel() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - switch:
+      cases:
+        - when: 'true'
+          steps:
+            - jq: "."
+    parallel:
+      branches:
+        - steps:
+            - jq: "."
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validates_steps_nested_inside_a_parallel_branch() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps:
             - prompt: "{{ input }}"
               agent: agents/extract.md
 "#,

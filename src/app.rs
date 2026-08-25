@@ -205,7 +205,8 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         }
     }
 
-    let (current_input, _) = run_steps(&wf.steps, run_args.prompt, &wf, &file_config, 0).await?;
+    let (current_input, _) =
+        run_steps(&wf.steps, run_args.prompt, &wf, &file_config, 0, "").await?;
     println!("{current_input}");
     Ok(())
 }
@@ -213,18 +214,26 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 /// The final input and the running progress counter, returned by `run_steps`.
 type StepsOutcome = Result<(String, usize)>;
 
-/// Runs a sequence of steps (the workflow's top-level `steps`, or the nested
-/// `steps` of a `switch` case/`else`), returning the final input and the
-/// running progress counter so nested calls keep numbering `[n]` labels
-/// continuously across the whole executed path (skipped steps still consume
-/// a number). Boxed because a `switch` step recurses into this function from
-/// within an `async` body, which Rust cannot size otherwise.
+/// Runs a sequence of steps (the workflow's top-level `steps`, the nested
+/// `steps` of a `switch` case/`else`, or a `parallel` branch), returning the
+/// final input and the running progress counter so nested calls keep
+/// numbering `[n]` labels continuously across the whole executed path
+/// (skipped steps still consume a number). `progress_prefix` is prepended to
+/// every progress line, so a `parallel` branch's interleaved output stays
+/// attributable to its branch; it is threaded through unchanged by `switch`
+/// (only one case ever runs, so its numbering stays continuous with the
+/// parent) but reset to a fresh branch-local prefix and counter by
+/// `parallel` (every branch runs concurrently, so a single shared counter
+/// would not reflect real execution order). Boxed because a `switch`/
+/// `parallel` step recurses into this function from within an `async` body,
+/// which Rust cannot size otherwise.
 fn run_steps<'a>(
     steps: &'a [workflow::StepDefinition],
     current_input: String,
     wf: &'a workflow::WorkflowFile,
     file_config: &'a ConfigFile,
     start_counter: usize,
+    progress_prefix: &'a str,
 ) -> Pin<Box<dyn Future<Output = StepsOutcome> + 'a>> {
     Box::pin(async move {
         let mut current_input = current_input;
@@ -234,7 +243,7 @@ fn run_steps<'a>(
             let label = step.id.clone().unwrap_or_else(|| format!("step-{counter}"));
 
             if let Some(switch) = &step.switch {
-                eprintln!("[{counter}] {label}");
+                eprintln!("{progress_prefix}[{counter}] {label}");
 
                 let mut matched = None;
                 for (case_index, case) in switch.cases.iter().enumerate() {
@@ -245,10 +254,17 @@ fn run_steps<'a>(
                             .id
                             .clone()
                             .unwrap_or_else(|| format!("case-{}", case_index + 1));
-                        eprintln!("    -> case '{case_label}' matched");
+                        eprintln!("{progress_prefix}    -> case '{case_label}' matched");
                         matched = Some(
-                            run_steps(&case.steps, current_input.clone(), wf, file_config, counter)
-                                .await?,
+                            run_steps(
+                                &case.steps,
+                                current_input.clone(),
+                                wf,
+                                file_config,
+                                counter,
+                                progress_prefix,
+                            )
+                            .await?,
                         );
                         break;
                     }
@@ -257,9 +273,16 @@ fn run_steps<'a>(
                     Some(result) => result,
                     None => match &switch.else_steps {
                         Some(else_steps) => {
-                            eprintln!("    -> no case matched, running 'else'");
-                            run_steps(else_steps, current_input.clone(), wf, file_config, counter)
-                                .await?
+                            eprintln!("{progress_prefix}    -> no case matched, running 'else'");
+                            run_steps(
+                                else_steps,
+                                current_input.clone(),
+                                wf,
+                                file_config,
+                                counter,
+                                progress_prefix,
+                            )
+                            .await?
                         }
                         None => {
                             bail!("step '{label}': no case matched and no 'else' branch is defined")
@@ -271,16 +294,66 @@ fn run_steps<'a>(
                 continue;
             }
 
+            if let Some(parallel) = &step.parallel {
+                eprintln!("{progress_prefix}[{counter}] {label}");
+                eprintln!(
+                    "{progress_prefix}    -> running {} branches concurrently",
+                    parallel.branches.len()
+                );
+
+                let branch_labels: Vec<String> = parallel
+                    .branches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, branch)| branch.label(index))
+                    .collect();
+                let branch_prefixes: Vec<String> = branch_labels
+                    .iter()
+                    .map(|branch_label| format!("{progress_prefix}[{branch_label}] "))
+                    .collect();
+                let branch_futures = parallel.branches.iter().zip(&branch_prefixes).map(
+                    |(branch, branch_prefix)| {
+                        run_steps(
+                            &branch.steps,
+                            current_input.clone(),
+                            wf,
+                            file_config,
+                            0,
+                            branch_prefix,
+                        )
+                    },
+                );
+                let branch_results = futures_util::future::try_join_all(branch_futures).await?;
+
+                let mut joined = serde_json::Map::new();
+                for (branch_label, (branch_output, _)) in
+                    branch_labels.into_iter().zip(branch_results)
+                {
+                    joined.insert(branch_label, template::parse_input(&branch_output));
+                }
+                let joined_json = serde_json::to_string(&serde_json::Value::Object(joined))
+                    .context("failed to serialize joined 'parallel' branch outputs")?;
+
+                eprintln!("{progress_prefix}    -> branches joined");
+
+                current_input = match &parallel.join {
+                    Some(filter) => jq::apply(filter, &joined_json)
+                        .with_context(|| format!("step '{label}'"))?,
+                    None => joined_json,
+                };
+                continue;
+            }
+
             if let Some(when) = &step.when {
                 let truthy = workflow::eval_when(when, &current_input)
                     .with_context(|| format!("step '{label}'"))?;
                 if !truthy {
-                    eprintln!("[{counter}] {label} (skipped)");
+                    eprintln!("{progress_prefix}[{counter}] {label} (skipped)");
                     continue;
                 }
             }
 
-            eprintln!("[{counter}] {label}");
+            eprintln!("{progress_prefix}[{counter}] {label}");
             current_input = execute_step(step, &current_input, wf, file_config, &label).await?;
         }
         Ok((current_input, counter))

@@ -1050,6 +1050,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "clap",
+ "futures-util",
  "handlebars",
  "jaq-core",
  "jaq-json",
