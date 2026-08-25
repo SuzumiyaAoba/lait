@@ -217,24 +217,59 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
     Ok(workflow)
 }
 
+/// A named predicate over a `StepDefinition`, used by `ACTION_FIELDS`.
+type ActionField = (&'static str, fn(&StepDefinition) -> bool);
+
+/// The fields that drive a model call or data transform (as opposed to just
+/// `id`), each paired with its name for use in an error message. Kept as a
+/// single list so `has_action_fields` and `action_fields_desc` can't drift
+/// out of sync when a field is added or removed.
+const ACTION_FIELDS: &[ActionField] = &[
+    ("when", |step| step.when.is_some()),
+    ("model", |step| step.model.is_some()),
+    ("reasoning_effort", |step| step.reasoning_effort.is_some()),
+    ("prompt", |step| step.prompt.is_some()),
+    ("agent", |step| step.agent.is_some()),
+    ("input_schema", |step| step.input_schema.is_some()),
+    ("output_schema", |step| step.output_schema.is_some()),
+    ("schema_name", |step| step.schema_name.is_some()),
+    ("jq", |step| step.jq.is_some()),
+];
+
 /// Whether `step` has any field that drives a model call or data transform
 /// (as opposed to just `id`), used to reject a `switch`/`parallel`/`loop`/
 /// `for_each` step that also sets one of these — they route to nested steps
 /// instead of acting directly.
 fn has_action_fields(step: &StepDefinition) -> bool {
-    step.when.is_some()
-        || step.model.is_some()
-        || step.reasoning_effort.is_some()
-        || step.prompt.is_some()
-        || step.agent.is_some()
-        || step.input_schema.is_some()
-        || step.output_schema.is_some()
-        || step.schema_name.is_some()
-        || step.jq.is_some()
+    ACTION_FIELDS.iter().any(|(_, is_set)| is_set(step))
 }
 
-const ACTION_FIELDS_DESC: &str = "'when', 'model', 'reasoning_effort', 'prompt', 'agent', \
-    'input_schema', 'output_schema', 'schema_name', or 'jq'";
+/// A human-readable, comma-separated list of `ACTION_FIELDS`' names, quoted
+/// and with a trailing "or", for use in the "it cannot also have ..." bails.
+fn action_fields_desc() -> String {
+    let (last, rest) = ACTION_FIELDS
+        .split_last()
+        .expect("ACTION_FIELDS must not be empty");
+    let quoted_rest: Vec<String> = rest.iter().map(|(name, _)| format!("'{name}'")).collect();
+    format!("{}, or '{}'", quoted_rest.join(", "), last.0)
+}
+
+/// Rejects `step` if it has any `ACTION_FIELDS` set, since it is about to be
+/// validated as a `router_name` (`switch`/`parallel`/`loop`/`for_each`) step,
+/// which routes to nested steps instead of acting directly.
+fn reject_action_fields_on_router(
+    step: &StepDefinition,
+    router_name: &str,
+    label: &str,
+) -> Result<()> {
+    if has_action_fields(step) {
+        bail!(
+            "step '{label}' has '{router_name}' set; it cannot also have {}",
+            action_fields_desc()
+        );
+    }
+    Ok(())
+}
 
 fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
@@ -261,12 +296,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         }
 
         if let Some(switch) = &step.switch {
-            if has_action_fields(step) {
-                bail!(
-                    "step '{}' has 'switch' set; it cannot also have {ACTION_FIELDS_DESC}",
-                    label()
-                );
-            }
+            reject_action_fields_on_router(step, "switch", &label())?;
             if switch.cases.is_empty() {
                 bail!("step '{}' has 'switch' with an empty 'cases' list", label());
             }
@@ -292,12 +322,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         }
 
         if let Some(parallel) = &step.parallel {
-            if has_action_fields(step) {
-                bail!(
-                    "step '{}' has 'parallel' set; it cannot also have {ACTION_FIELDS_DESC}",
-                    label()
-                );
-            }
+            reject_action_fields_on_router(step, "parallel", &label())?;
             if parallel.branches.is_empty() {
                 bail!(
                     "step '{}' has 'parallel' with an empty 'branches' list",
@@ -326,12 +351,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         }
 
         if let Some(loop_def) = &step.r#loop {
-            if has_action_fields(step) {
-                bail!(
-                    "step '{}' has 'loop' set; it cannot also have {ACTION_FIELDS_DESC}",
-                    label()
-                );
-            }
+            reject_action_fields_on_router(step, "loop", &label())?;
             match (&loop_def.r#while, &loop_def.until) {
                 (Some(_), Some(_)) => bail!(
                     "step '{}' has 'loop' with both 'while' and 'until'; exactly one is required",
@@ -362,12 +382,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         }
 
         if let Some(for_each) = &step.for_each {
-            if has_action_fields(step) {
-                bail!(
-                    "step '{}' has 'for_each' set; it cannot also have {ACTION_FIELDS_DESC}",
-                    label()
-                );
-            }
+            reject_action_fields_on_router(step, "for_each", &label())?;
             if for_each.steps.is_empty() {
                 bail!(
                     "step '{}' has 'for_each' with an empty 'steps' list",
