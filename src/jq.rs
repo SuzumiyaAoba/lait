@@ -36,6 +36,24 @@ pub(crate) fn apply_bool(filter_source: &str, input_json: &str) -> Result<bool> 
     }
 }
 
+/// Runs a jq filter that must produce exactly one JSON value (used by
+/// workflow `for_each.items:` filters). Unlike `apply`, the result is
+/// rendered as proper JSON text even for a string output (no `jq -r`-style
+/// unquoting), and multiple outputs are rejected instead of newline-joined.
+pub(crate) fn apply_one(filter_source: &str, input_json: &str) -> Result<String> {
+    let outputs = run_filter(filter_source, input_json)?;
+    match outputs.as_slice() {
+        [] => {
+            bail!("jq filter {filter_source:?} produced no output; expected exactly one value")
+        }
+        [value] => Ok(value.to_string()),
+        _ => bail!(
+            "jq filter {filter_source:?} produced {} outputs; expected exactly one value",
+            outputs.len()
+        ),
+    }
+}
+
 fn run_filter(filter_source: &str, input_json: &str) -> Result<Vec<Val>> {
     let input = read::parse_single(input_json.as_bytes())
         .map_err(|error| anyhow!("failed to parse jq input as JSON: {error}"))?;
@@ -81,7 +99,7 @@ fn render_val(value: Val) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, apply_bool};
+    use super::{apply, apply_bool, apply_one};
 
     #[test]
     fn extracts_a_string_field_raw() {
@@ -142,5 +160,31 @@ mod tests {
     #[test]
     fn apply_bool_rejects_multiple_outputs() {
         assert!(apply_bool(".[]", "[true, false]").is_err());
+    }
+
+    #[test]
+    fn apply_one_renders_a_string_output_as_quoted_json() {
+        assert_eq!(
+            apply_one(".name", r#"{"name":"Alice"}"#).unwrap(),
+            r#""Alice""#
+        );
+    }
+
+    #[test]
+    fn apply_one_renders_an_array_output_as_compact_json() {
+        assert_eq!(
+            apply_one(".items", r#"{"items":[1,2,3]}"#).unwrap(),
+            "[1,2,3]"
+        );
+    }
+
+    #[test]
+    fn apply_one_rejects_zero_outputs() {
+        assert!(apply_one(".[]", "[]").is_err());
+    }
+
+    #[test]
+    fn apply_one_rejects_multiple_outputs() {
+        assert!(apply_one(".[]", "[1, 2]").is_err());
     }
 }

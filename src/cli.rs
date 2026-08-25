@@ -21,7 +21,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Run a YAML-defined workflow (see run.yml).
+    /// Run a YAML-defined workflow (see workflow.yml).
     Run(RunArgs),
     /// Work with agent Markdown files (frontmatter + system prompt template).
     Agent(AgentCommand),
@@ -29,7 +29,7 @@ pub(crate) enum Command {
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
-    /// Path to the workflow YAML file (e.g. run.yml).
+    /// Path to the workflow YAML file (e.g. workflow.yml).
     #[arg(value_name = "FILE")]
     pub(crate) file: PathBuf,
 
@@ -246,12 +246,12 @@ mod tests {
 
     #[test]
     fn parses_run_subcommand() {
-        let cli = Cli::try_parse_from(["lait", "run", "run.yml", "hello world"])
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml", "hello world"])
             .expect("valid run subcommand arguments should parse");
 
         match cli.command {
             Some(Command::Run(run_args)) => {
-                assert_eq!(run_args.file.to_str(), Some("run.yml"));
+                assert_eq!(run_args.file.to_str(), Some("workflow.yml"));
                 assert_eq!(run_args.prompt, "hello world");
             }
             _ => panic!("expected the run subcommand to be selected"),
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn run_subcommand_accepts_global_no_config_after_its_args() {
-        let cli = Cli::try_parse_from(["lait", "run", "run.yml", "hello", "--no-config"])
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml", "hello", "--no-config"])
             .expect("global flags should be accepted after subcommand arguments");
 
         assert!(cli.no_config);
@@ -291,6 +291,6 @@ mod tests {
     #[test]
     fn run_subcommand_requires_file_and_prompt() {
         assert!(Cli::try_parse_from(["lait", "run"]).is_err());
-        assert!(Cli::try_parse_from(["lait", "run", "run.yml"]).is_err());
+        assert!(Cli::try_parse_from(["lait", "run", "workflow.yml"]).is_err());
     }
 }
