@@ -75,6 +75,21 @@ pub(crate) struct StepDefinition {
     /// running input if there is no `prompt`) before it becomes `{{ input }}` for
     /// the next step. The filtered value must be valid JSON.
     pub(crate) jq: Option<String>,
+    /// Retries this step's action (`input_schema` check, `prompt`/`agent`
+    /// call, and `jq`, as one unit) up to `max_attempts` times on failure.
+    /// Applies before `on_error`, which only runs once every attempt here
+    /// has failed.
+    pub(crate) retry: Option<RetryDefinition>,
+    /// A per-attempt time limit, in seconds, on this step's action. A timed
+    /// out attempt counts as a failure for `retry`, the same as any other
+    /// error.
+    pub(crate) timeout: Option<u64>,
+    /// Runs in place of failing the workflow when this step's action (after
+    /// every `retry` attempt, if any) still fails. Its steps receive
+    /// `{"error": "<the failure message>", "input": <this step's input>}` as
+    /// their `{{ input }}`; shape that with a leading `jq` step if the
+    /// workflow needs something else.
+    pub(crate) on_error: Option<OnErrorDefinition>,
     /// Turns this step into a branch router: evaluates `cases` in order and
     /// runs the first one whose `when` is truthy (or `else`, if none match).
     /// Mutually exclusive with every other field except `id` (including
@@ -107,6 +122,30 @@ pub(crate) struct StepDefinition {
     /// `loop`/`for_each` reachable without crossing a `parallel` branch
     /// boundary. Mutually exclusive with `stop`.
     pub(crate) r#break: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetryDefinition {
+    /// The total number of attempts, including the first (i.e. `3` means "try
+    /// once, then retry up to twice more"). Required, and must be at least 1.
+    pub(crate) max_attempts: Option<usize>,
+    /// How long to wait, in seconds, before the first retry (after attempt 1
+    /// fails). Defaults to 0 (retry immediately).
+    pub(crate) delay_seconds: Option<u64>,
+    /// Multiplies the wait before each subsequent retry (e.g. `2.0` doubles
+    /// it every time). Defaults to `1.0` (a constant delay).
+    pub(crate) backoff: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OnErrorDefinition {
+    /// Run once, with the failure's `{"error": ..., "input": ...}` object as
+    /// `{{ input }}`, in place of failing the workflow. `stop`/`break` are
+    /// allowed here like anywhere else (subject to the same nesting rules as
+    /// the failing step itself).
+    pub(crate) steps: Vec<StepDefinition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +286,9 @@ const ACTION_FIELDS: &[ActionField] = &[
     ("output_schema", |step| step.output_schema.is_some()),
     ("schema_name", |step| step.schema_name.is_some()),
     ("jq", |step| step.jq.is_some()),
+    ("retry", |step| step.retry.is_some()),
+    ("timeout", |step| step.timeout.is_some()),
+    ("on_error", |step| step.on_error.is_some()),
     ("stop", |step| step.stop.is_some()),
     ("break", |step| step.r#break.is_some()),
 ];
@@ -440,6 +482,35 @@ fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Result<()> {
             }
             validate_steps(&for_each.steps, ctx.in_loop_body())?;
             continue;
+        }
+
+        if let Some(retry) = &step.retry {
+            match retry.max_attempts {
+                None => bail!(
+                    "step '{}' has 'retry' with no 'max_attempts' (required)",
+                    label()
+                ),
+                Some(0) => bail!(
+                    "step '{}' has 'retry' with 'max_attempts: 0'; it must be at least 1",
+                    label()
+                ),
+                Some(_) => {}
+            }
+        }
+        if step.timeout == Some(0) {
+            bail!(
+                "step '{}' has 'timeout: 0'; it must be at least 1 second",
+                label()
+            );
+        }
+        if let Some(on_error) = &step.on_error {
+            if on_error.steps.is_empty() {
+                bail!(
+                    "step '{}' has 'on_error' with an empty 'steps' list",
+                    label()
+                );
+            }
+            validate_steps(&on_error.steps, ctx)?;
         }
 
         if step.r#break == Some(true) && step.stop == Some(true) {
@@ -1585,6 +1656,135 @@ steps:
 steps:
   - id: empty
     when: 'true'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_step_with_retry_timeout_and_on_error() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: call
+    prompt: "{{ input }}"
+    timeout: 30
+    retry:
+      max_attempts: 3
+      delay_seconds: 1
+      backoff: 2.0
+    on_error:
+      steps:
+        - jq: '{ fallback: .error }'
+"#,
+        )
+        .expect("workflow with retry/timeout/on_error should parse");
+
+        let step = &workflow.steps[0];
+        assert_eq!(step.timeout, Some(30));
+        let retry = step.retry.as_ref().unwrap();
+        assert_eq!(retry.max_attempts, Some(3));
+        assert_eq!(retry.delay_seconds, Some(1));
+        assert_eq!(retry.backoff, Some(2.0));
+        assert_eq!(step.on_error.as_ref().unwrap().steps.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_retry_with_no_max_attempts() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    retry:
+      delay_seconds: 1
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_retry_with_max_attempts_zero() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    retry:
+      max_attempts: 0
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_timeout_of_zero() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    timeout: 0
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_an_on_error_with_an_empty_steps_list() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    on_error:
+      steps: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validates_steps_nested_inside_on_error() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    on_error:
+      steps:
+        - prompt: "{{ input }}"
+          agent: agents/extract.md
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn on_error_inherits_the_failing_steps_loop_context_for_break() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 3
+      steps:
+        - prompt: "{{ input }}"
+          on_error:
+            steps:
+              - break: true
+"#,
+        );
+        assert!(workflow.is_ok());
+    }
+
+    #[test]
+    fn rejects_a_switch_combined_with_retry() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - retry:
+      max_attempts: 3
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
 "#,
         );
         assert!(result.is_err());

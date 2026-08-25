@@ -215,6 +215,56 @@ pub(crate) fn test_command() -> Command {
 
 impl MockServer {
     pub(crate) fn start(status: &str, response_body: &str) -> Self {
+        Self::start_sequence(&[(status, response_body)])
+    }
+
+    /// Starts a mock server that accepts `responses.len()` connections in
+    /// order, replying to the Nth one with `responses[n]` (a `(status,
+    /// body)` pair) and recording every request it received. Used to test
+    /// retry: e.g. `&[("500 Internal Server Error", "..."), ("200 OK", "...")]`
+    /// simulates one transient failure followed by a success.
+    pub(crate) fn start_sequence(responses: &[(&str, &str)]) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
+        let address = listener
+            .local_addr()
+            .expect("failed to get mock server address");
+        let (request_sender, requests) = mpsc::channel();
+        let responses: Vec<(String, String)> = responses
+            .iter()
+            .map(|(status, body)| ((*status).to_owned(), (*body).to_owned()))
+            .collect();
+
+        let thread = thread::spawn(move || {
+            for (status, response_body) in responses {
+                let (mut stream, _) = listener.accept()?;
+                let request = read_request(&mut stream)?;
+                request_sender
+                    .send(request)
+                    .map_err(|_| io::Error::other("test receiver was dropped"))?;
+
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len(),
+                );
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+            }
+            Ok(())
+        });
+
+        Self {
+            base_url: format!("http://{address}/v1"),
+            requests,
+            thread,
+        }
+    }
+
+    /// Starts a mock server that accepts one connection, reads its request,
+    /// then waits `delay` before writing the response. Used to test
+    /// `timeout`: a step whose `timeout` is shorter than `delay` should fail
+    /// (and its request future should be dropped) before the response is
+    /// ever written.
+    pub(crate) fn start_delayed(delay: Duration, status: &str, response_body: &str) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
         let address = listener
             .local_addr()
@@ -229,6 +279,8 @@ impl MockServer {
             request_sender
                 .send(request)
                 .map_err(|_| io::Error::other("test receiver was dropped"))?;
+
+            thread::sleep(delay);
 
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",

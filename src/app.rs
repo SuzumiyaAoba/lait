@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::ResponseFormat;
@@ -558,7 +558,46 @@ fn run_steps<'a>(
             }
 
             eprintln!("{progress_prefix}[{counter}] {label}");
-            current_input = execute_step(step, &current_input, wf, file_config, &label).await?;
+            let attempt_result = execute_step_with_retry(
+                step,
+                &current_input,
+                wf,
+                file_config,
+                &label,
+                progress_prefix,
+            )
+            .await;
+            current_input = match attempt_result {
+                Ok(output) => output,
+                Err(error) => match &step.on_error {
+                    Some(on_error) => {
+                        eprintln!(
+                            "{progress_prefix}    -> step failed, running 'on_error': {error}"
+                        );
+                        let error_input = serde_json::json!({
+                            "error": error.to_string(),
+                            "input": template::parse_input(&current_input),
+                        });
+                        let error_input_json = serde_json::to_string(&error_input)
+                            .context("failed to serialize 'on_error' input")?;
+                        let (result, new_counter, flow) = run_steps(
+                            &on_error.steps,
+                            error_input_json,
+                            wf,
+                            file_config,
+                            counter,
+                            progress_prefix,
+                        )
+                        .await?;
+                        counter = new_counter;
+                        if flow != Flow::Continue {
+                            return Ok((result, counter, flow));
+                        }
+                        result
+                    }
+                    None => return Err(error),
+                },
+            };
 
             if step.r#break == Some(true) {
                 return Ok((current_input, counter, Flow::Break));
@@ -569,6 +608,73 @@ fn run_steps<'a>(
         }
         Ok((current_input, counter, Flow::Continue))
     })
+}
+
+/// Runs `execute_step`, applying `step.timeout` to each attempt and retrying
+/// per `step.retry` on failure (a timed-out attempt counts as a failure).
+/// Returns the last attempt's error once `retry.max_attempts` (or 1, with no
+/// `retry`) is exhausted; the caller decides whether to run `on_error` or
+/// propagate it.
+async fn execute_step_with_retry(
+    step: &workflow::StepDefinition,
+    current_input: &str,
+    wf: &workflow::WorkflowFile,
+    file_config: &ConfigFile,
+    label: &str,
+    progress_prefix: &str,
+) -> Result<String> {
+    let max_attempts = step
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.max_attempts)
+        .unwrap_or(1);
+    let backoff = step
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.backoff)
+        .unwrap_or(1.0);
+    let mut delay = Duration::from_secs(
+        step.retry
+            .as_ref()
+            .and_then(|retry| retry.delay_seconds)
+            .unwrap_or(0),
+    );
+
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let outcome = match step.timeout {
+            Some(seconds) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(seconds),
+                    execute_step(step, current_input, wf, file_config, label),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow!(
+                        "step '{label}' timed out after {seconds}s (attempt {attempt}/{max_attempts})"
+                    )),
+                }
+            }
+            None => execute_step(step, current_input, wf, file_config, label).await,
+        };
+
+        match outcome {
+            Ok(output) => return Ok(output),
+            Err(error) if attempt < max_attempts => {
+                eprintln!(
+                    "{progress_prefix}    -> attempt {attempt}/{max_attempts} failed: {error}; retrying in {:.1}s",
+                    delay.as_secs_f64()
+                );
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                delay = Duration::from_secs_f64((delay.as_secs_f64() * backoff).max(0.0));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Resolves the model/reasoning-effort settings for a step's model call,

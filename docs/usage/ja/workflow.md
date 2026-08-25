@@ -168,6 +168,46 @@ steps:
 agent ファイル側の `input_schema` が使われるため、step に `input_schema` を重ねて指定すること
 はできません。
 
+## エラー処理（`retry` / `timeout` / `on_error`）
+
+step には `retry:`（再試行）、`timeout:`（1回の試行あたりの時間制限）、`on_error:`（再試行を
+使い切っても失敗したときのフォールバック）を指定できます。いずれも、その step自身のアクション
+（`input_schema` の検証 → `prompt`/`agent` の呼び出し → `jq`、をひとまとまりとして扱います）
+に対して働きます。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+steps:
+  - id: call
+    prompt: "{{ input }}"
+    timeout: 30
+    retry:
+      max_attempts: 3
+      delay_seconds: 1
+      backoff: 2.0
+    on_error:
+      steps:
+        - jq: '{ fallback: .error }'
+```
+
+- `timeout:` は1回の試行にかける秒数の上限です。超過した試行は失敗として扱われ（`retry` が
+  設定されていれば再試行の対象になります）、1以上である必要があります。
+- `retry:` の `max_attempts` は初回を含む総試行回数で、必須かつ1以上です（`max_attempts: 3` は
+  「1回試して、失敗したら最大2回まで再試行する」という意味です）。`delay_seconds`（初回の再試行
+  前に待つ秒数、既定0）と `backoff`（再試行のたびに待機時間へ掛ける倍率、既定1.0）は任意です。
+  進捗表示（標準エラー出力）に `-> attempt k/max failed: ...; retrying in Ns` の行が出ます。
+- `on_error:` は、`retry` を使い切っても（あるいは `retry` がなければ最初の1回で）失敗した
+  ときに、ワークフローを異常終了させる代わりに実行する `steps` です。入力には
+  `{"error": "<失敗内容のメッセージ>", "input": <その step に入ってきた入力>}` という
+  オブジェクトが渡されるので、`jq` で必要な形に加工してください。`on_error` の `steps` の中でも
+  `stop`/`break`/`switch`/`parallel`/`loop`/`for_each` を含め、通常の step と同じ構文が使えます
+  （`break` を使う場合は、失敗した step 自身が `loop`/`for_each` の本文の中にある必要があります）。
+  `on_error` を指定しなければ、これまでどおり失敗はワークフロー全体のエラーになります。
+- `retry`/`timeout`/`on_error` は `switch`/`parallel`/`loop`/`for_each` とは併用できません
+  （これらは入れ子の step 列に処理を委ねるだけで、自分ではアクションを実行しないためです）。
+
 ## 条件分岐（`when` / `switch`）
 
 step には [jq](https://jqlang.org/) フィルターを条件式として使う2種類の分岐構文が使えます。
