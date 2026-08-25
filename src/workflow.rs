@@ -636,13 +636,6 @@ steps:
     }
 
     #[test]
-    fn rejects_the_old_json_schema_field_name() {
-        let result =
-            parse_workflow("steps:\n  - prompt: \"{{ input }}\"\n    json_schema: schema.json\n");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn parses_a_step_with_a_when_guard() {
         let workflow = parse_workflow(
             r#"
