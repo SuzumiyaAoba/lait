@@ -140,6 +140,33 @@ steps:
   変換するだけの step になります（`model` の指定は不要です）。この場合、入力は有効な JSON で
   ある必要があります。
 
+### 入力の検証（`input_schema`）
+
+`json_schema` が出力（モデルの応答）を検証するのに対して、`input_schema` は step が実行される
+前の入力（`prompt` をレンダリングする前、あるいは `prompt` のない step では `jq` を適用する前
+の `{{ input }}`）を検証します。指定した値は `json_schema` と同じく、まず `json_schemas:` の
+キーとして解決を試み、一致するキーがなければ JSON Schema ファイルへのパスとして扱われます。
+
+```yaml
+json_schemas:
+  city:
+    schema:
+      type: object
+      required: [city]
+steps:
+  - id: introduce
+    input_schema: city
+    prompt: |
+      次の都市名を使って一文で紹介してください。
+      {{ input }}
+```
+
+検証は「JSON オブジェクトであること」と「`required` に列挙されたキーが揃っていること」だけを
+確認する簡易的なもので、型やネストしたスキーマまでは検査しません。必須フィールドが欠けている
+入力を早期に（モデルを呼び出す前に）エラーとして弾くためのものです。`agent` を指定した step では
+agent ファイル側の `input_schema` が使われるため、step に `input_schema` を重ねて指定すること
+はできません。
+
 ## 条件分岐（`when` / `switch`）
 
 step には [jq](https://jqlang.org/) フィルターを条件式として使う2種類の分岐構文が使えます。

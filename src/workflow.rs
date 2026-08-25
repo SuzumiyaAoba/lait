@@ -26,8 +26,9 @@ pub(crate) struct WorkflowFile {
     /// the same name defined in `lait.config.yml`.
     #[serde(default)]
     pub(crate) models: ModelMap,
-    /// Named schema definitions usable by `steps[].json_schema`, each either a
-    /// `file_path:` to a JSON schema file or an inline `schema:` body.
+    /// Named schema definitions usable by `steps[].json_schema` and
+    /// `steps[].input_schema`, each either a `file_path:` to a JSON schema
+    /// file or an inline `schema:` body.
     #[serde(default)]
     pub(crate) json_schemas: JsonSchemaMap,
     pub(crate) steps: Vec<StepDefinition>,
@@ -52,9 +53,16 @@ pub(crate) struct StepDefinition {
     pub(crate) prompt: Option<String>,
     /// Path to an agent Markdown file (see `agent::load_agent`) whose system
     /// prompt, model/reasoning defaults, and input/output schema drive this
-    /// step instead of `prompt`/`json_schema`/`schema_name`. Mutually
-    /// exclusive with `prompt`, `json_schema`, and `schema_name`.
+    /// step instead of `prompt`/`input_schema`/`json_schema`/`schema_name`.
+    /// Mutually exclusive with `prompt`, `input_schema`, `json_schema`, and
+    /// `schema_name`.
     pub(crate) agent: Option<PathBuf>,
+    /// Validates this step's input before it runs (before rendering `prompt`,
+    /// or before `jq` for a transform-only step). Resolved against the
+    /// workflow's top-level `json_schemas:` first; if no such key exists,
+    /// treated as a path to a JSON schema file instead. Mutually exclusive
+    /// with `agent`, whose agent file supplies its own `input_schema`.
+    pub(crate) input_schema: Option<String>,
     /// Request a structured JSON response using the named schema, like the CLI's
     /// `--json-schema`. Resolved against the workflow's top-level `json_schemas:`
     /// first; if no such key exists, treated as a path to a JSON schema file
@@ -174,13 +182,15 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                 || step.reasoning_effort.is_some()
                 || step.prompt.is_some()
                 || step.agent.is_some()
+                || step.input_schema.is_some()
                 || step.json_schema.is_some()
                 || step.schema_name.is_some()
                 || step.jq.is_some();
             if has_action_fields {
                 bail!(
                     "step '{}' has 'switch' set; it cannot also have 'when', 'model', \
-                     'reasoning_effort', 'prompt', 'agent', 'json_schema', 'schema_name', or 'jq'",
+                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'json_schema', \
+                     'schema_name', or 'jq'",
                     label()
                 );
             }
@@ -214,13 +224,15 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                 || step.reasoning_effort.is_some()
                 || step.prompt.is_some()
                 || step.agent.is_some()
+                || step.input_schema.is_some()
                 || step.json_schema.is_some()
                 || step.schema_name.is_some()
                 || step.jq.is_some();
             if has_action_fields {
                 bail!(
                     "step '{}' has 'parallel' set; it cannot also have 'when', 'model', \
-                     'reasoning_effort', 'prompt', 'agent', 'json_schema', 'schema_name', or 'jq'",
+                     'reasoning_effort', 'prompt', 'agent', 'input_schema', 'json_schema', \
+                     'schema_name', or 'jq'",
                     label()
                 );
             }
@@ -261,9 +273,13 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
         if step.prompt.is_some() && step.agent.is_some() {
             bail!("step '{}' cannot have both 'prompt' and 'agent'", label());
         }
-        if step.agent.is_some() && (step.json_schema.is_some() || step.schema_name.is_some()) {
+        if step.agent.is_some()
+            && (step.input_schema.is_some()
+                || step.json_schema.is_some()
+                || step.schema_name.is_some())
+        {
             bail!(
-                "step '{}' has 'agent' set; 'json_schema'/'schema_name' come from the agent file and must not be set on the step",
+                "step '{}' has 'agent' set; 'input_schema'/'json_schema'/'schema_name' come from the agent file and must not be set on the step",
                 label()
             );
         }
@@ -566,6 +582,30 @@ steps:
     }
 
     #[test]
+    fn parses_a_step_with_an_input_schema() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    input_schema: schema.json
+"#,
+        )
+        .expect("workflow with an input_schema should parse");
+
+        assert_eq!(
+            workflow.steps[0].input_schema.as_deref(),
+            Some("schema.json")
+        );
+    }
+
+    #[test]
+    fn rejects_a_step_with_agent_and_input_schema() {
+        let result =
+            parse_workflow("steps:\n  - agent: agents/extract.md\n    input_schema: schema.json\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn rejects_a_step_with_agent_and_json_schema() {
         let result =
             parse_workflow("steps:\n  - agent: agents/extract.md\n    json_schema: schema.json\n");
@@ -708,6 +748,22 @@ steps:
             r#"
 steps:
   - prompt: "{{ input }}"
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_switch_combined_with_input_schema() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - input_schema: schema.json
     switch:
       cases:
         - when: 'true'
@@ -866,6 +922,21 @@ steps:
             r#"
 steps:
   - prompt: "{{ input }}"
+    parallel:
+      branches:
+        - steps:
+            - jq: "."
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_parallel_combined_with_input_schema() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - input_schema: schema.json
     parallel:
       branches:
         - steps:

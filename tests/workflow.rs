@@ -285,6 +285,126 @@ steps:
 }
 
 #[test]
+fn step_input_schema_allows_a_call_when_input_has_every_required_field() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+json_schemas:
+  city:
+    schema:
+      type: object
+      required: [city]
+steps:
+  - prompt: "{{{{ input }}}}"
+    input_schema: city
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, r#"{"city":"Tokyo"}"#);
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+}
+
+#[test]
+fn step_input_schema_rejects_input_missing_a_required_field() {
+    let workflow = WorkflowFile::new(
+        r#"
+json_schemas:
+  city:
+    schema:
+      type: object
+      required: [city]
+steps:
+  - jq: "."
+    input_schema: city
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"other":true}"#);
+
+    assert!(
+        !output.status.success(),
+        "expected the step to reject input missing 'city'"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("city"), "stderr: {stderr}");
+}
+
+#[test]
+fn step_input_schema_resolves_a_direct_file_path_when_no_json_schemas_map_entry_matches() {
+    let schema = JsonSchemaFile::new(r#"{"type":"object","required":["city"]}"#);
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{{{ input }}}}"
+    input_schema: "{}"
+"#,
+        server.base_url,
+        schema.path.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, r#"{"city":"Tokyo"}"#);
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+}
+
+#[test]
+fn step_input_schema_reports_a_missing_schema_file_with_path_context() {
+    let missing_path = std::env::temp_dir().join(format!(
+        "lait-missing-input-schema-{}.json",
+        std::process::id()
+    ));
+    assert!(
+        !missing_path.exists(),
+        "test schema path unexpectedly exists: {missing_path:?}"
+    );
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+steps:
+  - jq: "."
+    input_schema: "{}"
+"#,
+        missing_path.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, r#"{"city":"Tokyo"}"#);
+
+    assert!(
+        !output.status.success(),
+        "expected the step to fail on a missing input_schema file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read JSON schema file"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(missing_path.to_string_lossy().as_ref()),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn step_with_an_agent_renders_its_system_prompt_and_uses_its_output_schema() {
     let server = MockServer::start(
         "200 OK",

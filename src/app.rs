@@ -369,6 +369,14 @@ async fn execute_step(
     file_config: &ConfigFile,
     label: &str,
 ) -> Result<String> {
+    if let Some(name_or_path) = &step.input_schema {
+        let schema = schema::resolve_named_schema_value(&wf.json_schemas, name_or_path)
+            .with_context(|| format!("step '{label}'"))?;
+        let input = template::parse_input(current_input);
+        schema::validate_input_against_schema(&schema, &input)
+            .with_context(|| format!("step '{label}'"))?;
+    }
+
     let mut step_output = if let Some(agent_path) = &step.agent {
         let agent_file =
             agent::load_agent(agent_path).with_context(|| format!("step '{label}'"))?;
