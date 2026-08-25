@@ -521,6 +521,46 @@ fn run_steps<'a>(
     })
 }
 
+/// Resolves the model/reasoning-effort settings for a step's model call,
+/// applying the step > agent file (when this step has one) > workflow
+/// default precedence chain shared by `execute_step`'s `agent` and `prompt`
+/// branches. `agent_file` is `Some` only for an `agent` step; besides adding
+/// its fallback layer, its presence also selects which hint text a
+/// missing-model error uses.
+fn resolve_step_settings(
+    step: &workflow::StepDefinition,
+    wf: &workflow::WorkflowFile,
+    file_config: &ConfigFile,
+    agent_file: Option<&AgentFile>,
+    label: &str,
+) -> Result<RequestSettings> {
+    let model_name = step
+        .model
+        .clone()
+        .or_else(|| agent_file.and_then(|agent_file| agent_file.model.clone()))
+        .or_else(|| wf.default.model.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "model is required for step '{label}'; set it on the step,{} the workflow's default.model, or in {}",
+                if agent_file.is_some() { " its agent file," } else { "" },
+                config::CONFIG_FILE_NAME
+            )
+        })?;
+    let reasoning_effort = step
+        .reasoning_effort
+        .or(agent_file.and_then(|agent_file| agent_file.reasoning_effort))
+        .or(wf.default.reasoning_effort);
+    resolve_request_settings(
+        model_name,
+        reasoning_effort,
+        None,
+        None,
+        &wf.models,
+        file_config,
+    )
+    .with_context(|| format!("step '{label}'"))
+}
+
 /// Runs a single non-`switch` step (agent call, prompt call, or `jq`-only
 /// data transform) and returns its output, with `jq` applied afterward if set.
 async fn execute_step(
@@ -547,55 +587,13 @@ async fn execute_step(
             .validate_input(&input)
             .with_context(|| format!("step '{label}'"))?;
 
-        let model_name = step
-            .model
-            .clone()
-            .or_else(|| agent_file.model.clone())
-            .or_else(|| wf.default.model.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "model is required for step '{label}'; set it on the step, its agent file, the workflow's default.model, or in {}",
-                    config::CONFIG_FILE_NAME
-                )
-            })?;
-        let reasoning_effort = step
-            .reasoning_effort
-            .or(agent_file.reasoning_effort)
-            .or(wf.default.reasoning_effort);
-        let settings = resolve_request_settings(
-            model_name,
-            reasoning_effort,
-            None,
-            None,
-            &wf.models,
-            file_config,
-        )
-        .with_context(|| format!("step '{label}'"))?;
+        let settings = resolve_step_settings(step, wf, file_config, Some(&agent_file), label)?;
 
         call_agent(&agent_file, &settings, &input, current_input)
             .await
             .with_context(|| format!("step '{label}'"))?
     } else if let Some(prompt_template) = &step.prompt {
-        let model_name = step
-            .model
-            .clone()
-            .or_else(|| wf.default.model.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "model is required for step '{label}'; set it on the step, the workflow's default.model, or in {}",
-                    config::CONFIG_FILE_NAME
-                )
-            })?;
-        let reasoning_effort = step.reasoning_effort.or(wf.default.reasoning_effort);
-        let settings = resolve_request_settings(
-            model_name,
-            reasoning_effort,
-            None,
-            None,
-            &wf.models,
-            file_config,
-        )
-        .with_context(|| format!("step '{label}'"))?;
+        let settings = resolve_step_settings(step, wf, file_config, None, label)?;
 
         let response_format = step
             .output_schema
