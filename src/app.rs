@@ -1,4 +1,6 @@
-use anyhow::{Context, Result, anyhow};
+use std::{future::Future, pin::Pin};
+
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     agent,
@@ -203,145 +205,221 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         }
     }
 
-    let total = wf.steps.len();
-    let mut current_input = run_args.prompt;
-    for (index, step) in wf.steps.iter().enumerate() {
-        let label = step
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("step-{}", index + 1));
-        eprintln!("[{}/{total}] {label}", index + 1);
-
-        let mut step_output = if let Some(agent_path) = &step.agent {
-            let agent_file =
-                agent::load_agent(agent_path).with_context(|| format!("step '{label}'"))?;
-
-            let input = template::parse_input(&current_input);
-            agent_file
-                .validate_input(&input)
-                .with_context(|| format!("step '{label}'"))?;
-
-            let model_name = step
-                .model
-                .clone()
-                .or_else(|| agent_file.model.clone())
-                .or_else(|| wf.default.model.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "model is required for step '{label}'; set it on the step, its agent file, the workflow's default.model, or in {}",
-                        config::CONFIG_FILE_NAME
-                    )
-                })?;
-            let reasoning_effort = step
-                .reasoning_effort
-                .or(agent_file.reasoning_effort)
-                .or(wf.default.reasoning_effort);
-            let settings = resolve_request_settings(
-                model_name,
-                reasoning_effort,
-                None,
-                None,
-                &wf.models,
-                &file_config,
-            )
-            .with_context(|| format!("step '{label}'"))?;
-
-            let system_prompt = template::render(&agent_file.system_prompt_template, &input)
-                .with_context(|| format!("step '{label}'"))?;
-            let response_format = agent_file
-                .structured_output
-                .then(|| {
-                    schema::build_response_format_from_entry(
-                        agent_file.output_schema.as_ref().expect(
-                            "load_agent validates structured_output implies output_schema is present",
-                        ),
-                        agent_file.schema_name(),
-                    )
-                })
-                .transpose()
-                .with_context(|| format!("step '{label}'"))?;
-
-            let response = llm::complete(llm::CompletionRequest {
-                base_url: &settings.base_url,
-                api_key: &settings.api_key,
-                model_id: &settings.resolved_model.model_id,
-                reasoning_effort: settings.reasoning_effort,
-                response_format,
-                system_prompt: Some(&system_prompt),
-                prompt: &current_input,
-            })
-            .await
-            .with_context(|| format!("step '{label}'"))?;
-
-            response::render_response(&response, false, false)
-                .with_context(|| format!("step '{label}'"))?
-        } else if let Some(prompt_template) = &step.prompt {
-            let model_name = step
-                .model
-                .clone()
-                .or_else(|| wf.default.model.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "model is required for step '{label}'; set it on the step, the workflow's default.model, or in {}",
-                        config::CONFIG_FILE_NAME
-                    )
-                })?;
-            let reasoning_effort = step.reasoning_effort.or(wf.default.reasoning_effort);
-            let settings = resolve_request_settings(
-                model_name,
-                reasoning_effort,
-                None,
-                None,
-                &wf.models,
-                &file_config,
-            )
-            .with_context(|| format!("step '{label}'"))?;
-
-            let response_format = step
-                .json_schema
-                .as_deref()
-                .map(|name_or_path| {
-                    let schema_name = step.schema_name.as_deref().unwrap_or("structured_output");
-                    match wf.json_schemas.get(name_or_path) {
-                        Some(entry) => schema::build_response_format_from_entry(entry, schema_name),
-                        None => schema::load_json_schema(
-                            std::path::Path::new(name_or_path),
-                            schema_name,
-                        ),
-                    }
-                })
-                .transpose()
-                .with_context(|| format!("step '{label}'"))?;
-
-            let prompt = workflow::render_prompt(prompt_template, &current_input)
-                .with_context(|| format!("step '{label}'"))?;
-
-            let response = llm::complete(llm::CompletionRequest {
-                base_url: &settings.base_url,
-                api_key: &settings.api_key,
-                model_id: &settings.resolved_model.model_id,
-                reasoning_effort: settings.reasoning_effort,
-                response_format,
-                system_prompt: None,
-                prompt: &prompt,
-            })
-            .await
-            .with_context(|| format!("step '{label}'"))?;
-
-            response::render_response(&response, false, false)
-                .with_context(|| format!("step '{label}'"))?
-        } else {
-            current_input.clone()
-        };
-
-        if let Some(filter) = &step.jq {
-            step_output =
-                jq::apply(filter, &step_output).with_context(|| format!("step '{label}'"))?;
-        }
-
-        current_input = step_output;
-    }
-
+    let (current_input, _) = run_steps(&wf.steps, run_args.prompt, &wf, &file_config, 0).await?;
     println!("{current_input}");
     Ok(())
+}
+
+/// The final input and the running progress counter, returned by `run_steps`.
+type StepsOutcome = Result<(String, usize)>;
+
+/// Runs a sequence of steps (the workflow's top-level `steps`, or the nested
+/// `steps` of a `switch` case/`else`), returning the final input and the
+/// running progress counter so nested calls keep numbering `[n]` labels
+/// continuously across the whole executed path (skipped steps still consume
+/// a number). Boxed because a `switch` step recurses into this function from
+/// within an `async` body, which Rust cannot size otherwise.
+fn run_steps<'a>(
+    steps: &'a [workflow::StepDefinition],
+    current_input: String,
+    wf: &'a workflow::WorkflowFile,
+    file_config: &'a ConfigFile,
+    start_counter: usize,
+) -> Pin<Box<dyn Future<Output = StepsOutcome> + 'a>> {
+    Box::pin(async move {
+        let mut current_input = current_input;
+        let mut counter = start_counter;
+        for step in steps {
+            counter += 1;
+            let label = step.id.clone().unwrap_or_else(|| format!("step-{counter}"));
+
+            if let Some(switch) = &step.switch {
+                eprintln!("[{counter}] {label}");
+
+                let mut matched = None;
+                for (case_index, case) in switch.cases.iter().enumerate() {
+                    if workflow::eval_when(&case.when, &current_input)
+                        .with_context(|| format!("step '{label}'"))?
+                    {
+                        let case_label = case
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("case-{}", case_index + 1));
+                        eprintln!("    -> case '{case_label}' matched");
+                        matched = Some(
+                            run_steps(&case.steps, current_input.clone(), wf, file_config, counter)
+                                .await?,
+                        );
+                        break;
+                    }
+                }
+                let (result, new_counter) = match matched {
+                    Some(result) => result,
+                    None => match &switch.else_steps {
+                        Some(else_steps) => {
+                            eprintln!("    -> no case matched, running 'else'");
+                            run_steps(else_steps, current_input.clone(), wf, file_config, counter)
+                                .await?
+                        }
+                        None => {
+                            bail!("step '{label}': no case matched and no 'else' branch is defined")
+                        }
+                    },
+                };
+                current_input = result;
+                counter = new_counter;
+                continue;
+            }
+
+            if let Some(when) = &step.when {
+                let truthy = workflow::eval_when(when, &current_input)
+                    .with_context(|| format!("step '{label}'"))?;
+                if !truthy {
+                    eprintln!("[{counter}] {label} (skipped)");
+                    continue;
+                }
+            }
+
+            eprintln!("[{counter}] {label}");
+            current_input = execute_step(step, &current_input, wf, file_config, &label).await?;
+        }
+        Ok((current_input, counter))
+    })
+}
+
+/// Runs a single non-`switch` step (agent call, prompt call, or `jq`-only
+/// data transform) and returns its output, with `jq` applied afterward if set.
+async fn execute_step(
+    step: &workflow::StepDefinition,
+    current_input: &str,
+    wf: &workflow::WorkflowFile,
+    file_config: &ConfigFile,
+    label: &str,
+) -> Result<String> {
+    let mut step_output = if let Some(agent_path) = &step.agent {
+        let agent_file =
+            agent::load_agent(agent_path).with_context(|| format!("step '{label}'"))?;
+
+        let input = template::parse_input(current_input);
+        agent_file
+            .validate_input(&input)
+            .with_context(|| format!("step '{label}'"))?;
+
+        let model_name = step
+            .model
+            .clone()
+            .or_else(|| agent_file.model.clone())
+            .or_else(|| wf.default.model.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "model is required for step '{label}'; set it on the step, its agent file, the workflow's default.model, or in {}",
+                    config::CONFIG_FILE_NAME
+                )
+            })?;
+        let reasoning_effort = step
+            .reasoning_effort
+            .or(agent_file.reasoning_effort)
+            .or(wf.default.reasoning_effort);
+        let settings = resolve_request_settings(
+            model_name,
+            reasoning_effort,
+            None,
+            None,
+            &wf.models,
+            file_config,
+        )
+        .with_context(|| format!("step '{label}'"))?;
+
+        let system_prompt = template::render(&agent_file.system_prompt_template, &input)
+            .with_context(|| format!("step '{label}'"))?;
+        let response_format = agent_file
+            .structured_output
+            .then(|| {
+                schema::build_response_format_from_entry(
+                    agent_file.output_schema.as_ref().expect(
+                        "load_agent validates structured_output implies output_schema is present",
+                    ),
+                    agent_file.schema_name(),
+                )
+            })
+            .transpose()
+            .with_context(|| format!("step '{label}'"))?;
+
+        let response = llm::complete(llm::CompletionRequest {
+            base_url: &settings.base_url,
+            api_key: &settings.api_key,
+            model_id: &settings.resolved_model.model_id,
+            reasoning_effort: settings.reasoning_effort,
+            response_format,
+            system_prompt: Some(&system_prompt),
+            prompt: current_input,
+        })
+        .await
+        .with_context(|| format!("step '{label}'"))?;
+
+        response::render_response(&response, false, false)
+            .with_context(|| format!("step '{label}'"))?
+    } else if let Some(prompt_template) = &step.prompt {
+        let model_name = step
+            .model
+            .clone()
+            .or_else(|| wf.default.model.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "model is required for step '{label}'; set it on the step, the workflow's default.model, or in {}",
+                    config::CONFIG_FILE_NAME
+                )
+            })?;
+        let reasoning_effort = step.reasoning_effort.or(wf.default.reasoning_effort);
+        let settings = resolve_request_settings(
+            model_name,
+            reasoning_effort,
+            None,
+            None,
+            &wf.models,
+            file_config,
+        )
+        .with_context(|| format!("step '{label}'"))?;
+
+        let response_format = step
+            .json_schema
+            .as_deref()
+            .map(|name_or_path| {
+                let schema_name = step.schema_name.as_deref().unwrap_or("structured_output");
+                match wf.json_schemas.get(name_or_path) {
+                    Some(entry) => schema::build_response_format_from_entry(entry, schema_name),
+                    None => {
+                        schema::load_json_schema(std::path::Path::new(name_or_path), schema_name)
+                    }
+                }
+            })
+            .transpose()
+            .with_context(|| format!("step '{label}'"))?;
+
+        let prompt = workflow::render_prompt(prompt_template, current_input)
+            .with_context(|| format!("step '{label}'"))?;
+
+        let response = llm::complete(llm::CompletionRequest {
+            base_url: &settings.base_url,
+            api_key: &settings.api_key,
+            model_id: &settings.resolved_model.model_id,
+            reasoning_effort: settings.reasoning_effort,
+            response_format,
+            system_prompt: None,
+            prompt: &prompt,
+        })
+        .await
+        .with_context(|| format!("step '{label}'"))?;
+
+        response::render_response(&response, false, false)
+            .with_context(|| format!("step '{label}'"))?
+    } else {
+        current_input.to_string()
+    };
+
+    if let Some(filter) = &step.jq {
+        step_output = jq::apply(filter, &step_output).with_context(|| format!("step '{label}'"))?;
+    }
+
+    Ok(step_output)
 }

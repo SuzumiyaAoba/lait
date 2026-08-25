@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use jaq_core::{
     Compiler, Ctx, Vars, data,
     load::{Arena, File, Loader},
@@ -11,6 +11,32 @@ use jaq_json::{Val, read};
 /// line). A string output is rendered raw/unquoted, like `jq -r`; every other
 /// value is rendered as compact JSON.
 pub(crate) fn apply(filter_source: &str, input_json: &str) -> Result<String> {
+    let outputs = run_filter(filter_source, input_json)?;
+    Ok(outputs
+        .into_iter()
+        .map(render_val)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Runs a jq filter as a boolean condition (used by workflow `when:` guards).
+/// The filter must produce exactly one output value; that value is falsy iff
+/// it is JSON `false` or `null` (jq's own truthiness rules), truthy otherwise.
+pub(crate) fn apply_bool(filter_source: &str, input_json: &str) -> Result<bool> {
+    let outputs = run_filter(filter_source, input_json)?;
+    match outputs.as_slice() {
+        [] => {
+            bail!("jq condition {filter_source:?} produced no output; expected exactly one value")
+        }
+        [value] => Ok(!matches!(value, Val::Null | Val::Bool(false))),
+        _ => bail!(
+            "jq condition {filter_source:?} produced {} outputs; expected exactly one value",
+            outputs.len()
+        ),
+    }
+}
+
+fn run_filter(filter_source: &str, input_json: &str) -> Result<Vec<Val>> {
     let input = read::parse_single(input_json.as_bytes())
         .map_err(|error| anyhow!("failed to parse jq input as JSON: {error}"))?;
 
@@ -36,18 +62,14 @@ pub(crate) fn apply(filter_source: &str, input_json: &str) -> Result<String> {
         .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
 
     let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
-    let outputs: Result<Vec<String>> = filter
+    filter
         .id
         .run((ctx, input))
         .map(unwrap_valr)
         .map(|result| {
-            result
-                .map(render_val)
-                .map_err(|error| anyhow!("jq filter {filter_source:?} failed: {error}"))
+            result.map_err(|error| anyhow!("jq filter {filter_source:?} failed: {error}"))
         })
-        .collect();
-
-    Ok(outputs?.join("\n"))
+        .collect()
 }
 
 fn render_val(value: Val) -> String {
@@ -59,7 +81,7 @@ fn render_val(value: Val) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::apply;
+    use super::{apply, apply_bool};
 
     #[test]
     fn extracts_a_string_field_raw() {
@@ -97,5 +119,28 @@ mod tests {
     #[test]
     fn reports_a_runtime_error_from_the_filter() {
         assert!(apply(".foo.bar", "1").is_err());
+    }
+
+    #[test]
+    fn apply_bool_treats_false_and_null_as_falsy() {
+        assert!(!apply_bool(".flag", r#"{"flag":false}"#).unwrap());
+        assert!(!apply_bool(".missing", "{}").unwrap());
+    }
+
+    #[test]
+    fn apply_bool_treats_everything_else_as_truthy() {
+        assert!(apply_bool(".flag", r#"{"flag":true}"#).unwrap());
+        assert!(apply_bool(".n", r#"{"n":0}"#).unwrap());
+        assert!(apply_bool(".s", r#"{"s":""}"#).unwrap());
+    }
+
+    #[test]
+    fn apply_bool_rejects_zero_outputs() {
+        assert!(apply_bool(".[]", "[]").is_err());
+    }
+
+    #[test]
+    fn apply_bool_rejects_multiple_outputs() {
+        assert!(apply_bool(".[]", "[true, false]").is_err());
     }
 }

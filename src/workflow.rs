@@ -9,7 +9,9 @@ use serde::Deserialize;
 use crate::{
     cli::ReasoningEffort,
     config::{DefaultSettings, ModelMap},
+    jq,
     schema::JsonSchemaMap,
+    template,
 };
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +37,12 @@ pub(crate) struct WorkflowFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StepDefinition {
     pub(crate) id: Option<String>,
+    /// A jq filter evaluated against the current input (JSON-parsed, falling
+    /// back to a JSON string for plain text, like `template::parse_input`).
+    /// A falsy result (`false`/`null`) skips this step entirely, passing the
+    /// input through unchanged to the next step. Mutually exclusive with
+    /// `switch`.
+    pub(crate) when: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     /// The prompt template sent to the model. A step without a `prompt` and
@@ -59,6 +67,32 @@ pub(crate) struct StepDefinition {
     /// running input if there is no `prompt`) before it becomes `{{ input }}` for
     /// the next step. The filtered value must be valid JSON.
     pub(crate) jq: Option<String>,
+    /// Turns this step into a branch router: evaluates `cases` in order and
+    /// runs the first one whose `when` is truthy (or `else`, if none match).
+    /// Mutually exclusive with every other field except `id`.
+    pub(crate) switch: Option<SwitchDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SwitchDefinition {
+    /// Evaluated in order; the first case whose `when` is truthy runs.
+    pub(crate) cases: Vec<CaseDefinition>,
+    /// Runs when no `case` matched. Required unless the workflow author is
+    /// sure `cases` is exhaustive: a `switch` with no matching case and no
+    /// `else` is a runtime error rather than a silent pass-through.
+    #[serde(rename = "else")]
+    pub(crate) else_steps: Option<Vec<StepDefinition>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CaseDefinition {
+    /// An optional label used only in progress output (like `StepDefinition::id`).
+    pub(crate) id: Option<String>,
+    /// A jq filter evaluated against the current input; see `StepDefinition::when`.
+    pub(crate) when: String,
+    pub(crate) steps: Vec<StepDefinition>,
 }
 
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
@@ -73,16 +107,62 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
     if workflow.steps.is_empty() {
         bail!("workflow must contain at least one step");
     }
-    for (index, step) in workflow.steps.iter().enumerate() {
+    validate_steps(&workflow.steps)?;
+    Ok(workflow)
+}
+
+fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
+    for (index, step) in steps.iter().enumerate() {
         let label = || {
             step.id
                 .clone()
                 .unwrap_or_else(|| format!("step-{}", index + 1))
         };
+
+        if let Some(switch) = &step.switch {
+            let has_action_fields = step.when.is_some()
+                || step.model.is_some()
+                || step.reasoning_effort.is_some()
+                || step.prompt.is_some()
+                || step.agent.is_some()
+                || step.json_schema.is_some()
+                || step.schema_name.is_some()
+                || step.jq.is_some();
+            if has_action_fields {
+                bail!(
+                    "step '{}' has 'switch' set; it cannot also have 'when', 'model', \
+                     'reasoning_effort', 'prompt', 'agent', 'json_schema', 'schema_name', or 'jq'",
+                    label()
+                );
+            }
+            if switch.cases.is_empty() {
+                bail!("step '{}' has 'switch' with an empty 'cases' list", label());
+            }
+            for case in &switch.cases {
+                if case.steps.is_empty() {
+                    bail!(
+                        "step '{}' has a 'switch' case with an empty 'steps' list",
+                        label()
+                    );
+                }
+                validate_steps(&case.steps)?;
+            }
+            if let Some(else_steps) = &switch.else_steps {
+                if else_steps.is_empty() {
+                    bail!(
+                        "step '{}' has a 'switch' with an empty 'else' list",
+                        label()
+                    );
+                }
+                validate_steps(else_steps)?;
+            }
+            continue;
+        }
+
         let calls_model = step.prompt.is_some() || step.agent.is_some();
         if !calls_model && step.jq.is_none() {
             bail!(
-                "step '{}' must have a 'prompt', an 'agent', a 'jq' filter, or a combination",
+                "step '{}' must have a 'prompt', an 'agent', a 'jq' filter, a 'switch', or a combination",
                 label()
             );
         }
@@ -105,7 +185,7 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
             bail!("step '{}' has 'schema_name' but no 'json_schema'", label());
         }
     }
-    Ok(workflow)
+    Ok(())
 }
 
 /// Replaces `{{ input }}` placeholders in a step's prompt template with `input`.
@@ -129,9 +209,20 @@ pub(crate) fn render_prompt(template: &str, input: &str) -> Result<String> {
     Ok(rendered)
 }
 
+/// Evaluates a `when`/case-condition jq filter against the current input,
+/// using the same JSON-or-string coercion as `{{ input }}` templates
+/// (`template::parse_input`) so a `when:` right after a plain-text `prompt:`
+/// step doesn't fail just because the input isn't JSON.
+pub(crate) fn eval_when(filter: &str, current_input: &str) -> Result<bool> {
+    let value = template::parse_input(current_input);
+    let input_json = serde_json::to_string(&value)
+        .context("failed to serialize the current input for a 'when' condition")?;
+    jq::apply_bool(filter, &input_json).context("failed to evaluate 'when' condition")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_workflow, render_prompt};
+    use super::{eval_when, parse_workflow, render_prompt};
     use crate::schema::JsonSchemaEntry;
 
     #[test]
@@ -406,5 +497,176 @@ steps:
 "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_step_with_a_when_guard() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: maybe
+    when: '. != null'
+    prompt: "{{ input }}"
+"#,
+        )
+        .expect("workflow with a 'when' guard should parse");
+
+        assert_eq!(workflow.steps[0].when.as_deref(), Some(". != null"));
+    }
+
+    #[test]
+    fn parses_a_switch_with_cases_and_else() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: route
+    switch:
+      cases:
+        - id: high
+          when: '.severity == "high"'
+          steps:
+            - prompt: "escalate: {{ input }}"
+        - when: '.severity == "medium"'
+          steps:
+            - prompt: "reply: {{ input }}"
+      else:
+        - jq: ".summary"
+"#,
+        )
+        .expect("workflow with a switch should parse");
+
+        let switch = workflow.steps[0]
+            .switch
+            .as_ref()
+            .expect("step should have a switch");
+        assert_eq!(switch.cases.len(), 2);
+        assert_eq!(switch.cases[0].id.as_deref(), Some("high"));
+        assert!(switch.else_steps.is_some());
+    }
+
+    #[test]
+    fn parses_a_switch_without_else() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+"#,
+        )
+        .expect("workflow with a switch without else should parse");
+
+        assert!(
+            workflow.steps[0]
+                .switch
+                .as_ref()
+                .unwrap()
+                .else_steps
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_a_switch_with_empty_cases() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - switch:
+      cases: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_switch_case_with_empty_steps() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - switch:
+      cases:
+        - when: 'true'
+          steps: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_switch_with_an_empty_else() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+      else: []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_switch_combined_with_prompt() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - prompt: "{{ input }}"
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_switch_combined_with_when() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - when: 'true'
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validates_steps_nested_inside_a_switch_case() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+              agent: agents/extract.md
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eval_when_coerces_plain_text_input_to_a_json_string() {
+        assert!(eval_when(". == \"hello\"", "hello").unwrap());
+        assert!(!eval_when(". == \"hello\"", "world").unwrap());
+    }
+
+    #[test]
+    fn eval_when_evaluates_against_parsed_json_input() {
+        assert!(eval_when(".flag", r#"{"flag":true}"#).unwrap());
+        assert!(!eval_when(".flag", r#"{"flag":false}"#).unwrap());
     }
 }
