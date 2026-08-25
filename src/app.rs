@@ -1,9 +1,10 @@
 use std::{future::Future, pin::Pin};
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_openai::types::chat::ResponseFormat;
 
 use crate::{
-    agent,
+    agent::{self, AgentFile},
     cli::{AgentAction, ChatArgs, Cli, Command, RunArgs},
     cli::{AgentRunArgs, ReasoningEffort},
     config::{self, ConfigFile, ModelMap},
@@ -29,6 +30,55 @@ struct RequestSettings {
     api_key: String,
     resolved_model: config::ResolvedModel,
     reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl RequestSettings {
+    /// Sends a single completion request built from these settings.
+    async fn complete(
+        &self,
+        system_prompt: Option<&str>,
+        prompt: &str,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<response::ChatCompletionResponse> {
+        llm::complete(llm::CompletionRequest {
+            base_url: &self.base_url,
+            api_key: &self.api_key,
+            model_id: &self.resolved_model.model_id,
+            reasoning_effort: self.reasoning_effort,
+            response_format,
+            system_prompt,
+            prompt,
+        })
+        .await
+    }
+}
+
+/// Renders an agent's system prompt against `input`, calls the model with
+/// `prompt` as the user message, and renders the response. Shared by
+/// `run_agent` and `execute_step`'s agent branch.
+async fn call_agent(
+    agent_file: &AgentFile,
+    settings: &RequestSettings,
+    input: &serde_json::Value,
+    prompt: &str,
+) -> Result<String> {
+    let system_prompt = template::render(&agent_file.system_prompt_template, input)?;
+    let response_format = agent_file
+        .structured_output
+        .then(|| {
+            schema::build_response_format_from_entry(
+                agent_file.output_schema.as_ref().expect(
+                    "load_agent validates structured_output implies output_schema is present",
+                ),
+                agent_file.schema_name(),
+            )
+        })
+        .transpose()?;
+
+    let response = settings
+        .complete(Some(&system_prompt), prompt, response_format)
+        .await?;
+    response::render_response(&response, false, false)
 }
 
 /// Resolves the settings for one completion request. `model_name` and
@@ -112,16 +162,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
-    let response = llm::complete(llm::CompletionRequest {
-        base_url: &settings.base_url,
-        api_key: &settings.api_key,
-        model_id: &settings.resolved_model.model_id,
-        reasoning_effort: settings.reasoning_effort,
-        response_format,
-        system_prompt: None,
-        prompt: &prompt,
-    })
-    .await?;
+    let response = settings.complete(None, &prompt, response_format).await?;
 
     let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
     println!("{output}");
@@ -163,33 +204,9 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         &file_config,
     )?;
 
-    let system_prompt = template::render(&agent_file.system_prompt_template, &input)
+    let output = call_agent(&agent_file, &settings, &input, &args.input)
+        .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;
-    let response_format = agent_file
-        .structured_output
-        .then(|| {
-            schema::build_response_format_from_entry(
-                agent_file.output_schema.as_ref().expect(
-                    "load_agent validates structured_output implies output_schema is present",
-                ),
-                agent_file.schema_name(),
-            )
-        })
-        .transpose()
-        .with_context(|| format!("agent '{}'", args.file.display()))?;
-
-    let response = llm::complete(llm::CompletionRequest {
-        base_url: &settings.base_url,
-        api_key: &settings.api_key,
-        model_id: &settings.resolved_model.model_id,
-        reasoning_effort: settings.reasoning_effort,
-        response_format,
-        system_prompt: Some(&system_prompt),
-        prompt: &args.input,
-    })
-    .await?;
-
-    let output = response::render_response(&response, false, false)?;
     println!("{output}");
     Ok(())
 }
@@ -411,34 +428,8 @@ async fn execute_step(
         )
         .with_context(|| format!("step '{label}'"))?;
 
-        let system_prompt = template::render(&agent_file.system_prompt_template, &input)
-            .with_context(|| format!("step '{label}'"))?;
-        let response_format = agent_file
-            .structured_output
-            .then(|| {
-                schema::build_response_format_from_entry(
-                    agent_file.output_schema.as_ref().expect(
-                        "load_agent validates structured_output implies output_schema is present",
-                    ),
-                    agent_file.schema_name(),
-                )
-            })
-            .transpose()
-            .with_context(|| format!("step '{label}'"))?;
-
-        let response = llm::complete(llm::CompletionRequest {
-            base_url: &settings.base_url,
-            api_key: &settings.api_key,
-            model_id: &settings.resolved_model.model_id,
-            reasoning_effort: settings.reasoning_effort,
-            response_format,
-            system_prompt: Some(&system_prompt),
-            prompt: current_input,
-        })
-        .await
-        .with_context(|| format!("step '{label}'"))?;
-
-        response::render_response(&response, false, false)
+        call_agent(&agent_file, &settings, &input, current_input)
+            .await
             .with_context(|| format!("step '{label}'"))?
     } else if let Some(prompt_template) = &step.prompt {
         let model_name = step
@@ -480,17 +471,10 @@ async fn execute_step(
         let prompt = workflow::render_prompt(prompt_template, current_input)
             .with_context(|| format!("step '{label}'"))?;
 
-        let response = llm::complete(llm::CompletionRequest {
-            base_url: &settings.base_url,
-            api_key: &settings.api_key,
-            model_id: &settings.resolved_model.model_id,
-            reasoning_effort: settings.reasoning_effort,
-            response_format,
-            system_prompt: None,
-            prompt: &prompt,
-        })
-        .await
-        .with_context(|| format!("step '{label}'"))?;
+        let response = settings
+            .complete(None, &prompt, response_format)
+            .await
+            .with_context(|| format!("step '{label}'"))?;
 
         response::render_response(&response, false, false)
             .with_context(|| format!("step '{label}'"))?
