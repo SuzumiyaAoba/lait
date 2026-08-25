@@ -222,14 +222,28 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         }
     }
 
-    let (current_input, _) =
+    let (current_input, _, _) =
         run_steps(&wf.steps, run_args.prompt, &wf, &file_config, 0, "").await?;
     println!("{current_input}");
     Ok(())
 }
 
-/// The final input and the running progress counter, returned by `run_steps`.
-type StepsOutcome = Result<(String, usize)>;
+/// A signal returned by `run_steps`, alongside its final input and progress
+/// counter, describing how the run ended: `Continue` is the normal
+/// end-of-list case; `Break`/`Stop` come from a `break: true`/`stop: true`
+/// step (see `workflow::StepDefinition`) and bubble up through `switch`/
+/// `loop`/`for_each` frames until something catches them (`loop`/`for_each`
+/// catch `Break`; nothing but `run_workflow` catches `Stop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Break,
+    Stop,
+}
+
+/// The final input, the running progress counter, and the `Flow` signal the
+/// run ended with, returned by `run_steps`.
+type StepsOutcome = Result<(String, usize, Flow)>;
 
 /// Runs a sequence of steps (the workflow's top-level `steps`, the nested
 /// `steps` of a `switch` case/`else`, or a `parallel` branch), returning the
@@ -286,7 +300,7 @@ fn run_steps<'a>(
                         break;
                     }
                 }
-                let (result, new_counter) = match matched {
+                let (result, new_counter, flow) = match matched {
                     Some(result) => result,
                     None => match &switch.else_steps {
                         Some(else_steps) => {
@@ -308,6 +322,9 @@ fn run_steps<'a>(
                 };
                 current_input = result;
                 counter = new_counter;
+                if flow != Flow::Continue {
+                    return Ok((current_input, counter, flow));
+                }
                 continue;
             }
 
@@ -342,8 +359,11 @@ fn run_steps<'a>(
                 );
                 let branch_results = futures_util::future::try_join_all(branch_futures).await?;
 
+                // `validate_steps` rejects `stop`/`break` anywhere inside a
+                // `parallel` branch, so every branch always finishes with
+                // `Flow::Continue`; only its output is used here.
                 let mut joined = serde_json::Map::new();
-                for (branch_label, (branch_output, _)) in
+                for (branch_label, (branch_output, _, _)) in
                     branch_labels.into_iter().zip(branch_results)
                 {
                     joined.insert(branch_label, template::parse_input(&branch_output));
@@ -392,7 +412,7 @@ fn run_steps<'a>(
                         eprintln!(
                             "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
                         );
-                        let (result, new_counter) = run_steps(
+                        let (result, new_counter, flow) = run_steps(
                             &loop_def.steps,
                             iteration_input.clone(),
                             wf,
@@ -403,6 +423,13 @@ fn run_steps<'a>(
                         .await?;
                         iteration_input = result;
                         loop_counter = new_counter;
+                        match flow {
+                            Flow::Continue => {}
+                            Flow::Break => break,
+                            Flow::Stop => {
+                                return Ok((iteration_input, loop_counter, Flow::Stop));
+                            }
+                        }
                     }
                 } else {
                     let until_cond = loop_def
@@ -416,7 +443,7 @@ fn run_steps<'a>(
                         eprintln!(
                             "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
                         );
-                        let (result, new_counter) = run_steps(
+                        let (result, new_counter, flow) = run_steps(
                             &loop_def.steps,
                             iteration_input.clone(),
                             wf,
@@ -427,6 +454,16 @@ fn run_steps<'a>(
                         .await?;
                         iteration_input = result;
                         loop_counter = new_counter;
+                        if flow == Flow::Stop {
+                            return Ok((iteration_input, loop_counter, Flow::Stop));
+                        }
+                        if flow == Flow::Break {
+                            // An explicit `break: true` ends the loop like a
+                            // satisfied `until`, not like exhausting
+                            // `max_iterations`.
+                            satisfied = true;
+                            break;
+                        }
                         satisfied = workflow::eval_when(until_cond, &iteration_input)
                             .with_context(|| format!("step '{label}'"))?;
                         if satisfied {
@@ -481,7 +518,7 @@ fn run_steps<'a>(
                         other => serde_json::to_string(other)
                             .context("failed to serialize a 'for_each' item")?,
                     };
-                    let (result, new_counter) = run_steps(
+                    let (result, new_counter, flow) = run_steps(
                         &for_each.steps,
                         item_input,
                         wf,
@@ -491,7 +528,13 @@ fn run_steps<'a>(
                     )
                     .await?;
                     for_each_counter = new_counter;
+                    if flow == Flow::Stop {
+                        return Ok((result, for_each_counter, Flow::Stop));
+                    }
                     results.push(template::parse_input(&result));
+                    if flow == Flow::Break {
+                        break;
+                    }
                 }
                 counter = for_each_counter;
                 let results_json = serde_json::to_string(&serde_json::Value::Array(results))
@@ -516,8 +559,15 @@ fn run_steps<'a>(
 
             eprintln!("{progress_prefix}[{counter}] {label}");
             current_input = execute_step(step, &current_input, wf, file_config, &label).await?;
+
+            if step.r#break == Some(true) {
+                return Ok((current_input, counter, Flow::Break));
+            }
+            if step.stop == Some(true) {
+                return Ok((current_input, counter, Flow::Stop));
+            }
         }
-        Ok((current_input, counter))
+        Ok((current_input, counter, Flow::Continue))
     })
 }
 

@@ -1005,3 +1005,99 @@ steps:
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn stop_ends_the_workflow_with_the_current_steps_output_and_skips_later_steps() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - id: call
+    prompt: "{{{{ input }}}}"
+    stop: true
+  - id: never
+    jq: '"should not run"'
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "mock response"
+    );
+}
+
+#[test]
+fn break_stops_a_loop_before_its_until_condition_or_max_iterations() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - loop:
+      until: '.n >= 10'
+      max_iterations: 5
+      steps:
+        - jq: '.n += 1'
+        - when: '.n == 2'
+          break: true
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"n":0}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), r#"{"n":2}"#);
+}
+
+#[test]
+fn break_stops_a_for_each_early_and_joins_only_the_items_processed_so_far() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - for_each:
+      items: '.items'
+      steps:
+        - when: '. == 2'
+          break: true
+        - jq: '.'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"items":[1,2,3]}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[1,2]");
+}
+
+#[test]
+fn stop_inside_a_loop_ends_the_whole_workflow_not_just_the_loop() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - loop:
+      until: '.n >= 10'
+      max_iterations: 5
+      steps:
+        - jq: '.n += 1'
+        - when: '.n == 2'
+          stop: true
+  - jq: '"should not run"'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"n":0}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), r#"{"n":2}"#);
+}

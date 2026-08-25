@@ -94,6 +94,19 @@ pub(crate) struct StepDefinition {
     /// JSON array. Mutually exclusive with every other field except `id`
     /// (including `switch`/`parallel`/`loop`).
     pub(crate) for_each: Option<ForEachDefinition>,
+    /// Ends the workflow successfully right after this step runs (after its
+    /// own `prompt`/`agent`/`jq` action, if any), using this step's output as
+    /// the workflow's final result; no further steps run. Rejected inside a
+    /// `parallel` branch, where concurrently running sibling branches make
+    /// "stop the workflow" ambiguous. Mutually exclusive with `break`.
+    pub(crate) stop: Option<bool>,
+    /// Exits the nearest enclosing `loop`/`for_each` body right after this
+    /// step runs, using this step's output as that iteration's result (the
+    /// loop then proceeds as if the iteration had finished normally, i.e.
+    /// checking `while`/`until` or moving to `join`). Requires an enclosing
+    /// `loop`/`for_each` reachable without crossing a `parallel` branch
+    /// boundary. Mutually exclusive with `stop`.
+    pub(crate) r#break: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,7 +226,7 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
     if workflow.steps.is_empty() {
         bail!("workflow must contain at least one step");
     }
-    validate_steps(&workflow.steps)?;
+    validate_steps(&workflow.steps, FlowContext::TOP_LEVEL)?;
     Ok(workflow)
 }
 
@@ -234,6 +247,8 @@ const ACTION_FIELDS: &[ActionField] = &[
     ("output_schema", |step| step.output_schema.is_some()),
     ("schema_name", |step| step.schema_name.is_some()),
     ("jq", |step| step.jq.is_some()),
+    ("stop", |step| step.stop.is_some()),
+    ("break", |step| step.r#break.is_some()),
 ];
 
 /// Whether `step` has any field that drives a model call or data transform
@@ -271,7 +286,41 @@ fn reject_action_fields_on_router(
     Ok(())
 }
 
-fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
+/// Tracks the lexical nesting `validate_steps` is currently inside, used to
+/// validate `break`/`stop` placement. `in_loop` requires an enclosing
+/// `loop`/`for_each` body reachable without crossing a `parallel` branch
+/// boundary (concurrently running branches can't share a single loop's break
+/// target, so entering a branch resets it). `in_parallel_branch` marks any
+/// depth inside a `parallel` branch, since there is no well-defined "the
+/// workflow" to `stop` while sibling branches may still be running.
+#[derive(Clone, Copy)]
+struct FlowContext {
+    in_loop: bool,
+    in_parallel_branch: bool,
+}
+
+impl FlowContext {
+    const TOP_LEVEL: Self = Self {
+        in_loop: false,
+        in_parallel_branch: false,
+    };
+
+    fn in_loop_body(self) -> Self {
+        Self {
+            in_loop: true,
+            ..self
+        }
+    }
+
+    fn in_parallel_branch(self) -> Self {
+        Self {
+            in_loop: false,
+            in_parallel_branch: true,
+        }
+    }
+}
+
+fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
         let label = || {
             step.id
@@ -307,7 +356,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                         label()
                     );
                 }
-                validate_steps(&case.steps)?;
+                validate_steps(&case.steps, ctx)?;
             }
             if let Some(else_steps) = &switch.else_steps {
                 if else_steps.is_empty() {
@@ -316,7 +365,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                         label()
                     );
                 }
-                validate_steps(else_steps)?;
+                validate_steps(else_steps, ctx)?;
             }
             continue;
         }
@@ -345,7 +394,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                         branch_label
                     );
                 }
-                validate_steps(&branch.steps)?;
+                validate_steps(&branch.steps, ctx.in_parallel_branch())?;
             }
             continue;
         }
@@ -377,7 +426,7 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
             if loop_def.steps.is_empty() {
                 bail!("step '{}' has 'loop' with an empty 'steps' list", label());
             }
-            validate_steps(&loop_def.steps)?;
+            validate_steps(&loop_def.steps, ctx.in_loop_body())?;
             continue;
         }
 
@@ -389,15 +438,35 @@ fn validate_steps(steps: &[StepDefinition]) -> Result<()> {
                     label()
                 );
             }
-            validate_steps(&for_each.steps)?;
+            validate_steps(&for_each.steps, ctx.in_loop_body())?;
             continue;
         }
 
+        if step.r#break == Some(true) && step.stop == Some(true) {
+            bail!(
+                "step '{}' cannot have both 'stop: true' and 'break: true'",
+                label()
+            );
+        }
+        if step.r#break == Some(true) && !ctx.in_loop {
+            bail!(
+                "step '{}' has 'break: true' outside a 'loop'/'for_each' body",
+                label()
+            );
+        }
+        if step.stop == Some(true) && ctx.in_parallel_branch {
+            bail!(
+                "step '{}' has 'stop: true' inside a 'parallel' branch, where there is no \
+                 single well-defined workflow to stop",
+                label()
+            );
+        }
+
         let calls_model = step.prompt.is_some() || step.agent.is_some();
-        if !calls_model && step.jq.is_none() {
+        if !calls_model && step.jq.is_none() && step.stop.is_none() && step.r#break.is_none() {
             bail!(
                 "step '{}' must have a 'prompt', an 'agent', a 'jq' filter, a 'switch', a \
-                 'parallel', a 'loop', a 'for_each', or a combination",
+                 'parallel', a 'loop', a 'for_each', 'stop', 'break', or a combination",
                 label()
             );
         }
@@ -1359,6 +1428,163 @@ steps:
       items: '.items'
       steps:
         - jq: '.'
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_step_with_stop() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: done
+    when: '.ready'
+    stop: true
+"#,
+        )
+        .expect("workflow with a top-level 'stop' should parse");
+
+        assert_eq!(workflow.steps[0].stop, Some(true));
+    }
+
+    #[test]
+    fn parses_a_step_with_break_inside_a_loop() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 3
+      steps:
+        - when: '.done'
+          break: true
+        - jq: '.'
+"#,
+        )
+        .expect("workflow with 'break' inside a loop should parse");
+
+        let loop_def = workflow.steps[0].r#loop.as_ref().unwrap();
+        assert_eq!(loop_def.steps[0].r#break, Some(true));
+    }
+
+    #[test]
+    fn parses_a_step_with_break_inside_a_for_each() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - for_each:
+      items: '.items'
+      steps:
+        - when: '.done'
+          break: true
+        - jq: '.'
+"#,
+        )
+        .expect("workflow with 'break' inside a for_each should parse");
+
+        let for_each = workflow.steps[0].for_each.as_ref().unwrap();
+        assert_eq!(for_each.steps[0].r#break, Some(true));
+    }
+
+    #[test]
+    fn allows_break_inside_a_loop_nested_inside_a_parallel_branch() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps:
+            - loop:
+                until: 'true'
+                max_iterations: 3
+                steps:
+                  - break: true
+"#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_break_at_the_top_level() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - break: true
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_break_directly_inside_a_parallel_branch() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps:
+            - break: true
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_stop_inside_a_parallel_branch() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps:
+            - stop: true
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_stop_inside_a_loop_nested_inside_a_parallel_branch() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - parallel:
+      branches:
+        - steps:
+            - loop:
+                until: 'true'
+                max_iterations: 3
+                steps:
+                  - stop: true
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_both_stop_and_break_on_the_same_step() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 3
+      steps:
+        - stop: true
+          break: true
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_step_with_neither_an_action_nor_stop_or_break() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - id: empty
+    when: 'true'
 "#,
         );
         assert!(result.is_err());

@@ -383,3 +383,51 @@ steps:
   しています。
 - 進捗表示は `loop` と同様、`switch` と同じ通し番号方式（要素をまたいで連続）に加えて、
   `-> item k/n` の行で現在の要素の位置を出力します。
+
+## 早期終了（`stop` / `break`）
+
+step に `stop: true` または `break: true` を指定すると、その step自身のアクション
+（`prompt`/`agent`/`jq`。両方省略も可）を実行した**後**に、通常の逐次実行を打ち切ります。
+どちらも `when:` と組み合わせて「ある条件が満たされたら打ち切る」という使い方が基本です。
+
+```yaml
+# workflow.yml
+steps:
+  - id: check
+    prompt: "十分な情報が揃っているか判定してください: {{ input }}"
+    output_schema: judgement
+
+  - when: '.sufficient == true'
+    stop: true          # 揃っていれば、ここでワークフロー全体を正常終了する
+
+  - id: ask-more
+    prompt: "不足している情報を尋ねる質問を1つ生成してください: {{ input }}"
+```
+
+```yaml
+# workflow.yml
+steps:
+  - id: refine
+    loop:
+      until: '.valid == true'
+      max_iterations: 5
+      steps:
+        - prompt: "{{ input }}"
+          output_schema: validation_result
+        - when: '.attempts >= 3'
+          break: true    # 3回試したら、valid になっていなくてもループを打ち切る
+```
+
+- `stop: true` は、その時点の値を**ワークフロー全体の最終出力**として、残りの step
+  （ネストしている `loop`/`for_each`/`switch` の外側も含めて）を一切実行せずに正常終了します。
+  ただし `parallel` の branch の中では使えません（他の branch が並行して走っている以上、
+  「ワークフローを止める」という操作の意味が定義できないためです）。
+- `break: true` は、最も内側の `loop`/`for_each` の本文だけを打ち切ります。`loop` では
+  `while`/`until` を満たした場合と同じ扱いで（`until` の場合は `max_iterations` 超過の
+  エラーにはなりません）、`for_each` ではそこまでに集めた結果で `join` を実行します。
+  `break: true` を使うには、`switch` の中などを経由してでもよいので、`loop`/`for_each` の
+  本文の中にいる必要があります（`parallel` の branch をまたいで外側のループを終了することは
+  できません）。
+- `stop`/`break` は他の全フィールド（`prompt`/`agent`/`jq`/`when` などの併用は可能ですが、
+  `switch`/`parallel`/`loop`/`for_each` との併用は不可）と同じ排他ルールに従います。両方を
+  同じ step に指定することもできません。
