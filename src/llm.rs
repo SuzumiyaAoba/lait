@@ -3,8 +3,9 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+        ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
     },
 };
 
@@ -29,6 +30,9 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) model_id: &'a str,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) response_format: Option<ResponseFormat>,
+    /// An optional system-role message sent before the user prompt, e.g. an
+    /// agent file's rendered system prompt template.
+    pub(crate) system_prompt: Option<&'a str>,
     pub(crate) prompt: &'a str,
 }
 
@@ -38,12 +42,21 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
         .with_api_key(request.api_key);
     let client = Client::with_config(config);
 
+    let mut messages = Vec::with_capacity(2);
+    if let Some(system_prompt) = request.system_prompt {
+        let system_message = ChatCompletionRequestSystemMessageArgs::default()
+            .content(system_prompt)
+            .build()?;
+        messages.push(ChatCompletionRequestMessage::from(system_message));
+    }
     let user_message = ChatCompletionRequestUserMessageArgs::default()
         .content(request.prompt)
         .build()?;
+    messages.push(ChatCompletionRequestMessage::from(user_message));
+
     let mut chat_request = CreateChatCompletionRequestArgs::default();
     chat_request.model(request.model_id);
-    chat_request.messages(vec![ChatCompletionRequestMessage::from(user_message)]);
+    chat_request.messages(messages);
     chat_request.stream(false);
     if let Some(reasoning_effort) = request.reasoning_effort {
         chat_request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));

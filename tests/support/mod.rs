@@ -35,6 +35,10 @@ pub(crate) struct WorkflowFile {
     pub(crate) path: PathBuf,
 }
 
+pub(crate) struct AgentMarkdownFile {
+    pub(crate) path: PathBuf,
+}
+
 pub(crate) struct ConfigDirectory {
     path: PathBuf,
 }
@@ -102,6 +106,40 @@ impl WorkflowFile {
 }
 
 impl Drop for WorkflowFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl AgentMarkdownFile {
+    pub(crate) fn new(contents: &str) -> Self {
+        let mut path = None;
+        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
+            let candidate = next_temp_path("lait-test-agent", ".md");
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to write test agent file: {error}"),
+            };
+            file.write_all(contents.as_bytes())
+                .expect("failed to write test agent file");
+            path = Some(candidate);
+            break;
+        }
+        let path = path.unwrap_or_else(|| {
+            panic!(
+                "failed to create a unique test agent path after {MAX_TEMP_PATH_ATTEMPTS} attempts"
+            )
+        });
+        Self { path }
+    }
+}
+
+impl Drop for AgentMarkdownFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
@@ -375,6 +413,16 @@ pub(crate) fn run_lait_workflow(workflow_path: &Path, prompt: &str) -> Output {
         .arg(prompt)
         .output()
         .expect("failed to execute lait run")
+}
+
+pub(crate) fn run_lait_agent(agent_path: &Path, input: &str) -> Output {
+    test_command()
+        .arg("agent")
+        .arg("run")
+        .arg(agent_path)
+        .arg(input)
+        .output()
+        .expect("failed to execute lait agent run")
 }
 
 pub(crate) fn without_json_whitespace(value: &str) -> String {
