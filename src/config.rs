@@ -32,7 +32,7 @@ pub(crate) struct DefaultSettings {
 /// `lait.config.yml`'s top-level `models:` and a workflow file's `models:`.
 pub(crate) type ModelMap = HashMap<String, Vec<ModelDefinition>>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelDefinition {
     provider: ProviderConfig,
@@ -40,7 +40,7 @@ pub(crate) struct ModelDefinition {
     default_reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderConfig {
     base_url: String,

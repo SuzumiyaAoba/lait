@@ -1,4 +1,9 @@
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::ResponseFormat;
@@ -230,10 +235,11 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         }
     }
 
+    let scope = WorkflowScope::top_level(&wf, &run_args.file)?;
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
         run_args.prompt,
-        &wf,
+        &scope,
         &file_config,
         0,
         "",
@@ -242,6 +248,125 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     .await?;
     println!("{current_input}");
     Ok(())
+}
+
+/// The maximum `workflow:` nesting depth (a workflow step calling another
+/// workflow file, whose own steps may call another, ...), rejected as a
+/// runtime error rather than left to overflow the stack or hang.
+const MAX_WORKFLOW_DEPTH: usize = 32;
+
+/// The default model/reasoning-effort, model aliases, and JSON schema
+/// definitions currently in effect, plus enough bookkeeping to run a nested
+/// `workflow:` step safely. Every `resolve_step_settings`/`execute_step` call
+/// reads through this instead of a `&workflow::WorkflowFile` directly, so a
+/// `workflow:` step's sub-workflow can see its own `default:`/`models:`/
+/// `json_schemas:` first, falling back to its caller's (`nested` builds
+/// that merge). `active_paths` records every workflow file currently
+/// executing (canonicalized), to reject a `workflow:` cycle and to cap
+/// nesting depth at `MAX_WORKFLOW_DEPTH`.
+struct WorkflowScope {
+    default_model: Option<String>,
+    default_reasoning_effort: Option<ReasoningEffort>,
+    models: ModelMap,
+    json_schemas: schema::JsonSchemaMap,
+    /// Directory relative paths in this scope's workflow file (currently
+    /// only `step.workflow`) are resolved against.
+    base_dir: PathBuf,
+    active_paths: Vec<PathBuf>,
+}
+
+impl WorkflowScope {
+    /// The scope for the workflow file passed on the command line.
+    fn top_level(wf: &workflow::WorkflowFile, file_path: &Path) -> Result<Self> {
+        let canonical = std::fs::canonicalize(file_path).with_context(|| {
+            format!(
+                "failed to resolve workflow file path '{}'",
+                file_path.display()
+            )
+        })?;
+        let base_dir = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Ok(Self {
+            default_model: wf.default.model.clone(),
+            default_reasoning_effort: wf.default.reasoning_effort,
+            models: wf.models.clone(),
+            json_schemas: wf.json_schemas.clone(),
+            base_dir,
+            active_paths: vec![canonical],
+        })
+    }
+
+    /// The scope for a `workflow:` step's sub-workflow: resolves
+    /// `relative_path` (as given in the step) against this scope's
+    /// `base_dir`, merges `sub_wf`'s `default`/`models`/`json_schemas` over
+    /// this scope's (the sub-workflow's own entries win; an entry it doesn't
+    /// define falls back to this scope's), and extends the cycle/depth
+    /// bookkeeping. Fails if `relative_path` resolves to a workflow file
+    /// already executing (a cycle) or nesting has reached
+    /// `MAX_WORKFLOW_DEPTH`.
+    fn nested(
+        &self,
+        relative_path: &Path,
+        sub_wf: &workflow::WorkflowFile,
+        label: &str,
+    ) -> Result<Self> {
+        let resolved_path = self.base_dir.join(relative_path);
+        let canonical = std::fs::canonicalize(&resolved_path).with_context(|| {
+            format!(
+                "step '{label}': failed to resolve workflow file path '{}'",
+                resolved_path.display()
+            )
+        })?;
+        if self.active_paths.contains(&canonical) {
+            bail!(
+                "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
+                relative_path.display(),
+                canonical.display()
+            );
+        }
+        if self.active_paths.len() >= MAX_WORKFLOW_DEPTH {
+            bail!(
+                "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
+            );
+        }
+
+        let mut models = sub_wf.models.clone();
+        for (name, definitions) in &self.models {
+            models
+                .entry(name.clone())
+                .or_insert_with(|| definitions.clone());
+        }
+        let mut json_schemas = sub_wf.json_schemas.clone();
+        for (name, entry) in &self.json_schemas {
+            json_schemas
+                .entry(name.clone())
+                .or_insert_with(|| entry.clone());
+        }
+        let mut active_paths = self.active_paths.clone();
+        active_paths.push(canonical.clone());
+        let base_dir = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        Ok(Self {
+            default_model: sub_wf
+                .default
+                .model
+                .clone()
+                .or_else(|| self.default_model.clone()),
+            default_reasoning_effort: sub_wf
+                .default
+                .reasoning_effort
+                .or(self.default_reasoning_effort),
+            models,
+            json_schemas,
+            base_dir,
+            active_paths,
+        })
+    }
 }
 
 /// Sets `steps_outputs[step.id]` to `output` (JSON-parsed, like a `parallel`
@@ -298,7 +423,7 @@ type StepsOutcome = Result<(String, usize, Flow, workflow::StepOutputs)>;
 fn run_steps<'a>(
     steps: &'a [workflow::StepDefinition],
     current_input: String,
-    wf: &'a workflow::WorkflowFile,
+    scope: &'a WorkflowScope,
     file_config: &'a ConfigFile,
     start_counter: usize,
     progress_prefix: &'a str,
@@ -329,7 +454,7 @@ fn run_steps<'a>(
                             run_steps(
                                 &case.steps,
                                 current_input.clone(),
-                                wf,
+                                scope,
                                 file_config,
                                 counter,
                                 progress_prefix,
@@ -348,7 +473,7 @@ fn run_steps<'a>(
                             run_steps(
                                 else_steps,
                                 current_input.clone(),
-                                wf,
+                                scope,
                                 file_config,
                                 counter,
                                 progress_prefix,
@@ -393,7 +518,7 @@ fn run_steps<'a>(
                         run_steps(
                             &branch.steps,
                             current_input.clone(),
-                            wf,
+                            scope,
                             file_config,
                             0,
                             branch_prefix,
@@ -463,7 +588,7 @@ fn run_steps<'a>(
                         let (result, new_counter, flow, new_steps_outputs) = run_steps(
                             &loop_def.steps,
                             iteration_input.clone(),
-                            wf,
+                            scope,
                             file_config,
                             loop_counter,
                             progress_prefix,
@@ -501,7 +626,7 @@ fn run_steps<'a>(
                         let (result, new_counter, flow, new_steps_outputs) = run_steps(
                             &loop_def.steps,
                             iteration_input.clone(),
-                            wf,
+                            scope,
                             file_config,
                             loop_counter,
                             progress_prefix,
@@ -584,7 +709,7 @@ fn run_steps<'a>(
                         let (result, new_counter, flow, new_steps_outputs) = run_steps(
                             &for_each.steps,
                             item_input,
-                            wf,
+                            scope,
                             file_config,
                             for_each_counter,
                             progress_prefix,
@@ -628,7 +753,7 @@ fn run_steps<'a>(
                             run_steps(
                                 &for_each.steps,
                                 item_input,
-                                wf,
+                                scope,
                                 file_config,
                                 0,
                                 item_prefix,
@@ -680,7 +805,7 @@ fn run_steps<'a>(
             let attempt_result = execute_step_with_retry(
                 step,
                 &current_input,
-                wf,
+                scope,
                 file_config,
                 &label,
                 progress_prefix,
@@ -703,7 +828,7 @@ fn run_steps<'a>(
                         let (result, new_counter, flow, new_steps_outputs) = run_steps(
                             &on_error.steps,
                             error_input_json,
-                            wf,
+                            scope,
                             file_config,
                             counter,
                             progress_prefix,
@@ -742,7 +867,7 @@ fn run_steps<'a>(
 async fn execute_step_with_retry(
     step: &workflow::StepDefinition,
     current_input: &str,
-    wf: &workflow::WorkflowFile,
+    scope: &WorkflowScope,
     file_config: &ConfigFile,
     label: &str,
     progress_prefix: &str,
@@ -772,7 +897,15 @@ async fn execute_step_with_retry(
             Some(seconds) => {
                 match tokio::time::timeout(
                     Duration::from_secs(seconds),
-                    execute_step(step, current_input, wf, file_config, label, steps_outputs),
+                    execute_step(
+                        step,
+                        current_input,
+                        scope,
+                        file_config,
+                        label,
+                        progress_prefix,
+                        steps_outputs,
+                    ),
                 )
                 .await
                 {
@@ -782,7 +915,18 @@ async fn execute_step_with_retry(
                     )),
                 }
             }
-            None => execute_step(step, current_input, wf, file_config, label, steps_outputs).await,
+            None => {
+                execute_step(
+                    step,
+                    current_input,
+                    scope,
+                    file_config,
+                    label,
+                    progress_prefix,
+                    steps_outputs,
+                )
+                .await
+            }
         };
 
         match outcome {
@@ -810,7 +954,7 @@ async fn execute_step_with_retry(
 /// missing-model error uses.
 fn resolve_step_settings(
     step: &workflow::StepDefinition,
-    wf: &workflow::WorkflowFile,
+    scope: &WorkflowScope,
     file_config: &ConfigFile,
     agent_file: Option<&AgentFile>,
     label: &str,
@@ -819,7 +963,7 @@ fn resolve_step_settings(
         .model
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.model.clone()))
-        .or_else(|| wf.default.model.clone())
+        .or_else(|| scope.default_model.clone())
         .ok_or_else(|| {
             anyhow!(
                 "model is required for step '{label}'; set it on the step,{} the workflow's default.model, or in {}",
@@ -830,13 +974,13 @@ fn resolve_step_settings(
     let reasoning_effort = step
         .reasoning_effort
         .or(agent_file.and_then(|agent_file| agent_file.reasoning_effort))
-        .or(wf.default.reasoning_effort);
+        .or(scope.default_reasoning_effort);
     resolve_request_settings(
         model_name,
         reasoning_effort,
         None,
         None,
-        &wf.models,
+        &scope.models,
         file_config,
     )
     .with_context(|| format!("step '{label}'"))
@@ -847,13 +991,14 @@ fn resolve_step_settings(
 async fn execute_step(
     step: &workflow::StepDefinition,
     current_input: &str,
-    wf: &workflow::WorkflowFile,
+    scope: &WorkflowScope,
     file_config: &ConfigFile,
     label: &str,
+    progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
     if let Some(name_or_path) = &step.input_schema {
-        let schema = schema::resolve_named_schema_value(&wf.json_schemas, name_or_path)
+        let schema = schema::resolve_named_schema_value(&scope.json_schemas, name_or_path)
             .with_context(|| format!("step '{label}'"))?;
         let input = template::parse_input(current_input);
         schema::validate_input_against_schema(&schema, &input)
@@ -869,20 +1014,20 @@ async fn execute_step(
             .validate_input(&input)
             .with_context(|| format!("step '{label}'"))?;
 
-        let settings = resolve_step_settings(step, wf, file_config, Some(&agent_file), label)?;
+        let settings = resolve_step_settings(step, scope, file_config, Some(&agent_file), label)?;
 
         call_agent(&agent_file, &settings, &input, current_input, steps_outputs)
             .await
             .with_context(|| format!("step '{label}'"))?
     } else if let Some(prompt_template) = &step.prompt {
-        let settings = resolve_step_settings(step, wf, file_config, None, label)?;
+        let settings = resolve_step_settings(step, scope, file_config, None, label)?;
 
         let response_format = step
             .output_schema
             .as_deref()
             .map(|name_or_path| {
                 let schema_name = step.schema_name.as_deref().unwrap_or("structured_output");
-                match wf.json_schemas.get(name_or_path) {
+                match scope.json_schemas.get(name_or_path) {
                     Some(entry) => schema::build_response_format_from_entry(entry, schema_name),
                     None => {
                         schema::load_json_schema(std::path::Path::new(name_or_path), schema_name)
@@ -903,6 +1048,36 @@ async fn execute_step(
 
         response::render_response(&response, false, false)
             .with_context(|| format!("step '{label}'"))?
+    } else if let Some(sub_workflow_path) = &step.workflow {
+        let resolved_path = scope.base_dir.join(sub_workflow_path);
+        let sub_wf =
+            workflow::load_workflow(&resolved_path).with_context(|| format!("step '{label}'"))?;
+        let sub_scope = scope.nested(sub_workflow_path, &sub_wf, label)?;
+        if let Some(name) = &sub_wf.name {
+            match &sub_wf.description {
+                Some(description) => eprintln!("{progress_prefix}    -> {name}: {description}"),
+                None => eprintln!("{progress_prefix}    -> {name}"),
+            }
+        }
+        // Isolated like an `agent:` call, not threaded like a `switch` case:
+        // the sub-workflow is a separate file with its own step ids, so it
+        // starts with an empty `steps_outputs` and its Flow (whether it
+        // ended via `stop`/`break` internally or just ran out of steps) is
+        // this step's own concern, not the caller's — only its final output
+        // crosses back.
+        let sub_progress_prefix = format!("{progress_prefix}    ");
+        let (result, ..) = run_steps(
+            &sub_wf.steps,
+            current_input.to_string(),
+            &sub_scope,
+            file_config,
+            0,
+            &sub_progress_prefix,
+            workflow::StepOutputs::new(),
+        )
+        .await
+        .with_context(|| format!("step '{label}'"))?;
+        result
     } else {
         current_input.to_string()
     };

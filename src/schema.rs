@@ -14,7 +14,7 @@ pub(crate) type JsonSchemaMap = HashMap<String, JsonSchemaEntry>;
 
 /// A named schema definition: either a path to a JSON schema file, or the
 /// schema body written directly inline.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
 pub(crate) enum JsonSchemaEntry {

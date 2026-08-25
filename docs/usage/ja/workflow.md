@@ -549,3 +549,51 @@ steps:
 - `stop`/`break` は他の全フィールド（`prompt`/`agent`/`jq`/`when` などの併用は可能ですが、
   `switch`/`parallel`/`loop`/`for_each` との併用は不可）と同じ排他ルールに従います。両方を
   同じ step に指定することもできません。
+
+## サブワークフロー呼び出し（`workflow`）
+
+step に `workflow:` を指定すると、その step は `prompt`/`agent` の代わりに**別のワークフロー
+YAML ファイル**を、その時点の入力に対して実行します。サブワークフローの最終出力が、この step
+の出力になります。共通の step 列を別ファイルに切り出して、複数のワークフローから再利用できます。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+steps:
+  - id: summarize
+    workflow: ./shared/summarize.yml
+    jq: '.summary'
+```
+
+```yaml
+# shared/summarize.yml
+steps:
+  - prompt: |
+      次の文章を3行で要約してJSON `{ "summary": "..." }` で返してください。
+      {{ input }}
+    output_schema: summary
+```
+
+- `workflow:` に書くパスは、**この step が書かれているワークフローファイル自身のディレクトリ**
+  からの相対パスとして解決されます。`agent:`（常にコマンドを実行したカレントディレクトリからの
+  相対パス）とは解決基準が異なるので注意してください。サブワークフローが入れ子になる場合、
+  各ファイルは自分のいる場所からの相対パスで次のファイルを指せます。
+- サブワークフロー側の `default:`/`models:`/`json_schemas:` が優先され、サブワークフロー側に
+  定義がない項目は、呼び出し元（さらにその呼び出し元、…）の定義にフォールバックします。
+  共通の `default.model` や `models:` エイリアスを一番外側のワークフローに一度書いておけば、
+  サブワークフロー側で省略できます。
+- サブワークフローに `name`/`description` があれば、進捗表示（標準エラー出力）に出力されます。
+- `{{ steps.<id> }}`/`$steps` はサブワークフローの境界を越えません。サブワークフロー内で `id`
+  を指定した step の出力は、そのサブワークフローの中だけで参照でき、呼び出し元には見えません。
+  逆に、呼び出し元で記録された `{{ steps.* }}` もサブワークフロー側からは参照できません
+  （`agent:` と同じく、別ファイルとして完全に独立した単位として扱われます）。サブワークフロー
+  内部で `stop:`/`break:` を使っても、それはそのサブワークフロー自身の実行を早期終了するだけで、
+  呼び出し元のワークフロー全体には影響しません。
+- `workflow:` は `prompt`/`agent`（どちらかで直接モデルを呼ぶ）や `switch`/`parallel`/`loop`/
+  `for_each`（入れ子の step 列に処理を委ねる）と併用できません。`model`/`reasoning_effort`/
+  `input_schema`/`output_schema`/`schema_name` はサブワークフロー側の step が個別に持つため、
+  この step には指定できません。同様に `retry`/`timeout`/`on_error` もサブワークフロー側の
+  step に指定してください。`when`/`jq`/`stop`/`break` は通常どおり併用できます。
+- 循環参照（A が B を呼び、B が A を呼ぶ、など）はエラーになります。ネストの深さにも上限が
+  あります。

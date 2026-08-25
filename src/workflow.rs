@@ -57,6 +57,17 @@ pub(crate) struct StepDefinition {
     /// Mutually exclusive with `prompt`, `input_schema`, `output_schema`, and
     /// `schema_name`.
     pub(crate) agent: Option<PathBuf>,
+    /// Path to another workflow YAML file (resolved relative to the
+    /// directory containing the workflow file this step is defined in, not
+    /// the current working directory), run against this step's input; that
+    /// sub-workflow's final output becomes this step's output. Its own
+    /// `default:`/`models:`/`json_schemas:` take precedence, falling back to
+    /// this workflow's when it doesn't define an entry. Mutually exclusive
+    /// with `prompt`, `agent`, `model`, `reasoning_effort`,
+    /// `input_schema`/`output_schema`/`schema_name` (which the sub-workflow's
+    /// own steps supply), and `retry`/`timeout`/`on_error` (set those on the
+    /// sub-workflow's own steps instead).
+    pub(crate) workflow: Option<PathBuf>,
     /// Validates this step's input before it runs (before rendering `prompt`,
     /// or before `jq` for a transform-only step). Resolved against the
     /// workflow's top-level `json_schemas:` first; if no such key exists,
@@ -289,6 +300,7 @@ const ACTION_FIELDS: &[ActionField] = &[
     ("reasoning_effort", |step| step.reasoning_effort.is_some()),
     ("prompt", |step| step.prompt.is_some()),
     ("agent", |step| step.agent.is_some()),
+    ("workflow", |step| step.workflow.is_some()),
     ("input_schema", |step| step.input_schema.is_some()),
     ("output_schema", |step| step.output_schema.is_some()),
     ("schema_name", |step| step.schema_name.is_some()),
@@ -557,16 +569,25 @@ fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Result<()> {
             );
         }
 
-        let calls_model = step.prompt.is_some() || step.agent.is_some();
+        let calls_model = step.prompt.is_some() || step.agent.is_some() || step.workflow.is_some();
         if !calls_model && step.jq.is_none() && step.stop.is_none() && step.r#break.is_none() {
             bail!(
-                "step '{}' must have a 'prompt', an 'agent', a 'jq' filter, a 'switch', a \
-                 'parallel', a 'loop', a 'for_each', 'stop', 'break', or a combination",
+                "step '{}' must have a 'prompt', an 'agent', a 'workflow', a 'jq' filter, a \
+                 'switch', a 'parallel', a 'loop', a 'for_each', 'stop', 'break', or a combination",
                 label()
             );
         }
         if step.prompt.is_some() && step.agent.is_some() {
             bail!("step '{}' cannot have both 'prompt' and 'agent'", label());
+        }
+        if step.workflow.is_some() && step.prompt.is_some() {
+            bail!(
+                "step '{}' cannot have both 'prompt' and 'workflow'",
+                label()
+            );
+        }
+        if step.workflow.is_some() && step.agent.is_some() {
+            bail!("step '{}' cannot have both 'agent' and 'workflow'", label());
         }
         if step.agent.is_some()
             && (step.input_schema.is_some()
@@ -575,6 +596,27 @@ fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Result<()> {
         {
             bail!(
                 "step '{}' has 'agent' set; 'input_schema'/'output_schema'/'schema_name' come from the agent file and must not be set on the step",
+                label()
+            );
+        }
+        if step.workflow.is_some()
+            && (step.model.is_some()
+                || step.reasoning_effort.is_some()
+                || step.input_schema.is_some()
+                || step.output_schema.is_some()
+                || step.schema_name.is_some())
+        {
+            bail!(
+                "step '{}' has 'workflow' set; 'model'/'reasoning_effort'/'input_schema'/'output_schema'/'schema_name' come from the referenced workflow file and must not be set on the step",
+                label()
+            );
+        }
+        if step.workflow.is_some()
+            && (step.retry.is_some() || step.timeout.is_some() || step.on_error.is_some())
+        {
+            bail!(
+                "step '{}' has 'workflow' set; 'retry'/'timeout'/'on_error' apply to a single \
+                 action and must be set on the steps inside the referenced workflow file instead",
                 label()
             );
         }
@@ -874,6 +916,92 @@ steps:
         let result =
             parse_workflow("steps:\n  - agent: agents/extract.md\n    schema_name: answer\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_a_step_with_a_workflow() {
+        let workflow = parse_workflow(
+            r#"
+steps:
+  - id: sub
+    workflow: ./shared/summarize.yml
+    jq: '.'
+"#,
+        )
+        .expect("workflow with a 'workflow' step should parse");
+
+        assert_eq!(
+            workflow.steps[0]
+                .workflow
+                .as_ref()
+                .and_then(|path| path.to_str()),
+            Some("./shared/summarize.yml")
+        );
+    }
+
+    #[test]
+    fn rejects_a_step_with_both_workflow_and_prompt() {
+        let result = parse_workflow("steps:\n  - prompt: \"{{ input }}\"\n    workflow: sub.yml\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_step_with_both_workflow_and_agent() {
+        let result =
+            parse_workflow("steps:\n  - agent: agents/extract.md\n    workflow: sub.yml\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_workflow_step_with_model() {
+        let result = parse_workflow("steps:\n  - workflow: sub.yml\n    model: local\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_workflow_step_with_input_schema() {
+        let result =
+            parse_workflow("steps:\n  - workflow: sub.yml\n    input_schema: schema.json\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_workflow_step_with_retry() {
+        let result =
+            parse_workflow("steps:\n  - workflow: sub.yml\n    retry:\n      max_attempts: 2\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_workflow_step_with_on_error() {
+        let result = parse_workflow(
+            "steps:\n  - workflow: sub.yml\n    on_error:\n      steps:\n        - jq: '.'\n",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_workflow_combined_with_switch() {
+        let result = parse_workflow(
+            r#"
+steps:
+  - workflow: sub.yml
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allows_a_workflow_step_with_when_jq_and_stop() {
+        let result = parse_workflow(
+            "steps:\n  - when: 'true'\n    workflow: sub.yml\n    jq: '.'\n    stop: true\n",
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
