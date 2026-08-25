@@ -402,3 +402,154 @@ steps:
     assert!(output.status.success(), "lait run failed: {output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Alice");
 }
+
+#[test]
+fn a_falsy_when_guard_skips_the_step_and_passes_the_input_through_unchanged() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - jq: "."
+  - id: guarded
+    when: ".flag"
+    jq: '"should not run"'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"flag":false}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        without_json_whitespace(&String::from_utf8_lossy(&output.stdout)),
+        r#"{"flag":false}"#
+    );
+}
+
+#[test]
+fn a_truthy_when_guard_runs_the_step() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - id: guarded
+    when: ".flag"
+    jq: '"ran"'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"flag":true}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ran");
+}
+
+#[test]
+fn switch_runs_the_first_matching_case_and_skips_the_rest() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - switch:
+      cases:
+        - when: '.severity == "high"'
+          steps:
+            - jq: '"escalated"'
+        - when: '.severity == "medium"'
+          steps:
+            - jq: '"replied"'
+      else:
+        - jq: '"closed"'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"severity":"medium"}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "replied");
+}
+
+#[test]
+fn switch_runs_else_when_no_case_matches() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - switch:
+      cases:
+        - when: '.severity == "high"'
+          steps:
+            - jq: '"escalated"'
+      else:
+        - jq: '"closed"'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"severity":"low"}"#);
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "closed");
+}
+
+#[test]
+fn switch_fails_when_no_case_matches_and_there_is_no_else() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - switch:
+      cases:
+        - when: '.severity == "high"'
+          steps:
+            - jq: '"escalated"'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, r#"{"severity":"low"}"#);
+
+    assert!(
+        !output.status.success(),
+        "expected an unmatched switch without 'else' to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no case matched"), "stderr: {stderr}");
+}
+
+#[test]
+fn switch_case_can_call_the_model_and_continues_the_outer_steps_afterward() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"\"escalation memo\""},"finish_reason":"stop"}]}"#,
+    );
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - switch:
+      cases:
+        - when: '.severity == "high"'
+          steps:
+            - prompt: "escalate: {{{{ input }}}}"
+      else:
+        - jq: '"closed"'
+  - id: notify
+    jq: '. + " (notified)"'
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, r#"{"severity":"high"}"#);
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""content":"escalate:{\"severity\":\"high\"}""#),
+        "request body: {body}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "escalation memo (notified)"
+    );
+}

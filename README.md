@@ -157,12 +157,13 @@ steps:
 cargo run -- run run.yml "要約・翻訳したい文章..."
 ```
 
-- `steps` は配列の先頭から逐次実行し、分岐・並列は行いません。
+- `steps` は配列の先頭から逐次実行するのが基本です。`when`/`switch` による分岐は可能ですが
+  （後述）、並列実行は行いません。
 - `model` / `reasoning_effort` は step 単位で省略可能。省略時は
   ワークフロー直下の `default:` → `lait.config.yml` の `default:`、の順にフォールバックします。
 - `id` は進捗表示（標準エラー出力）用のラベルで、省略した場合は `step-1`、`step-2`… になります。
-- `prompt` を省略した step はモデルを呼び出さず、`jq` によるデータ変換のみを行います（後述）。
-  この場合 `model` は不要です。
+- `prompt` も `agent` も `switch` も省略した step はモデルを呼び出さず、`jq` によるデータ変換
+  のみを行います（後述）。この場合 `model` は不要です。
 - 最後の step の出力のみを標準出力に出します。
 - `run` サブコマンドでも `--no-config` は利用できます（例: `lait run run.yml "..." --no-config`）。
 
@@ -258,6 +259,76 @@ steps:
 - `jq` のみを指定して `prompt` を省略すると、モデルを呼び出さずにその時点の `{{ input }}` を
   変換するだけの step になります（`model` の指定は不要です）。この場合、入力は有効な JSON で
   ある必要があります。
+
+#### 条件分岐（`when` / `switch`）
+
+step には [jq](https://jqlang.org/) フィルターを条件式として使う2種類の分岐構文が使えます。
+条件式はその時点の `{{ input }}` に対して評価されます。JSON としてパースできればそのオブジェクト
+/配列/値に対して、パースできないプレーンテキストであれば JSON 文字列としてラップした上で評価
+されるため、直前の step が `prompt` のみ（構造化出力なし）でテキストを返した場合でも条件式は
+壊れません。条件式の出力はちょうど1つの値である必要があり（0個・複数個はエラー）、その値が
+`false`/`null` なら偽、それ以外はすべて真になります（jq 自身の truthy/falsy 判定と同じです）。
+
+**`when:` ―― step 単位のガード**
+
+既存の step（`prompt`/`agent`/`jq` のいずれか）に `when:` を追加すると、条件が偽のときその
+step 全体（モデル呼び出しや `jq` を含む）をスキップし、入力を無変換のまま次の step に渡します。
+
+```yaml
+# run.yml
+steps:
+  - id: maybe-translate
+    when: '.lang != "en"'
+    prompt: |
+      次の文章を英訳してください。
+      {{ input }}
+```
+
+**`switch:` ―― 複数分岐**
+
+step に `switch:` を指定すると、その step は他の全フィールド（`prompt`/`agent`/`jq`/`when` 等）
+を持てない代わりに分岐ルーターになります。`cases` を先頭から評価し、最初に `when` が真になった
+ケースの `steps`（入れ子の step 列）を実行します。どのケースにも一致しなかった場合は `else:` の
+`steps` を実行し、`else:` がなければエラーで停止します（分岐漏れを黙って通過させないためです）。
+分岐後は `switch` step の続き（親の `steps` の次の要素）にそのまま戻ります。
+
+```yaml
+# run.yml
+steps:
+  - id: triage
+    prompt: |
+      次の問い合わせを分類してください。
+      {{ input }}
+    json_schema: triage
+    schema_name: triage
+
+  - id: route
+    switch:
+      cases:
+        - id: high              # 任意。進捗表示用のラベル
+          when: '.severity == "high"'
+          steps:
+            - id: escalate
+              model: cloud
+              prompt: "緊急対応メモを書いてください。\n{{ input }}"
+        - id: medium
+          when: '.severity == "medium"'
+          steps:
+            - id: draft-reply
+              prompt: "通常対応の返信文を作成してください。\n{{ input }}"
+      else:
+        - id: auto-close
+          jq: ".summary"
+
+  - id: notify
+    prompt: "次の内容を1行の通知文にしてください。\n{{ input }}"
+```
+
+- `switch` の `steps`（`cases[].steps`/`else`）は空配列にできません。少なくとも1step必要です。
+- `switch` は `id` によるジャンプ（`goto`）やループではありません。分岐は非循環で、実行後は必ず
+  親の `steps` に戻ります。
+- 分岐が入ると進捗表示（標準エラー出力）は `[index/total]` ではなく、実行された経路上の通し
+  番号 `[n] id` になります（スキップされた step も番号を1つ消費し `[n] id (skipped)` と出ます）。
 
 ### エージェント Markdown ファイル（agent.md）
 
