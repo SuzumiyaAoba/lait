@@ -69,10 +69,11 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 
 ## ワークフローからエージェントファイルを使う
 
-`run.yml` の step で `prompt`/`json_schema`/`schema_name` の代わりに `agent:` を指定すると、
-その step はエージェント Markdown ファイルのシステムプロンプト・入出力スキーマ・
+`run.yml` の step で `prompt`/`input_schema`/`output_schema`/`schema_name` の代わりに `agent:` を
+指定すると、その step はエージェント Markdown ファイルのシステムプロンプト・入出力スキーマ・
 `model`/`reasoning_effort` を使って実行されます。`agent:` は `prompt` と同時には指定できず、
-`json_schema`/`schema_name` はエージェントファイル側で決まるため step には書けません。
+`input_schema`/`output_schema`/`schema_name` はエージェントファイル側で決まるため step には
+書けません。
 
 ```yaml
 # run.yml

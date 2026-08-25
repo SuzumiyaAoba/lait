@@ -46,6 +46,25 @@ pub(crate) fn build_response_format_from_entry(
     build_json_schema(load_schema_value(entry)?, name)
 }
 
+/// Resolves a `StepDefinition::input_schema` value to its schema body: first
+/// as a key into a workflow's `json_schemas:`, falling back to treating it as
+/// a path to a JSON schema file (the same two-step lookup `json_schema` uses
+/// for output schemas).
+pub(crate) fn resolve_named_schema_value(
+    json_schemas: &JsonSchemaMap,
+    name_or_path: &str,
+) -> Result<serde_json::Value> {
+    match json_schemas.get(name_or_path) {
+        Some(entry) => load_schema_value(entry),
+        None => {
+            let contents = fs::read_to_string(name_or_path)
+                .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
+            serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse JSON schema file '{name_or_path}'"))
+        }
+    }
+}
+
 /// Checks `input` against `schema` well enough to catch the common mistakes: it
 /// must be a JSON object, and it must have every key `schema.required` lists.
 /// This is not full JSON Schema validation (types, formats, nested schemas are
