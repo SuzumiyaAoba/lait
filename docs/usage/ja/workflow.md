@@ -5,6 +5,10 @@
 `lait run <FILE> <PROMPT>` サブコマンドで、複数の LLM 呼び出しを YAML で逐次実行できます。
 各 step は前の step の応答テキストを `{{ input }}` プレースホルダーで受け取り、次の step の
 プロンプトに埋め込みます。最初の step の `{{ input }}` には `<PROMPT>`（CLI 引数）が使われます。
+`prompt` はエージェント Markdown ファイルのシステムプロンプトと同じテンプレートエンジン
+（[handlebars](https://handlebarsjs.com/)）でレンダリングされるため、入力が JSON オブジェクト/
+配列のときは裸の `{{ input }}` は使えません。`{{ input.field }}` でフィールドにアクセスするか、
+`{{ json input }}` で全体をコンパクトな JSON テキストとして展開してください（詳細は後述）。
 
 ```yaml
 # workflow.yml
@@ -167,6 +171,51 @@ steps:
 入力を早期に（モデルを呼び出す前に）エラーとして弾くためのものです。`agent` を指定した step では
 agent ファイル側の `input_schema` が使われるため、step に `input_schema` を重ねて指定すること
 はできません。
+
+## ステップ間の値の受け渡し（`{{ steps.<id> }}` / `$steps`）
+
+これまでの `{{ input }}` は「直前の step の出力」しか参照できませんでしたが、`id` を指定した
+step の出力は `steps.<id>` という名前でも記録され、以降のどの step からでも参照できます。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+json_schemas:
+  city_fact:
+    schema:
+      type: object
+      properties:
+        city: { type: string }
+      required: [city]
+steps:
+  - id: extract
+    prompt: |
+      次の文章から都市名を JSON で抽出してください。
+      {{ input }}
+    output_schema: city_fact
+
+  - id: weather
+    prompt: "{{ steps.extract.city }} の天気を教えてください。"
+
+  - jq: '{ city: $steps.extract.city, weather: . }'
+```
+
+- `prompt` テンプレートからは `{{ steps.<id> }}` / `{{ steps.<id>.field }}` / `{{ json steps.<id> }}`
+  で参照します（`{{ input }}` と同じ handlebars の記法・strict mode に従うため、未記録の `id` や
+  存在しないフィールドを参照するとエラーになります）。
+- `jq` フィルター（`when`、`switch` の `when`、`loop` の `while`/`until`、`for_each` の `items`、
+  すべての `join`、そして step の `jq` 自身）からは `$steps.<id>` という jq のグローバル変数として
+  参照します（`$steps.extract.city` のように）。未記録の `id` を参照した場合、handlebars と違って
+  jq はエラーにならず `null` になります（通常の jq のフィールドアクセスの挙動どおりです）。
+- 記録されるのは **明示的に `id` を指定した step だけ**です。`id` を省略して自動的に振られる
+  `step-1` のような進捗表示用ラベルは記録されません。
+- `loop`/`for_each` の本文で同じ `id` を持つ step が繰り返し実行された場合、`steps.<id>` は
+  最後に実行されたイテレーションの出力で上書きされます。
+- `parallel` の branch の中で記録した `id` は、その branch の中だけで有効です。branch の外
+  （`parallel` の次の step 以降）からは参照できません（各 branch は同時に走るため、複数の branch
+  が同じ `id` を記録した場合に「どちらが正か」を決められないからです）。branch の結果を外へ
+  出す方法は、これまでどおり `parallel` の `join` です。
 
 ## エラー処理（`retry` / `timeout` / `on_error`）
 

@@ -89,7 +89,10 @@ steps:
 または最初の step では `<PROMPT>`）は、`lait agent run` の `INPUT` と同じ規則でエージェントの
 システムプロンプトに渡され、`{{ input.field }}` でアクセスできます。
 
-なお、通常の `prompt:` を使う step のテンプレート構文（`{{ input }}` のみ）はこれまでどおりで、
-`{{ input.field }}` のようなフィールドアクセスはエージェントファイルの本文でのみ使えます。
+`prompt:` を使う通常の step も同じ handlebars テンプレート（`{{ input.field }}`/`{{ json input }}`
+を含む）でレンダリングされるため、フィールドアクセスはエージェントファイルの本文に限りません。
+さらに、ワークフロー内で `id` を指定した他の step の出力は、エージェントのシステムプロンプトから
+も `{{ steps.<id> }}` として参照できます（詳細は
+[ワークフロー（workflow.yml）](./workflow.md#ステップ間の値の受け渡し-steps-id--steps) を参照）。
 
 関連: [ワークフロー（workflow.yml）](./workflow.md)

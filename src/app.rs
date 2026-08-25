@@ -61,8 +61,9 @@ async fn call_agent(
     settings: &RequestSettings,
     input: &serde_json::Value,
     prompt: &str,
+    steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
-    let system_prompt = template::render(&agent_file.system_prompt_template, input)?;
+    let system_prompt = template::render(&agent_file.system_prompt_template, input, steps_outputs)?;
     let response_format = agent_file
         .structured_output
         .then(|| {
@@ -204,9 +205,15 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         &file_config,
     )?;
 
-    let output = call_agent(&agent_file, &settings, &input, &args.input)
-        .await
-        .with_context(|| format!("agent '{}'", args.file.display()))?;
+    let output = call_agent(
+        &agent_file,
+        &settings,
+        &input,
+        &args.input,
+        &workflow::StepOutputs::new(),
+    )
+    .await
+    .with_context(|| format!("agent '{}'", args.file.display()))?;
     println!("{output}");
     Ok(())
 }
@@ -222,10 +229,32 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         }
     }
 
-    let (current_input, _, _) =
-        run_steps(&wf.steps, run_args.prompt, &wf, &file_config, 0, "").await?;
+    let (current_input, _, _, _) = run_steps(
+        &wf.steps,
+        run_args.prompt,
+        &wf,
+        &file_config,
+        0,
+        "",
+        workflow::StepOutputs::new(),
+    )
+    .await?;
     println!("{current_input}");
     Ok(())
+}
+
+/// Sets `steps_outputs[step.id]` to `output` (JSON-parsed, like a `parallel`
+/// branch's output before joining), for a step with an explicit `id`. A step
+/// without one keeps its auto-generated `step-N` progress label out of
+/// `{{ steps.* }}`/`$steps`, since that label isn't a stable name to reference.
+fn record_step_output(
+    steps_outputs: &mut workflow::StepOutputs,
+    step: &workflow::StepDefinition,
+    output: &str,
+) {
+    if let Some(id) = &step.id {
+        steps_outputs.insert(id.clone(), template::parse_input(output));
+    }
 }
 
 /// A signal returned by `run_steps`, alongside its final input and progress
@@ -241,9 +270,10 @@ enum Flow {
     Stop,
 }
 
-/// The final input, the running progress counter, and the `Flow` signal the
-/// run ended with, returned by `run_steps`.
-type StepsOutcome = Result<(String, usize, Flow)>;
+/// The final input, the running progress counter, the `Flow` signal the run
+/// ended with, and the named step outputs recorded along the way, returned by
+/// `run_steps`.
+type StepsOutcome = Result<(String, usize, Flow, workflow::StepOutputs)>;
 
 /// Runs a sequence of steps (the workflow's top-level `steps`, the nested
 /// `steps` of a `switch` case/`else`, or a `parallel` branch), returning the
@@ -255,9 +285,15 @@ type StepsOutcome = Result<(String, usize, Flow)>;
 /// (only one case ever runs, so its numbering stays continuous with the
 /// parent) but reset to a fresh branch-local prefix and counter by
 /// `parallel` (every branch runs concurrently, so a single shared counter
-/// would not reflect real execution order). Boxed because a `switch`/
-/// `parallel` step recurses into this function from within an `async` body,
-/// which Rust cannot size otherwise.
+/// would not reflect real execution order). `steps_outputs` is threaded the
+/// same way as `current_input`/`counter` for a `switch` case, `loop`
+/// iteration, or `for_each` item (each sees every id recorded so far, and its
+/// own recordings flow to whatever runs after it), but is only ever cloned
+/// into a `parallel` branch, never merged back: concurrently running branches
+/// recording into a shared namespace would race, and there is no well-defined
+/// "the" value for an id set differently by two branches. Boxed because a
+/// `switch`/`parallel` step recurses into this function from within an
+/// `async` body, which Rust cannot size otherwise.
 fn run_steps<'a>(
     steps: &'a [workflow::StepDefinition],
     current_input: String,
@@ -265,10 +301,12 @@ fn run_steps<'a>(
     file_config: &'a ConfigFile,
     start_counter: usize,
     progress_prefix: &'a str,
+    steps_outputs: workflow::StepOutputs,
 ) -> Pin<Box<dyn Future<Output = StepsOutcome> + 'a>> {
     Box::pin(async move {
         let mut current_input = current_input;
         let mut counter = start_counter;
+        let mut steps_outputs = steps_outputs;
         for step in steps {
             counter += 1;
             let label = step.id.clone().unwrap_or_else(|| format!("step-{counter}"));
@@ -278,7 +316,7 @@ fn run_steps<'a>(
 
                 let mut matched = None;
                 for (case_index, case) in switch.cases.iter().enumerate() {
-                    if workflow::eval_when(&case.when, &current_input)
+                    if workflow::eval_when(&case.when, &current_input, &steps_outputs)
                         .with_context(|| format!("step '{label}'"))?
                     {
                         let case_label = case
@@ -294,13 +332,14 @@ fn run_steps<'a>(
                                 file_config,
                                 counter,
                                 progress_prefix,
+                                steps_outputs.clone(),
                             )
                             .await?,
                         );
                         break;
                     }
                 }
-                let (result, new_counter, flow) = match matched {
+                let (result, new_counter, flow, new_steps_outputs) = match matched {
                     Some(result) => result,
                     None => match &switch.else_steps {
                         Some(else_steps) => {
@@ -312,6 +351,7 @@ fn run_steps<'a>(
                                 file_config,
                                 counter,
                                 progress_prefix,
+                                steps_outputs.clone(),
                             )
                             .await?
                         }
@@ -322,8 +362,10 @@ fn run_steps<'a>(
                 };
                 current_input = result;
                 counter = new_counter;
+                steps_outputs = new_steps_outputs;
+                record_step_output(&mut steps_outputs, step, &current_input);
                 if flow != Flow::Continue {
-                    return Ok((current_input, counter, flow));
+                    return Ok((current_input, counter, flow, steps_outputs));
                 }
                 continue;
             }
@@ -354,6 +396,7 @@ fn run_steps<'a>(
                             file_config,
                             0,
                             branch_prefix,
+                            steps_outputs.clone(),
                         )
                     },
                 );
@@ -361,9 +404,11 @@ fn run_steps<'a>(
 
                 // `validate_steps` rejects `stop`/`break` anywhere inside a
                 // `parallel` branch, so every branch always finishes with
-                // `Flow::Continue`; only its output is used here.
+                // `Flow::Continue`; only its output is used here. Each branch
+                // got its own clone of `steps_outputs` (see this function's
+                // doc comment), so whatever it recorded stays branch-local.
                 let mut joined = serde_json::Map::new();
-                for (branch_label, (branch_output, _, _)) in
+                for (branch_label, (branch_output, _, _, _)) in
                     branch_labels.into_iter().zip(branch_results)
                 {
                     joined.insert(branch_label, template::parse_input(&branch_output));
@@ -374,10 +419,11 @@ fn run_steps<'a>(
                 eprintln!("{progress_prefix}    -> branches joined");
 
                 current_input = match &parallel.join {
-                    Some(filter) => jq::apply(filter, &joined_json)
+                    Some(filter) => jq::apply(filter, &joined_json, &steps_outputs)
                         .with_context(|| format!("step '{label}'"))?,
                     None => joined_json,
                 };
+                record_step_output(&mut steps_outputs, step, &current_input);
                 continue;
             }
 
@@ -398,8 +444,9 @@ fn run_steps<'a>(
                 if let Some(while_cond) = &loop_def.r#while {
                     let mut iterations_run = 0usize;
                     loop {
-                        let should_continue = workflow::eval_when(while_cond, &iteration_input)
-                            .with_context(|| format!("step '{label}'"))?;
+                        let should_continue =
+                            workflow::eval_when(while_cond, &iteration_input, &steps_outputs)
+                                .with_context(|| format!("step '{label}'"))?;
                         if !should_continue {
                             break;
                         }
@@ -412,22 +459,29 @@ fn run_steps<'a>(
                         eprintln!(
                             "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
                         );
-                        let (result, new_counter, flow) = run_steps(
+                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
                             &loop_def.steps,
                             iteration_input.clone(),
                             wf,
                             file_config,
                             loop_counter,
                             progress_prefix,
+                            steps_outputs.clone(),
                         )
                         .await?;
                         iteration_input = result;
                         loop_counter = new_counter;
+                        steps_outputs = new_steps_outputs;
                         match flow {
                             Flow::Continue => {}
                             Flow::Break => break,
                             Flow::Stop => {
-                                return Ok((iteration_input, loop_counter, Flow::Stop));
+                                return Ok((
+                                    iteration_input,
+                                    loop_counter,
+                                    Flow::Stop,
+                                    steps_outputs,
+                                ));
                             }
                         }
                     }
@@ -443,19 +497,21 @@ fn run_steps<'a>(
                         eprintln!(
                             "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
                         );
-                        let (result, new_counter, flow) = run_steps(
+                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
                             &loop_def.steps,
                             iteration_input.clone(),
                             wf,
                             file_config,
                             loop_counter,
                             progress_prefix,
+                            steps_outputs.clone(),
                         )
                         .await?;
                         iteration_input = result;
                         loop_counter = new_counter;
+                        steps_outputs = new_steps_outputs;
                         if flow == Flow::Stop {
-                            return Ok((iteration_input, loop_counter, Flow::Stop));
+                            return Ok((iteration_input, loop_counter, Flow::Stop, steps_outputs));
                         }
                         if flow == Flow::Break {
                             // An explicit `break: true` ends the loop like a
@@ -464,8 +520,9 @@ fn run_steps<'a>(
                             satisfied = true;
                             break;
                         }
-                        satisfied = workflow::eval_when(until_cond, &iteration_input)
-                            .with_context(|| format!("step '{label}'"))?;
+                        satisfied =
+                            workflow::eval_when(until_cond, &iteration_input, &steps_outputs)
+                                .with_context(|| format!("step '{label}'"))?;
                         if satisfied {
                             break;
                         }
@@ -478,12 +535,13 @@ fn run_steps<'a>(
                 }
                 current_input = iteration_input;
                 counter = loop_counter;
+                record_step_output(&mut steps_outputs, step, &current_input);
                 continue;
             }
 
             if let Some(for_each) = &step.for_each {
                 eprintln!("{progress_prefix}[{counter}] {label}");
-                let items_json = jq::apply_one(&for_each.items, &current_input)
+                let items_json = jq::apply_one(&for_each.items, &current_input, &steps_outputs)
                     .with_context(|| format!("step '{label}'"))?;
                 let items_value: serde_json::Value = serde_json::from_str(&items_json)
                     .with_context(|| {
@@ -518,18 +576,20 @@ fn run_steps<'a>(
                         other => serde_json::to_string(other)
                             .context("failed to serialize a 'for_each' item")?,
                     };
-                    let (result, new_counter, flow) = run_steps(
+                    let (result, new_counter, flow, new_steps_outputs) = run_steps(
                         &for_each.steps,
                         item_input,
                         wf,
                         file_config,
                         for_each_counter,
                         progress_prefix,
+                        steps_outputs.clone(),
                     )
                     .await?;
                     for_each_counter = new_counter;
+                    steps_outputs = new_steps_outputs;
                     if flow == Flow::Stop {
-                        return Ok((result, for_each_counter, Flow::Stop));
+                        return Ok((result, for_each_counter, Flow::Stop, steps_outputs));
                     }
                     results.push(template::parse_input(&result));
                     if flow == Flow::Break {
@@ -541,15 +601,16 @@ fn run_steps<'a>(
                     .context("failed to serialize 'for_each' results")?;
 
                 current_input = match &for_each.join {
-                    Some(filter) => jq::apply(filter, &results_json)
+                    Some(filter) => jq::apply(filter, &results_json, &steps_outputs)
                         .with_context(|| format!("step '{label}'"))?,
                     None => results_json,
                 };
+                record_step_output(&mut steps_outputs, step, &current_input);
                 continue;
             }
 
             if let Some(when) = &step.when {
-                let truthy = workflow::eval_when(when, &current_input)
+                let truthy = workflow::eval_when(when, &current_input, &steps_outputs)
                     .with_context(|| format!("step '{label}'"))?;
                 if !truthy {
                     eprintln!("{progress_prefix}[{counter}] {label} (skipped)");
@@ -565,6 +626,7 @@ fn run_steps<'a>(
                 file_config,
                 &label,
                 progress_prefix,
+                &steps_outputs,
             )
             .await;
             current_input = match attempt_result {
@@ -580,18 +642,20 @@ fn run_steps<'a>(
                         });
                         let error_input_json = serde_json::to_string(&error_input)
                             .context("failed to serialize 'on_error' input")?;
-                        let (result, new_counter, flow) = run_steps(
+                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
                             &on_error.steps,
                             error_input_json,
                             wf,
                             file_config,
                             counter,
                             progress_prefix,
+                            steps_outputs.clone(),
                         )
                         .await?;
                         counter = new_counter;
+                        steps_outputs = new_steps_outputs;
                         if flow != Flow::Continue {
-                            return Ok((result, counter, flow));
+                            return Ok((result, counter, flow, steps_outputs));
                         }
                         result
                     }
@@ -599,14 +663,16 @@ fn run_steps<'a>(
                 },
             };
 
+            record_step_output(&mut steps_outputs, step, &current_input);
+
             if step.r#break == Some(true) {
-                return Ok((current_input, counter, Flow::Break));
+                return Ok((current_input, counter, Flow::Break, steps_outputs));
             }
             if step.stop == Some(true) {
-                return Ok((current_input, counter, Flow::Stop));
+                return Ok((current_input, counter, Flow::Stop, steps_outputs));
             }
         }
-        Ok((current_input, counter, Flow::Continue))
+        Ok((current_input, counter, Flow::Continue, steps_outputs))
     })
 }
 
@@ -622,6 +688,7 @@ async fn execute_step_with_retry(
     file_config: &ConfigFile,
     label: &str,
     progress_prefix: &str,
+    steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
     let max_attempts = step
         .retry
@@ -647,7 +714,7 @@ async fn execute_step_with_retry(
             Some(seconds) => {
                 match tokio::time::timeout(
                     Duration::from_secs(seconds),
-                    execute_step(step, current_input, wf, file_config, label),
+                    execute_step(step, current_input, wf, file_config, label, steps_outputs),
                 )
                 .await
                 {
@@ -657,7 +724,7 @@ async fn execute_step_with_retry(
                     )),
                 }
             }
-            None => execute_step(step, current_input, wf, file_config, label).await,
+            None => execute_step(step, current_input, wf, file_config, label, steps_outputs).await,
         };
 
         match outcome {
@@ -725,6 +792,7 @@ async fn execute_step(
     wf: &workflow::WorkflowFile,
     file_config: &ConfigFile,
     label: &str,
+    steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
     if let Some(name_or_path) = &step.input_schema {
         let schema = schema::resolve_named_schema_value(&wf.json_schemas, name_or_path)
@@ -745,7 +813,7 @@ async fn execute_step(
 
         let settings = resolve_step_settings(step, wf, file_config, Some(&agent_file), label)?;
 
-        call_agent(&agent_file, &settings, &input, current_input)
+        call_agent(&agent_file, &settings, &input, current_input, steps_outputs)
             .await
             .with_context(|| format!("step '{label}'"))?
     } else if let Some(prompt_template) = &step.prompt {
@@ -766,7 +834,8 @@ async fn execute_step(
             .transpose()
             .with_context(|| format!("step '{label}'"))?;
 
-        let prompt = workflow::render_prompt(prompt_template, current_input)
+        let input = template::parse_input(current_input);
+        let prompt = template::render(prompt_template, &input, steps_outputs)
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
@@ -781,7 +850,8 @@ async fn execute_step(
     };
 
     if let Some(filter) = &step.jq {
-        step_output = jq::apply(filter, &step_output).with_context(|| format!("step '{label}'"))?;
+        step_output = jq::apply(filter, &step_output, steps_outputs)
+            .with_context(|| format!("step '{label}'"))?;
     }
 
     Ok(step_output)

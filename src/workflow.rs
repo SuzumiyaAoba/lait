@@ -570,72 +570,30 @@ fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Result<()> {
     Ok(())
 }
 
-/// Replaces `{{ input }}` placeholders in a step's prompt template with `input`.
-pub(crate) fn render_prompt(template: &str, input: &str) -> Result<String> {
-    let mut rendered = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("{{") {
-        let Some(relative_end) = rest[start..].find("}}") else {
-            bail!("unterminated placeholder in prompt template: {template:?}");
-        };
-        let end = start + relative_end;
-        rendered.push_str(&rest[..start]);
-        let name = rest[start + 2..end].trim();
-        match name {
-            "input" => rendered.push_str(input),
-            _ => bail!("unknown placeholder '{{{{ {name} }}}}' in prompt template"),
-        }
-        rest = &rest[end + 2..];
-    }
-    rendered.push_str(rest);
-    Ok(rendered)
-}
+/// Named step outputs recorded by `id` while a workflow runs, exposed to
+/// prompts as `{{ steps.<id> }}` and to jq filters (`when`/`jq`/`switch`
+/// cases/`loop` conditions/`for_each.items`/every `join`) as the `$steps`
+/// global variable. Only steps with an explicit `id` are recorded — the
+/// auto-generated `step-N` label used in progress output is not a stable name
+/// to reference.
+pub(crate) type StepOutputs = jq::Steps;
 
 /// Evaluates a `when`/case-condition jq filter against the current input,
 /// using the same JSON-or-string coercion as `{{ input }}` templates
 /// (`template::parse_input`) so a `when:` right after a plain-text `prompt:`
-/// step doesn't fail just because the input isn't JSON.
-pub(crate) fn eval_when(filter: &str, current_input: &str) -> Result<bool> {
+/// step doesn't fail just because the input isn't JSON. `steps` is exposed to
+/// the filter as `$steps` (see `StepOutputs`).
+pub(crate) fn eval_when(filter: &str, current_input: &str, steps: &StepOutputs) -> Result<bool> {
     let value = template::parse_input(current_input);
     let input_json = serde_json::to_string(&value)
         .context("failed to serialize the current input for a 'when' condition")?;
-    jq::apply_bool(filter, &input_json).context("failed to evaluate 'when' condition")
+    jq::apply_bool(filter, &input_json, steps).context("failed to evaluate 'when' condition")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{eval_when, parse_workflow, render_prompt};
+    use super::{StepOutputs, eval_when, parse_workflow};
     use crate::schema::JsonSchemaEntry;
-
-    #[test]
-    fn renders_input_placeholder_with_and_without_spaces() {
-        assert_eq!(
-            render_prompt("summarize: {{input}}", "hello").unwrap(),
-            "summarize: hello"
-        );
-        assert_eq!(
-            render_prompt("summarize: {{ input }}", "hello").unwrap(),
-            "summarize: hello"
-        );
-        assert_eq!(
-            render_prompt("{{ input }} and {{ input }}", "x").unwrap(),
-            "x and x"
-        );
-        assert_eq!(
-            render_prompt("no placeholder here", "x").unwrap(),
-            "no placeholder here"
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_placeholder() {
-        assert!(render_prompt("{{ nope }}", "x").is_err());
-    }
-
-    #[test]
-    fn rejects_unterminated_placeholder() {
-        assert!(render_prompt("{{ input", "x").is_err());
-    }
 
     #[test]
     fn parses_workflow_with_multiple_steps() {
@@ -1792,13 +1750,20 @@ steps:
 
     #[test]
     fn eval_when_coerces_plain_text_input_to_a_json_string() {
-        assert!(eval_when(". == \"hello\"", "hello").unwrap());
-        assert!(!eval_when(". == \"hello\"", "world").unwrap());
+        assert!(eval_when(". == \"hello\"", "hello", &StepOutputs::new()).unwrap());
+        assert!(!eval_when(". == \"hello\"", "world", &StepOutputs::new()).unwrap());
     }
 
     #[test]
     fn eval_when_evaluates_against_parsed_json_input() {
-        assert!(eval_when(".flag", r#"{"flag":true}"#).unwrap());
-        assert!(!eval_when(".flag", r#"{"flag":false}"#).unwrap());
+        assert!(eval_when(".flag", r#"{"flag":true}"#, &StepOutputs::new()).unwrap());
+        assert!(!eval_when(".flag", r#"{"flag":false}"#, &StepOutputs::new()).unwrap());
+    }
+
+    #[test]
+    fn eval_when_can_reference_a_named_step_output_via_dollar_steps() {
+        let mut steps = StepOutputs::new();
+        steps.insert("check".to_owned(), serde_json::json!({"ok": true}));
+        assert!(eval_when("$steps.check.ok", "null", &steps).unwrap());
     }
 }

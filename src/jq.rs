@@ -6,12 +6,16 @@ use jaq_core::{
 };
 use jaq_json::{Val, read};
 
+/// Named step outputs recorded by `id` (see `workflow::StepOutputs`), exposed
+/// to jq filters as the `$steps` global variable (e.g. `$steps.extract.city`).
+pub(crate) type Steps = serde_json::Map<String, serde_json::Value>;
+
 /// Runs a jq filter against a single JSON input, rendering each output value as
 /// text and joining multiple outputs with newlines (as `jq` does on the command
 /// line). A string output is rendered raw/unquoted, like `jq -r`; every other
 /// value is rendered as compact JSON.
-pub(crate) fn apply(filter_source: &str, input_json: &str) -> Result<String> {
-    let outputs = run_filter(filter_source, input_json)?;
+pub(crate) fn apply(filter_source: &str, input_json: &str, steps: &Steps) -> Result<String> {
+    let outputs = run_filter(filter_source, input_json, steps)?;
     Ok(outputs
         .into_iter()
         .map(render_val)
@@ -22,8 +26,8 @@ pub(crate) fn apply(filter_source: &str, input_json: &str) -> Result<String> {
 /// Runs a jq filter as a boolean condition (used by workflow `when:` guards).
 /// The filter must produce exactly one output value; that value is falsy iff
 /// it is JSON `false` or `null` (jq's own truthiness rules), truthy otherwise.
-pub(crate) fn apply_bool(filter_source: &str, input_json: &str) -> Result<bool> {
-    let outputs = run_filter(filter_source, input_json)?;
+pub(crate) fn apply_bool(filter_source: &str, input_json: &str, steps: &Steps) -> Result<bool> {
+    let outputs = run_filter(filter_source, input_json, steps)?;
     match outputs.as_slice() {
         [] => {
             bail!("jq condition {filter_source:?} produced no output; expected exactly one value")
@@ -40,8 +44,8 @@ pub(crate) fn apply_bool(filter_source: &str, input_json: &str) -> Result<bool> 
 /// workflow `for_each.items:` filters). Unlike `apply`, the result is
 /// rendered as proper JSON text even for a string output (no `jq -r`-style
 /// unquoting), and multiple outputs are rejected instead of newline-joined.
-pub(crate) fn apply_one(filter_source: &str, input_json: &str) -> Result<String> {
-    let outputs = run_filter(filter_source, input_json)?;
+pub(crate) fn apply_one(filter_source: &str, input_json: &str, steps: &Steps) -> Result<String> {
+    let outputs = run_filter(filter_source, input_json, steps)?;
     match outputs.as_slice() {
         [] => {
             bail!("jq filter {filter_source:?} produced no output; expected exactly one value")
@@ -54,9 +58,13 @@ pub(crate) fn apply_one(filter_source: &str, input_json: &str) -> Result<String>
     }
 }
 
-fn run_filter(filter_source: &str, input_json: &str) -> Result<Vec<Val>> {
+fn run_filter(filter_source: &str, input_json: &str, steps: &Steps) -> Result<Vec<Val>> {
     let input = read::parse_single(input_json.as_bytes())
         .map_err(|error| anyhow!("failed to parse jq input as JSON: {error}"))?;
+    let steps_json = serde_json::to_string(&serde_json::Value::Object(steps.clone()))
+        .map_err(|error| anyhow!("failed to serialize named step outputs for '$steps': {error}"))?;
+    let steps_val = read::parse_single(steps_json.as_bytes())
+        .map_err(|error| anyhow!("failed to parse named step outputs as JSON: {error}"))?;
 
     let program = File {
         code: filter_source,
@@ -76,10 +84,11 @@ fn run_filter(filter_source: &str, input_json: &str) -> Result<Vec<Val>> {
         .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
     let filter = Compiler::default()
         .with_funs(funs)
+        .with_global_vars(["$steps"])
         .compile(modules)
         .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
 
-    let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
+    let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([steps_val]));
     filter
         .id
         .run((ctx, input))
@@ -99,73 +108,89 @@ fn render_val(value: Val) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, apply_bool, apply_one};
+    use super::{Steps, apply, apply_bool, apply_one};
+
+    fn no_steps() -> Steps {
+        Steps::new()
+    }
+
+    fn steps_with(id: &str, value: serde_json::Value) -> Steps {
+        let mut steps = Steps::new();
+        steps.insert(id.to_owned(), value);
+        steps
+    }
 
     #[test]
     fn extracts_a_string_field_raw() {
-        assert_eq!(apply(".name", r#"{"name":"Alice"}"#).unwrap(), "Alice");
+        assert_eq!(
+            apply(".name", r#"{"name":"Alice"}"#, &no_steps()).unwrap(),
+            "Alice"
+        );
     }
 
     #[test]
     fn extracts_a_number_field_as_json() {
-        assert_eq!(apply(".age", r#"{"age":30}"#).unwrap(), "30");
+        assert_eq!(apply(".age", r#"{"age":30}"#, &no_steps()).unwrap(), "30");
     }
 
     #[test]
     fn joins_multiple_outputs_with_newlines() {
-        assert_eq!(apply(".[]", r#"["a","b","c"]"#).unwrap(), "a\nb\nc");
+        assert_eq!(
+            apply(".[]", r#"["a","b","c"]"#, &no_steps()).unwrap(),
+            "a\nb\nc"
+        );
     }
 
     #[test]
     fn renders_objects_and_arrays_as_compact_json() {
         assert_eq!(
-            apply("{n: .name}", r#"{"name":"Alice"}"#).unwrap(),
+            apply("{n: .name}", r#"{"name":"Alice"}"#, &no_steps()).unwrap(),
             r#"{"n":"Alice"}"#
         );
     }
 
     #[test]
     fn rejects_invalid_json_input() {
-        assert!(apply(".", "not json").is_err());
+        assert!(apply(".", "not json", &no_steps()).is_err());
     }
 
     #[test]
     fn rejects_invalid_filter_syntax() {
-        assert!(apply(".[", "{}").is_err());
+        assert!(apply(".[", "{}", &no_steps()).is_err());
     }
 
     #[test]
     fn reports_a_runtime_error_from_the_filter() {
-        assert!(apply(".foo.bar", "1").is_err());
+        assert!(apply(".foo.bar", "1", &no_steps()).is_err());
     }
 
     #[test]
     fn apply_bool_treats_false_and_null_as_falsy() {
-        assert!(!apply_bool(".flag", r#"{"flag":false}"#).unwrap());
-        assert!(!apply_bool(".missing", "{}").unwrap());
+        assert!(!apply_bool(".flag", r#"{"flag":false}"#, &no_steps()).unwrap());
+        assert!(!apply_bool(".missing", "{}", &no_steps()).unwrap());
     }
 
     #[test]
     fn apply_bool_treats_everything_else_as_truthy() {
-        assert!(apply_bool(".flag", r#"{"flag":true}"#).unwrap());
-        assert!(apply_bool(".n", r#"{"n":0}"#).unwrap());
-        assert!(apply_bool(".s", r#"{"s":""}"#).unwrap());
+        assert!(apply_bool(".flag", r#"{"flag":true}"#, &no_steps()).unwrap());
+        assert!(apply_bool(".n", r#"{"n":0}"#, &no_steps()).unwrap());
+        assert!(apply_bool(".s", r#"{"s":""}"#, &no_steps()).unwrap());
     }
 
     #[test]
     fn apply_bool_rejects_zero_outputs() {
-        assert!(apply_bool(".[]", "[]").is_err());
+        assert!(apply_bool(".[]", "[]", &no_steps()).is_err());
     }
 
     #[test]
     fn apply_bool_rejects_multiple_outputs() {
-        assert!(apply_bool(".[]", "[true, false]").is_err());
+        assert!(apply_bool(".[]", "[true, false]", &no_steps()).is_err());
     }
 
     #[test]
     fn apply_one_renders_a_string_output_as_quoted_json() {
         assert_eq!(
-            apply_one(".name", r#"{"name":"Alice"}"#).unwrap(),
+            apply_one(".name", r#"{"name":"Alice"}"#, &no_steps()).unwrap(),
             r#""Alice""#
         );
     }
@@ -173,18 +198,38 @@ mod tests {
     #[test]
     fn apply_one_renders_an_array_output_as_compact_json() {
         assert_eq!(
-            apply_one(".items", r#"{"items":[1,2,3]}"#).unwrap(),
+            apply_one(".items", r#"{"items":[1,2,3]}"#, &no_steps()).unwrap(),
             "[1,2,3]"
         );
     }
 
     #[test]
     fn apply_one_rejects_zero_outputs() {
-        assert!(apply_one(".[]", "[]").is_err());
+        assert!(apply_one(".[]", "[]", &no_steps()).is_err());
     }
 
     #[test]
     fn apply_one_rejects_multiple_outputs() {
-        assert!(apply_one(".[]", "[1, 2]").is_err());
+        assert!(apply_one(".[]", "[1, 2]", &no_steps()).is_err());
+    }
+
+    #[test]
+    fn apply_can_reference_a_named_step_output_via_dollar_steps() {
+        let steps = steps_with("extract", serde_json::json!({"city": "Tokyo"}));
+        assert_eq!(
+            apply("$steps.extract.city", "null", &steps).unwrap(),
+            "Tokyo"
+        );
+    }
+
+    #[test]
+    fn apply_bool_can_reference_a_named_step_output_via_dollar_steps() {
+        let steps = steps_with("check", serde_json::json!({"ok": true}));
+        assert!(apply_bool("$steps.check.ok", "null", &steps).unwrap());
+    }
+
+    #[test]
+    fn dollar_steps_is_an_empty_object_when_no_step_output_is_recorded() {
+        assert_eq!(apply("$steps", "null", &no_steps()).unwrap(), "{}");
     }
 }
