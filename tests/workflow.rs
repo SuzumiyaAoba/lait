@@ -510,6 +510,107 @@ steps:
 }
 
 #[test]
+fn parallel_runs_every_branch_and_joins_outputs_into_an_id_keyed_object_in_declaration_order() {
+    let server_a = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-a","object":"chat.completion","created":0,"model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":"response-a"},"finish_reason":"stop"}]}"#,
+    );
+    let server_b = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-b","object":"chat.completion","created":0,"model":"model-b","choices":[{"index":0,"message":{"role":"assistant","content":"response-b"},"finish_reason":"stop"}]}"#,
+    );
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: model-a
+  cloud:
+    - provider:
+        base_url: "{}"
+      model_id: model-b
+steps:
+  - parallel:
+      branches:
+        - id: a
+          steps:
+            - prompt: "{{{{ input }}}}"
+        - id: b
+          steps:
+            - model: cloud
+              prompt: "{{{{ input }}}}"
+"#,
+        server_a.base_url, server_b.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    server_a.receive_request();
+    server_b.receive_request();
+    server_a.finish();
+    server_b.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        without_json_whitespace(&String::from_utf8_lossy(&output.stdout)),
+        r#"{"a":"response-a","b":"response-b"}"#
+    );
+}
+
+#[test]
+fn parallel_join_filter_combines_the_id_keyed_object_into_the_next_input() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - parallel:
+      branches:
+        - id: upper
+          steps:
+            - jq: 'ascii_upcase'
+        - id: length
+          steps:
+            - jq: 'length'
+      join: '{summary: .upper, length: .length}'
+  - id: describe
+    jq: '.summary + " (" + (.length | tostring) + ")"'
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "\"hi\"");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "HI (2)");
+}
+
+#[test]
+fn parallel_fails_when_a_branch_id_is_duplicated() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - parallel:
+      branches:
+        - id: same
+          steps:
+            - jq: "."
+        - id: same
+          steps:
+            - jq: "."
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(
+        !output.status.success(),
+        "expected duplicate branch ids to be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("duplicate id"), "stderr: {stderr}");
+}
+
+#[test]
 fn switch_case_can_call_the_model_and_continues_the_outer_steps_afterward() {
     let server = MockServer::start(
         "200 OK",

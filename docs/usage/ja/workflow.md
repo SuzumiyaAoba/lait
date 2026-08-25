@@ -38,8 +38,8 @@ steps:
 cargo run -- run run.yml "要約・翻訳したい文章..."
 ```
 
-- `steps` は配列の先頭から逐次実行するのが基本です。`when`/`switch` による分岐は可能ですが
-  （後述）、並列実行は行いません。
+- `steps` は配列の先頭から逐次実行するのが基本です。`when`/`switch` による分岐（後述）に加え、
+  `parallel` で複数の step 列を同時実行するファンアウト/ファンインも可能です（後述）。
 - `model` / `reasoning_effort` は step 単位で省略可能。省略時は
   ワークフロー直下の `default:` → `lait.config.yml` の `default:`、の順にフォールバックします。
 - `id` は進捗表示（標準エラー出力）用のラベルで、省略した場合は `step-1`、`step-2`… になります。
@@ -209,3 +209,64 @@ steps:
   親の `steps` に戻ります。
 - 分岐が入ると進捗表示（標準エラー出力）は `[index/total]` ではなく、実行された経路上の通し
   番号 `[n] id` になります（スキップされた step も番号を1つ消費し `[n] id (skipped)` と出ます）。
+  `switch` は常にどちらか一方の経路しか実行しないため、この通し番号は分岐をまたいでも連続します。
+
+## 並列実行（`parallel`）
+
+step に `parallel:` を指定すると、その step は他の全フィールド（`prompt`/`agent`/`jq`/`when`/
+`switch` 等、`id` を除く）を持てない代わりに、複数の step 列（`branches`）を**同時実行**する
+ファンアウト/ファンインになります。各 branch は、その `parallel` step に入ってきた時点の
+`{{ input }}` を同じスナップショットとして受け取り、独立した step 列として並列に実行されます。
+
+```yaml
+# run.yml
+default:
+  model: local
+steps:
+  - id: analyze
+    parallel:
+      branches:
+        - id: sentiment
+          steps:
+            - prompt: |
+                次の文章の感情を一言で判定してください。
+                {{ input }}
+        - id: summary
+          steps:
+            - prompt: |
+                次の文章を1行で要約してください。
+                {{ input }}
+        - id: keywords
+          steps:
+            - prompt: |
+                次の文章からキーワードを3つ抽出してください。
+                {{ input }}
+      join: '{sentiment: .sentiment, summary: .summary, keywords: .keywords}'
+
+  - id: report
+    prompt: |
+      次の情報からレポートを1段落で書いてください。
+      {{ input }}
+```
+
+- 全 branch が完了すると、各 branch の最終出力（モデル応答、または `jq` で加工した結果）を
+  branch の `id` をキーにした JSON オブジェクトへ集約します。値は `when`/`jq` 入力と同じ
+  ルールで、JSON としてパースできればそのまま、できなければ JSON 文字列としてラップされます。
+  このオブジェクトは常に `branches` の宣言順でキーが並びます（branch の完了順ではありません）。
+  そのため `parallel` の出力は実行タイミングに依存せず決定的です。
+- `join`（任意）は、その集約オブジェクトに適用する [jq](https://jqlang.org/) フィルターで、
+  step の `jq:` と同じ働きをします。省略した場合は、集約オブジェクトそのもの（JSON テキスト）が
+  次の step の `{{ input }}` になります。
+- `branches` の各要素は `id`（任意。省略時は `branch-1`、`branch-2`… になり、進捗表示と
+  集約オブジェクトのキーの両方に使われます）と `steps`（空配列不可。通常の step 列と同様、
+  `when`/`switch`/`parallel` を入れ子にできます）を持ちます。同じ `parallel` 内で `id` が
+  重複しているとエラーになります（集約オブジェクトのキーとして意味を持つため、`switch` の
+  `case.id`＝ラベルのみ、とは異なります）。
+- branch のどれか1つでもエラーになった場合、その時点で `parallel` step 全体が失敗します
+  （他の branch の結果を待たずに停止する場合があります）。
+- `parallel` は `switch` と同時に指定できません。
+- 分岐中は進捗表示（標準エラー出力）が branch ごとに `[branch-id] [n] id` の形式でインター
+  リーブされます（`n` は branch 内だけで完結するローカルな通し番号で、0から数え直します）。
+  親の `steps` 側の通し番号は `parallel` step 自体で1つ進むだけで、`switch` と異なり
+  branch 内の step 数だけ連続して進むことはありません（複数 branch が同時に進行するため、
+  単一の通し番号では実行順を正しく表せないからです）。
