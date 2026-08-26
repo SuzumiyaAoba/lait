@@ -2,14 +2,19 @@ use anyhow::{Result, bail};
 use async_openai::{
     Client,
     config::OpenAIConfig,
+    error::OpenAIError,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
-        ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
     },
 };
+use futures_util::Stream;
 
-use crate::{cli::ReasoningEffort, response::ChatCompletionResponse};
+use crate::{
+    cli::ReasoningEffort,
+    response::{ChatCompletionResponse, ChatCompletionStreamChunk},
+};
 
 impl From<ReasoningEffort> for OpenAiReasoningEffort {
     fn from(effort: ReasoningEffort) -> Self {
@@ -75,12 +80,19 @@ pub(crate) fn validate_sampling_params(
     Ok(())
 }
 
-pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompletionResponse> {
-    let config = OpenAIConfig::new()
-        .with_api_base(request.base_url)
-        .with_api_key(request.api_key);
-    let client = Client::with_config(config);
+/// A parsed SSE stream of `chat.completion.chunk` events, as returned by
+/// [`complete_stream`]. Each item is `Err` when a chunk fails to parse or the
+/// connection drops mid-stream.
+pub(crate) type CompletionStream =
+    std::pin::Pin<Box<dyn Stream<Item = Result<ChatCompletionStreamChunk, OpenAIError>> + Send>>;
 
+/// Builds the request body shared by [`complete`] and [`complete_stream`];
+/// the two differ only in `stream` and in which `Chat::create*_byot` method
+/// the caller passes the result to.
+fn build_chat_request(
+    request: &CompletionRequest<'_>,
+    stream: bool,
+) -> Result<CreateChatCompletionRequest> {
     let mut messages = Vec::with_capacity(2);
     if let Some(system_prompt) = request.system_prompt {
         let system_message = ChatCompletionRequestSystemMessageArgs::default()
@@ -96,7 +108,7 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
     let mut chat_request = CreateChatCompletionRequestArgs::default();
     chat_request.model(request.model_id);
     chat_request.messages(messages);
-    chat_request.stream(false);
+    chat_request.stream(stream);
     if let Some(reasoning_effort) = request.reasoning_effort {
         chat_request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
     }
@@ -109,13 +121,34 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
     if let Some(max_tokens) = request.max_tokens {
         chat_request.max_completion_tokens(max_tokens);
     }
-    if let Some(response_format) = request.response_format {
+    if let Some(response_format) = request.response_format.clone() {
         chat_request.response_format(response_format);
     }
-    let chat_request = chat_request.build()?;
+    Ok(chat_request.build()?)
+}
 
+pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompletionResponse> {
+    let config = OpenAIConfig::new()
+        .with_api_base(request.base_url)
+        .with_api_key(request.api_key);
+    let client = Client::with_config(config);
+
+    let chat_request = build_chat_request(&request, false)?;
     let response: ChatCompletionResponse = client.chat().create_byot(chat_request).await?;
     Ok(response)
+}
+
+/// Like [`complete`], but requests `stream: true` and returns the parsed SSE
+/// stream of response chunks instead of waiting for the full response.
+pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<CompletionStream> {
+    let config = OpenAIConfig::new()
+        .with_api_base(request.base_url)
+        .with_api_key(request.api_key);
+    let client = Client::with_config(config);
+
+    let chat_request = build_chat_request(&request, true)?;
+    let stream = client.chat().create_stream_byot(chat_request).await?;
+    Ok(stream)
 }
 
 #[cfg(test)]

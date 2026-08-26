@@ -8,6 +8,18 @@
 こんにちは。今日はどのようなお手伝いができますか？
 ```
 
+## `--stream`（ストリーミング応答）
+
+`--stream` を指定すると、モデルの応答をまとめて待たずに、生成された分から順に標準出力へ書き出します。API へは `stream: true` を送信し、サーバーが返す SSE（Server-Sent Events）のチャンクを逐次読み取って表示します。
+
+```sh
+cargo run -- --stream --model "モデル ID" "Rustについて一文で説明してください。"
+```
+
+`--show-reasoning` と併用すると、推論内容のチャンクを先に（`Reasoning:` ヘッダー付きで）、回答本文のチャンクをその後に書き出します。`--show-reasoning` を指定しない場合、推論内容のチャンクは表示されません。
+
+応答全体を一つの JSON オブジェクトとして出力する `--json` は、逐次出力とは両立しないため `--stream` と同時には指定できません。`--json-schema` との併用は可能ですが、Structured Outputs の JSON はチャンク単位の断片として届くため、完成した JSON として読みたい場合は `--stream` を外してください。
+
 ## `--json-schema`（Structured Outputs）
 
 `--json-schema` を指定すると、API の Structured Outputs に JSON Schema を渡せます。`--json-schema` はモデルの応答形式を指定するオプションで、CLI の標準出力形式は変更しません。スキーマは JSON ファイルに記述します。

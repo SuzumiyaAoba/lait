@@ -57,9 +57,12 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 - `structured_output: true` を指定する場合は `output_schema` が必須です（逆に `output_schema`
   だけ指定して `structured_output` を省略/false にするのはエラーです）。`schema_name` は
   `structured_output: true` のときだけ使われ、省略時は `structured_output` になります。
-- `input_schema` を指定すると、`INPUT` が JSON オブジェクトであること、および
-  `input_schema.schema.required` に列挙したフィールドがすべて存在することを実行前に検証します
-  （型やネストした構造までは検証しません）。検証に失敗するとモデルを呼び出さずにエラーになります。
+- `input_schema` を指定すると、`INPUT` が JSON オブジェクトであること、
+  `input_schema.schema.required` に列挙したフィールドがすべて存在すること、さらに
+  `properties`/`items` で宣言したフィールドの `type`/`enum` やネストしたオブジェクト・配列の
+  中身までを実行前に再帰的に検証します（`format`・`pattern`・数値の範囲・
+  `additionalProperties`・`oneOf`/`anyOf`/`allOf`・`$ref` は検証しません）。検証に失敗すると
+  モデルを呼び出さずにエラーになります。
 - `INPUT` はまず JSON としてパースを試み、成功すればそのオブジェクト/配列/値がシステム
   プロンプトのテンプレートに渡され、失敗すれば文字列としてそのまま渡されます。
 - システムプロンプトのテンプレートは handlebars 構文です。`{{ input.city }}` のようにドット

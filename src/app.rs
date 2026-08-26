@@ -74,6 +74,72 @@ impl RequestSettings {
         })
         .await
     }
+
+    /// Like [`RequestSettings::complete`], but requests a streamed response.
+    async fn complete_stream(
+        &self,
+        system_prompt: Option<&str>,
+        prompt: &str,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<llm::CompletionStream> {
+        llm::complete_stream(llm::CompletionRequest {
+            base_url: &self.base_url,
+            api_key: &self.api_key,
+            model_id: &self.resolved_model.model_id,
+            reasoning_effort: self.sampling.reasoning_effort,
+            temperature: self.sampling.temperature,
+            top_p: self.sampling.top_p,
+            max_tokens: self.sampling.max_tokens,
+            response_format,
+            system_prompt,
+            prompt,
+        })
+        .await
+    }
+}
+
+/// Consumes `stream`, writing each chunk's content delta to stdout as it
+/// arrives (flushed immediately, since stdout is line-buffered and a delta
+/// rarely ends in a newline). When `show_reasoning` is set, reasoning deltas
+/// are written first, formatted like `response::format_response` formats a
+/// complete response: a `Reasoning:` header before the first reasoning
+/// delta, then a blank line before the first content delta. Reasoning deltas
+/// are dropped when `show_reasoning` is unset, same as the non-streaming
+/// path. Fails, like `response::response_content`, if the stream ends
+/// without ever producing content.
+async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: bool) -> Result<()> {
+    use std::io::Write;
+
+    let mut stdout = std::io::stdout();
+    let mut wrote_reasoning = false;
+    let mut wrote_content = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let (content, reasoning) = response::stream_chunk_deltas(&chunk);
+        if show_reasoning && let Some(reasoning) = reasoning {
+            if !wrote_reasoning {
+                writeln!(stdout, "Reasoning:")?;
+                wrote_reasoning = true;
+            }
+            write!(stdout, "{reasoning}")?;
+            stdout.flush()?;
+        }
+        if let Some(content) = content {
+            if wrote_reasoning && !wrote_content {
+                write!(stdout, "\n\n")?;
+            }
+            write!(stdout, "{content}")?;
+            stdout.flush()?;
+            wrote_content = true;
+        }
+    }
+
+    if !wrote_content {
+        bail!("API response contained no content in its first choice");
+    }
+    println!();
+    Ok(())
 }
 
 /// Renders an agent's system prompt against `input`, calls the model with
@@ -242,6 +308,13 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .as_deref()
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
+
+    if chat.stream {
+        let stream = settings
+            .complete_stream(None, &prompt, response_format)
+            .await?;
+        return stream_to_stdout(stream, chat.show_reasoning).await;
+    }
 
     let response = settings.complete(None, &prompt, response_format).await?;
 
