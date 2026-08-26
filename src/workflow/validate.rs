@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 
-use super::model::StepDefinition;
+use super::model::{
+    ForEachDefinition, LoopDefinition, ParallelDefinition, Router, StepDefinition, SwitchDefinition,
+};
 
 /// A named predicate over a `StepDefinition`, used by `ACTION_FIELDS`.
 type ActionField = (&'static str, fn(&StepDefinition) -> bool);
@@ -98,11 +100,10 @@ impl FlowContext {
 
 pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
-        let label = || {
-            step.id
-                .clone()
-                .unwrap_or_else(|| format!("step-{}", index + 1))
-        };
+        let label = step
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("step-{}", index + 1));
 
         let router_count = [
             step.switch.is_some(),
@@ -116,134 +117,42 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         if router_count > 1 {
             bail!(
                 "step '{}' can have at most one of 'switch', 'parallel', 'loop', or 'for_each'",
-                label()
+                label
             );
         }
 
-        if let Some(switch) = &step.switch {
-            reject_action_fields_on_router(step, "switch", &label())?;
-            if switch.cases.is_empty() {
-                bail!("step '{}' has 'switch' with an empty 'cases' list", label());
+        // `router_count` above guarantees at most one of these is set, so
+        // `step.router()` (which just checks them in a fixed order) can't
+        // silently prefer one over another here.
+        match step.router() {
+            Some(Router::Switch(switch)) => {
+                validate_switch(step, switch, &label, ctx)?;
+                continue;
             }
-            for case in &switch.cases {
-                if case.steps.is_empty() {
-                    bail!(
-                        "step '{}' has a 'switch' case with an empty 'steps' list",
-                        label()
-                    );
-                }
-                validate_steps(&case.steps, ctx)?;
+            Some(Router::Parallel(parallel)) => {
+                validate_parallel(step, parallel, &label, ctx)?;
+                continue;
             }
-            if let Some(else_steps) = &switch.else_steps {
-                if else_steps.is_empty() {
-                    bail!(
-                        "step '{}' has a 'switch' with an empty 'else' list",
-                        label()
-                    );
-                }
-                validate_steps(else_steps, ctx)?;
+            Some(Router::Loop(loop_def)) => {
+                validate_loop(step, loop_def, &label, ctx)?;
+                continue;
             }
-            continue;
-        }
-
-        if let Some(parallel) = &step.parallel {
-            reject_action_fields_on_router(step, "parallel", &label())?;
-            if parallel.branches.is_empty() {
-                bail!(
-                    "step '{}' has 'parallel' with an empty 'branches' list",
-                    label()
-                );
+            Some(Router::ForEach(for_each)) => {
+                validate_for_each(step, for_each, &label, ctx)?;
+                continue;
             }
-            let mut seen_branch_ids = std::collections::HashSet::new();
-            for (branch_index, branch) in parallel.branches.iter().enumerate() {
-                if branch.steps.is_empty() {
-                    bail!(
-                        "step '{}' has a 'parallel' branch with an empty 'steps' list",
-                        label()
-                    );
-                }
-                let branch_label = branch.label(branch_index);
-                if !seen_branch_ids.insert(branch_label.clone()) {
-                    bail!(
-                        "step '{}' has 'parallel' branches with a duplicate id '{}'",
-                        label(),
-                        branch_label
-                    );
-                }
-                validate_steps(&branch.steps, ctx.in_parallel_branch())?;
-            }
-            continue;
-        }
-
-        if let Some(loop_def) = &step.r#loop {
-            reject_action_fields_on_router(step, "loop", &label())?;
-            match (&loop_def.r#while, &loop_def.until) {
-                (Some(_), Some(_)) => bail!(
-                    "step '{}' has 'loop' with both 'while' and 'until'; exactly one is required",
-                    label()
-                ),
-                (None, None) => bail!(
-                    "step '{}' has 'loop' with neither 'while' nor 'until'; exactly one is required",
-                    label()
-                ),
-                _ => {}
-            }
-            match loop_def.max_iterations {
-                None => bail!(
-                    "step '{}' has 'loop' with no 'max_iterations' (required)",
-                    label()
-                ),
-                Some(0) => bail!(
-                    "step '{}' has 'loop' with 'max_iterations: 0'; it must be at least 1",
-                    label()
-                ),
-                Some(_) => {}
-            }
-            if loop_def.steps.is_empty() {
-                bail!("step '{}' has 'loop' with an empty 'steps' list", label());
-            }
-            validate_steps(&loop_def.steps, ctx.in_loop_body())?;
-            continue;
-        }
-
-        if let Some(for_each) = &step.for_each {
-            reject_action_fields_on_router(step, "for_each", &label())?;
-            if for_each.steps.is_empty() {
-                bail!(
-                    "step '{}' has 'for_each' with an empty 'steps' list",
-                    label()
-                );
-            }
-            let max_concurrency = match for_each.max_concurrency {
-                Some(0) => bail!(
-                    "step '{}' has 'for_each' with 'max_concurrency: 0'; it must be at least 1",
-                    label()
-                ),
-                Some(n) => n,
-                None => 1,
-            };
-            // A concurrent `for_each` (`max_concurrency > 1`) runs its body
-            // like a `parallel` branch per item; a sequential one (the
-            // default) runs it like a `loop` iteration. See
-            // `FlowContext`'s doc comment.
-            let item_ctx = if max_concurrency > 1 {
-                ctx.in_parallel_branch()
-            } else {
-                ctx.in_loop_body()
-            };
-            validate_steps(&for_each.steps, item_ctx)?;
-            continue;
+            None => {}
         }
 
         if let Some(retry) = &step.retry {
             match retry.max_attempts {
                 None => bail!(
                     "step '{}' has 'retry' with no 'max_attempts' (required)",
-                    label()
+                    label
                 ),
                 Some(0) => bail!(
                     "step '{}' has 'retry' with 'max_attempts: 0'; it must be at least 1",
-                    label()
+                    label
                 ),
                 Some(_) => {}
             }
@@ -251,15 +160,12 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         if step.timeout == Some(0) {
             bail!(
                 "step '{}' has 'timeout: 0'; it must be at least 1 second",
-                label()
+                label
             );
         }
         if let Some(on_error) = &step.on_error {
             if on_error.steps.is_empty() {
-                bail!(
-                    "step '{}' has 'on_error' with an empty 'steps' list",
-                    label()
-                );
+                bail!("step '{}' has 'on_error' with an empty 'steps' list", label);
             }
             validate_steps(&on_error.steps, ctx)?;
         }
@@ -267,20 +173,20 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         if step.r#break == Some(true) && step.stop == Some(true) {
             bail!(
                 "step '{}' cannot have both 'stop: true' and 'break: true'",
-                label()
+                label
             );
         }
         if step.r#break == Some(true) && !ctx.in_loop {
             bail!(
                 "step '{}' has 'break: true' outside a 'loop'/'for_each' body",
-                label()
+                label
             );
         }
         if step.stop == Some(true) && ctx.in_parallel_branch {
             bail!(
                 "step '{}' has 'stop: true' inside a 'parallel' branch, where there is no \
                  single well-defined workflow to stop",
-                label()
+                label
             );
         }
 
@@ -289,20 +195,17 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
             bail!(
                 "step '{}' must have a 'prompt', an 'agent', a 'workflow', a 'jq' filter, a \
                  'switch', a 'parallel', a 'loop', a 'for_each', 'stop', 'break', or a combination",
-                label()
+                label
             );
         }
         if step.prompt.is_some() && step.agent.is_some() {
-            bail!("step '{}' cannot have both 'prompt' and 'agent'", label());
+            bail!("step '{}' cannot have both 'prompt' and 'agent'", label);
         }
         if step.workflow.is_some() && step.prompt.is_some() {
-            bail!(
-                "step '{}' cannot have both 'prompt' and 'workflow'",
-                label()
-            );
+            bail!("step '{}' cannot have both 'prompt' and 'workflow'", label);
         }
         if step.workflow.is_some() && step.agent.is_some() {
-            bail!("step '{}' cannot have both 'agent' and 'workflow'", label());
+            bail!("step '{}' cannot have both 'agent' and 'workflow'", label);
         }
         if step.agent.is_some()
             && (step.input_schema.is_some()
@@ -311,7 +214,7 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         {
             bail!(
                 "step '{}' has 'agent' set; 'input_schema'/'output_schema'/'schema_name' come from the agent file and must not be set on the step",
-                label()
+                label
             );
         }
         if step.workflow.is_some()
@@ -323,7 +226,7 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         {
             bail!(
                 "step '{}' has 'workflow' set; 'model'/'reasoning_effort'/'input_schema'/'output_schema'/'schema_name' come from the referenced workflow file and must not be set on the step",
-                label()
+                label
             );
         }
         if step.workflow.is_some()
@@ -332,21 +235,165 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
             bail!(
                 "step '{}' has 'workflow' set; 'retry'/'timeout'/'on_error' apply to a single \
                  action and must be set on the steps inside the referenced workflow file instead",
-                label()
+                label
             );
         }
         if !calls_model && step.output_schema.is_some() {
             bail!(
                 "step '{}' has 'output_schema' but no 'prompt'/'agent' to apply it to",
-                label()
+                label
             );
         }
         if step.output_schema.is_none() && step.schema_name.is_some() {
-            bail!(
-                "step '{}' has 'schema_name' but no 'output_schema'",
-                label()
-            );
+            bail!("step '{}' has 'schema_name' but no 'output_schema'", label);
         }
     }
+    Ok(())
+}
+
+/// Validates a `switch` step: rejects it if it also has any `ACTION_FIELDS`
+/// set, requires a non-empty `cases` list (each with non-empty `steps`), and
+/// recurses into every case's `steps` (plus `else`'s, if present) with the
+/// same `ctx` — a `switch` only ever runs one of its cases, so it doesn't
+/// change the loop/parallel nesting its cases validate against.
+fn validate_switch(
+    step: &StepDefinition,
+    switch: &SwitchDefinition,
+    label: &str,
+    ctx: FlowContext,
+) -> Result<()> {
+    reject_action_fields_on_router(step, "switch", label)?;
+    if switch.cases.is_empty() {
+        bail!("step '{}' has 'switch' with an empty 'cases' list", label);
+    }
+    for case in &switch.cases {
+        if case.steps.is_empty() {
+            bail!(
+                "step '{}' has a 'switch' case with an empty 'steps' list",
+                label
+            );
+        }
+        validate_steps(&case.steps, ctx)?;
+    }
+    if let Some(else_steps) = &switch.else_steps {
+        if else_steps.is_empty() {
+            bail!("step '{}' has a 'switch' with an empty 'else' list", label);
+        }
+        validate_steps(else_steps, ctx)?;
+    }
+    Ok(())
+}
+
+/// Validates a `parallel` step: rejects it if it also has any
+/// `ACTION_FIELDS` set, requires a non-empty `branches` list (each with
+/// non-empty `steps` and a label unique among its siblings), and recurses
+/// into every branch's `steps` with `ctx.in_parallel_branch()` — branches run
+/// concurrently, so none of them can `stop`/reach an enclosing `loop`'s
+/// `break` (see `FlowContext`'s doc comment).
+fn validate_parallel(
+    step: &StepDefinition,
+    parallel: &ParallelDefinition,
+    label: &str,
+    ctx: FlowContext,
+) -> Result<()> {
+    reject_action_fields_on_router(step, "parallel", label)?;
+    if parallel.branches.is_empty() {
+        bail!(
+            "step '{}' has 'parallel' with an empty 'branches' list",
+            label
+        );
+    }
+    let mut seen_branch_ids = std::collections::HashSet::new();
+    for (branch_index, branch) in parallel.branches.iter().enumerate() {
+        if branch.steps.is_empty() {
+            bail!(
+                "step '{}' has a 'parallel' branch with an empty 'steps' list",
+                label
+            );
+        }
+        let branch_label = branch.label(branch_index);
+        if !seen_branch_ids.insert(branch_label.clone()) {
+            bail!(
+                "step '{}' has 'parallel' branches with a duplicate id '{}'",
+                label,
+                branch_label
+            );
+        }
+        validate_steps(&branch.steps, ctx.in_parallel_branch())?;
+    }
+    Ok(())
+}
+
+/// Validates a `loop` step: rejects it if it also has any `ACTION_FIELDS`
+/// set, requires exactly one of `while`/`until`, a `max_iterations` of at
+/// least 1, and non-empty `steps`, then recurses into `steps` with
+/// `ctx.in_loop_body()` so a `break` inside it validates against this loop.
+fn validate_loop(
+    step: &StepDefinition,
+    loop_def: &LoopDefinition,
+    label: &str,
+    ctx: FlowContext,
+) -> Result<()> {
+    reject_action_fields_on_router(step, "loop", label)?;
+    match (&loop_def.r#while, &loop_def.until) {
+        (Some(_), Some(_)) => bail!(
+            "step '{}' has 'loop' with both 'while' and 'until'; exactly one is required",
+            label
+        ),
+        (None, None) => bail!(
+            "step '{}' has 'loop' with neither 'while' nor 'until'; exactly one is required",
+            label
+        ),
+        _ => {}
+    }
+    match loop_def.max_iterations {
+        None => bail!(
+            "step '{}' has 'loop' with no 'max_iterations' (required)",
+            label
+        ),
+        Some(0) => bail!(
+            "step '{}' has 'loop' with 'max_iterations: 0'; it must be at least 1",
+            label
+        ),
+        Some(_) => {}
+    }
+    if loop_def.steps.is_empty() {
+        bail!("step '{}' has 'loop' with an empty 'steps' list", label);
+    }
+    validate_steps(&loop_def.steps, ctx.in_loop_body())?;
+    Ok(())
+}
+
+/// Validates a `for_each` step: rejects it if it also has any
+/// `ACTION_FIELDS` set, requires non-empty `steps` and a `max_concurrency` of
+/// at least 1 (when set), then recurses into `steps` with
+/// `ctx.in_loop_body()` for a sequential `for_each` (`max_concurrency <= 1`,
+/// the default) or `ctx.in_parallel_branch()` for a concurrent one — see
+/// `FlowContext`'s doc comment for why that distinction matters for
+/// `break`/`stop` validation.
+fn validate_for_each(
+    step: &StepDefinition,
+    for_each: &ForEachDefinition,
+    label: &str,
+    ctx: FlowContext,
+) -> Result<()> {
+    reject_action_fields_on_router(step, "for_each", label)?;
+    if for_each.steps.is_empty() {
+        bail!("step '{}' has 'for_each' with an empty 'steps' list", label);
+    }
+    let max_concurrency = match for_each.max_concurrency {
+        Some(0) => bail!(
+            "step '{}' has 'for_each' with 'max_concurrency: 0'; it must be at least 1",
+            label
+        ),
+        Some(n) => n,
+        None => 1,
+    };
+    let item_ctx = if max_concurrency > 1 {
+        ctx.in_parallel_branch()
+    } else {
+        ctx.in_loop_body()
+    };
+    validate_steps(&for_each.steps, item_ctx)?;
     Ok(())
 }

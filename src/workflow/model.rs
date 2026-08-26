@@ -129,6 +129,38 @@ pub(crate) struct StepDefinition {
     pub(crate) r#break: Option<bool>,
 }
 
+/// The step kinds that route to nested `steps` instead of acting directly on
+/// their own input, borrowed out of whichever of `StepDefinition::switch`/
+/// `parallel`/`loop`/`for_each` is set. See `StepDefinition::router`.
+pub(crate) enum Router<'a> {
+    Switch(&'a SwitchDefinition),
+    Parallel(&'a ParallelDefinition),
+    Loop(&'a LoopDefinition),
+    ForEach(&'a ForEachDefinition),
+}
+
+impl StepDefinition {
+    /// Which router kind this step is, if any. `validate::validate_steps`
+    /// checks `switch`/`parallel`/`loop`/`for_each` are not set together
+    /// before ever calling this (see its `router_count` check), so checking
+    /// them in a fixed order here is safe; called on a step that hasn't been
+    /// through that check, it would silently prefer the first one set.
+    /// `validate_steps` and `run_steps` both match on this so a new router
+    /// kind requires updating both.
+    pub(crate) fn router(&self) -> Option<Router<'_>> {
+        if let Some(switch) = &self.switch {
+            return Some(Router::Switch(switch));
+        }
+        if let Some(parallel) = &self.parallel {
+            return Some(Router::Parallel(parallel));
+        }
+        if let Some(loop_def) = &self.r#loop {
+            return Some(Router::Loop(loop_def));
+        }
+        self.for_each.as_ref().map(Router::ForEach)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RetryDefinition {
