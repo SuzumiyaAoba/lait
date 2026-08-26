@@ -29,13 +29,27 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// The model/base-URL/API-key/reasoning-effort settings for a single completion
+/// The reasoning-effort/temperature/top_p/max_tokens knobs a caller (CLI
+/// invocation, agent file, or workflow step) may set for a single completion
+/// request. Bundled into one struct (rather than four positional parameters)
+/// because every layer of `resolve_request_settings`'s fallback chain treats
+/// them identically: each field falls back independently to the next layer,
+/// unlike e.g. `workflow::RetryDefinition`, which falls back as a whole unit.
+#[derive(Debug, Default, Clone, Copy)]
+struct SamplingOverrides {
+    reasoning_effort: Option<ReasoningEffort>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
+}
+
+/// The model/base-URL/API-key/sampling settings for a single completion
 /// request, after resolving aliases and applying every fallback layer.
 struct RequestSettings {
     base_url: String,
     api_key: String,
     resolved_model: config::ResolvedModel,
-    reasoning_effort: Option<ReasoningEffort>,
+    sampling: SamplingOverrides,
 }
 
 impl RequestSettings {
@@ -50,7 +64,10 @@ impl RequestSettings {
             base_url: &self.base_url,
             api_key: &self.api_key,
             model_id: &self.resolved_model.model_id,
-            reasoning_effort: self.reasoning_effort,
+            reasoning_effort: self.sampling.reasoning_effort,
+            temperature: self.sampling.temperature,
+            top_p: self.sampling.top_p,
+            max_tokens: self.sampling.max_tokens,
             response_format,
             system_prompt,
             prompt,
@@ -88,16 +105,16 @@ async fn call_agent(
     response::render_response(&response, false, false)
 }
 
-/// Resolves the settings for one completion request. `model_name` and
-/// `reasoning_effort` must already reflect the caller's own precedence chain
-/// (e.g. step > agent > workflow default); this only adds the two layers every
-/// caller shares: the resolved model's own defaults, then `lait.config.yml`'s
-/// `default:` block. `local_models` is the alias map to check before falling
-/// back to `file_config`'s (a workflow's embedded `models:`, or empty when
-/// there is none).
+/// Resolves the settings for one completion request. `model_name` and every
+/// field of `overrides` must already reflect the caller's own precedence
+/// chain (e.g. step > agent > workflow default); this only adds the two
+/// layers every caller shares: the resolved model's own defaults, then
+/// `lait.config.yml`'s `default:` block. `local_models` is the alias map to
+/// check before falling back to `file_config`'s (a workflow's embedded
+/// `models:`, or empty when there is none).
 fn resolve_request_settings(
     model_name: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    overrides: SamplingOverrides,
     base_url_override: Option<String>,
     api_key_override: Option<String>,
     local_models: &ModelMap,
@@ -149,15 +166,43 @@ fn resolve_request_settings(
             // header value.
             "lm-studio".to_owned()
         });
-    let reasoning_effort = reasoning_effort
-        .or(resolved_model.reasoning_effort)
-        .or(file_config.default.reasoning_effort);
+    let sampling = SamplingOverrides {
+        reasoning_effort: overrides
+            .reasoning_effort
+            .or(resolved_model.reasoning_effort)
+            .or(file_config.default.reasoning_effort),
+        temperature: overrides
+            .temperature
+            .or(resolved_model.temperature)
+            .or(file_config.default.temperature),
+        top_p: overrides
+            .top_p
+            .or(resolved_model.top_p)
+            .or(file_config.default.top_p),
+        max_tokens: overrides
+            .max_tokens
+            .or(resolved_model.max_tokens)
+            .or(file_config.default.max_tokens),
+    };
+    // Catches an out-of-range value from any layer `workflow::validate`
+    // cannot see on its own (a config file's `models:`/`default:`), on top of
+    // whatever it already rejected at workflow parse time for values sourced
+    // from the workflow file itself. Named by the resolved `model_id` (rather
+    // than e.g. the alias) since that identifies the request uniformly
+    // whether the value came from a `models:` entry, `default:`, or an
+    // override — all of which have already been merged by this point.
+    llm::validate_sampling_params(
+        sampling.temperature,
+        sampling.top_p,
+        sampling.max_tokens,
+        &format!("the request for model '{}'", resolved_model.model_id),
+    )?;
 
     Ok(RequestSettings {
         base_url,
         api_key,
         resolved_model,
-        reasoning_effort,
+        sampling,
     })
 }
 
@@ -180,7 +225,12 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         })?;
     let settings = resolve_request_settings(
         model_name,
-        chat.reasoning_effort,
+        SamplingOverrides {
+            reasoning_effort: chat.reasoning_effort,
+            temperature: chat.temperature,
+            top_p: chat.top_p,
+            max_tokens: chat.max_tokens,
+        },
         chat.base_url.clone(),
         chat.api_key.clone(),
         &ModelMap::default(),
@@ -228,7 +278,12 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         })?;
     let settings = resolve_request_settings(
         model_name,
-        agent_file.reasoning_effort,
+        SamplingOverrides {
+            reasoning_effort: agent_file.reasoning_effort,
+            temperature: agent_file.temperature,
+            top_p: agent_file.top_p,
+            max_tokens: agent_file.max_tokens,
+        },
         None,
         None,
         &ModelMap::default(),
@@ -291,6 +346,13 @@ const MAX_WORKFLOW_DEPTH: usize = 32;
 struct WorkflowScope {
     default_model: Option<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
+    /// Fallback sampling `temperature`/`top_p`/`max_tokens`, merged across
+    /// `workflow:` nesting the same way as `default_model`/
+    /// `default_reasoning_effort` (each falls back independently, not as a
+    /// whole unit like `default_retry`).
+    default_temperature: Option<f64>,
+    default_top_p: Option<f64>,
+    default_max_tokens: Option<u32>,
     /// Fallback `retry`/`timeout` for a step that calls a model
     /// (`prompt`/`agent`) and doesn't set its own (see
     /// `execute_step_with_retry`). Merged across `workflow:` nesting the same
@@ -323,6 +385,9 @@ impl WorkflowScope {
         Ok(Self {
             default_model: wf.default.model.clone(),
             default_reasoning_effort: wf.default.reasoning_effort,
+            default_temperature: wf.default.temperature,
+            default_top_p: wf.default.top_p,
+            default_max_tokens: wf.default.max_tokens,
             default_retry: wf.default.retry.clone(),
             default_timeout: wf.default.timeout,
             models: wf.models.clone(),
@@ -395,6 +460,9 @@ impl WorkflowScope {
                 .default
                 .reasoning_effort
                 .or(self.default_reasoning_effort),
+            default_temperature: sub_wf.default.temperature.or(self.default_temperature),
+            default_top_p: sub_wf.default.top_p.or(self.default_top_p),
+            default_max_tokens: sub_wf.default.max_tokens.or(self.default_max_tokens),
             default_retry: sub_wf
                 .default
                 .retry
@@ -1041,13 +1109,27 @@ fn resolve_step_settings(
                 config::CONFIG_FILE_NAME
             )
         })?;
-    let reasoning_effort = step
-        .reasoning_effort
-        .or(agent_file.and_then(|agent_file| agent_file.reasoning_effort))
-        .or(scope.default_reasoning_effort);
+    let overrides = SamplingOverrides {
+        reasoning_effort: step
+            .reasoning_effort
+            .or(agent_file.and_then(|agent_file| agent_file.reasoning_effort))
+            .or(scope.default_reasoning_effort),
+        temperature: step
+            .temperature
+            .or(agent_file.and_then(|agent_file| agent_file.temperature))
+            .or(scope.default_temperature),
+        top_p: step
+            .top_p
+            .or(agent_file.and_then(|agent_file| agent_file.top_p))
+            .or(scope.default_top_p),
+        max_tokens: step
+            .max_tokens
+            .or(agent_file.and_then(|agent_file| agent_file.max_tokens))
+            .or(scope.default_max_tokens),
+    };
     resolve_request_settings(
         model_name,
-        reasoning_effort,
+        overrides,
         None,
         None,
         &scope.models,

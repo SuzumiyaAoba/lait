@@ -49,6 +49,9 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--json-schema <FILE>` | — | API の Structured Outputs に使用する JSON Schema ファイル。指定時は `response_format` の `type` を `json_schema`、`strict` を `true` として送信します。 |
 | `--schema-name <NAME>` | — | Structured Outputs のスキーマ名。既定値は `structured_output` です。`--json-schema` と組み合わせて使用します。 |
 | `--reasoning-effort <EFFORT>` | `LLM_REASONING_EFFORT` | 推論の実行レベル。`none`、`minimal`、`low`、`medium`、`high`、`xhigh` のいずれかを指定します。未指定時は API リクエストにフィールドを追加しません。 |
+| `--temperature <FLOAT>` | `LLM_TEMPERATURE` | サンプリング温度（`0.0`〜`2.0`）。低いほど決定的、高いほどランダムな応答になります。未指定時は API リクエストにフィールドを追加しません。 |
+| `--top-p <FLOAT>` | `LLM_TOP_P` | nucleus sampling の確率質量（`0.0`〜`1.0`）。`--temperature` の代替として使います。未指定時は API リクエストにフィールドを追加しません。 |
+| `--max-tokens <INT>` | `LLM_MAX_TOKENS` | 応答として生成するトークン数の上限（`1`以上）。API へは（非推奨の `max_tokens` ではなく）`max_completion_tokens` として送信されます。未指定時は API リクエストにフィールドを追加しません。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。 |
 
 詳細なオプションは次のコマンドで確認できます。
@@ -88,6 +91,16 @@ cargo run -- --model "モデル ID" --reasoning-effort high "複雑な問題を�
 ```sh
 export LLM_REASONING_EFFORT="medium"
 cargo run -- --model "モデル ID" "複雑な問題を解いてください。"
+```
+
+サンプリング温度・nucleus sampling・最大トークン数を指定する場合は、`--temperature`・`--top-p`・
+`--max-tokens`（環境変数では `LLM_TEMPERATURE`・`LLM_TOP_P`・`LLM_MAX_TOKENS`）をそれぞれ渡します。
+いずれも未指定時は API リクエストにフィールドを追加せず、サーバー側の既定値を使用します。範囲外の
+値（`temperature` が `0.0`〜`2.0` の外、`top_p` が `0.0`〜`1.0` の外、`max_tokens` が `0`）はモデルを
+呼び出す前にエラーになります。
+
+```sh
+cargo run -- --model "モデル ID" --temperature 0.7 --top-p 0.9 --max-tokens 512 "アイデアを出してください。"
 ```
 
 対応サーバーから返された推論内容を回答前に表示する場合は、`--show-reasoning` を指定します。推論内容が返されない場合は、従来どおり回答のみが表示されます。

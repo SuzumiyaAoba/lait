@@ -458,6 +458,36 @@ pub(crate) fn run_lait_with_request_options(
     command.output().expect("failed to execute lait")
 }
 
+pub(crate) fn run_lait_with_sampling_options(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    prompt: &str,
+    temperature: Option<&str>,
+    top_p: Option<&str>,
+    max_tokens: Option<&str>,
+) -> Output {
+    let mut command = test_command();
+    command.args(["--model", "test-model"]);
+    command.env_remove("LLM_REASONING_EFFORT");
+    if let Some(base_url) = base_url {
+        command.args(["--base-url", base_url]);
+    }
+    if let Some(api_key) = api_key {
+        command.args(["--api-key", api_key]);
+    }
+    if let Some(temperature) = temperature {
+        command.args(["--temperature", temperature]);
+    }
+    if let Some(top_p) = top_p {
+        command.args(["--top-p", top_p]);
+    }
+    if let Some(max_tokens) = max_tokens {
+        command.args(["--max-tokens", max_tokens]);
+    }
+    command.arg(prompt);
+    command.output().expect("failed to execute lait")
+}
+
 pub(crate) fn run_lait_workflow(workflow_path: &Path, prompt: &str) -> Output {
     test_command()
         .arg("run")

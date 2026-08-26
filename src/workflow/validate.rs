@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 
+use crate::llm::validate_sampling_params;
+
 use super::model::{
     ForEachDefinition, LoopDefinition, ParallelDefinition, RetryDefinition, Router, StepDefinition,
     SwitchDefinition, WorkflowDefaults,
@@ -16,6 +18,9 @@ const ACTION_FIELDS: &[ActionField] = &[
     ("when", |step| step.when.is_some()),
     ("model", |step| step.model.is_some()),
     ("reasoning_effort", |step| step.reasoning_effort.is_some()),
+    ("temperature", |step| step.temperature.is_some()),
+    ("top_p", |step| step.top_p.is_some()),
+    ("max_tokens", |step| step.max_tokens.is_some()),
     ("prompt", |step| step.prompt.is_some()),
     ("agent", |step| step.agent.is_some()),
     ("workflow", |step| step.workflow.is_some()),
@@ -162,6 +167,12 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
             None => {}
         }
 
+        validate_sampling_params(
+            step.temperature,
+            step.top_p,
+            step.max_tokens,
+            &format!("step '{label}'"),
+        )?;
         if let Some(retry) = &step.retry {
             validate_retry(retry, &format!("step '{label}'"))?;
         }
@@ -239,12 +250,15 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         if step.workflow.is_some()
             && (step.model.is_some()
                 || step.reasoning_effort.is_some()
+                || step.temperature.is_some()
+                || step.top_p.is_some()
+                || step.max_tokens.is_some()
                 || step.input_schema.is_some()
                 || step.output_schema.is_some()
                 || step.schema_name.is_some())
         {
             bail!(
-                "step '{}' has 'workflow' set; 'model'/'reasoning_effort'/'input_schema'/'output_schema'/'schema_name' come from the referenced workflow file and must not be set on the step",
+                "step '{}' has 'workflow' set; 'model'/'reasoning_effort'/'temperature'/'top_p'/'max_tokens'/'input_schema'/'output_schema'/'schema_name' come from the referenced workflow file and must not be set on the step",
                 label
             );
         }
@@ -441,9 +455,17 @@ fn validate_timeout(timeout: u64, description: &str) -> Result<()> {
 
 /// Validates a workflow file's top-level `default:` block: its `retry`/
 /// `timeout`, if set, follow the same rules as a step's own (see
-/// `validate_retry`/`validate_timeout`). `model`/`reasoning_effort` need no
-/// validation here (any string/`ReasoningEffort` value is acceptable).
+/// `validate_retry`/`validate_timeout`), and its `temperature`/`top_p`/
+/// `max_tokens` follow the same range rules as a step's own (see
+/// `validate_sampling_params`). `model`/`reasoning_effort` need no validation
+/// here (any string/`ReasoningEffort` value is acceptable).
 pub(super) fn validate_workflow_defaults(defaults: &WorkflowDefaults) -> Result<()> {
+    validate_sampling_params(
+        defaults.temperature,
+        defaults.top_p,
+        defaults.max_tokens,
+        "the workflow's 'default'",
+    )?;
     if let Some(retry) = &defaults.retry {
         validate_retry(retry, "the workflow's 'default.retry'")?;
     }

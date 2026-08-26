@@ -2,7 +2,7 @@ mod support;
 
 use support::{
     JsonSchemaFile, MockServer, run_lait, run_lait_with_json_schema, run_lait_with_request_options,
-    without_json_whitespace,
+    run_lait_with_sampling_options, without_json_whitespace,
 };
 
 #[test]
@@ -161,6 +161,63 @@ fn sends_reasoning_effort_from_environment() {
     assert!(
         body.contains(r#""reasoning_effort":"minimal""#),
         "request body: {body}"
+    );
+}
+
+#[test]
+fn sends_temperature_top_p_and_max_tokens_when_set() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_lait_with_sampling_options(
+        Some(&server.base_url),
+        None,
+        "hello",
+        Some("0.7"),
+        Some("0.9"),
+        Some("256"),
+    );
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""temperature":0.7"#),
+        "request body: {body}"
+    );
+    assert!(body.contains(r#""top_p":0.9"#), "request body: {body}");
+    assert!(
+        body.contains(r#""max_completion_tokens":256"#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn omits_temperature_top_p_and_max_tokens_when_unset() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let output =
+        run_lait_with_sampling_options(Some(&server.base_url), None, "hello", None, None, None);
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {:?}", output);
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        !body.contains(r#""temperature""#),
+        "request body should omit temperature when unspecified: {body}"
+    );
+    assert!(
+        !body.contains(r#""top_p""#),
+        "request body should omit top_p when unspecified: {body}"
+    );
+    assert!(
+        !body.contains(r#""max_completion_tokens""#),
+        "request body should omit max_completion_tokens when unspecified: {body}"
     );
 }
 

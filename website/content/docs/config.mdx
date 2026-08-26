@@ -13,14 +13,23 @@ api_key: lm-studio
 default:
   model: local-model
   reasoning_effort: medium
+  temperature: 0.7
+  top_p: 0.9
+  max_tokens: 512
 ```
+
+`default:` には `model`/`reasoning_effort` に加えて、サンプリングパラメータ `temperature`
+（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）も指定できます。CLI の
+`--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独立してフォールバックします
+（`reasoning_effort` と同じ仕組みで、`retry` のようなブロック単位のフォールバックではありません）。
 
 ## モデル定義と alias
 
 複数の呼び出しモデルを設定ファイルに定義し、alias で使い回せます。`models` は alias をキー、
 モデル定義の配列を値にするマップです。各要素には `provider.base_url` と `model_id` を指定し、
-`provider.api_key` と `default_reasoning_effort` は任意で指定できます。プロバイダーのキーは
-正式名称の `provider` を使用してください。
+`provider.api_key`・`default_reasoning_effort`・`default_temperature`・`default_top_p`・
+`default_max_tokens` は任意で指定できます。プロバイダーのキーは正式名称の `provider` を
+使用してください。
 
 ```yaml
 # lait.config.yml
@@ -36,6 +45,8 @@ models:
         api_key: your-api-key
       model_id: cloud-model
       default_reasoning_effort: high
+      default_temperature: 0.7
+      default_max_tokens: 512
 
 # alias は `default.model`、CLI、環境変数から参照できます。
 default:
@@ -58,8 +69,8 @@ default:
 上書きします。`provider.api_key` と `default_reasoning_effort` を省略した場合は、対応する
 トップレベルの `api_key`、`default.reasoning_effort` がフォールバックとして使用されます。
 
-`base_url`、`api_key` はトップレベルの項目として、フォールバック用の `model`、`reasoning_effort`
-は `default:` の配下にまとめて指定します。設定ファイルの自動読込を
+`base_url`、`api_key` はトップレベルの項目として、フォールバック用の `model`、`reasoning_effort`、
+`temperature`、`top_p`、`max_tokens` は `default:` の配下にまとめて指定します。設定ファイルの自動読込を
 無効にする場合は `--no-config` を指定してください。この場合は設定ファイルを読み込まず、CLI
 引数、環境変数、既定値だけが使用されます。
 

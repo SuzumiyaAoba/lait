@@ -89,6 +89,78 @@ steps:
 }
 
 #[test]
+fn a_step_overrides_the_workflow_default_temperature_top_p_and_max_tokens() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+  temperature: 0.2
+  top_p: 0.5
+  max_tokens: 64
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - temperature: 0.9
+    top_p: 0.95
+    max_tokens: 512
+    prompt: "{{{{ input }}}}"
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""temperature":0.9"#),
+        "request body: {body}"
+    );
+    assert!(body.contains(r#""top_p":0.95"#), "request body: {body}");
+    assert!(
+        body.contains(r#""max_completion_tokens":512"#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn a_step_falls_back_to_the_workflow_default_temperature_when_it_has_none_of_its_own() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+  temperature: 0.3
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{{{ input }}}}"
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""temperature":0.3"#),
+        "request body: {body}"
+    );
+}
+
+#[test]
 fn step_falls_back_to_a_config_file_alias_when_not_defined_in_the_workflow() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let config = ConfigDirectory::new(&format!(

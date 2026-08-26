@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -29,11 +29,50 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) api_key: &'a str,
     pub(crate) model_id: &'a str,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Sampling temperature (0.0-2.0), forwarded as-is; see
+    /// `validate_sampling_params` for the range check applied before a
+    /// request is ever built.
+    pub(crate) temperature: Option<f64>,
+    /// Nucleus sampling probability mass (0.0-1.0).
+    pub(crate) top_p: Option<f64>,
+    /// An upper bound on the number of tokens generated for the completion,
+    /// sent as the (non-deprecated) `max_completion_tokens` field.
+    pub(crate) max_tokens: Option<u32>,
     pub(crate) response_format: Option<ResponseFormat>,
     /// An optional system-role message sent before the user prompt, e.g. an
     /// agent file's rendered system prompt template.
     pub(crate) system_prompt: Option<&'a str>,
     pub(crate) prompt: &'a str,
+}
+
+/// Checks `temperature`/`top_p`/`max_tokens` are within the bounds the OpenAI
+/// chat completions API documents (`temperature`: 0.0-2.0, `top_p`: 0.0-1.0,
+/// `max_tokens`: at least 1), regardless of which layer they were resolved
+/// from (CLI/env, a `models:` alias, `default:`, or a step/agent override).
+/// Called both eagerly at workflow parse time (`workflow::validate`, so a bad
+/// value fails before any step runs) and again once every fallback layer has
+/// been resolved (`app::resolve_request_settings`, which also covers values
+/// that only workflow parsing can't see, like a config file's `models:`).
+pub(crate) fn validate_sampling_params(
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
+    description: &str,
+) -> Result<()> {
+    if let Some(temperature) = temperature
+        && !(0.0..=2.0).contains(&temperature)
+    {
+        bail!("{description} has 'temperature: {temperature}'; it must be between 0.0 and 2.0");
+    }
+    if let Some(top_p) = top_p
+        && !(0.0..=1.0).contains(&top_p)
+    {
+        bail!("{description} has 'top_p: {top_p}'; it must be between 0.0 and 1.0");
+    }
+    if max_tokens == Some(0) {
+        bail!("{description} has 'max_tokens: 0'; it must be at least 1");
+    }
+    Ok(())
 }
 
 pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompletionResponse> {
@@ -61,6 +100,15 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
     if let Some(reasoning_effort) = request.reasoning_effort {
         chat_request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
     }
+    if let Some(temperature) = request.temperature {
+        chat_request.temperature(temperature as f32);
+    }
+    if let Some(top_p) = request.top_p {
+        chat_request.top_p(top_p as f32);
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        chat_request.max_completion_tokens(max_tokens);
+    }
     if let Some(response_format) = request.response_format {
         chat_request.response_format(response_format);
     }
@@ -68,4 +116,39 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
 
     let response: ChatCompletionResponse = client.chat().create_byot(chat_request).await?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_sampling_params;
+
+    #[test]
+    fn accepts_unset_or_in_range_values() {
+        assert!(validate_sampling_params(None, None, None, "x").is_ok());
+        assert!(validate_sampling_params(Some(0.0), Some(0.0), Some(1), "x").is_ok());
+        assert!(validate_sampling_params(Some(2.0), Some(1.0), Some(u32::MAX), "x").is_ok());
+        assert!(validate_sampling_params(Some(0.7), Some(0.9), Some(256), "x").is_ok());
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_temperature() {
+        let error = validate_sampling_params(Some(2.1), None, None, "step 'x'").unwrap_err();
+        assert!(error.to_string().contains("temperature"));
+
+        assert!(validate_sampling_params(Some(-0.1), None, None, "x").is_err());
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_top_p() {
+        let error = validate_sampling_params(None, Some(1.1), None, "step 'x'").unwrap_err();
+        assert!(error.to_string().contains("top_p"));
+
+        assert!(validate_sampling_params(None, Some(-0.1), None, "x").is_err());
+    }
+
+    #[test]
+    fn rejects_a_zero_max_tokens() {
+        let error = validate_sampling_params(None, None, Some(0), "step 'x'").unwrap_err();
+        assert!(error.to_string().contains("max_tokens"));
+    }
 }

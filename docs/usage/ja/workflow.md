@@ -45,8 +45,11 @@ cargo run -- run workflow.yml "要約・翻訳したい文章..."
 - `steps` は配列の先頭から逐次実行するのが基本です。`when`/`switch` による分岐（後述）、
   `parallel` による複数の step 列の同時実行（ファンアウト/ファンイン）、`loop` による
   条件ループ、`for_each` による配列反復も可能です（いずれも後述）。
-- `model` / `reasoning_effort` は step 単位で省略可能。省略時は
-  ワークフロー直下の `default:` → `lait.config.yml` の `default:`、の順にフォールバックします。
+- `model` / `reasoning_effort` / `temperature` / `top_p` / `max_tokens` は step 単位で省略可能。
+  省略時はそれぞれ独立して、ワークフロー直下の `default:` → `lait.config.yml` の `default:`、
+  の順にフォールバックします。`temperature`（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・
+  `max_tokens`（`1`以上）は CLI の `--temperature`/`--top-p`/`--max-tokens` と同じサンプリング
+  パラメータで、範囲外の値は実行前にエラーになります。
 - `id` は進捗表示（標準エラー出力）用のラベルで、省略した場合は `step-1`、`step-2`… になります。
 - `prompt` も `agent` も `switch` も省略した step はモデルを呼び出さず、`jq` によるデータ変換
   のみを行います（後述）。この場合 `model` は不要です。
@@ -72,6 +75,8 @@ models:
         api_key: your-api-key
       model_id: cloud-model
       default_reasoning_effort: high
+      default_temperature: 0.7
+      default_max_tokens: 512
 
 default:
   model: local
@@ -665,8 +670,9 @@ steps:
   呼び出し元のワークフロー全体には影響しません。
 - `workflow:` は `prompt`/`agent`（どちらかで直接モデルを呼ぶ）や `switch`/`parallel`/`loop`/
   `for_each`（入れ子の step 列に処理を委ねる）と併用できません。`model`/`reasoning_effort`/
-  `input_schema`/`output_schema`/`schema_name` はサブワークフロー側の step が個別に持つため、
-  この step には指定できません。同様に `retry`/`timeout`/`on_error` もサブワークフロー側の
-  step に指定してください。`when`/`jq`/`stop`/`break` は通常どおり併用できます。
+  `temperature`/`top_p`/`max_tokens`/`input_schema`/`output_schema`/`schema_name` はサブワーク
+  フロー側の step が個別に持つため、この step には指定できません。同様に `retry`/`timeout`/
+  `on_error` もサブワークフロー側の step に指定してください。`when`/`jq`/`stop`/`break` は
+  通常どおり併用できます。
 - 循環参照（A が B を呼び、B が A を呼ぶ、など）はエラーになります。ネストの深さにも上限が
   あります。

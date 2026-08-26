@@ -1306,6 +1306,106 @@ steps:
 }
 
 #[test]
+fn parses_a_step_with_temperature_top_p_and_max_tokens() {
+    let workflow = parse_workflow(
+        r#"
+steps:
+  - model: local
+    temperature: 0.7
+    top_p: 0.9
+    max_tokens: 256
+    prompt: "{{ input }}"
+"#,
+    )
+    .expect("workflow should parse");
+
+    assert_eq!(workflow.steps[0].temperature, Some(0.7));
+    assert_eq!(workflow.steps[0].top_p, Some(0.9));
+    assert_eq!(workflow.steps[0].max_tokens, Some(256));
+}
+
+#[test]
+fn parses_workflow_default_temperature_top_p_and_max_tokens() {
+    let workflow = parse_workflow(
+        r#"
+default:
+  model: local
+  temperature: 0.5
+  top_p: 0.8
+  max_tokens: 128
+steps:
+  - prompt: "{{ input }}"
+"#,
+    )
+    .expect("workflow should parse");
+
+    assert_eq!(workflow.default.temperature, Some(0.5));
+    assert_eq!(workflow.default.top_p, Some(0.8));
+    assert_eq!(workflow.default.max_tokens, Some(128));
+}
+
+#[test]
+fn rejects_a_step_with_an_out_of_range_temperature() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - prompt: "{{ input }}"
+    temperature: 2.5
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_step_with_an_out_of_range_top_p() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - prompt: "{{ input }}"
+    top_p: 1.5
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_step_with_a_zero_max_tokens() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - prompt: "{{ input }}"
+    max_tokens: 0
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_default_with_an_out_of_range_temperature() {
+    let result = parse_workflow(
+        r#"
+default:
+  temperature: -0.1
+steps:
+  - prompt: "{{ input }}"
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_step_with_temperature_combined_with_workflow() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - workflow: ./sub.yml
+    temperature: 0.5
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn rejects_an_on_error_with_an_empty_steps_list() {
     let result = parse_workflow(
         r#"
