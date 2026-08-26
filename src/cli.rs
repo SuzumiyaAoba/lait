@@ -82,8 +82,14 @@ pub(crate) struct ChatArgs {
     pub(crate) show_reasoning: bool,
 
     /// Print the response as JSON.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "stream")]
     pub(crate) json: bool,
+
+    /// Stream the response to stdout as it is generated, instead of waiting
+    /// for the full completion. Incompatible with `--json`, which needs the
+    /// full response to build its JSON object.
+    #[arg(long)]
+    pub(crate) stream: bool,
 
     /// Request a structured JSON response using the schema in FILE.
     #[arg(long, value_name = "FILE")]
@@ -263,6 +269,37 @@ mod tests {
         assert!(cli.chat.temperature.is_none());
         assert!(cli.chat.top_p.is_none());
         assert!(cli.chat.max_tokens.is_none());
+    }
+
+    #[test]
+    fn parses_stream_flag() {
+        let cli = Cli::try_parse_from(["lait", "--model", "local-model", "--stream", "hello"])
+            .expect("valid CLI arguments should parse");
+
+        assert!(cli.chat.stream);
+    }
+
+    #[test]
+    fn leaves_stream_off_by_default() {
+        let cli = Cli::try_parse_from(["lait", "--model", "local-model", "hello"])
+            .expect("valid CLI arguments should parse");
+
+        assert!(!cli.chat.stream);
+    }
+
+    #[test]
+    fn rejects_stream_combined_with_json() {
+        assert!(
+            Cli::try_parse_from([
+                "lait",
+                "--model",
+                "local-model",
+                "--json",
+                "--stream",
+                "hello",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

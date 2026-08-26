@@ -208,11 +208,16 @@ steps:
       {{ input }}
 ```
 
-検証は「JSON オブジェクトであること」と「`required` に列挙されたキーが揃っていること」だけを
-確認する簡易的なもので、型やネストしたスキーマまでは検査しません。必須フィールドが欠けている
-入力を早期に（モデルを呼び出す前に）エラーとして弾くためのものです。`agent` を指定した step では
-agent ファイル側の `input_schema` が使われるため、step に `input_schema` を重ねて指定すること
-はできません。
+検証は「JSON オブジェクトであること」「`required` に列挙されたキーが揃っていること」に加えて、
+`properties`/`items` で宣言したフィールドの `type`（配列で複数型を許容する書き方も含む）や
+`enum`、そしてネストしたオブジェクト・配列の中身も再帰的に確認します。ただし `format`・
+`pattern`・数値の範囲・`additionalProperties`・`oneOf`/`anyOf`/`allOf`・`$ref` などは検査しない
+簡易的なものです。また、スキーマに書かれていないフィールドが入力に含まれていても拒否しません
+（`output_schema`／Structured Outputs 用の strict スキーマは `additionalProperties: false` を
+要求しますが、同じスキーマを `input_schema` としても使い回せるようにするためです）。必須
+フィールドの欠落や型の不一致を早期に（モデルを呼び出す前に）エラーとして弾くためのものです。
+`agent` を指定した step では agent ファイル側の `input_schema` が使われるため、step に
+`input_schema` を重ねて指定することはできません。
 
 ## ステップ間の値の受け渡し（`{{ steps.<id> }}` / `$steps`）
 

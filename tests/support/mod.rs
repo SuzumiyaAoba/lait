@@ -297,6 +297,50 @@ impl MockServer {
         }
     }
 
+    /// Starts a mock server that accepts one connection and replies with a
+    /// `text/event-stream` body built from `events` (each written as its own
+    /// `data: <event>\n\n` frame, in order), followed by the terminating
+    /// `data: [DONE]\n\n` frame every OpenAI-compatible SSE stream ends with.
+    /// Used to test `--stream`: the whole body is written up front (this is
+    /// a canned response, not truly incremental), which is enough since the
+    /// client parses events out of the byte stream as they're read either way.
+    pub(crate) fn start_stream(events: &[&str]) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
+        let address = listener
+            .local_addr()
+            .expect("failed to get mock server address");
+        let (request_sender, requests) = mpsc::channel();
+        let mut body = String::new();
+        for event in events {
+            body.push_str("data: ");
+            body.push_str(event);
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept()?;
+            let request = read_request(&mut stream)?;
+            request_sender
+                .send(request)
+                .map_err(|_| io::Error::other("test receiver was dropped"))?;
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes())?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        Self {
+            base_url: format!("http://{address}/v1"),
+            requests,
+            thread,
+        }
+    }
+
     pub(crate) fn receive_request(&self) -> HttpRequest {
         self.requests
             .recv_timeout(Duration::from_secs(5))
@@ -483,6 +527,28 @@ pub(crate) fn run_lait_with_sampling_options(
     }
     if let Some(max_tokens) = max_tokens {
         command.args(["--max-tokens", max_tokens]);
+    }
+    command.arg(prompt);
+    command.output().expect("failed to execute lait")
+}
+
+pub(crate) fn run_lait_with_stream(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    prompt: &str,
+    show_reasoning: bool,
+) -> Output {
+    let mut command = test_command();
+    command.args(["--model", "test-model", "--stream"]);
+    command.env_remove("LLM_REASONING_EFFORT");
+    if let Some(base_url) = base_url {
+        command.args(["--base-url", base_url]);
+    }
+    if let Some(api_key) = api_key {
+        command.args(["--api-key", api_key]);
+    }
+    if show_reasoning {
+        command.arg("--show-reasoning");
     }
     command.arg(prompt);
     command.output().expect("failed to execute lait")
