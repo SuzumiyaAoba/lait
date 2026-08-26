@@ -136,6 +136,65 @@ fn reports_malformed_config_with_its_path() {
 }
 
 #[test]
+fn rejects_an_out_of_range_cli_temperature() {
+    let output = test_command()
+        .args(["--model", "test-model", "--temperature", "2.5", "hello"])
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("temperature"));
+}
+
+#[test]
+fn rejects_an_out_of_range_cli_top_p() {
+    let output = test_command()
+        .args(["--model", "test-model", "--top-p", "1.5", "hello"])
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("top_p"));
+}
+
+#[test]
+fn rejects_a_zero_cli_max_tokens() {
+    let output = test_command()
+        .args(["--model", "test-model", "--max-tokens", "0", "hello"])
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("max_tokens"));
+}
+
+#[test]
+fn rejects_an_out_of_range_temperature_from_a_model_definition_with_context() {
+    let config = ConfigDirectory::new(
+        "default:\n  model: bad-alias\nmodels:\n  bad-alias:\n    - provider:\n        base_url: http://127.0.0.1:1/v1\n      model_id: bad-model\n      default_temperature: 3.0\n",
+    );
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("temperature"),
+        "stderr should mention temperature: {stderr}"
+    );
+    assert!(
+        stderr.contains("bad-model"),
+        "stderr should identify the model the invalid value came from: {stderr}"
+    );
+}
+
+#[test]
 fn requires_model_option() {
     let directory = ConfigDirectory::empty();
     let output = test_command()

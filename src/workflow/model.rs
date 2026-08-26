@@ -37,6 +37,12 @@ pub(crate) struct WorkflowFile {
 pub(crate) struct WorkflowDefaults {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Fallback sampling `temperature`/`top_p`/`max_tokens` for any step that
+    /// calls a model and doesn't set its own. Unlike `retry`, each falls back
+    /// independently (a step can override just one of the three).
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) max_tokens: Option<u32>,
     /// Fallback `retry` for any step that calls a model (`prompt`/`agent`)
     /// and doesn't set its own. Falls back as a whole struct, not
     /// field-by-field: a step with its own `retry: { max_attempts: 2 }` gets
@@ -60,6 +66,18 @@ pub(crate) struct StepDefinition {
     pub(crate) when: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Sampling temperature (0.0-2.0) for this step's model call. Falls back
+    /// independently to the workflow's `default.temperature` when unset (like
+    /// `reasoning_effort`, not like `retry`'s whole-unit fallback). Only
+    /// meaningful for a step that calls a model (`prompt`/`agent`).
+    pub(crate) temperature: Option<f64>,
+    /// Nucleus sampling probability mass (0.0-1.0) for this step's model
+    /// call. Falls back independently to `default.top_p`, like `temperature`.
+    pub(crate) top_p: Option<f64>,
+    /// An upper bound on the number of tokens generated for this step's
+    /// model call. Falls back independently to `default.max_tokens`, like
+    /// `temperature`.
+    pub(crate) max_tokens: Option<u32>,
     /// The prompt template sent to the model. A step without a `prompt` and
     /// without an `agent` does not call the model at all; it must then have a
     /// `jq` filter, making it a data-only transformation step. Mutually
@@ -78,6 +96,7 @@ pub(crate) struct StepDefinition {
     /// `default:`/`models:`/`json_schemas:` take precedence, falling back to
     /// this workflow's when it doesn't define an entry. Mutually exclusive
     /// with `prompt`, `agent`, `model`, `reasoning_effort`,
+    /// `temperature`/`top_p`/`max_tokens`,
     /// `input_schema`/`output_schema`/`schema_name` (which the sub-workflow's
     /// own steps supply), and `retry`/`timeout`/`on_error` (set those on the
     /// sub-workflow's own steps instead).

@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::{
     cli::ReasoningEffort,
+    llm,
     schema::{self, JsonSchemaEntry},
 };
 
@@ -15,6 +16,9 @@ struct AgentFrontmatter {
     description: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
     input_schema: Option<JsonSchemaEntry>,
     output_schema: Option<JsonSchemaEntry>,
     #[serde(default)]
@@ -31,6 +35,9 @@ pub(crate) struct AgentFile {
     pub(crate) description: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) max_tokens: Option<u32>,
     pub(crate) input_schema: Option<JsonSchemaEntry>,
     pub(crate) output_schema: Option<JsonSchemaEntry>,
     pub(crate) structured_output: bool,
@@ -77,12 +84,21 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
     if !frontmatter.structured_output && frontmatter.output_schema.is_some() {
         bail!("'output_schema' is set but 'structured_output' is not true");
     }
+    llm::validate_sampling_params(
+        frontmatter.temperature,
+        frontmatter.top_p,
+        frontmatter.max_tokens,
+        "the agent file",
+    )?;
 
     Ok(AgentFile {
         name: frontmatter.name,
         description: frontmatter.description,
         model: frontmatter.model,
         reasoning_effort: frontmatter.reasoning_effort,
+        temperature: frontmatter.temperature,
+        top_p: frontmatter.top_p,
+        max_tokens: frontmatter.max_tokens,
         input_schema: frontmatter.input_schema,
         output_schema: frontmatter.output_schema,
         structured_output: frontmatter.structured_output,
@@ -217,5 +233,23 @@ schema_name: city_fact
     fn skips_input_validation_when_no_input_schema_is_declared() {
         let agent = parse_agent("---\n---\n{{ input }}\n").expect("agent should parse");
         assert!(agent.validate_input(&json!("anything")).is_ok());
+    }
+
+    #[test]
+    fn parses_temperature_top_p_and_max_tokens() {
+        let agent = parse_agent(
+            "---\nmodel: local\ntemperature: 0.7\ntop_p: 0.9\nmax_tokens: 256\n---\nbody\n",
+        )
+        .expect("agent should parse");
+
+        assert_eq!(agent.temperature, Some(0.7));
+        assert_eq!(agent.top_p, Some(0.9));
+        assert_eq!(agent.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_temperature() {
+        let result = parse_agent("---\ntemperature: 2.5\n---\nbody\n");
+        assert!(result.is_err());
     }
 }

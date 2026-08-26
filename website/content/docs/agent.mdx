@@ -13,6 +13,9 @@ name: city-fact
 description: 文章から都市名と人口を抽出する
 model: local
 reasoning_effort: medium
+temperature: 0.7
+top_p: 0.9
+max_tokens: 512
 input_schema:
   schema:
     type: object
@@ -46,8 +49,10 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
   実行したディレクトリ（カレントディレクトリ）からの相対パスとして解決されます。エージェント
   ファイルや `workflow.yml` 自体の場所からの相対パスではないため、`workflow.yml` を別ディレクトリから
   実行する場合は注意してください。
-- `model` / `reasoning_effort` は省略可能で、`lait.config.yml` の `default:` にフォールバック
-  します。CLI から `--model` 等で上書きすることはできません。
+- `model` / `reasoning_effort` / `temperature` / `top_p` / `max_tokens` は省略可能で、
+  `lait.config.yml` の `default:` にフォールバックします。CLI から `--model` 等で上書きすること
+  はできません。`temperature`（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）は
+  範囲外の値を指定するとファイルの読み込み時点でエラーになります。
 - `input_schema` / `output_schema` は、`json_schemas:` と同じ形式で、スキーマ本体を直接書く
   `schema:` と外部ファイルを指す `file_path:` のどちらか一方を指定します。
 - `structured_output: true` を指定する場合は `output_schema` が必須です（逆に `output_schema`
@@ -85,8 +90,8 @@ steps:
     jq: ".city"
 ```
 
-`model`/`reasoning_effort` は `step` → エージェントファイルの frontmatter →
-ワークフローの `default:` の順にフォールバックします。ステップの入力（前の step の出力、
+`model`/`reasoning_effort`/`temperature`/`top_p`/`max_tokens` は `step` → エージェントファイルの
+frontmatter → ワークフローの `default:` の順に、それぞれ独立してフォールバックします。ステップの入力（前の step の出力、
 または最初の step では `<PROMPT>`）は、`lait agent run` の `INPUT` と同じ規則でエージェントの
 システムプロンプトに渡され、`{{ input.field }}` でアクセスできます。
 

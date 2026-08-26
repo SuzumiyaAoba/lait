@@ -26,6 +26,12 @@ pub(crate) struct ConfigFile {
 pub(crate) struct DefaultSettings {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Fallback sampling `temperature`/`top_p`/`max_tokens`, each falling back
+    /// independently (unlike `WorkflowDefaults::retry`, which falls back as a
+    /// whole unit) when a step/CLI invocation doesn't set its own.
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) max_tokens: Option<u32>,
 }
 
 /// A map of model alias to its candidate definitions, as used by both
@@ -38,6 +44,9 @@ pub(crate) struct ModelDefinition {
     provider: ProviderConfig,
     model_id: String,
     default_reasoning_effort: Option<ReasoningEffort>,
+    default_temperature: Option<f64>,
+    default_top_p: Option<f64>,
+    default_max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +62,9 @@ pub(crate) struct ResolvedModel {
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) max_tokens: Option<u32>,
 }
 
 /// Resolves `model_name` against a single alias map, returning `Ok(None)` when the
@@ -77,6 +89,9 @@ pub(crate) fn resolve_model_alias(
         base_url: Some(definition.provider.base_url.clone()),
         api_key: definition.provider.api_key.clone(),
         reasoning_effort: definition.default_reasoning_effort,
+        temperature: definition.default_temperature,
+        top_p: definition.default_top_p,
+        max_tokens: definition.default_max_tokens,
     }))
 }
 
@@ -89,6 +104,9 @@ pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<R
         base_url: None,
         api_key: None,
         reasoning_effort: None,
+        temperature: None,
+        top_p: None,
+        max_tokens: None,
     })
 }
 

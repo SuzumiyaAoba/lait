@@ -250,6 +250,78 @@ fn cli_options_override_a_model_definition_for_an_alias() {
 }
 
 #[test]
+fn resolves_temperature_top_p_and_max_tokens_from_a_model_definition_for_an_alias() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"sampling-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "default:\n  model: sampling-alias\nmodels:\n  sampling-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: sampling-model\n      default_temperature: 0.4\n      default_top_p: 0.6\n      default_max_tokens: 128\n",
+        server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""temperature":0.4"#),
+        "request body: {body}"
+    );
+    assert!(body.contains(r#""top_p":0.6"#), "request body: {body}");
+    assert!(
+        body.contains(r#""max_completion_tokens":128"#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn cli_temperature_top_p_and_max_tokens_override_a_model_definition_for_an_alias() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"sampling-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "default:\n  model: sampling-alias\nmodels:\n  sampling-alias:\n    - provider:\n        base_url: \"{}\"\n      model_id: sampling-model\n      default_temperature: 0.4\n      default_top_p: 0.6\n      default_max_tokens: 128\n",
+        server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--temperature",
+            "0.9",
+            "--top-p",
+            "0.99",
+            "--max-tokens",
+            "512",
+            "hello",
+        ])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""temperature":0.9"#),
+        "request body: {body}"
+    );
+    assert!(body.contains(r#""top_p":0.99"#), "request body: {body}");
+    assert!(
+        body.contains(r#""max_completion_tokens":512"#),
+        "request body: {body}"
+    );
+}
+
+#[test]
 fn environment_options_override_a_model_definition_for_an_alias() {
     let server = MockServer::start(
         "200 OK",

@@ -97,6 +97,21 @@ pub(crate) struct ChatArgs {
     #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
 
+    /// Sampling temperature (0.0-2.0). Lower is more deterministic, higher is
+    /// more random. Omitted from the request when unset.
+    #[arg(long, env = "LLM_TEMPERATURE")]
+    pub(crate) temperature: Option<f64>,
+
+    /// Nucleus sampling probability mass (0.0-1.0), an alternative to
+    /// `--temperature`. Omitted from the request when unset.
+    #[arg(long, env = "LLM_TOP_P")]
+    pub(crate) top_p: Option<f64>,
+
+    /// An upper bound on the number of tokens generated for the completion.
+    /// Omitted from the request when unset.
+    #[arg(long, env = "LLM_MAX_TOKENS")]
+    pub(crate) max_tokens: Option<u32>,
+
     /// A single prompt to send as a user message.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
@@ -217,6 +232,37 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn parses_temperature_top_p_and_max_tokens() {
+        let cli = Cli::try_parse_from([
+            "lait",
+            "--model",
+            "local-model",
+            "--temperature",
+            "0.7",
+            "--top-p",
+            "0.9",
+            "--max-tokens",
+            "256",
+            "hello",
+        ])
+        .expect("valid sampling options should parse");
+
+        assert_eq!(cli.chat.temperature, Some(0.7));
+        assert_eq!(cli.chat.top_p, Some(0.9));
+        assert_eq!(cli.chat.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn leaves_temperature_top_p_and_max_tokens_unset_by_default() {
+        let cli = Cli::try_parse_from(["lait", "--model", "local-model", "hello"])
+            .expect("valid CLI arguments should parse");
+
+        assert!(cli.chat.temperature.is_none());
+        assert!(cli.chat.top_p.is_none());
+        assert!(cli.chat.max_tokens.is_none());
     }
 
     #[test]
