@@ -437,171 +437,215 @@ fn run_steps<'a>(
             counter += 1;
             let label = step.id.clone().unwrap_or_else(|| format!("step-{counter}"));
 
-            if let Some(switch) = &step.switch {
-                eprintln!("{progress_prefix}[{counter}] {label}");
+            // `validate::validate_steps` guarantees at most one of
+            // `switch`/`parallel`/`loop`/`for_each` is set, so `router()`
+            // (which just checks them in a fixed order) can't silently
+            // prefer one over another here. Matched exhaustively (no `_`
+            // arm) so a new router kind fails to compile here until handled.
+            match step.router() {
+                Some(workflow::Router::Switch(switch)) => {
+                    eprintln!("{progress_prefix}[{counter}] {label}");
 
-                let mut matched = None;
-                for (case_index, case) in switch.cases.iter().enumerate() {
-                    if workflow::eval_when(&case.when, &current_input, &steps_outputs)
-                        .with_context(|| format!("step '{label}'"))?
-                    {
-                        let case_label = case
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| format!("case-{}", case_index + 1));
-                        eprintln!("{progress_prefix}    -> case '{case_label}' matched");
-                        matched = Some(
-                            run_steps(
-                                &case.steps,
-                                current_input.clone(),
-                                scope,
-                                file_config,
-                                counter,
-                                progress_prefix,
-                                steps_outputs.clone(),
-                            )
-                            .await?,
-                        );
-                        break;
-                    }
-                }
-                let (result, new_counter, flow, new_steps_outputs) = match matched {
-                    Some(result) => result,
-                    None => match &switch.else_steps {
-                        Some(else_steps) => {
-                            eprintln!("{progress_prefix}    -> no case matched, running 'else'");
-                            run_steps(
-                                else_steps,
-                                current_input.clone(),
-                                scope,
-                                file_config,
-                                counter,
-                                progress_prefix,
-                                steps_outputs.clone(),
-                            )
-                            .await?
-                        }
-                        None => {
-                            bail!("step '{label}': no case matched and no 'else' branch is defined")
-                        }
-                    },
-                };
-                current_input = result;
-                counter = new_counter;
-                steps_outputs = new_steps_outputs;
-                record_step_output(&mut steps_outputs, step, &current_input);
-                if flow != Flow::Continue {
-                    return Ok((current_input, counter, flow, steps_outputs));
-                }
-                continue;
-            }
-
-            if let Some(parallel) = &step.parallel {
-                eprintln!("{progress_prefix}[{counter}] {label}");
-                eprintln!(
-                    "{progress_prefix}    -> running {} branches concurrently",
-                    parallel.branches.len()
-                );
-
-                let branch_labels: Vec<String> = parallel
-                    .branches
-                    .iter()
-                    .enumerate()
-                    .map(|(index, branch)| branch.label(index))
-                    .collect();
-                let branch_prefixes: Vec<String> = branch_labels
-                    .iter()
-                    .map(|branch_label| format!("{progress_prefix}[{branch_label}] "))
-                    .collect();
-                let branch_futures = parallel.branches.iter().zip(&branch_prefixes).map(
-                    |(branch, branch_prefix)| {
-                        run_steps(
-                            &branch.steps,
-                            current_input.clone(),
-                            scope,
-                            file_config,
-                            0,
-                            branch_prefix,
-                            steps_outputs.clone(),
-                        )
-                    },
-                );
-                let branch_results = futures_util::future::try_join_all(branch_futures).await?;
-
-                // `validate_steps` rejects `stop`/`break` anywhere inside a
-                // `parallel` branch, so every branch always finishes with
-                // `Flow::Continue`; only its output is used here. Each branch
-                // got its own clone of `steps_outputs` (see this function's
-                // doc comment), so whatever it recorded stays branch-local.
-                let mut joined = serde_json::Map::new();
-                for (branch_label, (branch_output, _, _, _)) in
-                    branch_labels.into_iter().zip(branch_results)
-                {
-                    joined.insert(branch_label, template::parse_input(&branch_output));
-                }
-                let joined_json = serde_json::to_string(&serde_json::Value::Object(joined))
-                    .context("failed to serialize joined 'parallel' branch outputs")?;
-
-                eprintln!("{progress_prefix}    -> branches joined");
-
-                current_input = match &parallel.join {
-                    Some(filter) => jq::apply(filter, &joined_json, &steps_outputs)
-                        .with_context(|| format!("step '{label}'"))?,
-                    None => joined_json,
-                };
-                record_step_output(&mut steps_outputs, step, &current_input);
-                continue;
-            }
-
-            if let Some(loop_def) = &step.r#loop {
-                eprintln!("{progress_prefix}[{counter}] {label}");
-                // Validated by `workflow::validate_steps`: exactly one of
-                // `while`/`until` is set, and `max_iterations` is `Some(n)` with n >= 1.
-                let max_iterations = loop_def
-                    .max_iterations
-                    .expect("loop.max_iterations is required by validate_steps");
-
-                let mut iteration_input = current_input.clone();
-                // Threaded continuously across iterations (like `switch`, unlike
-                // `parallel`'s per-branch reset): the loop body genuinely runs
-                // sequentially, so a single growing counter reflects real execution
-                // order.
-                let mut loop_counter = counter;
-                if let Some(while_cond) = &loop_def.r#while {
-                    let mut iterations_run = 0usize;
-                    loop {
-                        let should_continue =
-                            workflow::eval_when(while_cond, &iteration_input, &steps_outputs)
-                                .with_context(|| format!("step '{label}'"))?;
-                        if !should_continue {
+                    let mut matched = None;
+                    for (case_index, case) in switch.cases.iter().enumerate() {
+                        if workflow::eval_when(&case.when, &current_input, &steps_outputs)
+                            .with_context(|| format!("step '{label}'"))?
+                        {
+                            let case_label = case
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| format!("case-{}", case_index + 1));
+                            eprintln!("{progress_prefix}    -> case '{case_label}' matched");
+                            matched = Some(
+                                run_steps(
+                                    &case.steps,
+                                    current_input.clone(),
+                                    scope,
+                                    file_config,
+                                    counter,
+                                    progress_prefix,
+                                    steps_outputs.clone(),
+                                )
+                                .await?,
+                            );
                             break;
                         }
-                        if iterations_run >= max_iterations {
-                            bail!(
-                                "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'while'"
+                    }
+                    let (result, new_counter, flow, new_steps_outputs) = match matched {
+                        Some(result) => result,
+                        None => match &switch.else_steps {
+                            Some(else_steps) => {
+                                eprintln!(
+                                    "{progress_prefix}    -> no case matched, running 'else'"
+                                );
+                                run_steps(
+                                    else_steps,
+                                    current_input.clone(),
+                                    scope,
+                                    file_config,
+                                    counter,
+                                    progress_prefix,
+                                    steps_outputs.clone(),
+                                )
+                                .await?
+                            }
+                            None => {
+                                bail!(
+                                    "step '{label}': no case matched and no 'else' branch is defined"
+                                )
+                            }
+                        },
+                    };
+                    current_input = result;
+                    counter = new_counter;
+                    steps_outputs = new_steps_outputs;
+                    record_step_output(&mut steps_outputs, step, &current_input);
+                    if flow != Flow::Continue {
+                        return Ok((current_input, counter, flow, steps_outputs));
+                    }
+                    continue;
+                }
+
+                Some(workflow::Router::Parallel(parallel)) => {
+                    eprintln!("{progress_prefix}[{counter}] {label}");
+                    eprintln!(
+                        "{progress_prefix}    -> running {} branches concurrently",
+                        parallel.branches.len()
+                    );
+
+                    let branch_labels: Vec<String> = parallel
+                        .branches
+                        .iter()
+                        .enumerate()
+                        .map(|(index, branch)| branch.label(index))
+                        .collect();
+                    let branch_prefixes: Vec<String> = branch_labels
+                        .iter()
+                        .map(|branch_label| format!("{progress_prefix}[{branch_label}] "))
+                        .collect();
+                    let branch_futures = parallel.branches.iter().zip(&branch_prefixes).map(
+                        |(branch, branch_prefix)| {
+                            run_steps(
+                                &branch.steps,
+                                current_input.clone(),
+                                scope,
+                                file_config,
+                                0,
+                                branch_prefix,
+                                steps_outputs.clone(),
+                            )
+                        },
+                    );
+                    let branch_results = futures_util::future::try_join_all(branch_futures).await?;
+
+                    // `validate_steps` rejects `stop`/`break` anywhere inside a
+                    // `parallel` branch, so every branch always finishes with
+                    // `Flow::Continue`; only its output is used here. Each branch
+                    // got its own clone of `steps_outputs` (see this function's
+                    // doc comment), so whatever it recorded stays branch-local.
+                    let mut joined = serde_json::Map::new();
+                    for (branch_label, (branch_output, _, _, _)) in
+                        branch_labels.into_iter().zip(branch_results)
+                    {
+                        joined.insert(branch_label, template::parse_input(&branch_output));
+                    }
+                    let joined_json = serde_json::to_string(&serde_json::Value::Object(joined))
+                        .context("failed to serialize joined 'parallel' branch outputs")?;
+
+                    eprintln!("{progress_prefix}    -> branches joined");
+
+                    current_input = match &parallel.join {
+                        Some(filter) => jq::apply(filter, &joined_json, &steps_outputs)
+                            .with_context(|| format!("step '{label}'"))?,
+                        None => joined_json,
+                    };
+                    record_step_output(&mut steps_outputs, step, &current_input);
+                    continue;
+                }
+
+                Some(workflow::Router::Loop(loop_def)) => {
+                    eprintln!("{progress_prefix}[{counter}] {label}");
+                    // Validated by `validate::validate_steps`: exactly one of
+                    // `while`/`until` is set, and `max_iterations` is `Some(n)` with n >= 1.
+                    let max_iterations = loop_def
+                        .max_iterations
+                        .expect("loop.max_iterations is required by validate_steps");
+
+                    let mut iteration_input = current_input.clone();
+                    // Threaded continuously across iterations (like `switch`, unlike
+                    // `parallel`'s per-branch reset): the loop body genuinely runs
+                    // sequentially, so a single growing counter reflects real execution
+                    // order.
+                    let mut loop_counter = counter;
+                    if let Some(while_cond) = &loop_def.r#while {
+                        let mut iterations_run = 0usize;
+                        loop {
+                            let should_continue =
+                                workflow::eval_when(while_cond, &iteration_input, &steps_outputs)
+                                    .with_context(|| format!("step '{label}'"))?;
+                            if !should_continue {
+                                break;
+                            }
+                            if iterations_run >= max_iterations {
+                                bail!(
+                                    "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'while'"
+                                );
+                            }
+                            iterations_run += 1;
+                            eprintln!(
+                                "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
                             );
+                            let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                                &loop_def.steps,
+                                iteration_input.clone(),
+                                scope,
+                                file_config,
+                                loop_counter,
+                                progress_prefix,
+                                steps_outputs.clone(),
+                            )
+                            .await?;
+                            iteration_input = result;
+                            loop_counter = new_counter;
+                            steps_outputs = new_steps_outputs;
+                            match flow {
+                                Flow::Continue => {}
+                                Flow::Break => break,
+                                Flow::Stop => {
+                                    return Ok((
+                                        iteration_input,
+                                        loop_counter,
+                                        Flow::Stop,
+                                        steps_outputs,
+                                    ));
+                                }
+                            }
                         }
-                        iterations_run += 1;
-                        eprintln!(
-                            "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
+                    } else {
+                        let until_cond = loop_def.until.as_ref().expect(
+                            "loop.until is required by validate_steps when 'while' is unset",
                         );
-                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
-                            &loop_def.steps,
-                            iteration_input.clone(),
-                            scope,
-                            file_config,
-                            loop_counter,
-                            progress_prefix,
-                            steps_outputs.clone(),
-                        )
-                        .await?;
-                        iteration_input = result;
-                        loop_counter = new_counter;
-                        steps_outputs = new_steps_outputs;
-                        match flow {
-                            Flow::Continue => {}
-                            Flow::Break => break,
-                            Flow::Stop => {
+                        let mut iterations_run = 0usize;
+                        let mut satisfied = false;
+                        while iterations_run < max_iterations {
+                            iterations_run += 1;
+                            eprintln!(
+                                "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
+                            );
+                            let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                                &loop_def.steps,
+                                iteration_input.clone(),
+                                scope,
+                                file_config,
+                                loop_counter,
+                                progress_prefix,
+                                steps_outputs.clone(),
+                            )
+                            .await?;
+                            iteration_input = result;
+                            loop_counter = new_counter;
+                            steps_outputs = new_steps_outputs;
+                            if flow == Flow::Stop {
                                 return Ok((
                                     iteration_input,
                                     loop_counter,
@@ -609,187 +653,162 @@ fn run_steps<'a>(
                                     steps_outputs,
                                 ));
                             }
+                            if flow == Flow::Break {
+                                // An explicit `break: true` ends the loop like a
+                                // satisfied `until`, not like exhausting
+                                // `max_iterations`.
+                                satisfied = true;
+                                break;
+                            }
+                            satisfied =
+                                workflow::eval_when(until_cond, &iteration_input, &steps_outputs)
+                                    .with_context(|| format!("step '{label}'"))?;
+                            if satisfied {
+                                break;
+                            }
+                        }
+                        if !satisfied {
+                            bail!(
+                                "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'until'"
+                            );
                         }
                     }
-                } else {
-                    let until_cond = loop_def
-                        .until
-                        .as_ref()
-                        .expect("loop.until is required by validate_steps when 'while' is unset");
-                    let mut iterations_run = 0usize;
-                    let mut satisfied = false;
-                    while iterations_run < max_iterations {
-                        iterations_run += 1;
-                        eprintln!(
-                            "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
-                        );
-                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
-                            &loop_def.steps,
-                            iteration_input.clone(),
-                            scope,
-                            file_config,
-                            loop_counter,
-                            progress_prefix,
-                            steps_outputs.clone(),
-                        )
-                        .await?;
-                        iteration_input = result;
-                        loop_counter = new_counter;
-                        steps_outputs = new_steps_outputs;
-                        if flow == Flow::Stop {
-                            return Ok((iteration_input, loop_counter, Flow::Stop, steps_outputs));
-                        }
-                        if flow == Flow::Break {
-                            // An explicit `break: true` ends the loop like a
-                            // satisfied `until`, not like exhausting
-                            // `max_iterations`.
-                            satisfied = true;
-                            break;
-                        }
-                        satisfied =
-                            workflow::eval_when(until_cond, &iteration_input, &steps_outputs)
-                                .with_context(|| format!("step '{label}'"))?;
-                        if satisfied {
-                            break;
-                        }
-                    }
-                    if !satisfied {
-                        bail!(
-                            "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'until'"
-                        );
-                    }
+                    current_input = iteration_input;
+                    counter = loop_counter;
+                    record_step_output(&mut steps_outputs, step, &current_input);
+                    continue;
                 }
-                current_input = iteration_input;
-                counter = loop_counter;
-                record_step_output(&mut steps_outputs, step, &current_input);
-                continue;
-            }
 
-            if let Some(for_each) = &step.for_each {
-                eprintln!("{progress_prefix}[{counter}] {label}");
-                let items_json = jq::apply_one(&for_each.items, &current_input, &steps_outputs)
-                    .with_context(|| format!("step '{label}'"))?;
-                let items_value: serde_json::Value = serde_json::from_str(&items_json)
-                    .with_context(|| {
-                        format!("step '{label}': failed to parse 'for_each.items' output as JSON")
+                Some(workflow::Router::ForEach(for_each)) => {
+                    eprintln!("{progress_prefix}[{counter}] {label}");
+                    let items_json = jq::apply_one(&for_each.items, &current_input, &steps_outputs)
+                        .with_context(|| format!("step '{label}'"))?;
+                    let items_value: serde_json::Value = serde_json::from_str(&items_json)
+                        .with_context(|| {
+                            format!(
+                                "step '{label}': failed to parse 'for_each.items' output as JSON"
+                            )
+                        })?;
+                    let items = items_value.as_array().cloned().ok_or_else(|| {
+                        anyhow!("step '{label}': 'for_each.items' must produce a JSON array")
                     })?;
-                let items = items_value.as_array().cloned().ok_or_else(|| {
-                    anyhow!("step '{label}': 'for_each.items' must produce a JSON array")
-                })?;
 
-                let max_concurrency = for_each.max_concurrency.unwrap_or(1);
-                let results: Vec<serde_json::Value> = if max_concurrency <= 1 {
-                    eprintln!(
-                        "{progress_prefix}    -> iterating over {} item(s)",
-                        items.len()
-                    );
-                    let mut results = Vec::with_capacity(items.len());
-                    // Threaded continuously across items, like `loop` (see its
-                    // comment above): a sequential `for_each` (the default)
-                    // runs its body one item at a time, so a single growing
-                    // counter matches real execution order.
-                    let mut for_each_counter = counter;
-                    let mut stop_result = None;
-                    for (item_index, item) in items.iter().enumerate() {
+                    let max_concurrency = for_each.max_concurrency.unwrap_or(1);
+                    let results: Vec<serde_json::Value> = if max_concurrency <= 1 {
                         eprintln!(
-                            "{progress_prefix}    -> item {}/{}",
-                            item_index + 1,
+                            "{progress_prefix}    -> iterating over {} item(s)",
                             items.len()
                         );
-                        // A string item is passed through raw (like `parallel`'s
-                        // `current_input`, and the inverse of `template::parse_input`
-                        // used below for results), not re-quoted as JSON, so
-                        // `{{ input }}` sees the same unquoted text everywhere else
-                        // in the pipeline does.
-                        let item_input = match item {
-                            serde_json::Value::String(text) => text.clone(),
-                            other => serde_json::to_string(other)
-                                .context("failed to serialize a 'for_each' item")?,
-                        };
-                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
-                            &for_each.steps,
-                            item_input,
-                            scope,
-                            file_config,
-                            for_each_counter,
-                            progress_prefix,
-                            steps_outputs.clone(),
-                        )
-                        .await?;
-                        for_each_counter = new_counter;
-                        steps_outputs = new_steps_outputs;
-                        if flow == Flow::Stop {
-                            stop_result = Some(result);
-                            break;
-                        }
-                        results.push(template::parse_input(&result));
-                        if flow == Flow::Break {
-                            break;
-                        }
-                    }
-                    counter = for_each_counter;
-                    if let Some(result) = stop_result {
-                        return Ok((result, counter, Flow::Stop, steps_outputs));
-                    }
-                    results
-                } else {
-                    eprintln!(
-                        "{progress_prefix}    -> iterating over {} item(s), up to {max_concurrency} concurrently",
-                        items.len()
-                    );
-                    let item_inputs: Vec<String> = items
-                        .iter()
-                        .map(|item| match item {
-                            serde_json::Value::String(text) => Ok(text.clone()),
-                            other => serde_json::to_string(other)
-                                .context("failed to serialize a 'for_each' item"),
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let item_prefixes: Vec<String> = (0..item_inputs.len())
-                        .map(|index| format!("{progress_prefix}[item-{}] ", index + 1))
-                        .collect();
-                    let item_futures = item_inputs.into_iter().zip(&item_prefixes).map(
-                        |(item_input, item_prefix)| {
-                            run_steps(
+                        let mut results = Vec::with_capacity(items.len());
+                        // Threaded continuously across items, like `loop` (see its
+                        // comment above): a sequential `for_each` (the default)
+                        // runs its body one item at a time, so a single growing
+                        // counter matches real execution order.
+                        let mut for_each_counter = counter;
+                        let mut stop_result = None;
+                        for (item_index, item) in items.iter().enumerate() {
+                            eprintln!(
+                                "{progress_prefix}    -> item {}/{}",
+                                item_index + 1,
+                                items.len()
+                            );
+                            // A string item is passed through raw (like `parallel`'s
+                            // `current_input`, and the inverse of `template::parse_input`
+                            // used below for results), not re-quoted as JSON, so
+                            // `{{ input }}` sees the same unquoted text everywhere else
+                            // in the pipeline does.
+                            let item_input = match item {
+                                serde_json::Value::String(text) => text.clone(),
+                                other => serde_json::to_string(other)
+                                    .context("failed to serialize a 'for_each' item")?,
+                            };
+                            let (result, new_counter, flow, new_steps_outputs) = run_steps(
                                 &for_each.steps,
                                 item_input,
                                 scope,
                                 file_config,
-                                0,
-                                item_prefix,
+                                for_each_counter,
+                                progress_prefix,
                                 steps_outputs.clone(),
                             )
-                        },
-                    );
-                    // `validate_steps` rejects `stop`/`break` inside a
-                    // `for_each` body whose `max_concurrency` is above 1, for
-                    // the same reason as a `parallel` branch: concurrently
-                    // running items can't share a single well-defined "break
-                    // this loop"/"stop the workflow" target. Each item also
-                    // got its own clone of `steps_outputs` (see this
-                    // function's doc comment), so nothing it records leaks
-                    // back here.
-                    let item_results: Vec<(String, usize, Flow, workflow::StepOutputs)> =
-                        futures_util::stream::iter(item_futures)
-                            .buffered(max_concurrency)
-                            .try_collect()
                             .await?;
-                    item_results
-                        .into_iter()
-                        .map(|(output, _, _, _)| template::parse_input(&output))
-                        .collect()
-                };
+                            for_each_counter = new_counter;
+                            steps_outputs = new_steps_outputs;
+                            if flow == Flow::Stop {
+                                stop_result = Some(result);
+                                break;
+                            }
+                            results.push(template::parse_input(&result));
+                            if flow == Flow::Break {
+                                break;
+                            }
+                        }
+                        counter = for_each_counter;
+                        if let Some(result) = stop_result {
+                            return Ok((result, counter, Flow::Stop, steps_outputs));
+                        }
+                        results
+                    } else {
+                        eprintln!(
+                            "{progress_prefix}    -> iterating over {} item(s), up to {max_concurrency} concurrently",
+                            items.len()
+                        );
+                        let item_inputs: Vec<String> = items
+                            .iter()
+                            .map(|item| match item {
+                                serde_json::Value::String(text) => Ok(text.clone()),
+                                other => serde_json::to_string(other)
+                                    .context("failed to serialize a 'for_each' item"),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let item_prefixes: Vec<String> = (0..item_inputs.len())
+                            .map(|index| format!("{progress_prefix}[item-{}] ", index + 1))
+                            .collect();
+                        let item_futures = item_inputs.into_iter().zip(&item_prefixes).map(
+                            |(item_input, item_prefix)| {
+                                run_steps(
+                                    &for_each.steps,
+                                    item_input,
+                                    scope,
+                                    file_config,
+                                    0,
+                                    item_prefix,
+                                    steps_outputs.clone(),
+                                )
+                            },
+                        );
+                        // `validate_steps` rejects `stop`/`break` inside a
+                        // `for_each` body whose `max_concurrency` is above 1, for
+                        // the same reason as a `parallel` branch: concurrently
+                        // running items can't share a single well-defined "break
+                        // this loop"/"stop the workflow" target. Each item also
+                        // got its own clone of `steps_outputs` (see this
+                        // function's doc comment), so nothing it records leaks
+                        // back here.
+                        let item_results: Vec<(String, usize, Flow, workflow::StepOutputs)> =
+                            futures_util::stream::iter(item_futures)
+                                .buffered(max_concurrency)
+                                .try_collect()
+                                .await?;
+                        item_results
+                            .into_iter()
+                            .map(|(output, _, _, _)| template::parse_input(&output))
+                            .collect()
+                    };
 
-                let results_json = serde_json::to_string(&serde_json::Value::Array(results))
-                    .context("failed to serialize 'for_each' results")?;
+                    let results_json = serde_json::to_string(&serde_json::Value::Array(results))
+                        .context("failed to serialize 'for_each' results")?;
 
-                current_input = match &for_each.join {
-                    Some(filter) => jq::apply(filter, &results_json, &steps_outputs)
-                        .with_context(|| format!("step '{label}'"))?,
-                    None => results_json,
-                };
-                record_step_output(&mut steps_outputs, step, &current_input);
-                continue;
+                    current_input = match &for_each.join {
+                        Some(filter) => jq::apply(filter, &results_json, &steps_outputs)
+                            .with_context(|| format!("step '{label}'"))?,
+                        None => results_json,
+                    };
+                    record_step_output(&mut steps_outputs, step, &current_input);
+                    continue;
+                }
+
+                None => {}
             }
 
             if let Some(when) = &step.when {
