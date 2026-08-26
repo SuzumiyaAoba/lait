@@ -61,3 +61,27 @@ default:
 は `default:` の配下にまとめて指定します。設定ファイルの自動読込を
 無効にする場合は `--no-config` を指定してください。この場合は設定ファイルを読み込まず、CLI
 引数、環境変数、既定値だけが使用されます。
+
+## `${VAR_NAME}` による環境変数参照
+
+トップレベルの `api_key`/`base_url`、および `models:` の `provider.api_key`/`provider.base_url`
+には、`${VAR_NAME}` という記法で環境変数を埋め込めます。API キーなどの秘密情報を設定ファイルに
+平文で書かずに済ませるためのものです。
+
+```yaml
+# lait.config.yml
+models:
+  cloud:
+    - provider:
+        base_url: https://api.example.com/v1
+        api_key: "${CLOUD_API_KEY}"
+      model_id: cloud-model
+```
+
+- `${VAR_NAME}` は文字列の中の任意の位置に埋め込めます（例: `https://${HOST}/v1`）。1つの値に
+  複数の `${VAR_NAME}` を含めることもできます。
+- 参照した環境変数が未設定の場合はエラーになります（空文字列として扱われることはありません）。
+- `VAR_NAME` は英数字と `_` のみが使えます。
+- この展開は設定ファイル（`lait.config.yml`、および後述するワークフローファイルの `models:`/
+  トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
+  そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。

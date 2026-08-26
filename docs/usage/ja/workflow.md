@@ -86,6 +86,10 @@ steps:
 定義が優先されます。ワークフローに定義がないエイリアスは、これまでどおり `lait.config.yml`
 の `models` から解決されます。
 
+`provider.api_key`/`provider.base_url` には `${VAR_NAME}` で環境変数を埋め込めます（[設定ファイル
+の該当節](./config.md#var_name-による環境変数参照)を参照）。API キーをワークフローファイルに平文で
+書かずに済みます。
+
 ## JSON 出力の指定と jq による加工
 
 step に `output_schema`（と任意で `schema_name`）を指定すると、CLI の `--json-schema` /
@@ -144,6 +148,39 @@ steps:
 - `jq` のみを指定して `prompt` を省略すると、モデルを呼び出さずにその時点の `{{ input }}` を
   変換するだけの step になります（`model` の指定は不要です）。この場合、入力は有効な JSON で
   ある必要があります。
+
+## ファイルへの出力（`write_file`）
+
+step に `write_file:` を指定すると、その step の最終出力（`jq` を指定している場合はその結果）を
+指定したパスに書き出します。次の step に渡される `{{ input }}` は変わりません（あくまで副作用
+としてファイルにも書き出すだけです）。
+
+```yaml
+# workflow.yml
+steps:
+  - id: summarize
+    prompt: |
+      次の文章を3行で要約してください。
+      {{ input }}
+    write_file: summary.txt
+```
+
+- パスは `agent:` と同じく、**コマンドを実行したカレントディレクトリ**からの相対パスとして
+  解決されます（`workflow:` とは異なり、ワークフローファイル自身のディレクトリ基準ではあり
+  ません）。
+- ファイルが既に存在する場合は上書きします。親ディレクトリが存在しない場合はエラーになります
+  （自動作成はしません）。
+- `retry` で同じ step が再試行された場合、書き込みも試行のたびに行われます（最後に成功した
+  試行の内容がファイルに残ります）。
+- `for_each` の `max_concurrency` が2以上の本体（複数の要素が同時に処理される）の中では
+  `write_file` を使えません。パスは固定文字列なので、同時に走る複数の要素が同じパスへ
+  競合して書き込んでしまうためです。`max_concurrency: 1`（既定）の本体や、`loop`の本体では
+  問題なく使えます（各イテレーションが同じパスへ順番に上書きしていく、という動作になります）。
+- `parallel` の複数の branch がそれぞれ異なる `write_file` パスを持つ分には問題ありません
+  （branch ごとに別々の step 列なので、パスさえ重複しなければ競合しません）。同じパスを複数の
+  branch に指定した場合は、`for_each` の場合と同様に競合するので避けてください。
+- 単独で（`prompt`/`agent`/`jq` などを何も伴わずに）`write_file` だけを指定した step も作れます。
+  この場合、その時点の `{{ input }}` をそのままファイルに書き出すだけの step になります。
 
 ### 入力の検証（`input_schema`）
 
@@ -256,6 +293,42 @@ steps:
   `on_error` を指定しなければ、これまでどおり失敗はワークフロー全体のエラーになります。
 - `retry`/`timeout`/`on_error` は `switch`/`parallel`/`loop`/`for_each` とは併用できません
   （これらは入れ子の step 列に処理を委ねるだけで、自分ではアクションを実行しないためです）。
+
+### ワークフロー全体の既定値（`default.retry` / `default.timeout`）
+
+`default:` 直下に `retry:`/`timeout:` を書くと、`model`/`reasoning_effort` と同じように
+ワークフロー全体の既定値になります。`prompt`/`agent` でモデルを呼び出す step が自分自身の
+`retry`/`timeout` を持たない場合、この既定値が使われます。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+  retry:
+    max_attempts: 3
+    delay_seconds: 1
+  timeout: 30
+steps:
+  - prompt: "{{ input }}"          # default.retry / default.timeout が適用される
+  - prompt: "{{ input }}"
+    retry:
+      max_attempts: 1              # この step だけ既定値を上書き（timeout は default の30秒のまま）
+  - jq: '.summary'                 # jq のみの step には適用されない
+```
+
+- 適用されるのは `prompt`/`agent` でモデルを呼び出す step だけです。`jq` のみの step や
+  `workflow:` step には適用されません（`workflow:` 側の `retry`/`timeout` はサブワークフロー
+  自身の step に設定してください。呼び出し元の既定値をそこに重ねて適用すると、サブワーク
+  フロー側が既に継承している既定値と二重になってしまうためです）。
+- `retry`/`timeout` はそれぞれ独立してフォールバックしますが、`retry` は
+  `max_attempts`/`delay_seconds`/`backoff` を**まとめて1つの単位として**フォールバックします
+  （フィールドごとに個別マージはしません）。つまり step 側に
+  `retry: { max_attempts: 2 }` だけを書くと、`delay_seconds`/`backoff` は
+  `default.retry` の値ではなく、それぞれの既定値（`0`/`1.0`）になります。
+- `switch`/`parallel`/`loop`/`for_each`/`on_error` の内側の step にもこの既定値は届きます
+  （これらは自分では `retry`/`timeout` を持てず、内側の step へ処理を委ねるだけのため）。
+- `retry.max_attempts` は必須かつ1以上、`timeout` は1以上である必要があります（step 単位の
+  `retry`/`timeout` と同じ検証です）。
 
 ## 条件分岐（`when` / `switch`）
 

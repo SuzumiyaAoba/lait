@@ -107,17 +107,41 @@ fn resolve_request_settings(
         Some(resolved) => resolved,
         None => config::resolve_model(model_name, file_config)?,
     };
+    // `${VAR}` placeholders are only expanded in values sourced from
+    // `lait.config.yml`/a workflow's `models:` (see
+    // `config::expand_env_placeholders`), never in a `--base-url`/`--api-key`
+    // CLI override, which the shell already expands on its own.
+    let resolved_base_url = resolved_model
+        .base_url
+        .as_deref()
+        .map(config::expand_env_placeholders)
+        .transpose()?;
+    let config_base_url = file_config
+        .base_url
+        .as_deref()
+        .map(config::expand_env_placeholders)
+        .transpose()?;
     let base_url = base_url_override
-        .or_else(|| resolved_model.base_url.clone())
-        .or_else(|| file_config.base_url.clone())
+        .or(resolved_base_url)
+        .or(config_base_url)
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
     let base_url = base_url.trim_end_matches('/').to_owned();
     if base_url.is_empty() {
         return Err(anyhow!("base URL must not be empty"));
     }
+    let resolved_api_key = resolved_model
+        .api_key
+        .as_deref()
+        .map(config::expand_env_placeholders)
+        .transpose()?;
+    let config_api_key = file_config
+        .api_key
+        .as_deref()
+        .map(config::expand_env_placeholders)
+        .transpose()?;
     let api_key = api_key_override
-        .or_else(|| resolved_model.api_key.clone())
-        .or_else(|| file_config.api_key.clone())
+        .or(resolved_api_key)
+        .or(config_api_key)
         .unwrap_or_else(|| {
             // async-openai always builds an Authorization header from its config.
             // LM Studio ignores the value, so use a non-empty dummy key when no
@@ -267,6 +291,14 @@ const MAX_WORKFLOW_DEPTH: usize = 32;
 struct WorkflowScope {
     default_model: Option<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
+    /// Fallback `retry`/`timeout` for a step that calls a model
+    /// (`prompt`/`agent`) and doesn't set its own (see
+    /// `execute_step_with_retry`). Merged across `workflow:` nesting the same
+    /// way as `default_model`/`default_reasoning_effort`: a sub-workflow's own
+    /// `default.retry`/`default.timeout` wins, falling back to its caller's
+    /// when unset.
+    default_retry: Option<workflow::RetryDefinition>,
+    default_timeout: Option<u64>,
     models: ModelMap,
     json_schemas: schema::JsonSchemaMap,
     /// Directory relative paths in this scope's workflow file (currently
@@ -291,6 +323,8 @@ impl WorkflowScope {
         Ok(Self {
             default_model: wf.default.model.clone(),
             default_reasoning_effort: wf.default.reasoning_effort,
+            default_retry: wf.default.retry.clone(),
+            default_timeout: wf.default.timeout,
             models: wf.models.clone(),
             json_schemas: wf.json_schemas.clone(),
             base_dir,
@@ -361,6 +395,12 @@ impl WorkflowScope {
                 .default
                 .reasoning_effort
                 .or(self.default_reasoning_effort),
+            default_retry: sub_wf
+                .default
+                .retry
+                .clone()
+                .or_else(|| self.default_retry.clone()),
+            default_timeout: sub_wf.default.timeout.or(self.default_timeout),
             models,
             json_schemas,
             base_dir,
@@ -878,11 +918,19 @@ fn run_steps<'a>(
     })
 }
 
-/// Runs `execute_step`, applying `step.timeout` to each attempt and retrying
-/// per `step.retry` on failure (a timed-out attempt counts as a failure).
-/// Returns the last attempt's error once `retry.max_attempts` (or 1, with no
-/// `retry`) is exhausted; the caller decides whether to run `on_error` or
-/// propagate it.
+/// Runs `execute_step`, applying an effective timeout to each attempt and
+/// retrying per an effective `retry` on failure (a timed-out attempt counts
+/// as a failure). "Effective" means the step's own `retry`/`timeout` if set,
+/// else `scope`'s `default_retry`/`default_timeout` (see
+/// `WorkflowScope::default_retry`) — but only for a step that calls a model
+/// (`prompt`/`agent`): a `jq`-only or `workflow:` step never falls back to
+/// the workflow default (a `workflow:` step's own `retry`/`timeout` are
+/// rejected by `validate::validate_steps` in favor of the sub-workflow's own
+/// steps setting theirs, and applying the *caller's* default on top of that
+/// would double up whatever the sub-workflow's own steps already inherit).
+/// Returns the last attempt's error once the effective `max_attempts` (or 1,
+/// with no effective `retry`) is exhausted; the caller decides whether to run
+/// `on_error` or propagate it.
 async fn execute_step_with_retry(
     step: &workflow::StepDefinition,
     current_input: &str,
@@ -892,19 +940,22 @@ async fn execute_step_with_retry(
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
-    let max_attempts = step
-        .retry
-        .as_ref()
+    let calls_model = step.prompt.is_some() || step.agent.is_some();
+    let effective_retry = step.retry.as_ref().or(calls_model
+        .then_some(scope.default_retry.as_ref())
+        .flatten());
+    let effective_timeout = step
+        .timeout
+        .or(calls_model.then_some(scope.default_timeout).flatten());
+
+    let max_attempts = effective_retry
         .and_then(|retry| retry.max_attempts)
         .unwrap_or(1);
-    let backoff = step
-        .retry
-        .as_ref()
+    let backoff = effective_retry
         .and_then(|retry| retry.backoff)
         .unwrap_or(1.0);
     let mut delay = Duration::from_secs(
-        step.retry
-            .as_ref()
+        effective_retry
             .and_then(|retry| retry.delay_seconds)
             .unwrap_or(0),
     );
@@ -912,7 +963,7 @@ async fn execute_step_with_retry(
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        let outcome = match step.timeout {
+        let outcome = match effective_timeout {
             Some(seconds) => {
                 match tokio::time::timeout(
                     Duration::from_secs(seconds),
@@ -1104,6 +1155,15 @@ async fn execute_step(
     if let Some(filter) = &step.jq {
         step_output = jq::apply(filter, &step_output, steps_outputs)
             .with_context(|| format!("step '{label}'"))?;
+    }
+
+    if let Some(path) = &step.write_file {
+        std::fs::write(path, &step_output).with_context(|| {
+            format!(
+                "step '{label}': failed to write output to '{}'",
+                path.display()
+            )
+        })?;
     }
 
     Ok(step_output)

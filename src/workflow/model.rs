@@ -2,11 +2,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::{
-    cli::ReasoningEffort,
-    config::{DefaultSettings, ModelMap},
-    schema::JsonSchemaMap,
-};
+use crate::{cli::ReasoningEffort, config::ModelMap, schema::JsonSchemaMap};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,7 +10,7 @@ pub(crate) struct WorkflowFile {
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
     #[serde(default)]
-    pub(crate) default: DefaultSettings,
+    pub(crate) default: WorkflowDefaults,
     /// Model aliases usable by `default.model`/`steps[].model`, in the same shape as
     /// `lait.config.yml`'s top-level `models:`. Takes precedence over an alias of
     /// the same name defined in `lait.config.yml`.
@@ -26,6 +22,30 @@ pub(crate) struct WorkflowFile {
     #[serde(default)]
     pub(crate) json_schemas: JsonSchemaMap,
     pub(crate) steps: Vec<StepDefinition>,
+}
+
+/// A workflow file's `default:` block: the same `model`/`reasoning_effort`
+/// fallback as `lait.config.yml`'s `default:` (see
+/// `config::DefaultSettings`), plus a workflow-only `retry`/`timeout`
+/// fallback applied to any step that calls a model (`prompt`/`agent`) and
+/// doesn't set its own (see `StepDefinition::retry`/`timeout`). Kept as its
+/// own type rather than reusing `config::DefaultSettings` (`#[serde(flatten)]`
+/// is documented as incompatible with `#[serde(deny_unknown_fields)]`, which
+/// both this and `DefaultSettings` rely on to reject typos).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowDefaults {
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Fallback `retry` for any step that calls a model (`prompt`/`agent`)
+    /// and doesn't set its own. Falls back as a whole struct, not
+    /// field-by-field: a step with its own `retry: { max_attempts: 2 }` gets
+    /// `delay_seconds: 0`/`backoff: 1.0` (the field's own defaults), not this
+    /// `default.retry`'s `delay_seconds`/`backoff`.
+    pub(crate) retry: Option<RetryDefinition>,
+    /// Fallback `timeout` (seconds) for any step that calls a model
+    /// (`prompt`/`agent`) and doesn't set its own.
+    pub(crate) timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,14 +100,27 @@ pub(crate) struct StepDefinition {
     /// running input if there is no `prompt`) before it becomes `{{ input }}` for
     /// the next step. The filtered value must be valid JSON.
     pub(crate) jq: Option<String>,
+    /// Writes this step's final output (after `jq`, if set) to this path,
+    /// overwriting it if it already exists (parent directories are not
+    /// created automatically). Resolved relative to the current working
+    /// directory, like `agent:` (not relative to the workflow file, unlike
+    /// `workflow:`). Does not change what becomes `{{ input }}` for the next
+    /// step. Rejected inside a `for_each` body whose `max_concurrency` is
+    /// above 1, where every concurrently running item would write the same
+    /// static path.
+    pub(crate) write_file: Option<PathBuf>,
     /// Retries this step's action (`input_schema` check, `prompt`/`agent`
     /// call, and `jq`, as one unit) up to `max_attempts` times on failure.
     /// Applies before `on_error`, which only runs once every attempt here
-    /// has failed.
+    /// has failed. Falls back to the workflow's `default.retry` (as a whole
+    /// struct, not merged field-by-field) when unset on a step that calls a
+    /// model (`prompt`/`agent`); a `jq`-only or `workflow:` step never retries
+    /// on its own account.
     pub(crate) retry: Option<RetryDefinition>,
     /// A per-attempt time limit, in seconds, on this step's action. A timed
     /// out attempt counts as a failure for `retry`, the same as any other
-    /// error.
+    /// error. Falls back to the workflow's `default.timeout` under the same
+    /// rule as `retry` above.
     pub(crate) timeout: Option<u64>,
     /// Runs in place of failing the workflow when this step's action (after
     /// every `retry` attempt, if any) still fails. Its steps receive
@@ -161,7 +194,7 @@ impl StepDefinition {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RetryDefinition {
     /// The total number of attempts, including the first (i.e. `3` means "try
