@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 
 use super::model::{
-    ForEachDefinition, LoopDefinition, ParallelDefinition, Router, StepDefinition, SwitchDefinition,
+    ForEachDefinition, LoopDefinition, ParallelDefinition, RetryDefinition, Router, StepDefinition,
+    SwitchDefinition, WorkflowDefaults,
 };
 
 /// A named predicate over a `StepDefinition`, used by `ACTION_FIELDS`.
@@ -22,6 +23,7 @@ const ACTION_FIELDS: &[ActionField] = &[
     ("output_schema", |step| step.output_schema.is_some()),
     ("schema_name", |step| step.schema_name.is_some()),
     ("jq", |step| step.jq.is_some()),
+    ("write_file", |step| step.write_file.is_some()),
     ("retry", |step| step.retry.is_some()),
     ("timeout", |step| step.timeout.is_some()),
     ("on_error", |step| step.on_error.is_some()),
@@ -65,22 +67,29 @@ fn reject_action_fields_on_router(
 }
 
 /// Tracks the lexical nesting `validate_steps` is currently inside, used to
-/// validate `break`/`stop` placement. `in_loop` requires an enclosing
-/// `loop`/`for_each` body reachable without crossing a `parallel` branch
-/// boundary (concurrently running branches can't share a single loop's break
-/// target, so entering a branch resets it). `in_parallel_branch` marks any
-/// depth inside a `parallel` branch, since there is no well-defined "the
+/// validate `break`/`stop`/`write_file` placement. `in_loop` requires an
+/// enclosing `loop`/`for_each` body reachable without crossing a `parallel`
+/// branch boundary (concurrently running branches can't share a single loop's
+/// break target, so entering a branch resets it). `in_parallel_branch` marks
+/// any depth inside a `parallel` branch, since there is no well-defined "the
 /// workflow" to `stop` while sibling branches may still be running.
+/// `in_concurrent_for_each` marks depth inside a `for_each` body whose
+/// `max_concurrency` is above 1: unlike a `parallel` branch (a distinct,
+/// separately-authored step list per branch), every concurrently running item
+/// there executes the exact same step list, so a `write_file` with its static
+/// path would race against itself.
 #[derive(Clone, Copy)]
 pub(super) struct FlowContext {
     in_loop: bool,
     in_parallel_branch: bool,
+    in_concurrent_for_each: bool,
 }
 
 impl FlowContext {
     pub(super) const TOP_LEVEL: Self = Self {
         in_loop: false,
         in_parallel_branch: false,
+        in_concurrent_for_each: false,
     };
 
     fn in_loop_body(self) -> Self {
@@ -94,6 +103,15 @@ impl FlowContext {
         Self {
             in_loop: false,
             in_parallel_branch: true,
+            ..self
+        }
+    }
+
+    fn in_concurrent_for_each_body(self) -> Self {
+        Self {
+            in_loop: false,
+            in_parallel_branch: true,
+            in_concurrent_for_each: true,
         }
     }
 }
@@ -145,21 +163,16 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         }
 
         if let Some(retry) = &step.retry {
-            match retry.max_attempts {
-                None => bail!(
-                    "step '{}' has 'retry' with no 'max_attempts' (required)",
-                    label
-                ),
-                Some(0) => bail!(
-                    "step '{}' has 'retry' with 'max_attempts: 0'; it must be at least 1",
-                    label
-                ),
-                Some(_) => {}
-            }
+            validate_retry(retry, &format!("step '{label}'"))?;
         }
-        if step.timeout == Some(0) {
+        if let Some(timeout) = step.timeout {
+            validate_timeout(timeout, &format!("step '{label}'"))?;
+        }
+        if step.write_file.is_some() && ctx.in_concurrent_for_each {
             bail!(
-                "step '{}' has 'timeout: 0'; it must be at least 1 second",
+                "step '{}' has 'write_file' set inside a 'for_each' body with 'max_concurrency' \
+                 above 1; every concurrently running item would write the same static path. \
+                 Move it after the 'for_each' step, or set 'max_concurrency: 1'",
                 label
             );
         }
@@ -191,10 +204,16 @@ pub(super) fn validate_steps(steps: &[StepDefinition], ctx: FlowContext) -> Resu
         }
 
         let calls_model = step.prompt.is_some() || step.agent.is_some() || step.workflow.is_some();
-        if !calls_model && step.jq.is_none() && step.stop.is_none() && step.r#break.is_none() {
+        if !calls_model
+            && step.jq.is_none()
+            && step.write_file.is_none()
+            && step.stop.is_none()
+            && step.r#break.is_none()
+        {
             bail!(
                 "step '{}' must have a 'prompt', an 'agent', a 'workflow', a 'jq' filter, a \
-                 'switch', a 'parallel', a 'loop', a 'for_each', 'stop', 'break', or a combination",
+                 'write_file' path, a 'switch', a 'parallel', a 'loop', a 'for_each', 'stop', \
+                 'break', or a combination",
                 label
             );
         }
@@ -368,9 +387,9 @@ fn validate_loop(
 /// `ACTION_FIELDS` set, requires non-empty `steps` and a `max_concurrency` of
 /// at least 1 (when set), then recurses into `steps` with
 /// `ctx.in_loop_body()` for a sequential `for_each` (`max_concurrency <= 1`,
-/// the default) or `ctx.in_parallel_branch()` for a concurrent one — see
-/// `FlowContext`'s doc comment for why that distinction matters for
-/// `break`/`stop` validation.
+/// the default) or `ctx.in_concurrent_for_each_body()` for a concurrent one —
+/// see `FlowContext`'s doc comment for why that distinction matters for
+/// `break`/`stop`/`write_file` validation.
 fn validate_for_each(
     step: &StepDefinition,
     for_each: &ForEachDefinition,
@@ -390,10 +409,46 @@ fn validate_for_each(
         None => 1,
     };
     let item_ctx = if max_concurrency > 1 {
-        ctx.in_parallel_branch()
+        ctx.in_concurrent_for_each_body()
     } else {
         ctx.in_loop_body()
     };
     validate_steps(&for_each.steps, item_ctx)?;
+    Ok(())
+}
+
+/// Validates a `retry` block (a step's own, or the workflow's
+/// `default.retry`): `max_attempts` is required and must be at least 1.
+/// `description` names what's being validated (e.g. `"step 'foo'"` or
+/// `"the workflow's 'default.retry'"`) for the error message.
+fn validate_retry(retry: &RetryDefinition, description: &str) -> Result<()> {
+    match retry.max_attempts {
+        None => bail!("{description} has 'retry' with no 'max_attempts' (required)"),
+        Some(0) => bail!("{description} has 'retry' with 'max_attempts: 0'; it must be at least 1"),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Validates a `timeout` value (a step's own, or the workflow's
+/// `default.timeout`): must be at least 1 second. `description` is used the
+/// same way as in `validate_retry`.
+fn validate_timeout(timeout: u64, description: &str) -> Result<()> {
+    if timeout == 0 {
+        bail!("{description} has 'timeout: 0'; it must be at least 1 second");
+    }
+    Ok(())
+}
+
+/// Validates a workflow file's top-level `default:` block: its `retry`/
+/// `timeout`, if set, follow the same rules as a step's own (see
+/// `validate_retry`/`validate_timeout`). `model`/`reasoning_effort` need no
+/// validation here (any string/`ReasoningEffort` value is acceptable).
+pub(super) fn validate_workflow_defaults(defaults: &WorkflowDefaults) -> Result<()> {
+    if let Some(retry) = &defaults.retry {
+        validate_retry(retry, "the workflow's 'default.retry'")?;
+    }
+    if let Some(timeout) = defaults.timeout {
+        validate_timeout(timeout, "the workflow's 'default.timeout'")?;
+    }
     Ok(())
 }

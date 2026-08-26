@@ -984,6 +984,56 @@ steps:
 }
 
 #[test]
+fn rejects_write_file_inside_a_for_each_with_max_concurrency_above_one() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - for_each:
+      items: '.items'
+      max_concurrency: 2
+      steps:
+        - jq: '.'
+          write_file: out.txt
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn allows_write_file_inside_a_sequential_for_each() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - for_each:
+      items: '.items'
+      steps:
+        - jq: '.'
+          write_file: out.txt
+"#,
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn rejects_write_file_inside_a_sequential_for_each_nested_in_a_concurrent_one() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - for_each:
+      items: '.outer'
+      max_concurrency: 2
+      steps:
+        - for_each:
+            items: '.inner'
+            steps:
+              - jq: '.'
+                write_file: out.txt
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn rejects_a_for_each_combined_with_when() {
     let result = parse_workflow(
         r#"
@@ -1313,6 +1363,112 @@ steps:
         - when: 'true'
           steps:
             - prompt: "{{ input }}"
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn parses_a_step_with_write_file() {
+    let workflow = parse_workflow(
+        r#"
+steps:
+  - prompt: "{{ input }}"
+    write_file: out.txt
+"#,
+    )
+    .expect("workflow with write_file should parse");
+
+    assert_eq!(
+        workflow.steps[0].write_file,
+        Some(std::path::PathBuf::from("out.txt"))
+    );
+}
+
+#[test]
+fn allows_a_step_with_only_write_file() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - write_file: out.txt
+"#,
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn rejects_a_switch_combined_with_write_file() {
+    let result = parse_workflow(
+        r#"
+steps:
+  - write_file: out.txt
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - prompt: "{{ input }}"
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn parses_a_workflow_default_retry_and_timeout() {
+    let workflow = parse_workflow(
+        r#"
+default:
+  retry:
+    max_attempts: 3
+    delay_seconds: 1
+    backoff: 2.0
+  timeout: 30
+steps:
+  - prompt: "{{ input }}"
+"#,
+    )
+    .expect("workflow with default retry/timeout should parse");
+
+    let retry = workflow.default.retry.as_ref().unwrap();
+    assert_eq!(retry.max_attempts, Some(3));
+    assert_eq!(workflow.default.timeout, Some(30));
+}
+
+#[test]
+fn rejects_a_workflow_default_retry_with_no_max_attempts() {
+    let result = parse_workflow(
+        r#"
+default:
+  retry:
+    delay_seconds: 1
+steps:
+  - prompt: "{{ input }}"
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_default_retry_with_max_attempts_zero() {
+    let result = parse_workflow(
+        r#"
+default:
+  retry:
+    max_attempts: 0
+steps:
+  - prompt: "{{ input }}"
+"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_default_timeout_of_zero() {
+    let result = parse_workflow(
+        r#"
+default:
+  timeout: 0
+steps:
+  - prompt: "{{ input }}"
 "#,
     );
     assert!(result.is_err());

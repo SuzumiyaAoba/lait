@@ -1608,3 +1608,171 @@ fn a_workflow_step_cycle_is_rejected() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cycle"), "stderr: {stderr}");
 }
+
+#[test]
+fn write_file_writes_the_steps_output_without_changing_what_flows_downstream() {
+    let server = MockServer::start_sequence(&[
+        ("200 OK", CHAT_COMPLETION_BODY),
+        ("200 OK", CHAT_COMPLETION_BODY),
+    ]);
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let output_path = std::env::temp_dir().join(format!("lait-test-write-file-{unique}.txt"));
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - id: written
+    prompt: "{{{{ input }}}}"
+    write_file: "{}"
+  - prompt: "echo: {{{{ steps.written }}}}"
+"#,
+        server.base_url,
+        output_path.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    server.receive_request();
+    server.receive_request();
+    server.finish();
+
+    let written = std::fs::read_to_string(&output_path);
+    std::fs::remove_file(&output_path).ok();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        written.expect("write_file should have created the output file"),
+        "mock response"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "mock response",
+        "the next step should still see write_file's own (unmodified) output"
+    );
+}
+
+#[test]
+fn a_default_retry_recovers_a_step_without_its_own_retry() {
+    let server = MockServer::start_sequence(&[
+        ("500 Internal Server Error", SERVER_ERROR_BODY),
+        ("200 OK", CHAT_COMPLETION_BODY),
+    ]);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+  retry:
+    max_attempts: 2
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{{{ input }}}}"
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    server.receive_request();
+    server.receive_request();
+    server.finish();
+
+    assert!(
+        output.status.success(),
+        "the workflow's 'default.retry' should have recovered the step: {output:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "mock response"
+    );
+}
+
+#[test]
+fn an_env_var_placeholder_expands_in_a_workflow_models_api_key() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+        api_key: "${{LAIT_TEST_ENV_API_KEY}}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{{{ input }}}}"
+"#,
+        server.base_url
+    ));
+
+    let output = test_command()
+        .env("LAIT_TEST_ENV_API_KEY", "secret-from-env")
+        .arg("run")
+        .arg(&workflow.path)
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait run");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer secret-from-env"),
+        "headers: {}",
+        request.headers
+    );
+}
+
+#[test]
+fn an_unset_env_var_placeholder_fails_with_a_clear_error() {
+    let workflow = WorkflowFile::new(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: http://127.0.0.1:65535/v1
+        api_key: "${LAIT_TEST_ENV_DEFINITELY_UNSET}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{ input }}"
+"#,
+    );
+
+    let output = test_command()
+        .env_remove("LAIT_TEST_ENV_DEFINITELY_UNSET")
+        .arg("run")
+        .arg(&workflow.path)
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(
+        !output.status.success(),
+        "expected a missing env var placeholder to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LAIT_TEST_ENV_DEFINITELY_UNSET"),
+        "stderr: {stderr}"
+    );
+}
