@@ -1,0 +1,13 @@
+{
+  "title": "ドキュメント",
+  "pages": [
+    "index",
+    "getting-started",
+    "config",
+    "workflow",
+    "agent",
+    "output",
+    "troubleshooting",
+    "development"
+  ]
+}
