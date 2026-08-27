@@ -45,20 +45,26 @@ impl McpRegistry {
 
     /// Connects to (or reuses an existing connection to) every server in
     /// `names`, lists their tools, and returns them qualified and converted
-    /// to OpenAI's `tools:` shape. `names` with no `mcp_servers:` entry is an
-    /// error naming `lait.config.yml`'s `mcp_servers:`, since that can only
-    /// be caught here (workflow/agent-file parsing never sees the config
-    /// file).
+    /// to OpenAI's `tools:` shape. Servers are connected to and listed
+    /// concurrently (each is an independent round trip), not one at a time.
+    /// `names` with no `mcp_servers:` entry is an error naming
+    /// `lait.config.yml`'s `mcp_servers:`, since that can only be caught here
+    /// (workflow/agent-file parsing never sees the config file).
     pub(crate) async fn tools(&self, names: &[String]) -> Result<ToolSet> {
-        let mut tools = Vec::new();
-        let mut index = HashMap::new();
-        for name in names {
+        let per_server = futures_util::future::try_join_all(names.iter().map(|name| async move {
             let connection = self.connection(name).await?;
             let server_tools = list_all_tools(&connection)
                 .await
                 .with_context(|| format!("failed to list tools for MCP server '{name}'"))?;
+            Ok::<_, anyhow::Error>((name.clone(), server_tools))
+        }))
+        .await?;
+
+        let mut tools = Vec::new();
+        let mut index = HashMap::new();
+        for (name, server_tools) in per_server {
             for tool in server_tools {
-                let qualified = qualify_tool_name(name, &tool.name)?;
+                let qualified = qualify_tool_name(&name, &tool.name)?;
                 if let Some((existing_server, existing_tool)) = index.get(&qualified) {
                     bail!(
                         "MCP tool name collision: '{name}'.'{}' and '{existing_server}'.'{existing_tool}' both qualify to '{qualified}'",
@@ -119,14 +125,20 @@ impl McpRegistry {
             format!("MCP server '{server_name}' failed to run tool '{tool_name}'")
         })?;
 
-        Ok(render_tool_result(&result))
+        Ok(render_tool_result(result))
     }
 
     /// Returns the running connection for `name`, connecting lazily (and
-    /// caching the result) on first use.
+    /// caching the result) on first use. The lock is never held across the
+    /// connect itself (spawning a child process or doing an HTTP handshake,
+    /// both real wall-clock I/O) — only to check/populate the cache — so
+    /// first-time connections to independent servers (e.g. two `parallel`
+    /// branches each first-using a different server) proceed concurrently
+    /// instead of queuing behind one another. A race where two callers both
+    /// connect to the same new server at once is resolved by keeping
+    /// whichever one wins the final cache insert and dropping the other.
     async fn connection(&self, name: &str) -> Result<Arc<RunningService<RoleClient, ()>>> {
-        let mut connections = self.connections.lock().await;
-        if let Some(existing) = connections.get(name) {
+        if let Some(existing) = self.connections.lock().await.get(name) {
             return Ok(existing.clone());
         }
         let server = self.servers.get(name).ok_or_else(|| {
@@ -137,7 +149,13 @@ impl McpRegistry {
         })?;
         let transport = server.resolve_transport(name)?;
         let running = Arc::new(connect(name, transport).await?);
-        connections.insert(name.to_owned(), running.clone());
+        let running = self
+            .connections
+            .lock()
+            .await
+            .entry(name.to_owned())
+            .or_insert(running)
+            .clone();
         Ok(running)
     }
 }
@@ -242,16 +260,19 @@ fn qualify_tool_name(server: &str, tool: &str) -> Result<String> {
 /// resource) JSON-serialized so nothing is silently dropped. `is_error` is
 /// not treated specially — the model sees the error content and decides how
 /// to react, the same way a real assistant sees a failed shell command.
-fn render_tool_result(result: &rmcp::model::CallToolResult) -> String {
+/// Takes `result` by value (the caller never reuses it) so a text block's
+/// content can be moved into the output instead of cloned — tool output can
+/// be large (file contents, search results, ...).
+fn render_tool_result(result: rmcp::model::CallToolResult) -> String {
     if result.content.is_empty() {
         return String::new();
     }
     result
         .content
-        .iter()
-        .map(|block| match block.as_text() {
-            Some(text) => text.text.clone(),
-            None => serde_json::to_string(block).unwrap_or_default(),
+        .into_iter()
+        .map(|block| match block {
+            rmcp::model::ContentBlock::Text(text) => text.text,
+            other => serde_json::to_string(&other).unwrap_or_default(),
         })
         .collect::<Vec<_>>()
         .join("\n\n")

@@ -1,9 +1,9 @@
 mod support;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 
-use support::{ConfigDirectory, MockServer, test_command, without_json_whitespace};
+use support::{ConfigDirectory, MockServer, read_request, test_command, without_json_whitespace};
 
 /// A hand-rolled streamable-HTTP MCP server for integration tests: routes on
 /// the JSON-RPC `method` field (something `support::MockServer` can't do,
@@ -11,6 +11,8 @@ use support::{ConfigDirectory, MockServer, test_command, without_json_whitespace
 /// `initialize` / `notifications/initialized` / `tools/list` / `tools/call` —
 /// the four requests one tool-call round trip makes. Exposes a single tool,
 /// `echo`, that always returns a fixed string regardless of its arguments.
+/// Request parsing itself reuses `support::read_request`, the same raw
+/// header/`Content-Length`/body reader `support::MockServer` uses.
 fn start_mock_mcp_server() -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock MCP server");
     let addr = listener
@@ -19,38 +21,9 @@ fn start_mock_mcp_server() -> (String, std::thread::JoinHandle<()>) {
     let handle = std::thread::spawn(move || {
         for _ in 0..4 {
             let (mut stream, _) = listener.accept().expect("failed to accept connection");
-            let mut buf = Vec::new();
-            let header_end = loop {
-                let mut chunk = [0u8; 4096];
-                let read = stream.read(&mut chunk).expect("failed to read request");
-                assert!(read > 0, "connection closed before headers were complete");
-                buf.extend_from_slice(&chunk[..read]);
-                if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break position + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-            let content_length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            while buf.len() < header_end + content_length {
-                let mut chunk = [0u8; 4096];
-                let read = stream
-                    .read(&mut chunk)
-                    .expect("failed to read request body");
-                assert!(read > 0, "connection closed before body was complete");
-                buf.extend_from_slice(&chunk[..read]);
-            }
-            let body =
-                String::from_utf8_lossy(&buf[header_end..header_end + content_length]).into_owned();
+            let request = read_request(&mut stream).expect("failed to read MCP request");
             let request: serde_json::Value =
-                serde_json::from_str(&body).expect("mock MCP server got non-JSON body");
+                serde_json::from_str(&request.body).expect("mock MCP server got non-JSON body");
             let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
             let id = request.get("id").cloned();
 

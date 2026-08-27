@@ -120,8 +120,12 @@ pub(crate) struct ChatArgs {
 
     /// Name of an `mcp_servers:` entry (from lait.config.yml) whose tools
     /// this request may call. Repeatable. Falls back to `default.mcp` in
-    /// lait.config.yml when unset. Incompatible with `--stream`.
-    #[arg(long = "mcp", value_name = "NAME")]
+    /// lait.config.yml when unset. Incompatible with `--stream` (a streamed
+    /// `tool_calls` field arrives as fragments lait does not yet reassemble;
+    /// see `RequestSettings::complete_stream`). `default.mcp` alone, with no
+    /// `--mcp` flag, is caught later at request-resolve time instead — clap
+    /// can only see flags actually passed on this invocation's command line.
+    #[arg(long = "mcp", value_name = "NAME", conflicts_with = "stream")]
     pub(crate) mcp: Vec<String>,
 
     /// A single prompt to send as a user message.

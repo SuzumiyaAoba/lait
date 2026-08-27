@@ -80,6 +80,32 @@ struct RequestSettings {
 }
 
 impl RequestSettings {
+    /// Builds an `llm::CompletionRequest` from these settings plus the
+    /// per-call `response_format`/`messages`/`tools`. The `base_url`/
+    /// `api_key`/`model_id`/sampling fields are the same for every request
+    /// `self` ever builds, so `complete`'s tool loop, `complete_once`, and
+    /// `complete_stream` all go through here instead of repeating that field
+    /// list at each call site.
+    fn request<'a>(
+        &'a self,
+        response_format: Option<ResponseFormat>,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &'a [ChatCompletionTools],
+    ) -> llm::CompletionRequest<'a> {
+        llm::CompletionRequest {
+            base_url: &self.base_url,
+            api_key: &self.api_key,
+            model_id: &self.resolved_model.model_id,
+            reasoning_effort: self.sampling.reasoning_effort,
+            temperature: self.sampling.temperature,
+            top_p: self.sampling.top_p,
+            max_tokens: self.sampling.max_tokens,
+            response_format,
+            messages,
+            tools,
+        }
+    }
+
     /// Sends a completion request built from these settings, driving a
     /// tool-call loop when `self.mcp` names at least one MCP server: each
     /// round sends the growing message history to the model, and if it comes
@@ -120,19 +146,8 @@ impl RequestSettings {
                 );
             }
 
-            let response = llm::complete(llm::CompletionRequest {
-                base_url: &self.base_url,
-                api_key: &self.api_key,
-                model_id: &self.resolved_model.model_id,
-                reasoning_effort: self.sampling.reasoning_effort,
-                temperature: self.sampling.temperature,
-                top_p: self.sampling.top_p,
-                max_tokens: self.sampling.max_tokens,
-                response_format: None,
-                messages: messages.clone(),
-                tools: &tool_set.tools,
-            })
-            .await?;
+            let response =
+                llm::complete(self.request(None, messages.clone(), &tool_set.tools)).await?;
 
             let tool_calls = response::first_message(&response)
                 .and_then(|message| message.tool_calls.as_ref())
@@ -145,19 +160,7 @@ impl RequestSettings {
                 // The model stopped calling tools; re-issue the same history
                 // once more with `response_format` attached, now that doing
                 // so can no longer suppress a tool call.
-                return llm::complete(llm::CompletionRequest {
-                    base_url: &self.base_url,
-                    api_key: &self.api_key,
-                    model_id: &self.resolved_model.model_id,
-                    reasoning_effort: self.sampling.reasoning_effort,
-                    temperature: self.sampling.temperature,
-                    top_p: self.sampling.top_p,
-                    max_tokens: self.sampling.max_tokens,
-                    response_format,
-                    messages,
-                    tools: &[],
-                })
-                .await;
+                return llm::complete(self.request(response_format, messages, &[])).await;
             };
 
             let tool_call_entries: Vec<ChatCompletionMessageToolCalls> = tool_calls
@@ -183,20 +186,29 @@ impl RequestSettings {
                 assistant_message.build()?,
             ));
 
-            for tool_call in tool_calls {
-                let result = registry
-                    .call(
-                        &tool_set,
-                        &tool_call.function.name,
-                        &tool_call.function.arguments,
-                    )
-                    .await?;
-                let tool_message = ChatCompletionRequestToolMessageArgs::default()
-                    .content(result)
-                    .tool_call_id(tool_call.id.clone())
-                    .build()?;
-                messages.push(ChatCompletionRequestMessage::from(tool_message));
-            }
+            // A model turn's `tool_calls` are independent by construction (it
+            // couldn't have seen one call's result before deciding on
+            // another), so they're run concurrently rather than one at a
+            // time; `try_join_all` preserves `tool_calls`' order regardless
+            // of completion order, so the appended `tool`-role messages stay
+            // in a stable, deterministic order.
+            let tool_messages =
+                futures_util::future::try_join_all(tool_calls.iter().map(|tool_call| async {
+                    let result = registry
+                        .call(
+                            &tool_set,
+                            &tool_call.function.name,
+                            &tool_call.function.arguments,
+                        )
+                        .await?;
+                    let tool_message = ChatCompletionRequestToolMessageArgs::default()
+                        .content(result)
+                        .tool_call_id(tool_call.id.clone())
+                        .build()?;
+                    Ok::<_, anyhow::Error>(ChatCompletionRequestMessage::from(tool_message))
+                }))
+                .await?;
+            messages.extend(tool_messages);
         }
     }
 
@@ -209,19 +221,8 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         tools: &[ChatCompletionTools],
     ) -> Result<response::ChatCompletionResponse> {
-        llm::complete(llm::CompletionRequest {
-            base_url: &self.base_url,
-            api_key: &self.api_key,
-            model_id: &self.resolved_model.model_id,
-            reasoning_effort: self.sampling.reasoning_effort,
-            temperature: self.sampling.temperature,
-            top_p: self.sampling.top_p,
-            max_tokens: self.sampling.max_tokens,
-            response_format,
-            messages: llm::initial_messages(system_prompt, prompt)?,
-            tools,
-        })
-        .await
+        let messages = llm::initial_messages(system_prompt, prompt)?;
+        llm::complete(self.request(response_format, messages, tools)).await
     }
 
     /// Like [`RequestSettings::complete`], but requests a streamed response.
@@ -240,19 +241,8 @@ impl RequestSettings {
                 "'--stream'/streaming is not supported together with 'mcp:' yet; drop one of them"
             );
         }
-        llm::complete_stream(llm::CompletionRequest {
-            base_url: &self.base_url,
-            api_key: &self.api_key,
-            model_id: &self.resolved_model.model_id,
-            reasoning_effort: self.sampling.reasoning_effort,
-            temperature: self.sampling.temperature,
-            top_p: self.sampling.top_p,
-            max_tokens: self.sampling.max_tokens,
-            response_format,
-            messages: llm::initial_messages(system_prompt, prompt)?,
-            tools: &[],
-        })
-        .await
+        let messages = llm::initial_messages(system_prompt, prompt)?;
+        llm::complete_stream(self.request(response_format, messages, &[])).await
     }
 }
 
@@ -432,16 +422,14 @@ fn resolve_request_settings(
         .mcp
         .or_else(|| file_config.default.mcp.clone())
         .unwrap_or_default();
-    let max_tool_rounds = mcp_overrides
+    let raw_max_tool_rounds = mcp_overrides
         .max_tool_rounds
-        .or(file_config.default.max_tool_rounds)
-        .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
-    if max_tool_rounds == 0 {
-        bail!(
-            "the request for model '{}' has 'max_tool_rounds: 0'; it must be at least 1",
-            resolved_model.model_id
-        );
-    }
+        .or(file_config.default.max_tool_rounds);
+    llm::validate_max_tool_rounds(
+        raw_max_tool_rounds,
+        &format!("the request for model '{}'", resolved_model.model_id),
+    )?;
+    let max_tool_rounds = raw_max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
 
     Ok(RequestSettings {
         base_url,

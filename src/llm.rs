@@ -109,6 +109,22 @@ pub(crate) fn validate_sampling_params(
     Ok(())
 }
 
+/// Checks a `max_tool_rounds` value (a CLI/agent-file/node/workflow-default
+/// setting, or the value once every fallback layer has resolved it) is at
+/// least 1, the same "validate eagerly everywhere, then again once resolved"
+/// pattern as [`validate_sampling_params`]. Called from `agent::parse_agent`,
+/// `workflow::validate::validate_node`/`validate_workflow_defaults`, and
+/// `app::resolve_request_settings`.
+pub(crate) fn validate_max_tool_rounds(
+    max_tool_rounds: Option<usize>,
+    description: &str,
+) -> Result<()> {
+    if max_tool_rounds == Some(0) {
+        bail!("{description} has 'max_tool_rounds: 0'; it must be at least 1");
+    }
+    Ok(())
+}
+
 /// A parsed SSE stream of `chat.completion.chunk` events, as returned by
 /// [`complete_stream`]. Each item is `Err` when a chunk fails to parse or the
 /// connection drops mid-stream.
@@ -117,14 +133,17 @@ pub(crate) type CompletionStream =
 
 /// Builds the request body shared by [`complete`] and [`complete_stream`];
 /// the two differ only in `stream` and in which `Chat::create*_byot` method
-/// the caller passes the result to.
+/// the caller passes the result to. Takes `request` by value (rather than
+/// `&CompletionRequest`) so `messages`/`response_format` can be moved into
+/// the builder instead of cloned — the caller never uses `request` again
+/// after this call.
 fn build_chat_request(
-    request: &CompletionRequest<'_>,
+    request: CompletionRequest<'_>,
     stream: bool,
 ) -> Result<CreateChatCompletionRequest> {
     let mut chat_request = CreateChatCompletionRequestArgs::default();
     chat_request.model(request.model_id);
-    chat_request.messages(request.messages.clone());
+    chat_request.messages(request.messages);
     chat_request.stream(stream);
     if let Some(reasoning_effort) = request.reasoning_effort {
         chat_request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
@@ -138,7 +157,7 @@ fn build_chat_request(
     if let Some(max_tokens) = request.max_tokens {
         chat_request.max_completion_tokens(max_tokens);
     }
-    if let Some(response_format) = request.response_format.clone() {
+    if let Some(response_format) = request.response_format {
         chat_request.response_format(response_format);
     }
     if !request.tools.is_empty() {
@@ -153,7 +172,7 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
         .with_api_key(request.api_key);
     let client = Client::with_config(config);
 
-    let chat_request = build_chat_request(&request, false)?;
+    let chat_request = build_chat_request(request, false)?;
     let response: ChatCompletionResponse = client.chat().create_byot(chat_request).await?;
     Ok(response)
 }
@@ -166,7 +185,7 @@ pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<Co
         .with_api_key(request.api_key);
     let client = Client::with_config(config);
 
-    let chat_request = build_chat_request(&request, true)?;
+    let chat_request = build_chat_request(request, true)?;
     let stream = client.chat().create_stream_byot(chat_request).await?;
     Ok(stream)
 }

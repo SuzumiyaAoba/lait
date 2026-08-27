@@ -96,9 +96,7 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
         frontmatter.max_tokens,
         "the agent file",
     )?;
-    if frontmatter.max_tool_rounds == Some(0) {
-        bail!("'max_tool_rounds: 0' is invalid; it must be at least 1");
-    }
+    llm::validate_max_tool_rounds(frontmatter.max_tool_rounds, "the agent file")?;
 
     Ok(AgentFile {
         name: frontmatter.name,
