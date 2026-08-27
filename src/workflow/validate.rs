@@ -110,13 +110,10 @@ impl FlowContext {
 
 pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowContext) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
-        // Same fallback `run_steps` uses for progress labels/`$steps` keys
-        // (`FlowStep::label`), so an error here always points at the same
-        // name the executor would show for this site.
-        let label = step
-            .label()
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("step-{}", index + 1));
+        // Same fallback `run_steps` uses for progress labels/`$steps` keys,
+        // so an error here always points at the same name the executor
+        // would show for this site.
+        let label = step.label_or(index + 1);
 
         let router_count = [
             step.switch.is_some(),
@@ -168,77 +165,56 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
             None => {}
         }
 
-        let Some(node_id) = &step.r#use else {
-            if step.stop.is_none() && step.r#break.is_none() {
-                bail!(
-                    "step '{}' must have a 'use', a 'switch', a 'parallel', a 'loop', a \
-                     'for_each', 'stop', 'break', or a combination",
-                    label
-                );
-            }
-            if step.on_error.is_some() {
-                bail!(
-                    "step '{}' has 'on_error' set without 'use'; there is no node action for it \
-                     to guard",
-                    label
-                );
-            }
-            if step.r#break == Some(true) && step.stop == Some(true) {
-                bail!(
-                    "step '{}' cannot have both 'stop: true' and 'break: true'",
-                    label
-                );
-            }
-            if step.r#break == Some(true) && !ctx.in_loop {
-                bail!(
-                    "step '{}' has 'break: true' outside a 'loop'/'for_each' body",
-                    label
-                );
-            }
-            if step.stop == Some(true) && ctx.in_parallel_branch {
-                bail!(
-                    "step '{}' has 'stop: true' inside a 'parallel' branch, where there is no \
-                     single well-defined workflow to stop",
-                    label
-                );
-            }
-            continue;
-        };
-
-        let Some(node) = nodes.get(node_id) else {
+        if step.r#use.is_none() && step.stop.is_none() && step.r#break.is_none() {
             bail!(
-                "step '{}' has 'use: {}', but no node with that id is defined in 'nodes'",
-                label,
-                node_id
-            );
-        };
-        if let Some(site_id) = &step.id
-            && site_id != node_id
-            && nodes.contains_key(site_id)
-        {
-            bail!(
-                "step '{}' has 'id: {}', which collides with a different node of the same id in \
-                 'nodes'; '{{{{ steps.{} }}}}'/'$steps.{}' would become ambiguous",
-                label,
-                site_id,
-                site_id,
-                site_id
+                "step '{}' must have a 'use', a 'switch', a 'parallel', a 'loop', a \
+                 'for_each', 'stop', 'break', or a combination",
+                label
             );
         }
-        if node.write_file.is_some() && ctx.in_concurrent_for_each {
+        if step.r#use.is_none() && step.on_error.is_some() {
             bail!(
-                "step '{}' uses node '{}', which has 'write_file' set, inside a 'for_each' body \
-                 with 'max_concurrency' above 1; every concurrently running item would write the \
-                 same static path. Move it after the 'for_each' step, or set 'max_concurrency: 1'",
-                label,
-                node_id
+                "step '{}' has 'on_error' set without 'use'; there is no node action for it \
+                 to guard",
+                label
             );
         }
-        if let Some(on_error) = &step.on_error {
-            if on_error.steps.is_empty() {
-                bail!("step '{}' has 'on_error' with an empty 'steps' list", label);
+        if let Some(node_id) = &step.r#use {
+            let Some(node) = nodes.get(node_id) else {
+                bail!(
+                    "step '{}' has 'use: {}', but no node with that id is defined in 'nodes'",
+                    label,
+                    node_id
+                );
+            };
+            if let Some(site_id) = &step.id
+                && site_id != node_id
+                && nodes.contains_key(site_id)
+            {
+                bail!(
+                    "step '{}' has 'id: {}', which collides with a different node of the same id in \
+                     'nodes'; '{{{{ steps.{} }}}}'/'$steps.{}' would become ambiguous",
+                    label,
+                    site_id,
+                    site_id,
+                    site_id
+                );
             }
-            validate_steps(&on_error.steps, nodes, ctx)?;
+            if node.write_file.is_some() && ctx.in_concurrent_for_each {
+                bail!(
+                    "step '{}' uses node '{}', which has 'write_file' set, inside a 'for_each' body \
+                     with 'max_concurrency' above 1; every concurrently running item would write the \
+                     same static path. Move it after the 'for_each' step, or set 'max_concurrency: 1'",
+                    label,
+                    node_id
+                );
+            }
+            if let Some(on_error) = &step.on_error {
+                if on_error.steps.is_empty() {
+                    bail!("step '{}' has 'on_error' with an empty 'steps' list", label);
+                }
+                validate_steps(&on_error.steps, nodes, ctx)?;
+            }
         }
 
         if step.r#break == Some(true) && step.stop == Some(true) {

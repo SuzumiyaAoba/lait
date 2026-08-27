@@ -71,7 +71,7 @@ pub(crate) struct WorkflowDefaults {
 /// A reusable action definition, referenced by id from `steps[].use`. Carries
 /// only "what to do" — model call or data transform — never "when"/"how many
 /// times", which lives on the `FlowStep` reference site instead.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NodeDefinition {
     pub(crate) model: Option<String>,
@@ -159,7 +159,7 @@ pub(crate) struct NodeDefinition {
 /// no action of its own — `use` points at a `NodeDefinition` in the
 /// workflow's `nodes:` map, or one of `switch`/`parallel`/`loop`/`for_each`
 /// routes to nested `steps` instead.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FlowStep {
     /// This site's label, used for progress output and as the key this
@@ -228,6 +228,16 @@ impl FlowStep {
     pub(crate) fn label(&self) -> Option<&str> {
         self.id.as_deref().or(self.r#use.as_deref())
     }
+
+    /// `label()`, falling back to `step-<fallback_n>` when this site has
+    /// neither an explicit `id` nor a `use` to name it. Shared by
+    /// `run_steps`' progress labels and `validate_steps`' error labels, so
+    /// both name a given site the same way.
+    pub(crate) fn label_or(&self, fallback_n: usize) -> String {
+        self.label()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("step-{fallback_n}"))
+    }
 }
 
 /// The step kinds that route to nested `steps` instead of acting directly on
@@ -276,7 +286,7 @@ pub(crate) struct RetryDefinition {
     pub(crate) backoff: Option<f64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OnErrorDefinition {
     /// Run once, with the failure's `{"error": ..., "input": ...}` object as
@@ -286,7 +296,7 @@ pub(crate) struct OnErrorDefinition {
     pub(crate) steps: Vec<FlowStep>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SwitchDefinition {
     /// Evaluated in order; the first case whose `when` is truthy runs.
@@ -298,7 +308,7 @@ pub(crate) struct SwitchDefinition {
     pub(crate) else_steps: Option<Vec<FlowStep>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CaseDefinition {
     /// An optional label used only in progress output (like `FlowStep::id`).
@@ -308,7 +318,7 @@ pub(crate) struct CaseDefinition {
     pub(crate) steps: Vec<FlowStep>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ParallelDefinition {
     /// Every branch runs concurrently against the same input (a snapshot of
@@ -324,7 +334,7 @@ pub(crate) struct ParallelDefinition {
     pub(crate) join: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BranchDefinition {
     /// Defaults to `branch-{n}` (1-based), like `FlowStep::id`. Unlike
@@ -344,7 +354,7 @@ impl BranchDefinition {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LoopDefinition {
     /// Checked before each iteration (including the first), against the
@@ -372,7 +382,7 @@ pub(crate) struct LoopDefinition {
     pub(crate) steps: Vec<FlowStep>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ForEachDefinition {
     /// A jq filter evaluated once against the current input; must produce

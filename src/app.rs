@@ -377,7 +377,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
 }
 
 async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
-    let wf = workflow::load_workflow(&run_args.file)?;
+    let mut wf = workflow::load_workflow(&run_args.file)?;
     let file_config = config::load_config(no_config)?;
 
     if let Some(name) = &wf.name {
@@ -387,7 +387,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         }
     }
 
-    let scope = WorkflowScope::top_level(&wf, &run_args.file)?;
+    let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
         run_args.prompt,
@@ -449,8 +449,11 @@ struct WorkflowScope {
 }
 
 impl WorkflowScope {
-    /// The scope for the workflow file passed on the command line.
-    fn top_level(wf: &workflow::WorkflowFile, file_path: &Path) -> Result<Self> {
+    /// The scope for the workflow file passed on the command line. Takes
+    /// `wf.nodes` by move (via `mem::take`) rather than cloning it: `wf`'s
+    /// `nodes` map is never read again after this call, only `wf.steps`
+    /// (see `run_workflow`).
+    fn top_level(wf: &mut workflow::WorkflowFile, file_path: &Path) -> Result<Self> {
         let canonical = std::fs::canonicalize(file_path).with_context(|| {
             format!(
                 "failed to resolve workflow file path '{}'",
@@ -471,7 +474,7 @@ impl WorkflowScope {
             default_timeout: wf.default.timeout,
             models: wf.models.clone(),
             json_schemas: wf.json_schemas.clone(),
-            nodes: wf.nodes.clone(),
+            nodes: std::mem::take(&mut wf.nodes),
             base_dir,
             active_paths: vec![canonical],
         })
@@ -482,14 +485,15 @@ impl WorkflowScope {
     /// `base_dir`, merges `sub_wf`'s `default`/`models`/`json_schemas` over
     /// this scope's (the sub-workflow's own entries win; an entry it doesn't
     /// define falls back to this scope's), takes `sub_wf`'s `nodes:` outright
-    /// (no fallback — see `WorkflowScope::nodes`), and extends the
-    /// cycle/depth bookkeeping. Fails if `relative_path` resolves to a
-    /// workflow file already executing (a cycle) or nesting has reached
-    /// `MAX_WORKFLOW_DEPTH`.
+    /// by move (no fallback — see `WorkflowScope::nodes` — and `sub_wf.nodes`
+    /// is never read again after this call, only `sub_wf.steps`), and
+    /// extends the cycle/depth bookkeeping. Fails if `relative_path`
+    /// resolves to a workflow file already executing (a cycle) or nesting
+    /// has reached `MAX_WORKFLOW_DEPTH`.
     fn nested(
         &self,
         relative_path: &Path,
-        sub_wf: &workflow::WorkflowFile,
+        sub_wf: &mut workflow::WorkflowFile,
         label: &str,
     ) -> Result<Self> {
         let resolved_path = self.base_dir.join(relative_path);
@@ -552,7 +556,7 @@ impl WorkflowScope {
             default_timeout: sub_wf.default.timeout.or(self.default_timeout),
             models,
             json_schemas,
-            nodes: sub_wf.nodes.clone(),
+            nodes: std::mem::take(&mut sub_wf.nodes),
             base_dir,
             active_paths,
         })
@@ -627,10 +631,7 @@ fn run_steps<'a>(
         let mut steps_outputs = steps_outputs;
         for step in steps {
             counter += 1;
-            let label = step
-                .label()
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("step-{counter}"));
+            let label = step.label_or(counter);
 
             // `validate::validate_steps` guarantees at most one of
             // `switch`/`parallel`/`loop`/`for_each` is set, so `router()`
@@ -1303,9 +1304,9 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?
     } else if let Some(sub_workflow_path) = &node.workflow {
         let resolved_path = scope.base_dir.join(sub_workflow_path);
-        let sub_wf =
+        let mut sub_wf =
             workflow::load_workflow(&resolved_path).with_context(|| format!("step '{label}'"))?;
-        let sub_scope = scope.nested(sub_workflow_path, &sub_wf, label)?;
+        let sub_scope = scope.nested(sub_workflow_path, &mut sub_wf, label)?;
         if let Some(name) = &sub_wf.name {
             match &sub_wf.description {
                 Some(description) => eprintln!("{progress_prefix}    -> {name}: {description}"),

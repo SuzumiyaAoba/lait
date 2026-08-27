@@ -19,36 +19,28 @@ pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
         .with_context(|| format!("failed to parse workflow file '{}'", path.display()))
 }
 
-/// The action-only fields that moved from `steps[]` to `nodes[]` when the
-/// nodes/steps split landed. Used only by `reject_legacy_steps` to give a
-/// migration-shaped error instead of a bare "unknown field" from
-/// `#[serde(deny_unknown_fields)]`.
-const LEGACY_NODE_ONLY_FIELDS: &[&str] = &[
-    "prompt",
-    "agent",
-    "workflow",
-    "jq",
-    "model",
-    "reasoning_effort",
-    "temperature",
-    "top_p",
-    "max_tokens",
-    "input_schema",
-    "output_schema",
-    "schema_name",
-    "write_file",
-    "retry",
-    "timeout",
+/// `FlowStep`'s own YAML field names (see `model.rs`). Used only by
+/// `reject_legacy_steps` to recognize a *foreign* field on a `steps[]` entry
+/// — most often a `NodeDefinition` field like `prompt`/`jq` left over from
+/// the pre-nodes/steps-split schema — and give a migration-shaped error
+/// instead of a bare "unknown field" from `#[serde(deny_unknown_fields)]`.
+/// Naming `FlowStep`'s allowed fields here, rather than listing
+/// `NodeDefinition`'s, means this list only needs updating when `FlowStep`
+/// itself grows a field (rare), not whenever a new node-only field is added.
+const FLOW_STEP_FIELDS: &[&str] = &[
+    "id", "use", "when", "on_error", "switch", "parallel", "loop", "for_each", "stop", "break",
 ];
 
-/// Detects the pre-nodes/steps-split schema (a `steps[]` entry with an action
-/// field like `prompt`/`jq` directly on it, instead of a `use:` reference into
-/// a top-level `nodes:` map) and bails with a migration-shaped message.
-/// Recurses into every nested step list (`switch` cases/`else`, `parallel`
-/// branches, `loop`/`for_each` bodies, `on_error`) so a file that is new-style
-/// at the top level but old-style in a nested block is still caught here,
-/// rather than falling through to a less helpful `deny_unknown_fields` error
-/// from `serde_yaml::from_str` deep inside the nesting.
+/// Detects the pre-nodes/steps-split schema (a `steps[]` entry with a field
+/// `FlowStep` doesn't recognize — almost always an action field like
+/// `prompt`/`jq` that belongs on a `nodes[]` entry instead) and bails with a
+/// migration-shaped message. Recurses into every nested step list (`switch`
+/// cases/`else`, `parallel` branches, `loop`/`for_each` bodies, `on_error`)
+/// so a file that is new-style at the top level but old-style in a nested
+/// block is still caught here. Only called after `WorkflowFile` deserialization
+/// has already failed (see `parse_workflow`), so this never costs anything on
+/// the success path; a raw `serde_yaml::Value` re-parse of the same text is
+/// how it inspects field names deserialization itself already rejected.
 fn reject_legacy_steps(raw: &serde_yaml::Value) -> Result<()> {
     let Some(steps) = raw.get("steps").and_then(serde_yaml::Value::as_sequence) else {
         return Ok(());
@@ -58,8 +50,12 @@ fn reject_legacy_steps(raw: &serde_yaml::Value) -> Result<()> {
 
 fn reject_legacy_steps_list(steps: &[serde_yaml::Value]) -> Result<()> {
     for step in steps {
-        for field in LEGACY_NODE_ONLY_FIELDS {
-            if step.get(field).is_some() {
+        let Some(mapping) = step.as_mapping() else {
+            continue;
+        };
+        for key in mapping.keys() {
+            let Some(field) = key.as_str() else { continue };
+            if !FLOW_STEP_FIELDS.contains(&field) {
                 bail!(
                     "this workflow file uses the pre-'nodes:'/'steps:'-split schema: a step has \
                      '{field}' directly. Move step bodies into a top-level 'nodes:' map (keyed by \
@@ -107,10 +103,21 @@ fn reject_legacy_steps_list(steps: &[serde_yaml::Value]) -> Result<()> {
 }
 
 fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
-    let raw: serde_yaml::Value = serde_yaml::from_str(contents)?;
-    reject_legacy_steps(&raw)?;
-
-    let workflow: WorkflowFile = serde_yaml::from_str(contents)?;
+    let workflow: WorkflowFile = match serde_yaml::from_str(contents) {
+        Ok(workflow) => workflow,
+        Err(err) => {
+            // A legacy-schema file (an action field like `prompt` directly on
+            // a `steps[]` entry) always fails the deserialize above, since
+            // `FlowStep` doesn't have those fields. Only re-parse as a raw
+            // `Value` here, on the error path, to check for that specific
+            // case and give a migration-shaped message; any other parse
+            // error is reported as-is.
+            if let Ok(raw) = serde_yaml::from_str(contents) {
+                reject_legacy_steps(&raw)?;
+            }
+            return Err(err.into());
+        }
+    };
     if workflow.steps.is_empty() {
         bail!("workflow must contain at least one step");
     }
