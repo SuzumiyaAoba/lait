@@ -25,7 +25,14 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
         bail!("workflow must contain at least one step");
     }
     validate::validate_workflow_defaults(&workflow.default)?;
-    validate::validate_steps(&workflow.steps, validate::FlowContext::TOP_LEVEL)?;
+    for (node_id, node) in &workflow.nodes {
+        validate::validate_node(node, node_id)?;
+    }
+    validate::validate_steps(
+        &workflow.steps,
+        &workflow.nodes,
+        validate::FlowContext::TOP_LEVEL,
+    )?;
     Ok(workflow)
 }
 

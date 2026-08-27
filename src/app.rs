@@ -377,7 +377,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
 }
 
 async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
-    let wf = workflow::load_workflow(&run_args.file)?;
+    let mut wf = workflow::load_workflow(&run_args.file)?;
     let file_config = config::load_config(no_config)?;
 
     if let Some(name) = &wf.name {
@@ -387,7 +387,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         }
     }
 
-    let scope = WorkflowScope::top_level(&wf, &run_args.file)?;
+    let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
         run_args.prompt,
@@ -436,15 +436,24 @@ struct WorkflowScope {
     default_timeout: Option<u64>,
     models: ModelMap,
     json_schemas: schema::JsonSchemaMap,
+    /// This scope's own `nodes:` map, resolved by every `steps[].use` in this
+    /// file. Unlike `models`/`json_schemas`, a `workflow:` node's sub-scope
+    /// does *not* fall back to this scope's `nodes` for entries it lacks —
+    /// each workflow file's `use:` sites only ever see that file's own
+    /// `nodes:` (see `WorkflowScope::nested`).
+    nodes: workflow::NodeMap,
     /// Directory relative paths in this scope's workflow file (currently
-    /// only `step.workflow`) are resolved against.
+    /// only `node.workflow`) are resolved against.
     base_dir: PathBuf,
     active_paths: Vec<PathBuf>,
 }
 
 impl WorkflowScope {
-    /// The scope for the workflow file passed on the command line.
-    fn top_level(wf: &workflow::WorkflowFile, file_path: &Path) -> Result<Self> {
+    /// The scope for the workflow file passed on the command line. Takes
+    /// `wf.nodes` by move (via `mem::take`) rather than cloning it: `wf`'s
+    /// `nodes` map is never read again after this call, only `wf.steps`
+    /// (see `run_workflow`).
+    fn top_level(wf: &mut workflow::WorkflowFile, file_path: &Path) -> Result<Self> {
         let canonical = std::fs::canonicalize(file_path).with_context(|| {
             format!(
                 "failed to resolve workflow file path '{}'",
@@ -465,23 +474,26 @@ impl WorkflowScope {
             default_timeout: wf.default.timeout,
             models: wf.models.clone(),
             json_schemas: wf.json_schemas.clone(),
+            nodes: std::mem::take(&mut wf.nodes),
             base_dir,
             active_paths: vec![canonical],
         })
     }
 
-    /// The scope for a `workflow:` step's sub-workflow: resolves
-    /// `relative_path` (as given in the step) against this scope's
+    /// The scope for a `workflow:` node's sub-workflow: resolves
+    /// `relative_path` (as given in the node) against this scope's
     /// `base_dir`, merges `sub_wf`'s `default`/`models`/`json_schemas` over
     /// this scope's (the sub-workflow's own entries win; an entry it doesn't
-    /// define falls back to this scope's), and extends the cycle/depth
-    /// bookkeeping. Fails if `relative_path` resolves to a workflow file
-    /// already executing (a cycle) or nesting has reached
-    /// `MAX_WORKFLOW_DEPTH`.
+    /// define falls back to this scope's), takes `sub_wf`'s `nodes:` outright
+    /// by move (no fallback — see `WorkflowScope::nodes` — and `sub_wf.nodes`
+    /// is never read again after this call, only `sub_wf.steps`), and
+    /// extends the cycle/depth bookkeeping. Fails if `relative_path`
+    /// resolves to a workflow file already executing (a cycle) or nesting
+    /// has reached `MAX_WORKFLOW_DEPTH`.
     fn nested(
         &self,
         relative_path: &Path,
-        sub_wf: &workflow::WorkflowFile,
+        sub_wf: &mut workflow::WorkflowFile,
         label: &str,
     ) -> Result<Self> {
         let resolved_path = self.base_dir.join(relative_path);
@@ -544,30 +556,33 @@ impl WorkflowScope {
             default_timeout: sub_wf.default.timeout.or(self.default_timeout),
             models,
             json_schemas,
+            nodes: std::mem::take(&mut sub_wf.nodes),
             base_dir,
             active_paths,
         })
     }
 }
 
-/// Sets `steps_outputs[step.id]` to `output` (JSON-parsed, like a `parallel`
-/// branch's output before joining), for a step with an explicit `id`. A step
-/// without one keeps its auto-generated `step-N` progress label out of
-/// `{{ steps.* }}`/`$steps`, since that label isn't a stable name to reference.
+/// Sets `steps_outputs[step.label()]` to `output` (JSON-parsed, like a
+/// `parallel` branch's output before joining). `FlowStep::label` is the
+/// site's explicit `id`, else the node id it `use`s, else `None` for a
+/// router site with no `id` — that case keeps the auto-generated `step-N`
+/// progress label out of `{{ steps.* }}`/`$steps`, since that label isn't a
+/// stable name to reference.
 fn record_step_output(
     steps_outputs: &mut workflow::StepOutputs,
-    step: &workflow::StepDefinition,
+    step: &workflow::FlowStep,
     output: &str,
 ) {
-    if let Some(id) = &step.id {
-        steps_outputs.insert(id.clone(), template::parse_input(output));
+    if let Some(key) = step.label() {
+        steps_outputs.insert(key.to_string(), template::parse_input(output));
     }
 }
 
 /// A signal returned by `run_steps`, alongside its final input and progress
 /// counter, describing how the run ended: `Continue` is the normal
 /// end-of-list case; `Break`/`Stop` come from a `break: true`/`stop: true`
-/// step (see `workflow::StepDefinition`) and bubble up through `switch`/
+/// step (see `workflow::FlowStep`) and bubble up through `switch`/
 /// `loop`/`for_each` frames until something catches them (`loop`/`for_each`
 /// catch `Break`; nothing but `run_workflow` catches `Stop`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,7 +617,7 @@ type StepsOutcome = Result<(String, usize, Flow, workflow::StepOutputs)>;
 /// `switch`/`parallel` step recurses into this function from within an
 /// `async` body, which Rust cannot size otherwise.
 fn run_steps<'a>(
-    steps: &'a [workflow::StepDefinition],
+    steps: &'a [workflow::FlowStep],
     current_input: String,
     scope: &'a WorkflowScope,
     file_config: &'a ConfigFile,
@@ -616,7 +631,7 @@ fn run_steps<'a>(
         let mut steps_outputs = steps_outputs;
         for step in steps {
             counter += 1;
-            let label = step.id.clone().unwrap_or_else(|| format!("step-{counter}"));
+            let label = step.label_or(counter);
 
             // `validate::validate_steps` guarantees at most one of
             // `switch`/`parallel`/`loop`/`for_each` is set, so `router()`
@@ -1002,48 +1017,59 @@ fn run_steps<'a>(
             }
 
             eprintln!("{progress_prefix}[{counter}] {label}");
-            let attempt_result = execute_step_with_retry(
-                step,
-                &current_input,
-                scope,
-                file_config,
-                &label,
-                progress_prefix,
-                &steps_outputs,
-            )
-            .await;
-            current_input = match attempt_result {
-                Ok(output) => output,
-                Err(error) => match &step.on_error {
-                    Some(on_error) => {
-                        eprintln!(
-                            "{progress_prefix}    -> step failed, running 'on_error': {error}"
-                        );
-                        let error_input = serde_json::json!({
-                            "error": error.to_string(),
-                            "input": template::parse_input(&current_input),
-                        });
-                        let error_input_json = serde_json::to_string(&error_input)
-                            .context("failed to serialize 'on_error' input")?;
-                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
-                            &on_error.steps,
-                            error_input_json,
-                            scope,
-                            file_config,
-                            counter,
-                            progress_prefix,
-                            steps_outputs.clone(),
-                        )
-                        .await?;
-                        counter = new_counter;
-                        steps_outputs = new_steps_outputs;
-                        if flow != Flow::Continue {
-                            return Ok((result, counter, flow, steps_outputs));
-                        }
-                        result
+            current_input = match &step.r#use {
+                None => current_input,
+                Some(node_id) => {
+                    // `validate::validate_steps` guarantees every `use:` site
+                    // resolves against `scope.nodes` before execution starts.
+                    let node = scope
+                        .nodes
+                        .get(node_id)
+                        .expect("validate_steps guarantees 'use' resolves in 'nodes'");
+                    let attempt_result = execute_step_with_retry(
+                        node,
+                        &current_input,
+                        scope,
+                        file_config,
+                        &label,
+                        progress_prefix,
+                        &steps_outputs,
+                    )
+                    .await;
+                    match attempt_result {
+                        Ok(output) => output,
+                        Err(error) => match &step.on_error {
+                            Some(on_error) => {
+                                eprintln!(
+                                    "{progress_prefix}    -> step failed, running 'on_error': {error}"
+                                );
+                                let error_input = serde_json::json!({
+                                    "error": error.to_string(),
+                                    "input": template::parse_input(&current_input),
+                                });
+                                let error_input_json = serde_json::to_string(&error_input)
+                                    .context("failed to serialize 'on_error' input")?;
+                                let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                                    &on_error.steps,
+                                    error_input_json,
+                                    scope,
+                                    file_config,
+                                    counter,
+                                    progress_prefix,
+                                    steps_outputs.clone(),
+                                )
+                                .await?;
+                                counter = new_counter;
+                                steps_outputs = new_steps_outputs;
+                                if flow != Flow::Continue {
+                                    return Ok((result, counter, flow, steps_outputs));
+                                }
+                                result
+                            }
+                            None => return Err(error),
+                        },
                     }
-                    None => return Err(error),
-                },
+                }
             };
 
             record_step_output(&mut steps_outputs, step, &current_input);
@@ -1061,19 +1087,21 @@ fn run_steps<'a>(
 
 /// Runs `execute_step`, applying an effective timeout to each attempt and
 /// retrying per an effective `retry` on failure (a timed-out attempt counts
-/// as a failure). "Effective" means the step's own `retry`/`timeout` if set,
+/// as a failure). "Effective" means the node's own `retry`/`timeout` if set,
 /// else `scope`'s `default_retry`/`default_timeout` (see
-/// `WorkflowScope::default_retry`) — but only for a step that calls a model
-/// (`prompt`/`agent`): a `jq`-only or `workflow:` step never falls back to
-/// the workflow default (a `workflow:` step's own `retry`/`timeout` are
-/// rejected by `validate::validate_steps` in favor of the sub-workflow's own
+/// `WorkflowScope::default_retry`) — but only for a node that calls a model
+/// (`prompt`/`agent`): a `jq`-only or `workflow:` node never falls back to
+/// the workflow default (a `workflow:` node's own `retry`/`timeout` are
+/// rejected by `validate::validate_node` in favor of the sub-workflow's own
 /// steps setting theirs, and applying the *caller's* default on top of that
 /// would double up whatever the sub-workflow's own steps already inherit).
 /// Returns the last attempt's error once the effective `max_attempts` (or 1,
 /// with no effective `retry`) is exhausted; the caller decides whether to run
-/// `on_error` or propagate it.
+/// `on_error` or propagate it. `label` is the calling `use:` site's label
+/// (not the node's own id), so error messages point at where in the flow the
+/// failure happened.
 async fn execute_step_with_retry(
-    step: &workflow::StepDefinition,
+    node: &workflow::NodeDefinition,
     current_input: &str,
     scope: &WorkflowScope,
     file_config: &ConfigFile,
@@ -1081,11 +1109,11 @@ async fn execute_step_with_retry(
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
-    let calls_model = step.prompt.is_some() || step.agent.is_some();
-    let effective_retry = step.retry.as_ref().or(calls_model
+    let calls_model = node.prompt.is_some() || node.agent.is_some();
+    let effective_retry = node.retry.as_ref().or(calls_model
         .then_some(scope.default_retry.as_ref())
         .flatten());
-    let effective_timeout = step
+    let effective_timeout = node
         .timeout
         .or(calls_model.then_some(scope.default_timeout).flatten());
 
@@ -1109,7 +1137,7 @@ async fn execute_step_with_retry(
                 match tokio::time::timeout(
                     Duration::from_secs(seconds),
                     execute_step(
-                        step,
+                        node,
                         current_input,
                         scope,
                         file_config,
@@ -1128,7 +1156,7 @@ async fn execute_step_with_retry(
             }
             None => {
                 execute_step(
-                    step,
+                    node,
                     current_input,
                     scope,
                     file_config,
@@ -1157,45 +1185,45 @@ async fn execute_step_with_retry(
     }
 }
 
-/// Resolves the model/reasoning-effort settings for a step's model call,
-/// applying the step > agent file (when this step has one) > workflow
+/// Resolves the model/reasoning-effort settings for a node's model call,
+/// applying the node > agent file (when this node has one) > workflow
 /// default precedence chain shared by `execute_step`'s `agent` and `prompt`
-/// branches. `agent_file` is `Some` only for an `agent` step; besides adding
+/// branches. `agent_file` is `Some` only for an `agent` node; besides adding
 /// its fallback layer, its presence also selects which hint text a
 /// missing-model error uses.
 fn resolve_step_settings(
-    step: &workflow::StepDefinition,
+    node: &workflow::NodeDefinition,
     scope: &WorkflowScope,
     file_config: &ConfigFile,
     agent_file: Option<&AgentFile>,
     label: &str,
 ) -> Result<RequestSettings> {
-    let model_name = step
+    let model_name = node
         .model
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.model.clone()))
         .or_else(|| scope.default_model.clone())
         .ok_or_else(|| {
             anyhow!(
-                "model is required for step '{label}'; set it on the step,{} the workflow's default.model, or in {}",
+                "model is required for step '{label}'; set it on the node,{} the workflow's default.model, or in {}",
                 if agent_file.is_some() { " its agent file," } else { "" },
                 config::CONFIG_FILE_NAME
             )
         })?;
     let overrides = SamplingOverrides {
-        reasoning_effort: step
+        reasoning_effort: node
             .reasoning_effort
             .or(agent_file.and_then(|agent_file| agent_file.reasoning_effort))
             .or(scope.default_reasoning_effort),
-        temperature: step
+        temperature: node
             .temperature
             .or(agent_file.and_then(|agent_file| agent_file.temperature))
             .or(scope.default_temperature),
-        top_p: step
+        top_p: node
             .top_p
             .or(agent_file.and_then(|agent_file| agent_file.top_p))
             .or(scope.default_top_p),
-        max_tokens: step
+        max_tokens: node
             .max_tokens
             .or(agent_file.and_then(|agent_file| agent_file.max_tokens))
             .or(scope.default_max_tokens),
@@ -1211,10 +1239,11 @@ fn resolve_step_settings(
     .with_context(|| format!("step '{label}'"))
 }
 
-/// Runs a single non-`switch` step (agent call, prompt call, or `jq`-only
-/// data transform) and returns its output, with `jq` applied afterward if set.
+/// Runs a single node (agent call, prompt call, or `jq`-only data transform)
+/// and returns its output, with `jq` applied afterward if set. `label` is the
+/// calling `use:` site's label, used only for progress output/error messages.
 async fn execute_step(
-    step: &workflow::StepDefinition,
+    node: &workflow::NodeDefinition,
     current_input: &str,
     scope: &WorkflowScope,
     file_config: &ConfigFile,
@@ -1222,7 +1251,7 @@ async fn execute_step(
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
-    if let Some(name_or_path) = &step.input_schema {
+    if let Some(name_or_path) = &node.input_schema {
         let schema = schema::resolve_named_schema_value(&scope.json_schemas, name_or_path)
             .with_context(|| format!("step '{label}'"))?;
         let input = template::parse_input(current_input);
@@ -1230,7 +1259,7 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
     }
 
-    let mut step_output = if let Some(agent_path) = &step.agent {
+    let mut step_output = if let Some(agent_path) = &node.agent {
         let agent_file =
             agent::load_agent(agent_path).with_context(|| format!("step '{label}'"))?;
 
@@ -1239,19 +1268,19 @@ async fn execute_step(
             .validate_input(&input)
             .with_context(|| format!("step '{label}'"))?;
 
-        let settings = resolve_step_settings(step, scope, file_config, Some(&agent_file), label)?;
+        let settings = resolve_step_settings(node, scope, file_config, Some(&agent_file), label)?;
 
         call_agent(&agent_file, &settings, &input, current_input, steps_outputs)
             .await
             .with_context(|| format!("step '{label}'"))?
-    } else if let Some(prompt_template) = &step.prompt {
-        let settings = resolve_step_settings(step, scope, file_config, None, label)?;
+    } else if let Some(prompt_template) = &node.prompt {
+        let settings = resolve_step_settings(node, scope, file_config, None, label)?;
 
-        let response_format = step
+        let response_format = node
             .output_schema
             .as_deref()
             .map(|name_or_path| {
-                let schema_name = step.schema_name.as_deref().unwrap_or("structured_output");
+                let schema_name = node.schema_name.as_deref().unwrap_or("structured_output");
                 match scope.json_schemas.get(name_or_path) {
                     Some(entry) => schema::build_response_format_from_entry(entry, schema_name),
                     None => {
@@ -1273,11 +1302,11 @@ async fn execute_step(
 
         response::render_response(&response, false, false)
             .with_context(|| format!("step '{label}'"))?
-    } else if let Some(sub_workflow_path) = &step.workflow {
+    } else if let Some(sub_workflow_path) = &node.workflow {
         let resolved_path = scope.base_dir.join(sub_workflow_path);
-        let sub_wf =
+        let mut sub_wf =
             workflow::load_workflow(&resolved_path).with_context(|| format!("step '{label}'"))?;
-        let sub_scope = scope.nested(sub_workflow_path, &sub_wf, label)?;
+        let sub_scope = scope.nested(sub_workflow_path, &mut sub_wf, label)?;
         if let Some(name) = &sub_wf.name {
             match &sub_wf.description {
                 Some(description) => eprintln!("{progress_prefix}    -> {name}: {description}"),
@@ -1307,12 +1336,12 @@ async fn execute_step(
         current_input.to_string()
     };
 
-    if let Some(filter) = &step.jq {
+    if let Some(filter) = &node.jq {
         step_output = jq::apply(filter, &step_output, steps_outputs)
             .with_context(|| format!("step '{label}'"))?;
     }
 
-    if let Some(path) = &step.write_file {
+    if let Some(path) = &node.write_file {
         std::fs::write(path, &step_output).with_context(|| {
             format!(
                 "step '{label}': failed to write output to '{}'",

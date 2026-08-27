@@ -43,7 +43,7 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 
 - ファイルは1行目が必ず `---` で始まり、次に現れる `---` 行までが frontmatter（YAML）、
   それ以降が本文（システムプロンプトのテンプレート）になります。
-- `agent:`（step）や `file_path:`（`json_schemas:`/`input_schema:`/`output_schema:`）に書く
+- `agent:`（ノード）や `file_path:`（`json_schemas:`/`input_schema:`/`output_schema:`）に書く
   パスは、既存の `--json-schema <FILE>` や `lait.config.yml` の探索と同じく、常にコマンドを
   実行したディレクトリ（カレントディレクトリ）からの相対パスとして解決されます。エージェント
   ファイルや `workflow.yml` 自体の場所からの相対パスではないため、`workflow.yml` を別ディレクトリから
@@ -77,29 +77,32 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 
 ## ワークフローからエージェントファイルを使う
 
-`workflow.yml` の step で `prompt`/`input_schema`/`output_schema`/`schema_name` の代わりに `agent:` を
-指定すると、その step はエージェント Markdown ファイルのシステムプロンプト・入出力スキーマ・
-`model`/`reasoning_effort` を使って実行されます。`agent:` は `prompt` と同時には指定できず、
-`input_schema`/`output_schema`/`schema_name` はエージェントファイル側で決まるため step には
-書けません。
+`workflow.yml` の `nodes:` エントリで `prompt`/`input_schema`/`output_schema`/`schema_name` の
+代わりに `agent:` を指定すると、そのノードはエージェント Markdown ファイルのシステムプロンプト・
+入出力スキーマ・`model`/`reasoning_effort` を使って実行されます。`agent:` は `prompt` と同時には
+指定できず、`input_schema`/`output_schema`/`schema_name` はエージェントファイル側で決まるため
+ノードには書けません。
 
 ```yaml
 # workflow.yml
 default:
   model: local
-steps:
-  - agent: agents/city-fact.md
+nodes:
+  city-fact:
+    agent: agents/city-fact.md
     jq: ".city"
+steps:
+  - use: city-fact
 ```
 
-`model`/`reasoning_effort`/`temperature`/`top_p`/`max_tokens` は `step` → エージェントファイルの
-frontmatter → ワークフローの `default:` の順に、それぞれ独立してフォールバックします。ステップの入力（前の step の出力、
-または最初の step では `<PROMPT>`）は、`lait agent run` の `INPUT` と同じ規則でエージェントの
-システムプロンプトに渡され、`{{ input.field }}` でアクセスできます。
+`model`/`reasoning_effort`/`temperature`/`top_p`/`max_tokens` は `ノード` → エージェントファイルの
+frontmatter → ワークフローの `default:` の順に、それぞれ独立してフォールバックします。ステップの
+入力（前のステップの出力、または最初のステップでは `<PROMPT>`）は、`lait agent run` の `INPUT`
+と同じ規則でエージェントのシステムプロンプトに渡され、`{{ input.field }}` でアクセスできます。
 
-`prompt:` を使う通常の step も同じ handlebars テンプレート（`{{ input.field }}`/`{{ json input }}`
+`prompt:` を使う通常のノードも同じ handlebars テンプレート（`{{ input.field }}`/`{{ json input }}`
 を含む）でレンダリングされるため、フィールドアクセスはエージェントファイルの本文に限りません。
-さらに、ワークフロー内で `id` を指定した他の step の出力は、エージェントのシステムプロンプトから
+さらに、ワークフロー内で `id` を持つ他のステップの出力は、エージェントのシステムプロンプトから
 も `{{ steps.<id> }}` として参照できます（詳細は
 [ワークフロー（workflow.yml）](./workflow.md#ステップ間の値の受け渡し-stepsid---steps) を参照）。
 
