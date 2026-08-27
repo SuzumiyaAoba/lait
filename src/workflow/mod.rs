@@ -19,13 +19,110 @@ pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
         .with_context(|| format!("failed to parse workflow file '{}'", path.display()))
 }
 
+/// The action-only fields that moved from `steps[]` to `nodes[]` when the
+/// nodes/steps split landed. Used only by `reject_legacy_steps` to give a
+/// migration-shaped error instead of a bare "unknown field" from
+/// `#[serde(deny_unknown_fields)]`.
+const LEGACY_NODE_ONLY_FIELDS: &[&str] = &[
+    "prompt",
+    "agent",
+    "workflow",
+    "jq",
+    "model",
+    "reasoning_effort",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "input_schema",
+    "output_schema",
+    "schema_name",
+    "write_file",
+    "retry",
+    "timeout",
+];
+
+/// Detects the pre-nodes/steps-split schema (a `steps[]` entry with an action
+/// field like `prompt`/`jq` directly on it, instead of a `use:` reference into
+/// a top-level `nodes:` map) and bails with a migration-shaped message.
+/// Recurses into every nested step list (`switch` cases/`else`, `parallel`
+/// branches, `loop`/`for_each` bodies, `on_error`) so a file that is new-style
+/// at the top level but old-style in a nested block is still caught here,
+/// rather than falling through to a less helpful `deny_unknown_fields` error
+/// from `serde_yaml::from_str` deep inside the nesting.
+fn reject_legacy_steps(raw: &serde_yaml::Value) -> Result<()> {
+    let Some(steps) = raw.get("steps").and_then(serde_yaml::Value::as_sequence) else {
+        return Ok(());
+    };
+    reject_legacy_steps_list(steps)
+}
+
+fn reject_legacy_steps_list(steps: &[serde_yaml::Value]) -> Result<()> {
+    for step in steps {
+        for field in LEGACY_NODE_ONLY_FIELDS {
+            if step.get(field).is_some() {
+                bail!(
+                    "this workflow file uses the pre-'nodes:'/'steps:'-split schema: a step has \
+                     '{field}' directly. Move step bodies into a top-level 'nodes:' map (keyed by \
+                     an id) and reference them from 'steps:' via 'use: <node id>' instead. See \
+                     docs/usage/ja/workflow.md."
+                );
+            }
+        }
+        if let Some(switch) = step.get("switch") {
+            if let Some(cases) = switch.get("cases").and_then(serde_yaml::Value::as_sequence) {
+                for case in cases {
+                    if let Some(case_steps) =
+                        case.get("steps").and_then(serde_yaml::Value::as_sequence)
+                    {
+                        reject_legacy_steps_list(case_steps)?;
+                    }
+                }
+            }
+            if let Some(else_steps) = switch.get("else").and_then(serde_yaml::Value::as_sequence) {
+                reject_legacy_steps_list(else_steps)?;
+            }
+        }
+        if let Some(parallel) = step.get("parallel")
+            && let Some(branches) = parallel
+                .get("branches")
+                .and_then(serde_yaml::Value::as_sequence)
+        {
+            for branch in branches {
+                if let Some(branch_steps) =
+                    branch.get("steps").and_then(serde_yaml::Value::as_sequence)
+                {
+                    reject_legacy_steps_list(branch_steps)?;
+                }
+            }
+        }
+        for router_key in ["loop", "for_each", "on_error"] {
+            if let Some(router) = step.get(router_key)
+                && let Some(body) = router.get("steps").and_then(serde_yaml::Value::as_sequence)
+            {
+                reject_legacy_steps_list(body)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
+    let raw: serde_yaml::Value = serde_yaml::from_str(contents)?;
+    reject_legacy_steps(&raw)?;
+
     let workflow: WorkflowFile = serde_yaml::from_str(contents)?;
     if workflow.steps.is_empty() {
         bail!("workflow must contain at least one step");
     }
     validate::validate_workflow_defaults(&workflow.default)?;
-    validate::validate_steps(&workflow.steps, validate::FlowContext::TOP_LEVEL)?;
+    for (node_id, node) in &workflow.nodes {
+        validate::validate_node(node, node_id)?;
+    }
+    validate::validate_steps(
+        &workflow.steps,
+        &workflow.nodes,
+        validate::FlowContext::TOP_LEVEL,
+    )?;
     Ok(workflow)
 }
 

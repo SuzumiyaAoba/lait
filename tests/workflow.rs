@@ -24,8 +24,11 @@ models:
         base_url: "{}"
         api_key: workflow-key
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
-  - prompt: "{{{{ input }}}}"
+  - use: echo
 "#,
         server.base_url
     ));
@@ -64,8 +67,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
-  - prompt: "{{{{ input }}}}"
+  - use: echo
 "#,
         server.base_url
     ));
@@ -103,11 +109,14 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - temperature: 0.9
+nodes:
+  echo:
+    temperature: 0.9
     top_p: 0.95
     max_tokens: 512
     prompt: "{{{{ input }}}}"
+steps:
+  - use: echo
 "#,
         server.base_url
     ));
@@ -142,8 +151,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
-  - prompt: "{{{{ input }}}}"
+  - use: echo
 "#,
         server.base_url
     ));
@@ -171,8 +183,11 @@ fn step_falls_back_to_a_config_file_alias_when_not_defined_in_the_workflow() {
         r#"
 default:
   model: from-config
+nodes:
+  echo:
+    prompt: "{{ input }}"
 steps:
-  - prompt: "{{ input }}"
+  - use: echo
 "#,
     );
 
@@ -212,11 +227,14 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - prompt: "{{{{ input }}}}"
+nodes:
+  answer:
+    prompt: "{{{{ input }}}}"
     output_schema: "{}"
     schema_name: answer_schema
     jq: ".answer"
+steps:
+  - use: answer
 "#,
         server.base_url,
         schema.path.display()
@@ -272,10 +290,13 @@ json_schemas:
           type: string
       required: [answer]
       additionalProperties: false
-steps:
-  - prompt: "{{{{ input }}}}"
+nodes:
+  answer:
+    prompt: "{{{{ input }}}}"
     output_schema: answer
     schema_name: answer_schema
+steps:
+  - use: answer
 "#,
         server.base_url
     ));
@@ -326,10 +347,13 @@ models:
 json_schemas:
   answer:
     file_path: "{}"
-steps:
-  - prompt: "{{{{ input }}}}"
+nodes:
+  answer:
+    prompt: "{{{{ input }}}}"
     output_schema: answer
     schema_name: answer_schema
+steps:
+  - use: answer
 "#,
         server.base_url,
         schema.path.display()
@@ -377,9 +401,12 @@ json_schemas:
     schema:
       type: object
       required: [city]
-steps:
-  - prompt: "{{{{ json input }}}}"
+nodes:
+  echo:
+    prompt: "{{{{ json input }}}}"
     input_schema: city
+steps:
+  - use: echo
 "#,
         server.base_url
     ));
@@ -400,9 +427,12 @@ json_schemas:
     schema:
       type: object
       required: [city]
-steps:
-  - jq: "."
+nodes:
+  echo:
+    jq: "."
     input_schema: city
+steps:
+  - use: echo
 "#,
     );
 
@@ -429,9 +459,12 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - prompt: "{{{{ json input }}}}"
+nodes:
+  echo:
+    prompt: "{{{{ json input }}}}"
     input_schema: "{}"
+steps:
+  - use: echo
 "#,
         server.base_url,
         schema.path.display()
@@ -456,9 +489,12 @@ fn step_input_schema_reports_a_missing_schema_file_with_path_context() {
     );
     let workflow = WorkflowFile::new(&format!(
         r#"
-steps:
-  - jq: "."
+nodes:
+  echo:
+    jq: "."
     input_schema: "{}"
+steps:
+  - use: echo
 "#,
         missing_path.display()
     ));
@@ -510,8 +546,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  extract:
+    agent: "{}"
 steps:
-  - agent: "{}"
+  - use: extract
 "#,
         server.base_url,
         agent.path.display()
@@ -560,12 +599,17 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - id: extract
+nodes:
+  extract:
     prompt: "{{{{ input }}}}"
     output_schema: "{}"
-  - id: summarize
+  summarize:
     agent: "{}"
+steps:
+  - id: extract
+    use: extract
+  - id: summarize
+    use: summarize
 "#,
         server.base_url,
         extract_schema.path.display(),
@@ -588,8 +632,11 @@ steps:
 fn transform_only_step_reshapes_input_without_calling_the_model() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  extract_name:
+    jq: ".name"
 steps:
-  - jq: ".name"
+  - use: extract_name
 "#,
     );
 
@@ -603,11 +650,16 @@ steps:
 fn a_falsy_when_guard_skips_the_step_and_passes_the_input_through_unchanged() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  passthrough:
+    jq: "."
+  guarded:
+    jq: '"should not run"'
 steps:
-  - jq: "."
+  - use: passthrough
   - id: guarded
     when: ".flag"
-    jq: '"should not run"'
+    use: guarded
 "#,
     );
 
@@ -624,10 +676,13 @@ steps:
 fn a_truthy_when_guard_runs_the_step() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  guarded:
+    jq: '"ran"'
 steps:
   - id: guarded
     when: ".flag"
-    jq: '"ran"'
+    use: guarded
 "#,
     );
 
@@ -641,17 +696,24 @@ steps:
 fn switch_runs_the_first_matching_case_and_skips_the_rest() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  escalated:
+    jq: '"escalated"'
+  replied:
+    jq: '"replied"'
+  closed:
+    jq: '"closed"'
 steps:
   - switch:
       cases:
         - when: '.severity == "high"'
           steps:
-            - jq: '"escalated"'
+            - use: escalated
         - when: '.severity == "medium"'
           steps:
-            - jq: '"replied"'
+            - use: replied
       else:
-        - jq: '"closed"'
+        - use: closed
 "#,
     );
 
@@ -665,14 +727,19 @@ steps:
 fn switch_runs_else_when_no_case_matches() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  escalated:
+    jq: '"escalated"'
+  closed:
+    jq: '"closed"'
 steps:
   - switch:
       cases:
         - when: '.severity == "high"'
           steps:
-            - jq: '"escalated"'
+            - use: escalated
       else:
-        - jq: '"closed"'
+        - use: closed
 "#,
     );
 
@@ -686,12 +753,15 @@ steps:
 fn switch_fails_when_no_case_matches_and_there_is_no_else() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  escalated:
+    jq: '"escalated"'
 steps:
   - switch:
       cases:
         - when: '.severity == "high"'
           steps:
-            - jq: '"escalated"'
+            - use: escalated
 "#,
     );
 
@@ -728,16 +798,21 @@ models:
     - provider:
         base_url: "{}"
       model_id: model-b
+nodes:
+  echo_a:
+    prompt: "{{{{ input }}}}"
+  echo_b:
+    model: cloud
+    prompt: "{{{{ input }}}}"
 steps:
   - parallel:
       branches:
         - id: a
           steps:
-            - prompt: "{{{{ input }}}}"
+            - use: echo_a
         - id: b
           steps:
-            - model: cloud
-              prompt: "{{{{ input }}}}"
+            - use: echo_b
 "#,
         server_a.base_url, server_b.base_url
     ));
@@ -759,18 +834,25 @@ steps:
 fn parallel_join_filter_combines_the_id_keyed_object_into_the_next_input() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  upper:
+    jq: 'ascii_upcase'
+  length_of:
+    jq: 'length'
+  describe:
+    jq: '.summary + " (" + (.length | tostring) + ")"'
 steps:
   - parallel:
       branches:
         - id: upper
           steps:
-            - jq: 'ascii_upcase'
+            - use: upper
         - id: length
           steps:
-            - jq: 'length'
+            - use: length_of
       join: '{summary: .upper, length: .length}'
   - id: describe
-    jq: '.summary + " (" + (.length | tostring) + ")"'
+    use: describe
 "#,
     );
 
@@ -784,15 +866,18 @@ steps:
 fn parallel_fails_when_a_branch_id_is_duplicated() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  passthrough:
+    jq: "."
 steps:
   - parallel:
       branches:
         - id: same
           steps:
-            - jq: "."
+            - use: passthrough
         - id: same
           steps:
-            - jq: "."
+            - use: passthrough
 "#,
     );
 
@@ -821,16 +906,23 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  escalate:
+    prompt: "escalate: {{{{ json input }}}}"
+  closed:
+    jq: '"closed"'
+  notify:
+    jq: '. + " (notified)"'
 steps:
   - switch:
       cases:
         - when: '.severity == "high"'
           steps:
-            - prompt: "escalate: {{{{ json input }}}}"
+            - use: escalate
       else:
-        - jq: '"closed"'
+        - use: closed
   - id: notify
-    jq: '. + " (notified)"'
+    use: notify
 "#,
         server.base_url
     ));
@@ -855,13 +947,16 @@ steps:
 fn loop_while_reruns_steps_until_the_pre_check_condition_goes_false() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  bump:
+    jq: '{n: (.n + 1)}'
 steps:
   - id: count-up
     loop:
       while: '.n < 3'
       max_iterations: 10
       steps:
-        - jq: '{n: (.n + 1)}'
+        - use: bump
 "#,
     );
 
@@ -878,12 +973,15 @@ steps:
 fn loop_while_runs_zero_times_when_the_condition_starts_false() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  never:
+    jq: '"should not run"'
 steps:
   - loop:
       while: '.n < 0'
       max_iterations: 10
       steps:
-        - jq: '"should not run"'
+        - use: never
 "#,
     );
 
@@ -900,12 +998,15 @@ steps:
 fn loop_while_fails_when_max_iterations_is_reached_without_the_condition_going_false() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  passthrough:
+    jq: '.'
 steps:
   - loop:
       while: 'true'
       max_iterations: 3
       steps:
-        - jq: '.'
+        - use: passthrough
 "#,
     );
 
@@ -923,13 +1024,16 @@ steps:
 fn loop_until_runs_at_least_once_and_stops_once_the_post_check_condition_is_true() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  bump:
+    jq: '{n: (.n + 1)}'
 steps:
   - id: retry
     loop:
       until: '.n >= 3'
       max_iterations: 10
       steps:
-        - jq: '{n: (.n + 1)}'
+        - use: bump
 "#,
     );
 
@@ -946,12 +1050,15 @@ steps:
 fn loop_until_fails_when_max_iterations_is_reached_without_the_condition_going_true() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  passthrough:
+    jq: '.'
 steps:
   - loop:
       until: 'false'
       max_iterations: 3
       steps:
-        - jq: '.'
+        - use: passthrough
 "#,
     );
 
@@ -977,11 +1084,14 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  summarize:
+    prompt: "summarize: {{{{ input }}}}"
 steps:
   - for_each:
       items: '.names'
       steps:
-        - prompt: "summarize: {{{{ input }}}}"
+        - use: summarize
 "#,
         server.base_url
     ));
@@ -1002,12 +1112,15 @@ steps:
 fn for_each_runs_steps_per_item_and_collects_results_in_order() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  doubler:
+    jq: '. * 2'
 steps:
   - id: double
     for_each:
       items: '.items'
       steps:
-        - jq: '. * 2'
+        - use: doubler
 "#,
     );
 
@@ -1024,11 +1137,14 @@ steps:
 fn for_each_join_filter_combines_the_collected_array_into_the_next_input() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  doubler:
+    jq: '. * 2'
 steps:
   - for_each:
       items: '.items'
       steps:
-        - jq: '. * 2'
+        - use: doubler
       join: 'add'
 "#,
     );
@@ -1043,11 +1159,14 @@ steps:
 fn for_each_runs_zero_times_on_an_empty_array_and_yields_an_empty_result() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  never:
+    jq: '"should not run"'
 steps:
   - for_each:
       items: '.items'
       steps:
-        - jq: '"should not run"'
+        - use: never
 "#,
     );
 
@@ -1061,11 +1180,14 @@ steps:
 fn for_each_fails_when_items_does_not_produce_a_json_array() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  passthrough:
+    jq: '.'
 steps:
   - for_each:
       items: '.count'
       steps:
-        - jq: '.'
+        - use: passthrough
 "#,
     );
 
@@ -1094,12 +1216,17 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  call:
+    prompt: "{{{{ input }}}}"
+  never:
+    jq: '"should not run"'
 steps:
   - id: call
-    prompt: "{{{{ input }}}}"
+    use: call
     stop: true
   - id: never
-    jq: '"should not run"'
+    use: never
 "#,
         server.base_url
     ));
@@ -1119,12 +1246,15 @@ steps:
 fn break_stops_a_loop_before_its_until_condition_or_max_iterations() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  bump:
+    jq: '.n += 1'
 steps:
   - loop:
       until: '.n >= 10'
       max_iterations: 5
       steps:
-        - jq: '.n += 1'
+        - use: bump
         - when: '.n == 2'
           break: true
 "#,
@@ -1140,13 +1270,16 @@ steps:
 fn break_stops_a_for_each_early_and_joins_only_the_items_processed_so_far() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  passthrough:
+    jq: '.'
 steps:
   - for_each:
       items: '.items'
       steps:
         - when: '. == 2'
           break: true
-        - jq: '.'
+        - use: passthrough
 "#,
     );
 
@@ -1160,15 +1293,20 @@ steps:
 fn stop_inside_a_loop_ends_the_whole_workflow_not_just_the_loop() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  bump:
+    jq: '.n += 1'
+  never:
+    jq: '"should not run"'
 steps:
   - loop:
       until: '.n >= 10'
       max_iterations: 5
       steps:
-        - jq: '.n += 1'
+        - use: bump
         - when: '.n == 2'
           stop: true
-  - jq: '"should not run"'
+  - use: never
 "#,
     );
 
@@ -1193,11 +1331,14 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - id: call
+nodes:
+  call:
     prompt: "{{{{ input }}}}"
     retry:
       max_attempts: 2
+steps:
+  - id: call
+    use: call
 "#,
         server.base_url
     ));
@@ -1229,14 +1370,19 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - id: call
+nodes:
+  call:
     prompt: "{{{{ input }}}}"
     retry:
       max_attempts: 2
+  recover:
+    jq: '.input'
+steps:
+  - id: call
+    use: call
     on_error:
       steps:
-        - jq: '.input'
+        - use: recover
 "#,
         server.base_url
     ));
@@ -1265,8 +1411,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
-  - prompt: "{{{{ input }}}}"
+  - use: echo
 "#,
         server.base_url
     ));
@@ -1293,10 +1442,13 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - id: call
+nodes:
+  call:
     prompt: "{{{{ input }}}}"
     timeout: 1
+steps:
+  - id: call
+    use: call
 "#,
         server.base_url
     ));
@@ -1341,12 +1493,17 @@ json_schemas:
         city: {{ type: string }}
       required: [city]
       additionalProperties: false
-steps:
-  - id: extract
+nodes:
+  extract:
     prompt: "{{{{ input }}}}"
     output_schema: city
     schema_name: city
-  - prompt: "city was {{{{ steps.extract.city }}}}"
+  greet:
+    prompt: "city was {{{{ steps.extract.city }}}}"
+steps:
+  - id: extract
+    use: extract
+  - use: greet
 "#,
         server.base_url
     ));
@@ -1368,10 +1525,15 @@ steps:
 fn a_jq_filter_can_reference_an_earlier_named_steps_output_via_dollar_steps() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  check:
+    jq: '{ ok: true }'
+  read_check:
+    jq: '$steps.check.ok'
 steps:
   - id: check
-    jq: '{ ok: true }'
-  - jq: '$steps.check.ok'
+    use: check
+  - use: read_check
 "#,
     );
 
@@ -1385,13 +1547,18 @@ steps:
 fn a_named_step_output_recorded_inside_a_parallel_branch_does_not_leak_outside_it() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  inner:
+    jq: '"branch value"'
+  read_inner:
+    jq: '$steps.inner'
 steps:
   - parallel:
       branches:
         - steps:
             - id: inner
-              jq: '"branch value"'
-  - jq: '$steps.inner'
+              use: inner
+  - use: read_inner
 "#,
     );
 
@@ -1409,12 +1576,15 @@ steps:
 fn concurrent_for_each_preserves_item_order_in_its_results_regardless_of_completion_order() {
     let workflow = WorkflowFile::new(
         r#"
+nodes:
+  times10:
+    jq: '. * 10'
 steps:
   - for_each:
       items: '.items'
       max_concurrency: 3
       steps:
-        - jq: '. * 10'
+        - use: times10
 "#,
     );
 
@@ -1440,12 +1610,15 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
   - for_each:
       items: '.items'
       max_concurrency: 3
       steps:
-        - prompt: "{{{{ input }}}}"
+        - use: echo
       join: 'length'
 "#,
         server.base_url
@@ -1500,16 +1673,22 @@ steps:
 fn a_workflow_step_runs_a_sub_workflow_and_uses_its_output() {
     let sub = WorkflowFile::new(
         r#"
+nodes:
+  add_one:
+    jq: '. + 1'
 steps:
-  - jq: '. + 1'
+  - use: add_one
 "#,
     );
     let sub_name = sub.path.file_name().unwrap().to_str().unwrap();
     let parent = WorkflowFile::new(&format!(
         r#"
-steps:
-  - workflow: {sub_name}
+nodes:
+  sub:
+    workflow: {sub_name}
     jq: '. * 2'
+steps:
+  - use: sub
 "#
     ));
 
@@ -1520,12 +1699,15 @@ steps:
 }
 
 #[test]
-fn a_sub_workflow_falls_back_to_the_callers_default_model() {
+fn a_sub_workflows_falls_back_to_the_callers_default_model() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let sub = WorkflowFile::new(
         r#"
+nodes:
+  echo:
+    prompt: "{{ input }}"
 steps:
-  - prompt: "{{ input }}"
+  - use: echo
 "#,
     );
     let sub_name = sub.path.file_name().unwrap().to_str().unwrap();
@@ -1538,8 +1720,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  sub:
+    workflow: {sub_name}
 steps:
-  - workflow: {sub_name}
+  - use: sub
 "#,
         server.base_url
     ));
@@ -1571,8 +1756,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: sub-model-id
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
-  - prompt: "{{{{ input }}}}"
+  - use: echo
 "#,
         sub_server.base_url
     ));
@@ -1586,8 +1774,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  sub:
+    workflow: {sub_name}
 steps:
-  - workflow: {sub_name}
+  - use: sub
 "#,
         caller_server.base_url
     ));
@@ -1612,19 +1803,29 @@ steps:
 fn a_sub_workflows_named_step_outputs_are_isolated_from_the_caller_in_both_directions() {
     let sub = WorkflowFile::new(
         r#"
+nodes:
+  inner:
+    jq: '$steps.outer'
 steps:
   - id: inner
-    jq: '$steps.outer'
+    use: inner
 "#,
     );
     let sub_name = sub.path.file_name().unwrap().to_str().unwrap();
     let parent = WorkflowFile::new(&format!(
         r#"
+nodes:
+  outer:
+    jq: '{{ from_outer: true }}'
+  sub:
+    workflow: {sub_name}
+  read_inner:
+    jq: '$steps.inner'
 steps:
   - id: outer
-    jq: '{{ from_outer: true }}'
-  - workflow: {sub_name}
-  - jq: '$steps.inner'
+    use: outer
+  - use: sub
+  - use: read_inner
 "#
     ));
 
@@ -1654,7 +1855,7 @@ fn a_workflow_step_cycle_is_rejected() {
     std::fs::write(
         &a_path,
         format!(
-            "steps:\n  - workflow: {}\n",
+            "nodes:\n  sub:\n    workflow: {}\nsteps:\n  - use: sub\n",
             b_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -1662,7 +1863,7 @@ fn a_workflow_step_cycle_is_rejected() {
     std::fs::write(
         &b_path,
         format!(
-            "steps:\n  - workflow: {}\n",
+            "nodes:\n  sub:\n    workflow: {}\nsteps:\n  - use: sub\n",
             a_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -1705,11 +1906,16 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-steps:
-  - id: written
+nodes:
+  written:
     prompt: "{{{{ input }}}}"
     write_file: "{}"
-  - prompt: "echo: {{{{ steps.written }}}}"
+  echo:
+    prompt: "echo: {{{{ steps.written }}}}"
+steps:
+  - id: written
+    use: written
+  - use: echo
 "#,
         server.base_url,
         output_path.display()
@@ -1752,8 +1958,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
-  - prompt: "{{{{ input }}}}"
+  - use: echo
 "#,
         server.base_url
     ));
@@ -1786,8 +1995,11 @@ models:
         base_url: "{}"
         api_key: "${{LAIT_TEST_ENV_API_KEY}}"
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
 steps:
-  - prompt: "{{{{ input }}}}"
+  - use: echo
 "#,
         server.base_url
     ));
@@ -1825,8 +2037,11 @@ models:
         base_url: http://127.0.0.1:65535/v1
         api_key: "${LAIT_TEST_ENV_DEFINITELY_UNSET}"
       model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{ input }}"
 steps:
-  - prompt: "{{ input }}"
+  - use: echo
 "#,
     );
 
