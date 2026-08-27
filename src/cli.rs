@@ -118,6 +118,12 @@ pub(crate) struct ChatArgs {
     #[arg(long, env = "LLM_MAX_TOKENS")]
     pub(crate) max_tokens: Option<u32>,
 
+    /// Name of an `mcp_servers:` entry (from lait.config.yml) whose tools
+    /// this request may call. Repeatable. Falls back to `default.mcp` in
+    /// lait.config.yml when unset. Incompatible with `--stream`.
+    #[arg(long = "mcp", value_name = "NAME")]
+    pub(crate) mcp: Vec<String>,
+
     /// A single prompt to send as a user message.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,

@@ -6,6 +6,7 @@
     "config",
     "workflow",
     "agent",
+    "mcp",
     "output",
     "troubleshooting",
     "development"

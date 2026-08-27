@@ -254,6 +254,9 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
     if let Some(timeout) = node.timeout {
         validate_timeout(timeout, &description)?;
     }
+    if let Some(max_tool_rounds) = node.max_tool_rounds {
+        validate_max_tool_rounds(max_tool_rounds, &description)?;
+    }
 
     let calls_model = node.prompt.is_some() || node.agent.is_some() || node.workflow.is_some();
     if !calls_model && node.jq.is_none() && node.write_file.is_none() {
@@ -301,6 +304,17 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
         bail!(
             "{description} has 'workflow' set; 'retry'/'timeout' apply to a single action and \
              must be set on the steps inside the referenced workflow file instead"
+        );
+    }
+    if node.workflow.is_some() && (node.mcp.is_some() || node.max_tool_rounds.is_some()) {
+        bail!(
+            "{description} has 'workflow' set; 'mcp'/'max_tool_rounds' apply to a single model \
+             call and must be set on the steps inside the referenced workflow file instead"
+        );
+    }
+    if !calls_model && (node.mcp.is_some() || node.max_tool_rounds.is_some()) {
+        bail!(
+            "{description} has 'mcp'/'max_tool_rounds' set but no 'prompt'/'agent' to apply it to"
         );
     }
     if !calls_model && node.output_schema.is_some() {
@@ -475,6 +489,16 @@ fn validate_timeout(timeout: u64, description: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates a `max_tool_rounds` value (a node's own, or the workflow's
+/// `default.max_tool_rounds`): must be at least 1. `description` is used the
+/// same way as in `validate_retry`.
+fn validate_max_tool_rounds(max_tool_rounds: usize, description: &str) -> Result<()> {
+    if max_tool_rounds == 0 {
+        bail!("{description} has 'max_tool_rounds: 0'; it must be at least 1");
+    }
+    Ok(())
+}
+
 /// Validates a workflow file's top-level `default:` block: its `retry`/
 /// `timeout`, if set, follow the same rules as a node's own (see
 /// `validate_retry`/`validate_timeout`), and its `temperature`/`top_p`/
@@ -493,6 +517,9 @@ pub(super) fn validate_workflow_defaults(defaults: &WorkflowDefaults) -> Result<
     }
     if let Some(timeout) = defaults.timeout {
         validate_timeout(timeout, "the workflow's 'default.timeout'")?;
+    }
+    if let Some(max_tool_rounds) = defaults.max_tool_rounds {
+        validate_max_tool_rounds(max_tool_rounds, "the workflow's 'default.max_tool_rounds'")?;
     }
     Ok(())
 }

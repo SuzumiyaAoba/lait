@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod jq;
 mod llm;
+mod mcp;
 mod response;
 mod schema;
 mod template;

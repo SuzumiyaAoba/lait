@@ -5,7 +5,7 @@ use async_openai::{
     error::OpenAIError,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequest,
         CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
     },
 };
@@ -44,10 +44,39 @@ pub(crate) struct CompletionRequest<'a> {
     /// sent as the (non-deprecated) `max_completion_tokens` field.
     pub(crate) max_tokens: Option<u32>,
     pub(crate) response_format: Option<ResponseFormat>,
-    /// An optional system-role message sent before the user prompt, e.g. an
-    /// agent file's rendered system prompt template.
-    pub(crate) system_prompt: Option<&'a str>,
-    pub(crate) prompt: &'a str,
+    /// The full message history for this request: for a single-shot call
+    /// this is just `initial_messages(system_prompt, prompt)`, but a tool
+    /// loop (`app::RequestSettings::complete`) grows it across rounds with
+    /// the assistant's `tool_calls` message and each tool's `tool`-role
+    /// result. Owned (not built from `system_prompt`/`prompt` here) so the
+    /// caller can reuse/extend the same history across rounds without lait
+    /// re-deriving it each time.
+    pub(crate) messages: Vec<ChatCompletionRequestMessage>,
+    /// The MCP-derived tools available to the model this round. Empty means
+    /// "don't send a `tools:` field at all", not "send an empty list" —
+    /// some servers treat the two differently.
+    pub(crate) tools: &'a [ChatCompletionTools],
+}
+
+/// Builds the initial two-message history shared by every completion request
+/// (chat/agent/workflow-step): an optional system prompt, then the user's
+/// prompt. A tool loop starts from this and appends to it round by round.
+pub(crate) fn initial_messages(
+    system_prompt: Option<&str>,
+    prompt: &str,
+) -> Result<Vec<ChatCompletionRequestMessage>> {
+    let mut messages = Vec::with_capacity(2);
+    if let Some(system_prompt) = system_prompt {
+        let system_message = ChatCompletionRequestSystemMessageArgs::default()
+            .content(system_prompt)
+            .build()?;
+        messages.push(ChatCompletionRequestMessage::from(system_message));
+    }
+    let user_message = ChatCompletionRequestUserMessageArgs::default()
+        .content(prompt)
+        .build()?;
+    messages.push(ChatCompletionRequestMessage::from(user_message));
+    Ok(messages)
 }
 
 /// Checks `temperature`/`top_p`/`max_tokens` are within the bounds the OpenAI
@@ -93,21 +122,9 @@ fn build_chat_request(
     request: &CompletionRequest<'_>,
     stream: bool,
 ) -> Result<CreateChatCompletionRequest> {
-    let mut messages = Vec::with_capacity(2);
-    if let Some(system_prompt) = request.system_prompt {
-        let system_message = ChatCompletionRequestSystemMessageArgs::default()
-            .content(system_prompt)
-            .build()?;
-        messages.push(ChatCompletionRequestMessage::from(system_message));
-    }
-    let user_message = ChatCompletionRequestUserMessageArgs::default()
-        .content(request.prompt)
-        .build()?;
-    messages.push(ChatCompletionRequestMessage::from(user_message));
-
     let mut chat_request = CreateChatCompletionRequestArgs::default();
     chat_request.model(request.model_id);
-    chat_request.messages(messages);
+    chat_request.messages(request.messages.clone());
     chat_request.stream(stream);
     if let Some(reasoning_effort) = request.reasoning_effort {
         chat_request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
@@ -123,6 +140,9 @@ fn build_chat_request(
     }
     if let Some(response_format) = request.response_format.clone() {
         chat_request.response_format(response_format);
+    }
+    if !request.tools.is_empty() {
+        chat_request.tools(request.tools.to_vec());
     }
     Ok(chat_request.build()?)
 }

@@ -75,6 +75,23 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 - レンダリングされた本文は system ロールのメッセージとして送信され、`INPUT`（元の生テキスト）
   は別途 user ロールのメッセージとして送信されます。
 
+## MCP ツールの利用
+
+frontmatter に `mcp:`（`lait.config.yml` の `mcp_servers:` エントリ名のリスト）と、任意で
+`max_tool_rounds:`（既定 8）を指定すると、その agent の呼び出しに MCP ツールが渡されます。
+
+```markdown
+---
+model: local
+mcp: [filesystem]
+max_tool_rounds: 8
+---
+{{ input.task }} を実行してください。
+```
+
+`mcp:` を省略した場合は `lait.config.yml` の `default.mcp` にフォールバックします。詳しい仕組みは
+[MCP サーバーのツールを使う](./mcp.md) を参照してください。
+
 ## ワークフローからエージェントファイルを使う
 
 `workflow.yml` の `nodes:` エントリで `prompt`/`input_schema`/`output_schema`/`schema_name` の

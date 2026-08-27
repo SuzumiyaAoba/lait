@@ -1,6 +1,6 @@
 ---
 title: "ワークフロー（workflow.yml）"
-description: "nodes/steps の分離とノードの再利用、モデル定義、JSON 出力と jq による加工、write_file、steps 参照、retry/timeout/on_error、when/switch、parallel、loop、for_each、stop/break、サブワークフロー呼び出し"
+description: "nodes/steps の分離とノードの再利用、モデル定義、JSON 出力と jq による加工、write_file、MCP ツールの利用、steps 参照、retry/timeout/on_error、when/switch、parallel、loop、for_each、stop/break、サブワークフロー呼び出し"
 ---
 
 `lait run <FILE> <PROMPT>` サブコマンドで、複数の LLM 呼び出しを YAML で逐次実行できます。
@@ -308,6 +308,50 @@ steps:
 フィールドの欠落や型の不一致を早期に（モデルを呼び出す前に）エラーとして弾くためのものです。
 `agent` を指定したノードでは agent ファイル側の `input_schema` が使われるため、ノードに
 `input_schema` を重ねて指定することはできません。
+
+## MCP ツールの利用（`mcp`）
+
+`prompt`/`agent` を持つノードに `mcp:` で `lait.config.yml` の `mcp_servers:`（登録方法は
+[設定ファイル](./config.mdx#mcp-サーバー) を参照）のエントリ名を並べると、そのノードのモデル
+呼び出しに MCP ツールが渡され、モデルがツール呼び出しを返すたびに lait が実行してその結果を
+モデルに返す、というやり取りを最大 `max_tool_rounds` 回まで自動で繰り返します。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+  mcp: [filesystem]        # ワークフロー全体の既定
+  max_tool_rounds: 8
+nodes:
+  research:
+    prompt: "{{ input }} について調べて要約してください。"
+    mcp: [filesystem, remote-search]   # ノードで上書き
+  summarize:
+    agent: agents/summarize.md
+    # mcp を書かなければ agent ファイル → default.mcp の順にフォールバック
+steps:
+  - use: research
+  - use: summarize
+```
+
+- `mcp`/`max_tool_rounds` は `model`/`reasoning_effort` と同じ、ノード → （`agent` ノードなら）
+  agent ファイルの frontmatter → ワークフローの `default:` → `lait.config.yml` の `default:` の
+  順に、それぞれ独立してフォールバックします。
+- `mcp`/`max_tool_rounds` は `prompt`/`agent` を持つノードだけに指定できます。データ変換のみの
+  `jq` ノードや `workflow:` ノード（サブワークフロー側の各ノードに指定してください）には
+  指定できません。
+- `max_tool_rounds`（既定 8）に達してもモデルが最終回答を返さない場合はエラーになります。
+- `structured_output: true`（`output_schema`）と `mcp` は併用できます。ツールを呼び出している間は
+  `response_format` を送らず、モデルがツール呼び出しを止めた最後のラウンドだけ `response_format`
+  を付けて再送します。多くの OpenAI 互換サーバーは、厳密な `json_schema` の `response_format` を
+  渡された状態だとツール呼び出しを一切返さなくなるため、この順序で送ることでツールと
+  structured output を両立させています。
+- `--stream` と `mcp` の併用は未対応です（ストリームの `tool_calls` はチャンクに分割されて届く
+  ため、まだ組み立て直す実装がありません）。
+- ツール呼び出しはノードの `retry` が包む単位に含まれます。リトライが発生すると、副作用のある
+  ツール呼び出しも含めてそのノードのツール周回全体がやり直されます。
+- 対応モデルは LM Studio 上のツール呼び出し対応モデル（`qwen3` 系など）を想定しています。
+  ツール呼び出しに対応していないモデルでは `tool_calls` が一切返らず、ツールは呼ばれません。
 
 ## ステップ間の値の受け渡し（`{{ steps.<id> }}` / `$steps`）
 

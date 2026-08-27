@@ -3,7 +3,7 @@ name = "lait"
 version = "0.1.0"
 edition = "2024"
 description = "Lightweight AI Tool"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1"
@@ -11,10 +11,12 @@ async-openai = { version = "0.41.3", default-features = false, features = ["byot
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 handlebars = "6.4.4"
+http = "1"
 jaq-core = "3.1.0"
 jaq-json = "2.0.2"
 jaq-std = "3.0.2"
+rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process", "io-util", "sync"] }
