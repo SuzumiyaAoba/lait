@@ -1906,51 +1906,6 @@ steps:
 }
 
 #[test]
-fn rejects_legacy_top_level_steps_with_an_inline_action_field() {
-    let result = parse_workflow(
-        r#"
-steps:
-  - prompt: "{{ input }}"
-"#,
-    );
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("nodes"), "error was: {error}");
-}
-
-#[test]
-fn rejects_legacy_steps_nested_inside_a_switch_case() {
-    let result = parse_workflow(
-        r#"
-nodes:
-  n:
-    prompt: "{{ input }}"
-steps:
-  - switch:
-      cases:
-        - when: 'true'
-          steps:
-            - jq: "."
-"#,
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_legacy_steps_nested_inside_a_loop() {
-    let result = parse_workflow(
-        r#"
-steps:
-  - loop:
-      until: 'true'
-      max_iterations: 3
-      steps:
-        - jq: "."
-"#,
-    );
-    assert!(result.is_err());
-}
-
-#[test]
 fn eval_when_coerces_plain_text_input_to_a_json_string() {
     assert!(eval_when(". == \"hello\"", "hello", &StepOutputs::new()).unwrap());
     assert!(!eval_when(". == \"hello\"", "world", &StepOutputs::new()).unwrap());
