@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -20,6 +20,10 @@ pub(crate) struct ConfigFile {
     /// file/workflow node/`default:` block. See `crate::mcp::McpRegistry`.
     #[serde(default)]
     pub(crate) mcp_servers: McpServerMap,
+    /// Named skill files, referenced by a `skills:` list on the agent
+    /// file/workflow node/`default:` block. See `crate::skill`.
+    #[serde(default)]
+    pub(crate) skills: SkillMap,
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
@@ -44,6 +48,10 @@ pub(crate) struct DefaultSettings {
     /// request may take before lait gives up and errors, when `mcp:` names at
     /// least one server. Falls back independently, like `temperature`.
     pub(crate) max_tool_rounds: Option<usize>,
+    /// Names of `skills:` entries whose content is appended to the system
+    /// prompt by default, when an agent file/workflow node doesn't set its
+    /// own `skills:`. Falls back independently, like `temperature`.
+    pub(crate) skills: Option<Vec<String>>,
 }
 
 /// A map of `mcp_servers:` name to its connection settings, as used by
@@ -137,6 +145,11 @@ impl McpServerConfig {
         }
     }
 }
+
+/// A map of `skills:` name to the path of its skill file (or a directory
+/// containing a `SKILL.md`), as used by `lait.config.yml`'s top-level
+/// `skills:`. See `crate::skill::load_skill`.
+pub(crate) type SkillMap = HashMap<String, PathBuf>;
 
 /// A map of model alias to its candidate definitions, as used by both
 /// `lait.config.yml`'s top-level `models:` and a workflow file's `models:`.

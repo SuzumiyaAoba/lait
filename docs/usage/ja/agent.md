@@ -92,6 +92,24 @@ max_tool_rounds: 8
 `mcp:` を省略した場合は `lait.config.yml` の `default.mcp` にフォールバックします。詳しい仕組みは
 [MCP サーバーのツールを使う](./mcp.md) を参照してください。
 
+## スキルの利用
+
+frontmatter に `skills:`（`lait.config.yml` の `skills:` エントリ名のリスト）を指定すると、
+その内容がシステムプロンプトテンプレートのレンダリング結果の末尾に `---` 区切りで追記されます。
+
+```markdown
+---
+model: local
+skills: [code-review]
+---
+次の差分をレビューしてください。
+
+{{ input.diff }}
+```
+
+`skills:` を省略した場合は `lait.config.yml` の `default.skills` にフォールバックします。詳しい
+仕組みは [スキルを使う](./skills.md) を参照してください。
+
 ## ワークフローからエージェントファイルを使う
 
 `workflow.yml` の `nodes:` エントリで `prompt`/`input_schema`/`output_schema`/`schema_name` の

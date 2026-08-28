@@ -210,6 +210,59 @@ steps:
 }
 
 #[test]
+fn a_node_overrides_the_workflow_default_skills() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\nskills:\n  from-default: from-default.md\n  from-node: from-node.md\n",
+        server.base_url
+    ));
+    std::fs::write(
+        config.path().join("from-default.md"),
+        "---\n---\nworkflow default skill body\n",
+    )
+    .expect("failed to write test skill file");
+    std::fs::write(
+        config.path().join("from-node.md"),
+        "---\n---\nnode-level skill body\n",
+    )
+    .expect("failed to write test skill file");
+    let workflow = WorkflowFile::new(
+        r#"
+default:
+  model: workflow-model
+  skills: [from-default]
+nodes:
+  echo:
+    prompt: "{{ input }}"
+    skills: [from-node]
+steps:
+  - use: echo
+"#,
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("run")
+        .arg(&workflow.path)
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait run");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["messages"][0],
+        serde_json::json!({
+            "role": "system",
+            "content": "## Skill: from-node\n\nnode-level skill body",
+        })
+    );
+}
+
+#[test]
 fn step_requests_structured_output_and_extracts_a_field_with_jq() {
     let schema = JsonSchemaFile::new(
         r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,
