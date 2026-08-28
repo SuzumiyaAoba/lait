@@ -24,6 +24,10 @@ struct AgentFrontmatter {
     #[serde(default)]
     structured_output: bool,
     schema_name: Option<String>,
+    /// Names of `mcp_servers:` entries (from `lait.config.yml`) whose tools
+    /// this agent may call.
+    mcp: Option<Vec<String>>,
+    max_tool_rounds: Option<usize>,
 }
 
 /// An agent Markdown file: YAML frontmatter (model/reasoning defaults,
@@ -42,6 +46,8 @@ pub(crate) struct AgentFile {
     pub(crate) output_schema: Option<JsonSchemaEntry>,
     pub(crate) structured_output: bool,
     pub(crate) schema_name: Option<String>,
+    pub(crate) mcp: Option<Vec<String>>,
+    pub(crate) max_tool_rounds: Option<usize>,
     /// The Markdown body, rendered as a handlebars template against the
     /// agent's input (see `crate::template::render`) to produce the system
     /// prompt actually sent to the model.
@@ -90,6 +96,7 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
         frontmatter.max_tokens,
         "the agent file",
     )?;
+    llm::validate_max_tool_rounds(frontmatter.max_tool_rounds, "the agent file")?;
 
     Ok(AgentFile {
         name: frontmatter.name,
@@ -103,6 +110,8 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
         output_schema: frontmatter.output_schema,
         structured_output: frontmatter.structured_output,
         schema_name: frontmatter.schema_name,
+        mcp: frontmatter.mcp,
+        max_tool_rounds: frontmatter.max_tool_rounds,
         system_prompt_template: body.trim().to_owned(),
     })
 }

@@ -4,16 +4,19 @@ use async_openai::{
     config::OpenAIConfig,
     error::OpenAIError,
     types::chat::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, FunctionCall, ReasoningEffort as OpenAiReasoningEffort,
+        ResponseFormat,
     },
 };
 use futures_util::Stream;
 
 use crate::{
     cli::ReasoningEffort,
-    response::{ChatCompletionResponse, ChatCompletionStreamChunk},
+    response::{ChatCompletionResponse, ChatCompletionStreamChunk, ToolCall},
 };
 
 impl From<ReasoningEffort> for OpenAiReasoningEffort {
@@ -44,10 +47,83 @@ pub(crate) struct CompletionRequest<'a> {
     /// sent as the (non-deprecated) `max_completion_tokens` field.
     pub(crate) max_tokens: Option<u32>,
     pub(crate) response_format: Option<ResponseFormat>,
-    /// An optional system-role message sent before the user prompt, e.g. an
-    /// agent file's rendered system prompt template.
-    pub(crate) system_prompt: Option<&'a str>,
-    pub(crate) prompt: &'a str,
+    /// The full message history for this request: for a single-shot call
+    /// this is just `initial_messages(system_prompt, prompt)`, but a tool
+    /// loop (`app::RequestSettings::complete`) grows it across rounds with
+    /// the assistant's `tool_calls` message and each tool's `tool`-role
+    /// result. Owned (not built from `system_prompt`/`prompt` here) so the
+    /// caller can reuse/extend the same history across rounds without lait
+    /// re-deriving it each time.
+    pub(crate) messages: Vec<ChatCompletionRequestMessage>,
+    /// The MCP-derived tools available to the model this round. Empty means
+    /// "don't send a `tools:` field at all", not "send an empty list" —
+    /// some servers treat the two differently.
+    pub(crate) tools: &'a [ChatCompletionTools],
+}
+
+/// Builds the initial two-message history shared by every completion request
+/// (chat/agent/workflow-step): an optional system prompt, then the user's
+/// prompt. A tool loop starts from this and appends to it round by round.
+pub(crate) fn initial_messages(
+    system_prompt: Option<&str>,
+    prompt: &str,
+) -> Result<Vec<ChatCompletionRequestMessage>> {
+    let mut messages = Vec::with_capacity(2);
+    if let Some(system_prompt) = system_prompt {
+        let system_message = ChatCompletionRequestSystemMessageArgs::default()
+            .content(system_prompt)
+            .build()?;
+        messages.push(ChatCompletionRequestMessage::from(system_message));
+    }
+    let user_message = ChatCompletionRequestUserMessageArgs::default()
+        .content(prompt)
+        .build()?;
+    messages.push(ChatCompletionRequestMessage::from(user_message));
+    Ok(messages)
+}
+
+/// Builds the assistant-role message recording a model turn's `tool_calls`
+/// (and any `content` it produced alongside them), the shape a tool loop
+/// (`app::RequestSettings::complete`) appends to its message history right
+/// before running the calls themselves.
+pub(crate) fn assistant_tool_call_message(
+    tool_calls: &[ToolCall],
+    content: Option<&str>,
+) -> Result<ChatCompletionRequestMessage> {
+    let tool_call_entries: Vec<ChatCompletionMessageToolCalls> = tool_calls
+        .iter()
+        .map(|tool_call| {
+            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                id: tool_call.id.clone(),
+                function: FunctionCall {
+                    name: tool_call.function.name.clone(),
+                    arguments: tool_call.function.arguments.clone(),
+                },
+            })
+        })
+        .collect();
+    let mut assistant_message = ChatCompletionRequestAssistantMessageArgs::default();
+    assistant_message.tool_calls(tool_call_entries);
+    if let Some(content) = content {
+        assistant_message.content(content);
+    }
+    Ok(ChatCompletionRequestMessage::from(
+        assistant_message.build()?,
+    ))
+}
+
+/// Builds the `tool`-role message carrying one tool call's result back to the
+/// model, the shape a tool loop appends to its message history for each call
+/// a round makes.
+pub(crate) fn tool_result_message(
+    tool_call_id: &str,
+    content: String,
+) -> Result<ChatCompletionRequestMessage> {
+    let tool_message = ChatCompletionRequestToolMessageArgs::default()
+        .content(content)
+        .tool_call_id(tool_call_id)
+        .build()?;
+    Ok(ChatCompletionRequestMessage::from(tool_message))
 }
 
 /// Checks `temperature`/`top_p`/`max_tokens` are within the bounds the OpenAI
@@ -80,6 +156,22 @@ pub(crate) fn validate_sampling_params(
     Ok(())
 }
 
+/// Checks a `max_tool_rounds` value (a CLI/agent-file/node/workflow-default
+/// setting, or the value once every fallback layer has resolved it) is at
+/// least 1, the same "validate eagerly everywhere, then again once resolved"
+/// pattern as [`validate_sampling_params`]. Called from `agent::parse_agent`,
+/// `workflow::validate::validate_node`/`validate_workflow_defaults`, and
+/// `app::resolve_request_settings`.
+pub(crate) fn validate_max_tool_rounds(
+    max_tool_rounds: Option<usize>,
+    description: &str,
+) -> Result<()> {
+    if max_tool_rounds == Some(0) {
+        bail!("{description} has 'max_tool_rounds: 0'; it must be at least 1");
+    }
+    Ok(())
+}
+
 /// A parsed SSE stream of `chat.completion.chunk` events, as returned by
 /// [`complete_stream`]. Each item is `Err` when a chunk fails to parse or the
 /// connection drops mid-stream.
@@ -88,26 +180,17 @@ pub(crate) type CompletionStream =
 
 /// Builds the request body shared by [`complete`] and [`complete_stream`];
 /// the two differ only in `stream` and in which `Chat::create*_byot` method
-/// the caller passes the result to.
+/// the caller passes the result to. Takes `request` by value (rather than
+/// `&CompletionRequest`) so `messages`/`response_format` can be moved into
+/// the builder instead of cloned — the caller never uses `request` again
+/// after this call.
 fn build_chat_request(
-    request: &CompletionRequest<'_>,
+    request: CompletionRequest<'_>,
     stream: bool,
 ) -> Result<CreateChatCompletionRequest> {
-    let mut messages = Vec::with_capacity(2);
-    if let Some(system_prompt) = request.system_prompt {
-        let system_message = ChatCompletionRequestSystemMessageArgs::default()
-            .content(system_prompt)
-            .build()?;
-        messages.push(ChatCompletionRequestMessage::from(system_message));
-    }
-    let user_message = ChatCompletionRequestUserMessageArgs::default()
-        .content(request.prompt)
-        .build()?;
-    messages.push(ChatCompletionRequestMessage::from(user_message));
-
     let mut chat_request = CreateChatCompletionRequestArgs::default();
     chat_request.model(request.model_id);
-    chat_request.messages(messages);
+    chat_request.messages(request.messages);
     chat_request.stream(stream);
     if let Some(reasoning_effort) = request.reasoning_effort {
         chat_request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
@@ -121,8 +204,11 @@ fn build_chat_request(
     if let Some(max_tokens) = request.max_tokens {
         chat_request.max_completion_tokens(max_tokens);
     }
-    if let Some(response_format) = request.response_format.clone() {
+    if let Some(response_format) = request.response_format {
         chat_request.response_format(response_format);
+    }
+    if !request.tools.is_empty() {
+        chat_request.tools(request.tools.to_vec());
     }
     Ok(chat_request.build()?)
 }
@@ -133,7 +219,7 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
         .with_api_key(request.api_key);
     let client = Client::with_config(config);
 
-    let chat_request = build_chat_request(&request, false)?;
+    let chat_request = build_chat_request(request, false)?;
     let response: ChatCompletionResponse = client.chat().create_byot(chat_request).await?;
     Ok(response)
 }
@@ -146,7 +232,7 @@ pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<Co
         .with_api_key(request.api_key);
     let client = Client::with_config(config);
 
-    let chat_request = build_chat_request(&request, true)?;
+    let chat_request = build_chat_request(request, true)?;
     let stream = client.chat().create_stream_byot(chat_request).await?;
     Ok(stream)
 }

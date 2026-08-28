@@ -66,6 +66,11 @@ pub(crate) struct WorkflowDefaults {
     /// Fallback `timeout` (seconds) for any step that calls a model
     /// (`prompt`/`agent`) and doesn't set its own.
     pub(crate) timeout: Option<u64>,
+    /// Fallback `mcp`/`max_tool_rounds` for any node that calls a model
+    /// (`prompt`/`agent`) and doesn't set its own. Each falls back
+    /// independently, like `temperature`, not as a whole unit like `retry`.
+    pub(crate) mcp: Option<Vec<String>>,
+    pub(crate) max_tool_rounds: Option<usize>,
 }
 
 /// A reusable action definition, referenced by id from `steps[].use`. Carries
@@ -153,6 +158,16 @@ pub(crate) struct NodeDefinition {
     /// error. Falls back to the workflow's `default.timeout` under the same
     /// rule as `retry` above.
     pub(crate) timeout: Option<u64>,
+    /// Names of `mcp_servers:` entries (from `lait.config.yml`) whose tools
+    /// this node's model call may use. Only meaningful for a node that calls
+    /// a model (`prompt`/`agent`); falls back to the agent file's own `mcp:`
+    /// (for an `agent` node), then to the workflow's `default.mcp`, the same
+    /// way as `reasoning_effort`.
+    pub(crate) mcp: Option<Vec<String>>,
+    /// The maximum number of tool-call round trips this node's model call may
+    /// take before lait errors, when `mcp` (from any fallback layer) names at
+    /// least one server. Falls back the same way as `mcp`.
+    pub(crate) max_tool_rounds: Option<usize>,
 }
 
 /// A control-flow reference site: one position in a `steps:` list. Carries

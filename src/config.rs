@@ -16,6 +16,10 @@ pub(crate) struct ConfigFile {
     pub(crate) default: DefaultSettings,
     #[serde(default)]
     models: ModelMap,
+    /// Named MCP servers, referenced by a `mcp:` list on the CLI/agent
+    /// file/workflow node/`default:` block. See `crate::mcp::McpRegistry`.
+    #[serde(default)]
+    pub(crate) mcp_servers: McpServerMap,
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
@@ -32,6 +36,106 @@ pub(crate) struct DefaultSettings {
     pub(crate) temperature: Option<f64>,
     pub(crate) top_p: Option<f64>,
     pub(crate) max_tokens: Option<u32>,
+    /// Names of `mcp_servers:` entries whose tools are available by default,
+    /// when a CLI invocation/agent file/workflow node doesn't set its own
+    /// `mcp:`. Falls back independently, like `temperature`.
+    pub(crate) mcp: Option<Vec<String>>,
+    /// The maximum number of tool-call round trips a single completion
+    /// request may take before lait gives up and errors, when `mcp:` names at
+    /// least one server. Falls back independently, like `temperature`.
+    pub(crate) max_tool_rounds: Option<usize>,
+}
+
+/// A map of `mcp_servers:` name to its connection settings, as used by
+/// `lait.config.yml`'s top-level `mcp_servers:`.
+pub(crate) type McpServerMap = HashMap<String, McpServerConfig>;
+
+/// One `mcp_servers:` entry. Exactly one of `command` (stdio, a child
+/// process) or `url` (streamable HTTP) must be set; see
+/// `McpServerConfig::resolve_transport`, which is where that's enforced (not
+/// here, matching how `ModelDefinition`'s `model_id` emptiness is checked
+/// lazily in `resolve_model_alias` rather than at parse time).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpServerConfig {
+    /// The executable to spawn for a stdio server. Mutually exclusive with `url`.
+    pub(crate) command: Option<String>,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    #[serde(default)]
+    pub(crate) env: HashMap<String, String>,
+    pub(crate) cwd: Option<String>,
+    /// The endpoint for a streamable-HTTP server. Mutually exclusive with `command`.
+    pub(crate) url: Option<String>,
+    #[serde(default)]
+    pub(crate) headers: HashMap<String, String>,
+}
+
+/// The transport settings for one MCP server, after resolving `${VAR}`
+/// placeholders (see `expand_env_placeholders`) and deciding stdio vs. HTTP.
+#[derive(Debug, Clone)]
+pub(crate) enum McpTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        cwd: Option<String>,
+    },
+    Http {
+        url: String,
+        headers: HashMap<String, String>,
+    },
+}
+
+impl McpServerConfig {
+    /// Resolves this entry into a transport, expanding `${VAR}` placeholders
+    /// in every field the same way `base_url`/`api_key` are expanded (see
+    /// `expand_env_placeholders`) — this entry is always config-sourced, never
+    /// a CLI override. `name` is only used to name the server in error
+    /// messages.
+    pub(crate) fn resolve_transport(&self, name: &str) -> Result<McpTransport> {
+        match (&self.command, &self.url) {
+            (Some(_), Some(_)) => bail!(
+                "mcp_servers.{name} has both 'command' and 'url'; set exactly one (stdio vs. streamable HTTP)"
+            ),
+            (None, None) => bail!(
+                "mcp_servers.{name} has neither 'command' nor 'url'; set exactly one (stdio vs. streamable HTTP)"
+            ),
+            (Some(command), None) => {
+                let command = expand_env_placeholders(command)?;
+                let args = self
+                    .args
+                    .iter()
+                    .map(|arg| expand_env_placeholders(arg))
+                    .collect::<Result<Vec<_>>>()?;
+                let env = self
+                    .env
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
+                    .collect::<Result<HashMap<_, _>>>()?;
+                let cwd = self
+                    .cwd
+                    .as_deref()
+                    .map(expand_env_placeholders)
+                    .transpose()?;
+                Ok(McpTransport::Stdio {
+                    command,
+                    args,
+                    env,
+                    cwd,
+                })
+            }
+            (None, Some(url)) => {
+                let url = expand_env_placeholders(url)?;
+                let headers = self
+                    .headers
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
+                    .collect::<Result<HashMap<_, _>>>()?;
+                Ok(McpTransport::Http { url, headers })
+            }
+        }
+    }
 }
 
 /// A map of model alias to its candidate definitions, as used by both
@@ -188,7 +292,7 @@ pub(crate) fn load_config(no_config: bool) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_with;
+    use super::{McpServerConfig, McpTransport, expand_with};
     use std::collections::HashMap;
 
     fn lookup_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -258,5 +362,91 @@ mod tests {
     #[test]
     fn errors_on_a_placeholder_name_with_invalid_characters() {
         assert!(expand_with("${API-KEY}", lookup_from(&[("API-KEY", "x")])).is_err());
+    }
+
+    fn stdio_config(command: &str) -> McpServerConfig {
+        McpServerConfig {
+            command: Some(command.to_owned()),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn http_config(url: &str) -> McpServerConfig {
+        McpServerConfig {
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            url: Some(url.to_owned()),
+            headers: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn resolves_a_stdio_server() {
+        let transport = stdio_config("npx").resolve_transport("test").unwrap();
+        match transport {
+            McpTransport::Stdio { command, .. } => assert_eq!(command, "npx"),
+            McpTransport::Http { .. } => panic!("expected a stdio transport"),
+        }
+    }
+
+    #[test]
+    fn resolves_an_http_server() {
+        let transport = http_config("https://example.com/mcp")
+            .resolve_transport("test")
+            .unwrap();
+        match transport {
+            McpTransport::Http { url, .. } => assert_eq!(url, "https://example.com/mcp"),
+            McpTransport::Stdio { .. } => panic!("expected an http transport"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_server_with_neither_command_nor_url() {
+        let config = McpServerConfig {
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+        };
+        let error = config.resolve_transport("test").unwrap_err();
+        assert!(error.to_string().contains("neither"));
+    }
+
+    #[test]
+    fn rejects_a_server_with_both_command_and_url() {
+        let mut config = stdio_config("npx");
+        config.url = Some("https://example.com/mcp".to_owned());
+        let error = config.resolve_transport("test").unwrap_err();
+        assert!(error.to_string().contains("both"));
+    }
+
+    #[test]
+    fn expands_placeholders_in_stdio_env_and_args() {
+        // SAFETY: single-threaded test-only env mutation, restored immediately.
+        unsafe {
+            std::env::set_var("LAIT_TEST_MCP_TOKEN", "secret");
+        }
+        let mut config = stdio_config("npx");
+        config
+            .env
+            .insert("TOKEN".to_owned(), "${LAIT_TEST_MCP_TOKEN}".to_owned());
+        let transport = config.resolve_transport("test").unwrap();
+        unsafe {
+            std::env::remove_var("LAIT_TEST_MCP_TOKEN");
+        }
+        match transport {
+            McpTransport::Stdio { env, .. } => {
+                assert_eq!(env.get("TOKEN").map(String::as_str), Some("secret"));
+            }
+            McpTransport::Http { .. } => panic!("expected a stdio transport"),
+        }
     }
 }

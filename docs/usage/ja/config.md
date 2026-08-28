@@ -97,3 +97,39 @@ models:
 - この展開は設定ファイル（`lait.config.yml`、および後述するワークフローファイルの `models:`/
   トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
+
+## MCP サーバー
+
+`mcp_servers:` に MCP (Model Context Protocol) サーバーを登録すると、`--mcp`（チャット）・
+agent ファイルの `mcp:`・ワークフローノードの `mcp:` から名前で参照してツールを使えるように
+なります。詳しい使い方は [MCP サーバーのツールを使う](./mcp.md) を参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  model: local
+  mcp: [filesystem]        # 全経路（チャット / agent / workflow）の最終フォールバック
+  max_tool_rounds: 8        # 省略時は 8
+
+mcp_servers:
+  # stdio: 子プロセスとして起動
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    env:
+      SOME_TOKEN: ${SOME_TOKEN}
+    cwd: ./work             # 省略可
+
+  # streamable HTTP: リモートサーバーに接続
+  remote-search:
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: "Bearer ${SEARCH_TOKEN}"
+```
+
+- `command:`（stdio）と `url:`（streamable HTTP）はどちらか一方だけを指定します。両方または
+  どちらも指定しない場合はエラーになります。
+- `command`/`args`/`env` の値、`cwd`、`url`、`headers` の値は、いずれも `${VAR_NAME}` 展開の対象
+  です（前節と同じ規則）。
+- 実際に使われるサーバーだけがその場で接続されます（`mcp:` で名前を挙げていないサーバーは
+  起動しません）。

@@ -373,6 +373,59 @@ fn rejects_a_workflow_node_with_retry() {
 }
 
 #[test]
+fn rejects_a_workflow_node_with_mcp() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    workflow: sub.yml\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_node_with_max_tool_rounds() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    workflow: sub.yml\n    max_tool_rounds: 4\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_mcp_on_a_jq_only_node() {
+    let result =
+        parse_workflow("nodes:\n  n:\n    jq: '.'\n    mcp: [filesystem]\nsteps:\n  - use: n\n");
+    assert!(result.is_err());
+}
+
+#[test]
+fn allows_mcp_on_a_prompt_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_mcp_on_an_agent_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    agent: agents/a.md\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn rejects_a_node_max_tool_rounds_of_zero() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    max_tool_rounds: 0\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_default_max_tool_rounds_of_zero() {
+    let result = parse_workflow("default:\n  max_tool_rounds: 0\nsteps:\n  - use: n\n");
+    assert!(result.is_err());
+}
+
+#[test]
 fn allows_a_workflow_node_with_on_error_at_its_use_site() {
     // `on_error` lives on the `steps[]` reference site, not on the node
     // (unlike `retry`/`timeout`, which stay forbidden on a `workflow:` node —

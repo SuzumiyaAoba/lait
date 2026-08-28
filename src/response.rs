@@ -12,10 +12,32 @@ struct ChatCompletionChoice {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatCompletionResponseMessage {
+pub(crate) struct ChatCompletionResponseMessage {
     content: Option<String>,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
+    /// The tool calls the model asked to make, when it stopped to call a
+    /// tool instead of (or in addition to) producing `content`. `None`/empty
+    /// when the server doesn't support tool calling or the model didn't call
+    /// one this turn.
+    #[serde(default)]
+    pub(crate) tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// One tool call from a `tool_calls` response field, in the OpenAI chat
+/// completions shape (`{"id", "type": "function", "function": {"name",
+/// "arguments"}}`). `arguments` is the raw JSON text the model produced, not
+/// yet parsed — parsing/validating it is `McpRegistry::call`'s job.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ToolCall {
+    pub(crate) id: String,
+    pub(crate) function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ToolCallFunction {
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,16 +115,28 @@ pub(crate) fn render_response(
     }
 }
 
+/// The first choice's message, for callers (the tool loop in `app.rs`) that
+/// need to inspect `tool_calls`/raw `content` before deciding whether a lack
+/// of `content` is even an error — unlike `response_content`, this never
+/// errors on an empty/missing `content`.
+pub(crate) fn first_message(
+    response: &ChatCompletionResponse,
+) -> Option<&ChatCompletionResponseMessage> {
+    response.choices.first().map(|choice| &choice.message)
+}
+
+impl ChatCompletionResponseMessage {
+    pub(crate) fn content(&self) -> Option<&str> {
+        self.content
+            .as_deref()
+            .filter(|content| !content.is_empty())
+    }
+}
+
 fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&str, &'static str> {
-    let choice = response
-        .choices
-        .first()
-        .ok_or("API response contained no choices")?;
-    choice
-        .message
-        .content
-        .as_deref()
-        .filter(|content| !content.is_empty())
+    let message = first_message(response).ok_or("API response contained no choices")?;
+    message
+        .content()
         .ok_or("API response contained no content in its first choice")
 }
 

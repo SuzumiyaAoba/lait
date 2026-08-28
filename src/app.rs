@@ -6,7 +6,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use async_openai::types::chat::ResponseFormat;
+use async_openai::types::chat::{
+    ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat,
+};
 use futures_util::{StreamExt, TryStreamExt};
 
 use crate::{
@@ -14,10 +16,17 @@ use crate::{
     cli::{AgentAction, ChatArgs, Cli, Command, RunArgs},
     cli::{AgentRunArgs, ReasoningEffort},
     config::{self, ConfigFile, ModelMap},
-    jq, llm, response, schema, template, workflow,
+    jq, llm, mcp, response, schema, template, workflow,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+
+/// The maximum number of tool-call round trips a single completion request
+/// may take (see `RequestSettings::complete`) before lait gives up and
+/// errors instead of looping forever on a model that keeps calling tools.
+/// Overridable per CLI invocation/agent file/workflow node/`default:` via
+/// `max_tool_rounds`.
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     match cli.command {
@@ -43,6 +52,17 @@ struct SamplingOverrides {
     max_tokens: Option<u32>,
 }
 
+/// The `mcp`/`max_tool_rounds` knobs a caller may set for a single completion
+/// request, bundled the same way as `SamplingOverrides` and for the same
+/// reason (keeps `resolve_request_settings`'s argument count down; each
+/// field falls back independently to `file_config.default`, not as a whole
+/// unit).
+#[derive(Debug, Default, Clone)]
+struct McpOverrides {
+    mcp: Option<Vec<String>>,
+    max_tool_rounds: Option<usize>,
+}
+
 /// The model/base-URL/API-key/sampling settings for a single completion
 /// request, after resolving aliases and applying every fallback layer.
 struct RequestSettings {
@@ -50,17 +70,27 @@ struct RequestSettings {
     api_key: String,
     resolved_model: config::ResolvedModel,
     sampling: SamplingOverrides,
+    /// Names of `mcp_servers:` entries whose tools this request may call.
+    /// Empty means "no tools" — `complete`'s fast path then behaves exactly
+    /// like a single-shot request always has.
+    mcp: Vec<String>,
+    max_tool_rounds: usize,
 }
 
 impl RequestSettings {
-    /// Sends a single completion request built from these settings.
-    async fn complete(
-        &self,
-        system_prompt: Option<&str>,
-        prompt: &str,
+    /// Builds an `llm::CompletionRequest` from these settings plus the
+    /// per-call `response_format`/`messages`/`tools`. The `base_url`/
+    /// `api_key`/`model_id`/sampling fields are the same for every request
+    /// `self` ever builds, so both `complete`'s tool loop and
+    /// `complete_stream` go through here instead of repeating that field
+    /// list at each call site.
+    fn request<'a>(
+        &'a self,
         response_format: Option<ResponseFormat>,
-    ) -> Result<response::ChatCompletionResponse> {
-        llm::complete(llm::CompletionRequest {
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &'a [ChatCompletionTools],
+    ) -> llm::CompletionRequest<'a> {
+        llm::CompletionRequest {
             base_url: &self.base_url,
             api_key: &self.api_key,
             model_id: &self.resolved_model.model_id,
@@ -69,32 +99,110 @@ impl RequestSettings {
             top_p: self.sampling.top_p,
             max_tokens: self.sampling.max_tokens,
             response_format,
-            system_prompt,
-            prompt,
-        })
-        .await
+            messages,
+            tools,
+        }
+    }
+
+    /// Sends a completion request built from these settings, driving a
+    /// tool-call loop when `self.mcp` names at least one MCP server: each
+    /// round sends the growing message history to the model, and if it comes
+    /// back with `tool_calls`, `registry` executes them and their results are
+    /// appended as `tool`-role messages before the next round. Ends either
+    /// when a round produces no `tool_calls` (the model's final answer) or
+    /// after `self.max_tool_rounds` rounds, whichever comes first.
+    ///
+    /// `response_format` is withheld from every round while tools are still
+    /// in play and only attached to the final, tool-free round: many
+    /// OpenAI-compatible servers, given a strict `json_schema` response
+    /// format, force schema-conforming output and never emit `tool_calls` at
+    /// all, which would silently stop tools from ever firing. See
+    /// `docs/usage/ja/mcp.md`.
+    async fn complete(
+        &self,
+        registry: &mcp::McpRegistry<'_>,
+        system_prompt: Option<&str>,
+        prompt: &str,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<response::ChatCompletionResponse> {
+        if self.mcp.is_empty() {
+            let messages = llm::initial_messages(system_prompt, prompt)?;
+            return llm::complete(self.request(response_format, messages, &[])).await;
+        }
+
+        let tool_set = registry.tools(&self.mcp).await?;
+        let mut messages = llm::initial_messages(system_prompt, prompt)?;
+
+        let mut round = 0usize;
+        loop {
+            round += 1;
+            if round > self.max_tool_rounds {
+                bail!(
+                    "tool loop exceeded max_tool_rounds ({}) without the model producing a final response",
+                    self.max_tool_rounds
+                );
+            }
+
+            let response =
+                llm::complete(self.request(None, messages.clone(), &tool_set.tools)).await?;
+
+            let tool_calls = response::first_message(&response)
+                .and_then(|message| message.tool_calls.as_ref())
+                .filter(|tool_calls| !tool_calls.is_empty());
+
+            let Some(tool_calls) = tool_calls else {
+                if response_format.is_none() {
+                    return Ok(response);
+                }
+                // The model stopped calling tools; re-issue the same history
+                // once more with `response_format` attached, now that doing
+                // so can no longer suppress a tool call.
+                return llm::complete(self.request(response_format, messages, &[])).await;
+            };
+
+            let content = response::first_message(&response).and_then(|message| message.content());
+            messages.push(llm::assistant_tool_call_message(tool_calls, content)?);
+
+            // A model turn's `tool_calls` are independent by construction (it
+            // couldn't have seen one call's result before deciding on
+            // another), so they're run concurrently rather than one at a
+            // time; `try_join_all` preserves `tool_calls`' order regardless
+            // of completion order, so the appended `tool`-role messages stay
+            // in a stable, deterministic order.
+            let tool_messages =
+                futures_util::future::try_join_all(tool_calls.iter().map(|tool_call| async {
+                    let result = registry
+                        .call(
+                            &tool_set,
+                            &tool_call.function.name,
+                            &tool_call.function.arguments,
+                        )
+                        .await?;
+                    llm::tool_result_message(&tool_call.id, result)
+                }))
+                .await?;
+            messages.extend(tool_messages);
+        }
     }
 
     /// Like [`RequestSettings::complete`], but requests a streamed response.
+    /// Rejects `self.mcp` being non-empty: a streamed `tool_calls` field
+    /// arrives as index-keyed fragments that must be reassembled before they
+    /// can be routed to an MCP server, which lait does not yet do (see
+    /// `docs/usage/ja/mcp.md`).
     async fn complete_stream(
         &self,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
     ) -> Result<llm::CompletionStream> {
-        llm::complete_stream(llm::CompletionRequest {
-            base_url: &self.base_url,
-            api_key: &self.api_key,
-            model_id: &self.resolved_model.model_id,
-            reasoning_effort: self.sampling.reasoning_effort,
-            temperature: self.sampling.temperature,
-            top_p: self.sampling.top_p,
-            max_tokens: self.sampling.max_tokens,
-            response_format,
-            system_prompt,
-            prompt,
-        })
-        .await
+        if !self.mcp.is_empty() {
+            bail!(
+                "'--stream'/streaming is not supported together with 'mcp:' yet; drop one of them"
+            );
+        }
+        let messages = llm::initial_messages(system_prompt, prompt)?;
+        llm::complete_stream(self.request(response_format, messages, &[])).await
     }
 }
 
@@ -148,6 +256,7 @@ async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: boo
 async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
+    registry: &mcp::McpRegistry<'_>,
     input: &serde_json::Value,
     prompt: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -166,7 +275,7 @@ async fn call_agent(
         .transpose()?;
 
     let response = settings
-        .complete(Some(&system_prompt), prompt, response_format)
+        .complete(registry, Some(&system_prompt), prompt, response_format)
         .await?;
     response::render_response(&response, false, false)
 }
@@ -177,12 +286,17 @@ async fn call_agent(
 /// layers every caller shares: the resolved model's own defaults, then
 /// `lait.config.yml`'s `default:` block. `local_models` is the alias map to
 /// check before falling back to `file_config`'s (a workflow's embedded
-/// `models:`, or empty when there is none).
+/// `models:`, or empty when there is none). `mcp_overrides` follows the same
+/// two-layer fallback (caller's own value, then `file_config.default`) —
+/// there is no per-model-alias `mcp:`, unlike `reasoning_effort`/
+/// `temperature`, since an MCP server has no natural connection to a model
+/// definition.
 fn resolve_request_settings(
     model_name: String,
     overrides: SamplingOverrides,
     base_url_override: Option<String>,
     api_key_override: Option<String>,
+    mcp_overrides: McpOverrides,
     local_models: &ModelMap,
     file_config: &ConfigFile,
 ) -> Result<RequestSettings> {
@@ -264,11 +378,26 @@ fn resolve_request_settings(
         &format!("the request for model '{}'", resolved_model.model_id),
     )?;
 
+    let mcp = mcp_overrides
+        .mcp
+        .or_else(|| file_config.default.mcp.clone())
+        .unwrap_or_default();
+    let max_tool_rounds = mcp_overrides
+        .max_tool_rounds
+        .or(file_config.default.max_tool_rounds);
+    llm::validate_max_tool_rounds(
+        max_tool_rounds,
+        &format!("the request for model '{}'", resolved_model.model_id),
+    )?;
+    let max_tool_rounds = max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
+
     Ok(RequestSettings {
         base_url,
         api_key,
         resolved_model,
         sampling,
+        mcp,
+        max_tool_rounds,
     })
 }
 
@@ -299,6 +428,10 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         },
         chat.base_url.clone(),
         chat.api_key.clone(),
+        McpOverrides {
+            mcp: (!chat.mcp.is_empty()).then(|| chat.mcp.clone()),
+            max_tool_rounds: None,
+        },
         &ModelMap::default(),
         &file_config,
     )?;
@@ -316,7 +449,10 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         return stream_to_stdout(stream, chat.show_reasoning).await;
     }
 
-    let response = settings.complete(None, &prompt, response_format).await?;
+    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
+    let response = settings
+        .complete(&registry, None, &prompt, response_format)
+        .await?;
 
     let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
     println!("{output}");
@@ -359,13 +495,19 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         },
         None,
         None,
+        McpOverrides {
+            mcp: agent_file.mcp.clone(),
+            max_tool_rounds: agent_file.max_tool_rounds,
+        },
         &ModelMap::default(),
         &file_config,
     )?;
 
+    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let output = call_agent(
         &agent_file,
         &settings,
+        &registry,
         &input,
         &args.input,
         &workflow::StepOutputs::new(),
@@ -388,11 +530,16 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     }
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
+    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
+    let env = RunEnv {
+        file_config: &file_config,
+        registry: &registry,
+    };
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
         run_args.prompt,
         &scope,
-        &file_config,
+        &env,
         0,
         "",
         workflow::StepOutputs::new(),
@@ -406,6 +553,17 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 /// workflow file, whose own steps may call another, ...), rejected as a
 /// runtime error rather than left to overflow the stack or hang.
 const MAX_WORKFLOW_DEPTH: usize = 32;
+
+/// The loaded config file and the MCP registry for the whole `lait run`
+/// invocation — unlike `WorkflowScope`, neither changes at a `workflow:`
+/// nesting boundary, so the same `&RunEnv` flows unchanged through every
+/// `run_steps`/`execute_step_with_retry`/`execute_step` call. Bundled into
+/// one struct (rather than two parameters) purely to keep those functions'
+/// argument counts under clippy's `too_many_arguments` threshold.
+struct RunEnv<'a> {
+    file_config: &'a ConfigFile,
+    registry: &'a mcp::McpRegistry<'a>,
+}
 
 /// The default model/reasoning-effort, model aliases, and JSON schema
 /// definitions currently in effect, plus enough bookkeeping to run a nested
@@ -434,6 +592,13 @@ struct WorkflowScope {
     /// when unset.
     default_retry: Option<workflow::RetryDefinition>,
     default_timeout: Option<u64>,
+    /// Fallback `mcp`/`max_tool_rounds` for a node that doesn't set its own
+    /// (see `resolve_step_settings`). Merged across `workflow:` nesting the
+    /// same way as `default_model`/`default_reasoning_effort`: each falls
+    /// back independently, like `temperature`, not as a whole unit like
+    /// `default_retry`.
+    default_mcp: Option<Vec<String>>,
+    default_max_tool_rounds: Option<usize>,
     models: ModelMap,
     json_schemas: schema::JsonSchemaMap,
     /// This scope's own `nodes:` map, resolved by every `steps[].use` in this
@@ -472,6 +637,8 @@ impl WorkflowScope {
             default_max_tokens: wf.default.max_tokens,
             default_retry: wf.default.retry.clone(),
             default_timeout: wf.default.timeout,
+            default_mcp: wf.default.mcp.clone(),
+            default_max_tool_rounds: wf.default.max_tool_rounds,
             models: wf.models.clone(),
             json_schemas: wf.json_schemas.clone(),
             nodes: std::mem::take(&mut wf.nodes),
@@ -554,6 +721,15 @@ impl WorkflowScope {
                 .clone()
                 .or_else(|| self.default_retry.clone()),
             default_timeout: sub_wf.default.timeout.or(self.default_timeout),
+            default_mcp: sub_wf
+                .default
+                .mcp
+                .clone()
+                .or_else(|| self.default_mcp.clone()),
+            default_max_tool_rounds: sub_wf
+                .default
+                .max_tool_rounds
+                .or(self.default_max_tool_rounds),
             models,
             json_schemas,
             nodes: std::mem::take(&mut sub_wf.nodes),
@@ -620,7 +796,7 @@ fn run_steps<'a>(
     steps: &'a [workflow::FlowStep],
     current_input: String,
     scope: &'a WorkflowScope,
-    file_config: &'a ConfigFile,
+    env: &'a RunEnv<'a>,
     start_counter: usize,
     progress_prefix: &'a str,
     steps_outputs: workflow::StepOutputs,
@@ -657,7 +833,7 @@ fn run_steps<'a>(
                                     &case.steps,
                                     current_input.clone(),
                                     scope,
-                                    file_config,
+                                    env,
                                     counter,
                                     progress_prefix,
                                     steps_outputs.clone(),
@@ -678,7 +854,7 @@ fn run_steps<'a>(
                                     else_steps,
                                     current_input.clone(),
                                     scope,
-                                    file_config,
+                                    env,
                                     counter,
                                     progress_prefix,
                                     steps_outputs.clone(),
@@ -725,7 +901,7 @@ fn run_steps<'a>(
                                 &branch.steps,
                                 current_input.clone(),
                                 scope,
-                                file_config,
+                                env,
                                 0,
                                 branch_prefix,
                                 steps_outputs.clone(),
@@ -795,7 +971,7 @@ fn run_steps<'a>(
                                 &loop_def.steps,
                                 iteration_input.clone(),
                                 scope,
-                                file_config,
+                                env,
                                 loop_counter,
                                 progress_prefix,
                                 steps_outputs.clone(),
@@ -832,7 +1008,7 @@ fn run_steps<'a>(
                                 &loop_def.steps,
                                 iteration_input.clone(),
                                 scope,
-                                file_config,
+                                env,
                                 loop_counter,
                                 progress_prefix,
                                 steps_outputs.clone(),
@@ -922,7 +1098,7 @@ fn run_steps<'a>(
                                 &for_each.steps,
                                 item_input,
                                 scope,
-                                file_config,
+                                env,
                                 for_each_counter,
                                 progress_prefix,
                                 steps_outputs.clone(),
@@ -966,7 +1142,7 @@ fn run_steps<'a>(
                                     &for_each.steps,
                                     item_input,
                                     scope,
-                                    file_config,
+                                    env,
                                     0,
                                     item_prefix,
                                     steps_outputs.clone(),
@@ -1030,7 +1206,7 @@ fn run_steps<'a>(
                         node,
                         &current_input,
                         scope,
-                        file_config,
+                        env,
                         &label,
                         progress_prefix,
                         &steps_outputs,
@@ -1053,7 +1229,7 @@ fn run_steps<'a>(
                                     &on_error.steps,
                                     error_input_json,
                                     scope,
-                                    file_config,
+                                    env,
                                     counter,
                                     progress_prefix,
                                     steps_outputs.clone(),
@@ -1104,7 +1280,7 @@ async fn execute_step_with_retry(
     node: &workflow::NodeDefinition,
     current_input: &str,
     scope: &WorkflowScope,
-    file_config: &ConfigFile,
+    env: &RunEnv<'_>,
     label: &str,
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -1140,7 +1316,7 @@ async fn execute_step_with_retry(
                         node,
                         current_input,
                         scope,
-                        file_config,
+                        env,
                         label,
                         progress_prefix,
                         steps_outputs,
@@ -1159,7 +1335,7 @@ async fn execute_step_with_retry(
                     node,
                     current_input,
                     scope,
-                    file_config,
+                    env,
                     label,
                     progress_prefix,
                     steps_outputs,
@@ -1228,11 +1404,24 @@ fn resolve_step_settings(
             .or(agent_file.and_then(|agent_file| agent_file.max_tokens))
             .or(scope.default_max_tokens),
     };
+    let mcp = node
+        .mcp
+        .clone()
+        .or_else(|| agent_file.and_then(|agent_file| agent_file.mcp.clone()))
+        .or_else(|| scope.default_mcp.clone());
+    let max_tool_rounds = node
+        .max_tool_rounds
+        .or_else(|| agent_file.and_then(|agent_file| agent_file.max_tool_rounds))
+        .or(scope.default_max_tool_rounds);
     resolve_request_settings(
         model_name,
         overrides,
         None,
         None,
+        McpOverrides {
+            mcp,
+            max_tool_rounds,
+        },
         &scope.models,
         file_config,
     )
@@ -1246,7 +1435,7 @@ async fn execute_step(
     node: &workflow::NodeDefinition,
     current_input: &str,
     scope: &WorkflowScope,
-    file_config: &ConfigFile,
+    env: &RunEnv<'_>,
     label: &str,
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -1268,13 +1457,21 @@ async fn execute_step(
             .validate_input(&input)
             .with_context(|| format!("step '{label}'"))?;
 
-        let settings = resolve_step_settings(node, scope, file_config, Some(&agent_file), label)?;
+        let settings =
+            resolve_step_settings(node, scope, env.file_config, Some(&agent_file), label)?;
 
-        call_agent(&agent_file, &settings, &input, current_input, steps_outputs)
-            .await
-            .with_context(|| format!("step '{label}'"))?
+        call_agent(
+            &agent_file,
+            &settings,
+            env.registry,
+            &input,
+            current_input,
+            steps_outputs,
+        )
+        .await
+        .with_context(|| format!("step '{label}'"))?
     } else if let Some(prompt_template) = &node.prompt {
-        let settings = resolve_step_settings(node, scope, file_config, None, label)?;
+        let settings = resolve_step_settings(node, scope, env.file_config, None, label)?;
 
         let response_format = node
             .output_schema
@@ -1296,7 +1493,7 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(None, &prompt, response_format)
+            .complete(env.registry, None, &prompt, response_format)
             .await
             .with_context(|| format!("step '{label}'"))?;
 
@@ -1324,7 +1521,7 @@ async fn execute_step(
             &sub_wf.steps,
             current_input.to_string(),
             &sub_scope,
-            file_config,
+            env,
             0,
             &sub_progress_prefix,
             workflow::StepOutputs::new(),

@@ -355,7 +355,7 @@ impl MockServer {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+pub(crate) fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut chunk = [0; 4096];
