@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -84,16 +85,20 @@ struct RequestSettings {
 
 /// Combines a caller's own system prompt (an agent's rendered template, or
 /// `None` for a plain `prompt:`/chat call) with a request's rendered skill
-/// content, if any (see `skill::render`). The skill content is appended
-/// after `base`, under a `---` delimiter, so the caller's own instructions
-/// lead and a skill's own Markdown heading structure stays visually distinct
-/// from them.
-fn with_skills(base: Option<&str>, skills_text: Option<&str>) -> Option<String> {
+/// content, if any (see `skill::SkillCache::render`). The skill content is
+/// appended after `base`, under a `---` delimiter, so the caller's own
+/// instructions lead and a skill's own Markdown heading structure stays
+/// visually distinct from them. Returns `base` unchanged (borrowed, no copy)
+/// when there's no skill content to append — the common case, since most
+/// requests don't set `skills:`.
+fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<Cow<'a, str>> {
     match (base, skills_text) {
         (None, None) => None,
-        (Some(base), None) => Some(base.to_owned()),
-        (None, Some(skills_text)) => Some(skills_text.to_owned()),
-        (Some(base), Some(skills_text)) => Some(format!("{base}\n\n---\n\n{skills_text}")),
+        (Some(base), None) => Some(Cow::Borrowed(base)),
+        (None, Some(skills_text)) => Some(Cow::Owned(skills_text.to_owned())),
+        (Some(base), Some(skills_text)) => {
+            Some(Cow::Owned(format!("{base}\n\n---\n\n{skills_text}")))
+        }
     }
 }
 
@@ -139,19 +144,18 @@ impl RequestSettings {
     /// all, which would silently stop tools from ever firing. See
     /// `docs/usage/ja/mcp.md`.
     ///
-    /// `self.skills` (resolved against `skills_map`, `lait.config.yml`'s
+    /// `self.skills` (resolved against `skill_cache`, `lait.config.yml`'s
     /// top-level `skills:`) is appended to `system_prompt` before either path
     /// below ever sees it — see `with_skills`.
     async fn complete(
         &self,
         registry: &mcp::McpRegistry<'_>,
-        skills_map: &config::SkillMap,
+        skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
     ) -> Result<response::ChatCompletionResponse> {
-        let skills_text = skill::render(skills_map, &self.skills)?;
-        let system_prompt = with_skills(system_prompt, skills_text.as_deref());
+        let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
         let system_prompt = system_prompt.as_deref();
 
         if self.mcp.is_empty() {
@@ -223,7 +227,7 @@ impl RequestSettings {
     /// unlike `mcp` they impose no such restriction on streaming.
     async fn complete_stream(
         &self,
-        skills_map: &config::SkillMap,
+        skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
@@ -233,10 +237,21 @@ impl RequestSettings {
                 "'--stream'/streaming is not supported together with 'mcp:' yet; drop one of them"
             );
         }
-        let skills_text = skill::render(skills_map, &self.skills)?;
-        let system_prompt = with_skills(system_prompt, skills_text.as_deref());
+        let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
         let messages = llm::initial_messages(system_prompt.as_deref(), prompt)?;
         llm::complete_stream(self.request(response_format, messages, &[])).await
+    }
+
+    /// Shared by `complete`/`complete_stream`: resolves `self.skills` against
+    /// `skill_cache` and appends the result to `system_prompt` — see
+    /// `with_skills`.
+    fn system_prompt_with_skills<'a>(
+        &self,
+        skill_cache: &skill::SkillCache<'_>,
+        system_prompt: Option<&'a str>,
+    ) -> Result<Option<Cow<'a, str>>> {
+        let skills_text = skill_cache.render(&self.skills)?;
+        Ok(with_skills(system_prompt, skills_text.as_deref()))
     }
 }
 
@@ -291,7 +306,7 @@ async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
     registry: &mcp::McpRegistry<'_>,
-    skills_map: &config::SkillMap,
+    skill_cache: &skill::SkillCache<'_>,
     input: &serde_json::Value,
     prompt: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -312,7 +327,7 @@ async fn call_agent(
     let response = settings
         .complete(
             registry,
-            skills_map,
+            skill_cache,
             Some(&system_prompt),
             prompt,
             response_format,
@@ -492,22 +507,18 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
+    let skill_cache = skill::SkillCache::new(&file_config.skills);
+
     if chat.stream {
         let stream = settings
-            .complete_stream(&file_config.skills, None, &prompt, response_format)
+            .complete_stream(&skill_cache, None, &prompt, response_format)
             .await?;
         return stream_to_stdout(stream, chat.show_reasoning).await;
     }
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let response = settings
-        .complete(
-            &registry,
-            &file_config.skills,
-            None,
-            &prompt,
-            response_format,
-        )
+        .complete(&registry, &skill_cache, None, &prompt, response_format)
         .await?;
 
     let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
@@ -561,11 +572,12 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     )?;
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
+    let skill_cache = skill::SkillCache::new(&file_config.skills);
     let output = call_agent(
         &agent_file,
         &settings,
         &registry,
-        &file_config.skills,
+        &skill_cache,
         &input,
         &args.input,
         &workflow::StepOutputs::new(),
@@ -589,9 +601,11 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
+    let skill_cache = skill::SkillCache::new(&file_config.skills);
     let env = RunEnv {
         file_config: &file_config,
         registry: &registry,
+        skill_cache: &skill_cache,
     };
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
@@ -621,6 +635,7 @@ const MAX_WORKFLOW_DEPTH: usize = 32;
 struct RunEnv<'a> {
     file_config: &'a ConfigFile,
     registry: &'a mcp::McpRegistry<'a>,
+    skill_cache: &'a skill::SkillCache<'a>,
 }
 
 /// The default model/reasoning-effort, model aliases, and JSON schema
@@ -1535,7 +1550,7 @@ async fn execute_step(
             &agent_file,
             &settings,
             env.registry,
-            &env.file_config.skills,
+            env.skill_cache,
             &input,
             current_input,
             steps_outputs,
@@ -1567,7 +1582,7 @@ async fn execute_step(
         let response = settings
             .complete(
                 env.registry,
-                &env.file_config.skills,
+                env.skill_cache,
                 None,
                 &prompt,
                 response_format,

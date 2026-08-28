@@ -312,13 +312,13 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
              model call and must be set on the steps inside the referenced workflow file instead"
         );
     }
-    if !calls_model && (node.mcp.is_some() || node.max_tool_rounds.is_some()) {
+    if !calls_model
+        && (node.mcp.is_some() || node.max_tool_rounds.is_some() || node.skills.is_some())
+    {
         bail!(
-            "{description} has 'mcp'/'max_tool_rounds' set but no 'prompt'/'agent' to apply it to"
+            "{description} has 'mcp'/'max_tool_rounds'/'skills' set but no 'prompt'/'agent' to \
+             apply it to"
         );
-    }
-    if !calls_model && node.skills.is_some() {
-        bail!("{description} has 'skills' set but no 'prompt'/'agent' to apply it to");
     }
     if !calls_model && node.output_schema.is_some() {
         bail!("{description} has 'output_schema' but no 'prompt'/'agent' to apply it to");

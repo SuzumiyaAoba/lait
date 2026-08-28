@@ -1,6 +1,8 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -65,54 +67,92 @@ fn parse_skill(name: &str, contents: &str) -> Result<SkillFile> {
     })
 }
 
-/// Renders `names` (a resolved `skills:` list, already merged through every
-/// fallback layer) into the block of text appended to a completion request's
-/// system prompt — see `app::with_skills`. Returns `None` when `names` is
-/// empty, so a request that never turns on skills pays no cost. Each name is
-/// resolved against `skills_map` (`lait.config.yml`'s top-level `skills:`)
-/// here, at request time, not at workflow/agent-file parse time: parsing
-/// never sees the config file, the same reason `mcp::McpRegistry::connection`
-/// resolves `mcp_servers:` names lazily (see its doc comment).
-///
-/// A skill's body is appended literally, never rendered as a handlebars
-/// template: unlike an agent's own `system_prompt_template`, a skill's
-/// Markdown body may legitimately contain `{{`/`}}` (e.g. in a code sample),
-/// and `template::render` treats an undefined variable as a hard error.
-pub(crate) fn render(skills_map: &config::SkillMap, names: &[String]) -> Result<Option<String>> {
-    if names.is_empty() {
-        return Ok(None);
+fn format_skill(skill: &SkillFile) -> String {
+    let mut section = format!("## Skill: {}\n", skill.name);
+    if let Some(description) = &skill.description {
+        section.push('\n');
+        section.push_str(description);
+        section.push('\n');
+    }
+    section.push('\n');
+    section.push_str(&skill.body);
+    section
+}
+
+/// A skill's rendered `## Skill: ...` section, cached by name for the
+/// `SkillCache`'s lifetime: a skill file's content doesn't change over the
+/// course of one `lait run`/`lait agent run`/chat invocation, so every
+/// `render()` call after the first for a given name reuses this instead of
+/// re-reading and re-parsing the file (which a `for_each`/`loop` node with
+/// `skills:` set would otherwise do on every iteration) — mirrors
+/// `mcp::McpRegistry`'s `tool_lists` cache.
+pub(crate) struct SkillCache<'a> {
+    skills_map: &'a config::SkillMap,
+    sections: Mutex<HashMap<String, Arc<String>>>,
+}
+
+impl<'a> SkillCache<'a> {
+    pub(crate) fn new(skills_map: &'a config::SkillMap) -> Self {
+        Self {
+            skills_map,
+            sections: Mutex::new(HashMap::new()),
+        }
     }
 
-    let mut rendered = String::new();
-    for name in names {
-        let configured_path = skills_map.get(name).ok_or_else(|| {
+    /// Renders `names` (a resolved `skills:` list, already merged through
+    /// every fallback layer) into the block of text appended to a completion
+    /// request's system prompt — see `app::with_skills`. Returns `None` when
+    /// `names` is empty, so a request that never turns on skills pays no
+    /// cost. Each name is resolved against `skills_map` (`lait.config.yml`'s
+    /// top-level `skills:`) here, at request time, not at workflow/agent-file
+    /// parse time: parsing never sees the config file, the same reason
+    /// `mcp::McpRegistry::connection` resolves `mcp_servers:` names lazily
+    /// (see its doc comment).
+    ///
+    /// A skill's body is appended literally, never rendered as a handlebars
+    /// template: unlike an agent's own `system_prompt_template`, a skill's
+    /// Markdown body may legitimately contain `{{`/`}}` (e.g. in a code
+    /// sample), and `template::render` treats an undefined variable as a
+    /// hard error.
+    pub(crate) fn render(&self, names: &[String]) -> Result<Option<String>> {
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let sections = names
+            .iter()
+            .map(|name| self.section(name))
+            .collect::<Result<Vec<_>>>()?;
+        let joined = sections
+            .iter()
+            .map(|section| section.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Ok(Some(joined))
+    }
+
+    fn section(&self, name: &str) -> Result<Arc<String>> {
+        if let Some(cached) = self.sections.lock().unwrap().get(name) {
+            return Ok(Arc::clone(cached));
+        }
+        let configured_path = self.skills_map.get(name).ok_or_else(|| {
             anyhow!(
                 "unknown skill '{name}'; define it under 'skills:' in {}",
                 config::CONFIG_FILE_NAME
             )
         })?;
         let skill = load_skill(name, configured_path)?;
-
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n");
-        }
-        rendered.push_str("## Skill: ");
-        rendered.push_str(&skill.name);
-        rendered.push('\n');
-        if let Some(description) = &skill.description {
-            rendered.push('\n');
-            rendered.push_str(description);
-            rendered.push('\n');
-        }
-        rendered.push('\n');
-        rendered.push_str(&skill.body);
+        let section = Arc::new(format_skill(&skill));
+        self.sections
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), Arc::clone(&section));
+        Ok(section)
     }
-    Ok(Some(rendered))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_skill, render};
+    use super::{SkillCache, parse_skill};
     use std::collections::HashMap;
 
     #[test]
@@ -146,13 +186,15 @@ mod tests {
     #[test]
     fn render_returns_none_for_an_empty_name_list() {
         let skills_map = HashMap::new();
-        assert!(render(&skills_map, &[]).unwrap().is_none());
+        let cache = SkillCache::new(&skills_map);
+        assert!(cache.render(&[]).unwrap().is_none());
     }
 
     #[test]
     fn render_errors_on_an_unknown_skill_name() {
         let skills_map = HashMap::new();
-        let error = render(&skills_map, &["missing".to_owned()]).unwrap_err();
+        let cache = SkillCache::new(&skills_map);
+        let error = cache.render(&["missing".to_owned()]).unwrap_err();
         assert!(error.to_string().contains("missing"));
     }
 
