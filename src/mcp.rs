@@ -14,19 +14,24 @@ use rmcp::{
 
 use crate::config;
 
+/// A running MCP connection: lait only ever calls tools, so it never needs
+/// the more elaborate `ClientHandler`/`RoleClient` type parameters a server
+/// that answered sampling/roots/elicitation requests would need.
+type McpConnection = RunningService<RoleClient, ()>;
+
+/// One server name's entry in `McpRegistry::connections`: a cell so
+/// concurrent first-time callers for the same name await one shared connect
+/// instead of each racing to spawn their own (see `McpRegistry::connection`).
+type ConnectionCell = Arc<tokio::sync::OnceCell<Arc<McpConnection>>>;
+
 /// A connected (or lazily-connectable) set of MCP servers, built once per
 /// `lait run`/`lait agent run`/chat invocation and shared across every
 /// completion request it makes — including concurrent ones (`parallel`/
 /// `for_each` branches), which is why connections are cached behind a
-/// `tokio::sync::Mutex`. Each entry is a `OnceCell` rather than a plain,
-/// already-connected value so that concurrent first-time callers for the
-/// *same* server name await one shared connect instead of each racing to
-/// spawn their own (see `McpRegistry::connection`).
+/// `tokio::sync::Mutex`.
 pub(crate) struct McpRegistry {
     servers: config::McpServerMap,
-    connections: tokio::sync::Mutex<
-        HashMap<String, Arc<tokio::sync::OnceCell<Arc<RunningService<RoleClient, ()>>>>>,
-    >,
+    connections: tokio::sync::Mutex<HashMap<String, ConnectionCell>>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request, plus the
@@ -143,7 +148,7 @@ impl McpRegistry {
     /// share one `OnceCell` and thus one connect: `get_or_try_init` runs the
     /// connect for exactly one of them and the rest await its result, so no
     /// connection is ever established and then discarded.
-    async fn connection(&self, name: &str) -> Result<Arc<RunningService<RoleClient, ()>>> {
+    async fn connection(&self, name: &str) -> Result<Arc<McpConnection>> {
         let cell = self
             .connections
             .lock()
@@ -170,10 +175,7 @@ impl McpRegistry {
 /// Opens one MCP connection over the given transport, using the default
 /// (do-nothing) `ClientHandler` — lait only ever calls tools, so it never
 /// needs to answer server-initiated requests (sampling, roots, elicitation).
-async fn connect(
-    name: &str,
-    transport: config::McpTransport,
-) -> Result<RunningService<RoleClient, ()>> {
+async fn connect(name: &str, transport: config::McpTransport) -> Result<McpConnection> {
     match transport {
         config::McpTransport::Stdio {
             command,
@@ -217,7 +219,7 @@ async fn connect(
 
 /// Lists every tool a server exposes, following `next_cursor` pagination
 /// until the server reports none left.
-async fn list_all_tools(connection: &RunningService<RoleClient, ()>) -> Result<Vec<Tool>> {
+async fn list_all_tools(connection: &McpConnection) -> Result<Vec<Tool>> {
     let mut tools = Vec::new();
     let mut cursor = None;
     loop {
