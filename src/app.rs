@@ -422,14 +422,14 @@ fn resolve_request_settings(
         .mcp
         .or_else(|| file_config.default.mcp.clone())
         .unwrap_or_default();
-    let raw_max_tool_rounds = mcp_overrides
+    let max_tool_rounds = mcp_overrides
         .max_tool_rounds
         .or(file_config.default.max_tool_rounds);
     llm::validate_max_tool_rounds(
-        raw_max_tool_rounds,
+        max_tool_rounds,
         &format!("the request for model '{}'", resolved_model.model_id),
     )?;
-    let max_tool_rounds = raw_max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
+    let max_tool_rounds = max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
 
     Ok(RequestSettings {
         base_url,

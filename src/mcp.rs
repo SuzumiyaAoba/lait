@@ -18,10 +18,14 @@ use crate::config;
 /// `lait run`/`lait agent run`/chat invocation and shared across every
 /// completion request it makes — including concurrent ones (`parallel`/
 /// `for_each` branches), which is why connections are cached behind a
-/// `tokio::sync::Mutex` rather than opened per-request.
+/// `tokio::sync::Mutex`. Each entry is a `OnceCell` rather than a plain,
+/// already-connected value so that concurrent first-time callers for the
+/// *same* server name await one shared connect instead of each racing to
+/// spawn their own (see `McpRegistry::connection`).
 pub(crate) struct McpRegistry {
     servers: config::McpServerMap,
-    connections: tokio::sync::Mutex<HashMap<String, Arc<RunningService<RoleClient, ()>>>>,
+    connections:
+        tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<RunningService<RoleClient, ()>>>>>>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request, plus the
@@ -129,34 +133,36 @@ impl McpRegistry {
     }
 
     /// Returns the running connection for `name`, connecting lazily (and
-    /// caching the result) on first use. The lock is never held across the
-    /// connect itself (spawning a child process or doing an HTTP handshake,
-    /// both real wall-clock I/O) — only to check/populate the cache — so
-    /// first-time connections to independent servers (e.g. two `parallel`
-    /// branches each first-using a different server) proceed concurrently
-    /// instead of queuing behind one another. A race where two callers both
-    /// connect to the same new server at once is resolved by keeping
-    /// whichever one wins the final cache insert and dropping the other.
+    /// caching the result) on first use. The lock is only ever held to
+    /// fetch-or-insert the `OnceCell` for `name`, never across the connect
+    /// itself (spawning a child process or doing an HTTP handshake, both real
+    /// wall-clock I/O) — so connections to independent servers (e.g. two
+    /// `parallel` branches each first-using a different server) proceed
+    /// concurrently. Concurrent callers racing on the *same* new server name
+    /// share one `OnceCell` and thus one connect: `get_or_try_init` runs the
+    /// connect for exactly one of them and the rest await its result, so no
+    /// connection is ever established and then discarded.
     async fn connection(&self, name: &str) -> Result<Arc<RunningService<RoleClient, ()>>> {
-        if let Some(existing) = self.connections.lock().await.get(name) {
-            return Ok(existing.clone());
-        }
-        let server = self.servers.get(name).ok_or_else(|| {
-            anyhow!(
-                "unknown MCP server '{name}'; define it under 'mcp_servers:' in {}",
-                config::CONFIG_FILE_NAME
-            )
-        })?;
-        let transport = server.resolve_transport(name)?;
-        let running = Arc::new(connect(name, transport).await?);
-        let running = self
+        let cell = self
             .connections
             .lock()
             .await
             .entry(name.to_owned())
-            .or_insert(running)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
             .clone();
-        Ok(running)
+
+        cell.get_or_try_init(|| async {
+            let server = self.servers.get(name).ok_or_else(|| {
+                anyhow!(
+                    "unknown MCP server '{name}'; define it under 'mcp_servers:' in {}",
+                    config::CONFIG_FILE_NAME
+                )
+            })?;
+            let transport = server.resolve_transport(name)?;
+            Ok::<_, anyhow::Error>(Arc::new(connect(name, transport).await?))
+        })
+        .await
+        .map(Arc::clone)
     }
 }
 
