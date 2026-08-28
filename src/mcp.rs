@@ -24,8 +24,9 @@ use crate::config;
 /// spawn their own (see `McpRegistry::connection`).
 pub(crate) struct McpRegistry {
     servers: config::McpServerMap,
-    connections:
-        tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<RunningService<RoleClient, ()>>>>>>,
+    connections: tokio::sync::Mutex<
+        HashMap<String, Arc<tokio::sync::OnceCell<Arc<RunningService<RoleClient, ()>>>>>,
+    >,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request, plus the
