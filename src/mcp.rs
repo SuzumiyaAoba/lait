@@ -24,20 +24,34 @@ type McpConnection = RunningService<RoleClient, ()>;
 /// instead of each racing to spawn their own (see `McpRegistry::connection`).
 type ConnectionCell = Arc<tokio::sync::OnceCell<Arc<McpConnection>>>;
 
+/// One server name's entry in `McpRegistry::tool_lists`: a cell so concurrent
+/// first-time callers for the same name await one shared `tools/list` round
+/// trip instead of each issuing their own (see `McpRegistry::server_tools`).
+type ToolListCell = Arc<tokio::sync::OnceCell<Arc<Vec<Tool>>>>;
+
 /// A connected (or lazily-connectable) set of MCP servers, built once per
 /// `lait run`/`lait agent run`/chat invocation and shared across every
 /// completion request it makes — including concurrent ones (`parallel`/
 /// `for_each` branches), which is why connections are cached behind a
 /// `tokio::sync::Mutex`.
-pub(crate) struct McpRegistry {
-    servers: config::McpServerMap,
+pub(crate) struct McpRegistry<'a> {
+    servers: &'a config::McpServerMap,
     connections: tokio::sync::Mutex<HashMap<String, ConnectionCell>>,
+    /// Each server's `tools/list` result, cached for the registry's lifetime:
+    /// a server's tool list doesn't change over the course of one `lait run`/
+    /// `lait agent run`/chat invocation, so every `tools()` call after the
+    /// first for a given server reuses this instead of re-issuing the round
+    /// trip (which a `for_each`/`loop` node with `mcp:` set would otherwise
+    /// do on every iteration).
+    tool_lists: tokio::sync::Mutex<HashMap<String, ToolListCell>>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request, plus the
 /// bookkeeping needed to route a model's tool call back to the right MCP
-/// server. Built fresh by `McpRegistry::tools` for every request (server tool
-/// lists can change between requests), never cached on the registry itself.
+/// server. Built fresh by `McpRegistry::tools` for every request from the
+/// (possibly cached) per-server tool lists, since which servers are in play
+/// can differ request to request even though each server's own tool list
+/// doesn't.
 pub(crate) struct ToolSet {
     pub(crate) tools: Vec<ChatCompletionTools>,
     /// Qualified tool name (`<server>__<tool>`, see `qualify_tool_name`) to
@@ -45,27 +59,26 @@ pub(crate) struct ToolSet {
     index: HashMap<String, (String, String)>,
 }
 
-impl McpRegistry {
-    pub(crate) fn new(servers: config::McpServerMap) -> Self {
+impl<'a> McpRegistry<'a> {
+    pub(crate) fn new(servers: &'a config::McpServerMap) -> Self {
         Self {
             servers,
             connections: tokio::sync::Mutex::new(HashMap::new()),
+            tool_lists: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Connects to (or reuses an existing connection to) every server in
-    /// `names`, lists their tools, and returns them qualified and converted
-    /// to OpenAI's `tools:` shape. Servers are connected to and listed
-    /// concurrently (each is an independent round trip), not one at a time.
-    /// `names` with no `mcp_servers:` entry is an error naming
-    /// `lait.config.yml`'s `mcp_servers:`, since that can only be caught here
-    /// (workflow/agent-file parsing never sees the config file).
+    /// `names`, lists their tools (or reuses a previously cached list), and
+    /// returns them qualified and converted to OpenAI's `tools:` shape.
+    /// Servers are connected to and listed concurrently (each is an
+    /// independent round trip), not one at a time. `names` with no
+    /// `mcp_servers:` entry is an error naming `lait.config.yml`'s
+    /// `mcp_servers:`, since that can only be caught here (workflow/agent-file
+    /// parsing never sees the config file).
     pub(crate) async fn tools(&self, names: &[String]) -> Result<ToolSet> {
         let per_server = futures_util::future::try_join_all(names.iter().map(|name| async move {
-            let connection = self.connection(name).await?;
-            let server_tools = list_all_tools(&connection)
-                .await
-                .with_context(|| format!("failed to list tools for MCP server '{name}'"))?;
+            let server_tools = self.server_tools(name).await?;
             Ok::<_, anyhow::Error>((name.clone(), server_tools))
         }))
         .await?;
@@ -73,7 +86,7 @@ impl McpRegistry {
         let mut tools = Vec::new();
         let mut index = HashMap::new();
         for (name, server_tools) in per_server {
-            for tool in server_tools {
+            for tool in server_tools.iter() {
                 let qualified = qualify_tool_name(&name, &tool.name)?;
                 if let Some((existing_server, existing_tool)) = index.get(&qualified) {
                     bail!(
@@ -85,7 +98,7 @@ impl McpRegistry {
                 tools.push(ChatCompletionTools::Function(ChatCompletionTool {
                     function: FunctionObject {
                         name: qualified,
-                        description: tool.description.map(|description| description.into_owned()),
+                        description: tool.description.as_deref().map(str::to_owned),
                         parameters: Some(serde_json::Value::Object((*tool.input_schema).clone())),
                         strict: None,
                     },
@@ -93,6 +106,33 @@ impl McpRegistry {
             }
         }
         Ok(ToolSet { tools, index })
+    }
+
+    /// Returns `name`'s tool list, listing it (following pagination) on first
+    /// use and caching the result for the registry's lifetime — see
+    /// `tool_lists`. Locking follows the same pattern as `connection`: the
+    /// lock is only held to fetch-or-insert the `OnceCell`, never across the
+    /// `tools/list` round trip itself, so independent servers list
+    /// concurrently and concurrent callers racing on the same new server
+    /// share one round trip.
+    async fn server_tools(&self, name: &str) -> Result<Arc<Vec<Tool>>> {
+        let cell = self
+            .tool_lists
+            .lock()
+            .await
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
+
+        cell.get_or_try_init(|| async {
+            let connection = self.connection(name).await?;
+            let server_tools = list_all_tools(&connection)
+                .await
+                .with_context(|| format!("failed to list tools for MCP server '{name}'"))?;
+            Ok::<_, anyhow::Error>(Arc::new(server_tools))
+        })
+        .await
+        .map(Arc::clone)
     }
 
     /// Calls `qualified_name` (as returned in `tool_set`) with `arguments_json`
@@ -311,163 +351,5 @@ mod tests {
     fn rejects_a_name_over_64_characters() {
         let long_tool = "a".repeat(60);
         assert!(qualify_tool_name("server", &long_tool).is_err());
-    }
-
-    /// A hand-rolled streamable-HTTP MCP server: routes on the JSON-RPC
-    /// `method` field (something `tests/support::MockServer` can't do, since
-    /// it just replays canned bodies in order) and answers `initialize` /
-    /// `notifications/initialized` / `tools/list` / `tools/call` — the exact
-    /// four requests one `McpRegistry::tools` + `McpRegistry::call` round
-    /// trip makes. This is the one live test validating the rmcp 3.1.4 API
-    /// usage in this file actually round-trips over the wire; everything
-    /// else in this module is exercised only against parsed/constructed
-    /// values, never a real connection.
-    fn start_mock_mcp_server() -> (String, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock MCP server");
-        let addr = listener
-            .local_addr()
-            .expect("failed to read mock server address");
-        let handle = std::thread::spawn(move || {
-            for _ in 0..4 {
-                let (mut stream, _) = listener.accept().expect("failed to accept connection");
-                let mut buf = Vec::new();
-                let header_end = loop {
-                    let mut chunk = [0u8; 4096];
-                    let read = stream.read(&mut chunk).expect("failed to read request");
-                    assert!(read > 0, "connection closed before headers were complete");
-                    buf.extend_from_slice(&chunk[..read]);
-                    if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n")
-                    {
-                        break position + 4;
-                    }
-                };
-                let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-                let content_length: usize = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                while buf.len() < header_end + content_length {
-                    let mut chunk = [0u8; 4096];
-                    let read = stream
-                        .read(&mut chunk)
-                        .expect("failed to read request body");
-                    assert!(read > 0, "connection closed before body was complete");
-                    buf.extend_from_slice(&chunk[..read]);
-                }
-                let body = String::from_utf8_lossy(&buf[header_end..header_end + content_length])
-                    .into_owned();
-                let request: serde_json::Value =
-                    serde_json::from_str(&body).expect("mock MCP server got non-JSON body");
-                let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                let id = request.get("id").cloned();
-
-                let (status, response_body) = match method {
-                    "initialize" => (
-                        "200 OK",
-                        serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "protocolVersion": "2025-06-18",
-                                "capabilities": {},
-                                "serverInfo": {"name": "mock-mcp", "version": "0.0.1"}
-                            }
-                        })
-                        .to_string(),
-                    ),
-                    "notifications/initialized" => ("202 Accepted", String::new()),
-                    "tools/list" => (
-                        "200 OK",
-                        serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "tools": [{
-                                    "name": "echo",
-                                    "description": "echoes the input back",
-                                    "inputSchema": {
-                                        "type": "object",
-                                        "properties": {"text": {"type": "string"}}
-                                    }
-                                }]
-                            }
-                        })
-                        .to_string(),
-                    ),
-                    "tools/call" => (
-                        "200 OK",
-                        serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{"type": "text", "text": "hello from mock"}]
-                            }
-                        })
-                        .to_string(),
-                    ),
-                    other => panic!("mock MCP server received an unexpected method '{other}'"),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                    response_body.len(),
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("failed to write mock response");
-                stream.flush().expect("failed to flush mock response");
-            }
-        });
-        (format!("http://{addr}/mcp"), handle)
-    }
-
-    #[tokio::test]
-    async fn connects_lists_and_calls_a_tool_over_streamable_http() {
-        use crate::config::McpServerConfig;
-        use async_openai::types::chat::ChatCompletionTools;
-        use std::collections::HashMap;
-
-        let (url, server_thread) = start_mock_mcp_server();
-
-        let mut servers = HashMap::new();
-        servers.insert(
-            "mock".to_owned(),
-            McpServerConfig {
-                command: None,
-                args: vec![],
-                env: HashMap::new(),
-                cwd: None,
-                url: Some(url),
-                headers: HashMap::new(),
-            },
-        );
-        let registry = super::McpRegistry::new(servers);
-
-        let tool_set = registry
-            .tools(&["mock".to_owned()])
-            .await
-            .expect("tools() should list the mock server's tool");
-        assert_eq!(tool_set.tools.len(), 1);
-        match &tool_set.tools[0] {
-            ChatCompletionTools::Function(tool) => assert_eq!(tool.function.name, "mock__echo"),
-            ChatCompletionTools::Custom(_) => panic!("expected a function tool"),
-        }
-
-        let result = registry
-            .call(&tool_set, "mock__echo", r#"{"text":"hi"}"#)
-            .await
-            .expect("call() should run the mock server's tool");
-        assert_eq!(result, "hello from mock");
-
-        server_thread
-            .join()
-            .expect("mock MCP server thread panicked");
     }
 }

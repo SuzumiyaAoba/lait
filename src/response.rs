@@ -134,15 +134,9 @@ impl ChatCompletionResponseMessage {
 }
 
 fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&str, &'static str> {
-    let choice = response
-        .choices
-        .first()
-        .ok_or("API response contained no choices")?;
-    choice
-        .message
-        .content
-        .as_deref()
-        .filter(|content| !content.is_empty())
+    let message = first_message(response).ok_or("API response contained no choices")?;
+    message
+        .content()
         .ok_or("API response contained no content in its first choice")
 }
 

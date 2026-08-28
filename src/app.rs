@@ -7,9 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionTools, FunctionCall, ResponseFormat,
+    ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat,
 };
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -83,8 +81,8 @@ impl RequestSettings {
     /// Builds an `llm::CompletionRequest` from these settings plus the
     /// per-call `response_format`/`messages`/`tools`. The `base_url`/
     /// `api_key`/`model_id`/sampling fields are the same for every request
-    /// `self` ever builds, so `complete`'s tool loop, `complete_once`, and
-    /// `complete_stream` all go through here instead of repeating that field
+    /// `self` ever builds, so both `complete`'s tool loop and
+    /// `complete_stream` go through here instead of repeating that field
     /// list at each call site.
     fn request<'a>(
         &'a self,
@@ -122,15 +120,14 @@ impl RequestSettings {
     /// `docs/usage/ja/mcp.md`.
     async fn complete(
         &self,
-        registry: &mcp::McpRegistry,
+        registry: &mcp::McpRegistry<'_>,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
     ) -> Result<response::ChatCompletionResponse> {
         if self.mcp.is_empty() {
-            return self
-                .complete_once(system_prompt, prompt, response_format, &[])
-                .await;
+            let messages = llm::initial_messages(system_prompt, prompt)?;
+            return llm::complete(self.request(response_format, messages, &[])).await;
         }
 
         let tool_set = registry.tools(&self.mcp).await?;
@@ -163,28 +160,8 @@ impl RequestSettings {
                 return llm::complete(self.request(response_format, messages, &[])).await;
             };
 
-            let tool_call_entries: Vec<ChatCompletionMessageToolCalls> = tool_calls
-                .iter()
-                .map(|tool_call| {
-                    ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                        id: tool_call.id.clone(),
-                        function: FunctionCall {
-                            name: tool_call.function.name.clone(),
-                            arguments: tool_call.function.arguments.clone(),
-                        },
-                    })
-                })
-                .collect();
-            let mut assistant_message = ChatCompletionRequestAssistantMessageArgs::default();
-            assistant_message.tool_calls(tool_call_entries);
-            if let Some(content) =
-                response::first_message(&response).and_then(|message| message.content())
-            {
-                assistant_message.content(content);
-            }
-            messages.push(ChatCompletionRequestMessage::from(
-                assistant_message.build()?,
-            ));
+            let content = response::first_message(&response).and_then(|message| message.content());
+            messages.push(llm::assistant_tool_call_message(tool_calls, content)?);
 
             // A model turn's `tool_calls` are independent by construction (it
             // couldn't have seen one call's result before deciding on
@@ -201,28 +178,11 @@ impl RequestSettings {
                             &tool_call.function.arguments,
                         )
                         .await?;
-                    let tool_message = ChatCompletionRequestToolMessageArgs::default()
-                        .content(result)
-                        .tool_call_id(tool_call.id.clone())
-                        .build()?;
-                    Ok::<_, anyhow::Error>(ChatCompletionRequestMessage::from(tool_message))
+                    llm::tool_result_message(&tool_call.id, result)
                 }))
                 .await?;
             messages.extend(tool_messages);
         }
-    }
-
-    /// A single non-looping completion request: `system_prompt`/`prompt` as
-    /// the whole history, `tools` sent as-is (usually empty).
-    async fn complete_once(
-        &self,
-        system_prompt: Option<&str>,
-        prompt: &str,
-        response_format: Option<ResponseFormat>,
-        tools: &[ChatCompletionTools],
-    ) -> Result<response::ChatCompletionResponse> {
-        let messages = llm::initial_messages(system_prompt, prompt)?;
-        llm::complete(self.request(response_format, messages, tools)).await
     }
 
     /// Like [`RequestSettings::complete`], but requests a streamed response.
@@ -296,7 +256,7 @@ async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: boo
 async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
-    registry: &mcp::McpRegistry,
+    registry: &mcp::McpRegistry<'_>,
     input: &serde_json::Value,
     prompt: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -489,7 +449,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         return stream_to_stdout(stream, chat.show_reasoning).await;
     }
 
-    let registry = mcp::McpRegistry::new(file_config.mcp_servers.clone());
+    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let response = settings
         .complete(&registry, None, &prompt, response_format)
         .await?;
@@ -543,7 +503,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         &file_config,
     )?;
 
-    let registry = mcp::McpRegistry::new(file_config.mcp_servers.clone());
+    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let output = call_agent(
         &agent_file,
         &settings,
@@ -570,7 +530,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     }
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
-    let registry = mcp::McpRegistry::new(file_config.mcp_servers.clone());
+    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let env = RunEnv {
         file_config: &file_config,
         registry: &registry,
@@ -602,7 +562,7 @@ const MAX_WORKFLOW_DEPTH: usize = 32;
 /// argument counts under clippy's `too_many_arguments` threshold.
 struct RunEnv<'a> {
     file_config: &'a ConfigFile,
-    registry: &'a mcp::McpRegistry,
+    registry: &'a mcp::McpRegistry<'a>,
 }
 
 /// The default model/reasoning-effort, model aliases, and JSON schema

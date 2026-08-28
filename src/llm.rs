@@ -4,16 +4,19 @@ use async_openai::{
     config::OpenAIConfig,
     error::OpenAIError,
     types::chat::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
         ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
+        CreateChatCompletionRequestArgs, FunctionCall, ReasoningEffort as OpenAiReasoningEffort,
+        ResponseFormat,
     },
 };
 use futures_util::Stream;
 
 use crate::{
     cli::ReasoningEffort,
-    response::{ChatCompletionResponse, ChatCompletionStreamChunk},
+    response::{ChatCompletionResponse, ChatCompletionStreamChunk, ToolCall},
 };
 
 impl From<ReasoningEffort> for OpenAiReasoningEffort {
@@ -77,6 +80,50 @@ pub(crate) fn initial_messages(
         .build()?;
     messages.push(ChatCompletionRequestMessage::from(user_message));
     Ok(messages)
+}
+
+/// Builds the assistant-role message recording a model turn's `tool_calls`
+/// (and any `content` it produced alongside them), the shape a tool loop
+/// (`app::RequestSettings::complete`) appends to its message history right
+/// before running the calls themselves.
+pub(crate) fn assistant_tool_call_message(
+    tool_calls: &[ToolCall],
+    content: Option<&str>,
+) -> Result<ChatCompletionRequestMessage> {
+    let tool_call_entries: Vec<ChatCompletionMessageToolCalls> = tool_calls
+        .iter()
+        .map(|tool_call| {
+            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                id: tool_call.id.clone(),
+                function: FunctionCall {
+                    name: tool_call.function.name.clone(),
+                    arguments: tool_call.function.arguments.clone(),
+                },
+            })
+        })
+        .collect();
+    let mut assistant_message = ChatCompletionRequestAssistantMessageArgs::default();
+    assistant_message.tool_calls(tool_call_entries);
+    if let Some(content) = content {
+        assistant_message.content(content);
+    }
+    Ok(ChatCompletionRequestMessage::from(
+        assistant_message.build()?,
+    ))
+}
+
+/// Builds the `tool`-role message carrying one tool call's result back to the
+/// model, the shape a tool loop appends to its message history for each call
+/// a round makes.
+pub(crate) fn tool_result_message(
+    tool_call_id: &str,
+    content: String,
+) -> Result<ChatCompletionRequestMessage> {
+    let tool_message = ChatCompletionRequestToolMessageArgs::default()
+        .content(content)
+        .tool_call_id(tool_call_id)
+        .build()?;
+    Ok(ChatCompletionRequestMessage::from(tool_message))
 }
 
 /// Checks `temperature`/`top_p`/`max_tokens` are within the bounds the OpenAI
