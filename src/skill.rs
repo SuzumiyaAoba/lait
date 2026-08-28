@@ -1,8 +1,8 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -84,18 +84,21 @@ fn format_skill(skill: &SkillFile) -> String {
 /// course of one `lait run`/`lait agent run`/chat invocation, so every
 /// `render()` call after the first for a given name reuses this instead of
 /// re-reading and re-parsing the file (which a `for_each`/`loop` node with
-/// `skills:` set would otherwise do on every iteration) — mirrors
-/// `mcp::McpRegistry`'s `tool_lists` cache.
+/// `skills:` set would otherwise do on every iteration). `render`/`section`
+/// are synchronous and never called from a spawned task, so a plain
+/// `RefCell` (no locking, no `Arc`) is enough — unlike `mcp::McpRegistry`'s
+/// cache, which really does need `tokio::sync::Mutex` because connecting is
+/// async I/O that can interleave.
 pub(crate) struct SkillCache<'a> {
     skills_map: &'a config::SkillMap,
-    sections: Mutex<HashMap<String, Arc<String>>>,
+    sections: RefCell<HashMap<String, String>>,
 }
 
 impl<'a> SkillCache<'a> {
     pub(crate) fn new(skills_map: &'a config::SkillMap) -> Self {
         Self {
             skills_map,
-            sections: Mutex::new(HashMap::new()),
+            sections: RefCell::new(HashMap::new()),
         }
     }
 
@@ -121,18 +124,13 @@ impl<'a> SkillCache<'a> {
         let sections = names
             .iter()
             .map(|name| self.section(name))
-            .collect::<Result<Vec<_>>>()?;
-        let joined = sections
-            .iter()
-            .map(|section| section.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        Ok(Some(joined))
+            .collect::<Result<Vec<String>>>()?;
+        Ok(Some(sections.join("\n\n")))
     }
 
-    fn section(&self, name: &str) -> Result<Arc<String>> {
-        if let Some(cached) = self.sections.lock().unwrap().get(name) {
-            return Ok(Arc::clone(cached));
+    fn section(&self, name: &str) -> Result<String> {
+        if let Some(cached) = self.sections.borrow().get(name) {
+            return Ok(cached.clone());
         }
         let configured_path = self.skills_map.get(name).ok_or_else(|| {
             anyhow!(
@@ -141,11 +139,10 @@ impl<'a> SkillCache<'a> {
             )
         })?;
         let skill = load_skill(name, configured_path)?;
-        let section = Arc::new(format_skill(&skill));
+        let section = format_skill(&skill);
         self.sections
-            .lock()
-            .unwrap()
-            .insert(name.to_owned(), Arc::clone(&section));
+            .borrow_mut()
+            .insert(name.to_owned(), section.clone());
         Ok(section)
     }
 }
