@@ -37,6 +37,16 @@ pub(crate) enum Command {
     /// List the model aliases configured in lait.config.yml, or the models
     /// the server itself offers with `--remote`.
     Models(ModelsArgs),
+    /// Generate a shell completion script on stdout (e.g. `lait completions
+    /// zsh > ~/.zfunc/_lait`).
+    Completions(CompletionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CompletionsArgs {
+    /// The shell to generate a completion script for.
+    #[arg(value_enum, value_name = "SHELL")]
+    pub(crate) shell: clap_complete::Shell,
 }
 
 #[derive(Debug, Args)]

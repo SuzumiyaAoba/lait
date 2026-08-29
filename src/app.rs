@@ -168,8 +168,19 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         },
         Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
         Some(Command::Models(models_args)) => crate::models::run(models_args, cli.no_config).await,
+        Some(Command::Completions(completions_args)) => {
+            generate_completions(completions_args);
+            Ok(())
+        }
         None => run_chat(cli.chat, cli.no_config).await,
     }
+}
+
+/// Writes the completion script for the requested shell to stdout, derived
+/// from the same clap `Command` tree `--help` is.
+fn generate_completions(args: crate::cli::CompletionsArgs) {
+    let mut command = <Cli as clap::CommandFactory>::command();
+    clap_complete::generate(args.shell, &mut command, "lait", &mut std::io::stdout());
 }
 
 /// Statically checks every file in `lint_args.files` (see `lint::lint_file`)

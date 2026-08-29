@@ -9,6 +9,7 @@ rust-version = "1.88"
 anyhow = "1"
 async-openai = { version = "0.41.3", default-features = false, features = ["byot", "chat-completion", "rustls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.6.9"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 handlebars = "6.4.4"
 http = "1"
