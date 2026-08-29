@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
-    app::MAX_WORKFLOW_DEPTH,
+    app::{MAX_WORKFLOW_DEPTH, WorkflowNestingError, check_workflow_nesting},
     config::{self, ConfigFile},
     jq, schema, template, workflow,
 };
@@ -126,9 +126,9 @@ fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
             // Seeded with this file's own canonical path so a `workflow:`
             // chain that loops back to it is caught the same way
             // `WorkflowScope::nested` catches it at `run` time.
-            let mut visited = HashSet::new();
+            let mut visited = Vec::new();
             if let Ok(canonical) = std::fs::canonicalize(path) {
-                visited.insert(canonical);
+                visited.push(canonical);
             }
             lint_workflow_contents(&wf, &base_dir, &mut ctx, &mut issues, &mut visited);
         }
@@ -178,12 +178,12 @@ fn lint_workflow_contents(
     base_dir: &Path,
     ctx: &mut LintCtx,
     issues: &mut Vec<LintIssue>,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut Vec<PathBuf>,
 ) {
     let mut used_node_ids = HashSet::new();
     walk_steps(&wf.steps, &mut used_node_ids, issues);
     for node_id in wf.nodes.keys() {
-        if !used_node_ids.contains(node_id) {
+        if !used_node_ids.contains(node_id.as_str()) {
             issues.push(LintIssue::warning(format!(
                 "node '{node_id}' is defined in 'nodes:' but never referenced by a step's 'use'"
             )));
@@ -222,14 +222,14 @@ fn lint_workflow_contents(
 /// `while`/`until`, `for_each` `items`, `parallel`/`for_each` `join`) for
 /// syntax errors along the way. Mirrors the tree `workflow::validate_steps`
 /// walks, so a router kind added there needs updating here too.
-fn walk_steps(
-    steps: &[workflow::FlowStep],
-    used: &mut HashSet<String>,
+fn walk_steps<'a>(
+    steps: &'a [workflow::FlowStep],
+    used: &mut HashSet<&'a str>,
     issues: &mut Vec<LintIssue>,
 ) {
     for step in steps {
         if let Some(node_id) = &step.r#use {
-            used.insert(node_id.clone());
+            used.insert(node_id.as_str());
         }
         if let Some(when) = &step.when {
             check_jq(when, "a step's 'when'", issues);
@@ -293,18 +293,15 @@ fn lint_node(
     json_schemas: &schema::JsonSchemaMap,
     ctx: &mut LintCtx,
     issues: &mut Vec<LintIssue>,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut Vec<PathBuf>,
 ) {
+    let node_context = format!("node '{node_id}'");
+
     if let Some(filter) = &node.jq {
-        check_jq(filter, &format!("node '{node_id}': 'jq'"), issues);
+        check_jq(filter, &format!("{node_context}: 'jq'"), issues);
     }
     if let Some(prompt) = &node.prompt {
-        check_prompt_template(
-            &format!("node '{node_id}'"),
-            "'prompt' template",
-            prompt,
-            issues,
-        );
+        check_prompt_template(&node_context, "'prompt' template", prompt, issues);
     }
     if let Some(name_or_path) = &node.input_schema
         && let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path)
@@ -331,18 +328,8 @@ fn lint_node(
         }
     }
 
-    check_mcp_names(
-        &format!("node '{node_id}'"),
-        node.mcp.as_deref(),
-        ctx,
-        issues,
-    );
-    check_skill_names(
-        &format!("node '{node_id}'"),
-        node.skills.as_deref(),
-        ctx,
-        issues,
-    );
+    check_mcp_names(&node_context, node.mcp.as_deref(), ctx, issues);
+    check_skill_names(&node_context, node.skills.as_deref(), ctx, issues);
 
     if let Some(agent_path) = &node.agent {
         // Matches `execute_step`: `agent:` is loaded as given, relative to
@@ -387,13 +374,31 @@ fn check_prompt_template(
     }
 }
 
+/// Checks an agent file's `input_schema`/`output_schema` entry (an inline
+/// schema or a file path — see `schema::load_schema_value`), shared since
+/// both fields are checked identically, only differing in `field`'s name in
+/// the issue's message.
+fn check_schema_entry(
+    context: &str,
+    field: &str,
+    entry: Option<&schema::JsonSchemaEntry>,
+    issues: &mut Vec<LintIssue>,
+) {
+    let Some(entry) = entry else { return };
+    if let Err(error) = schema::load_schema_value(entry) {
+        issues.push(LintIssue::error(format!(
+            "{context}'s '{field}' is invalid: {error:#}"
+        )));
+    }
+}
+
 fn lint_sub_workflow(
     node_id: &str,
     sub_workflow_path: &Path,
     base_dir: &Path,
     ctx: &mut LintCtx,
     issues: &mut Vec<LintIssue>,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut Vec<PathBuf>,
 ) {
     let resolved = base_dir.join(sub_workflow_path);
     let canonical = match std::fs::canonicalize(&resolved) {
@@ -406,24 +411,23 @@ fn lint_sub_workflow(
             return;
         }
     };
-    if visited.contains(&canonical) {
-        issues.push(LintIssue::error(format!(
-            "node '{node_id}' has 'workflow: {}', which would create a cycle ('{}' is already \
-             being linted)",
-            sub_workflow_path.display(),
-            canonical.display()
-        )));
-        return;
-    }
-    // Mirrors `WorkflowScope::nested`'s cap, so a non-cyclic but arbitrarily
-    // deep `workflow:` chain is flagged here the same way it would fail at
-    // `run` time, rather than recursing without bound.
-    if visited.len() >= MAX_WORKFLOW_DEPTH {
-        issues.push(LintIssue::error(format!(
-            "node '{node_id}' has 'workflow: {}', which exceeds the maximum 'workflow:' nesting \
-             depth of {MAX_WORKFLOW_DEPTH}",
-            sub_workflow_path.display()
-        )));
+    // Shares `WorkflowScope::nested`'s cycle/depth-cap check, so a
+    // non-cyclic-but-arbitrarily-deep or cyclic `workflow:` chain is flagged
+    // here the same way it would fail at `run` time.
+    if let Err(error) = check_workflow_nesting(visited, &canonical) {
+        issues.push(LintIssue::error(match error {
+            WorkflowNestingError::Cycle => format!(
+                "node '{node_id}' has 'workflow: {}', which would create a cycle ('{}' is \
+                 already being linted)",
+                sub_workflow_path.display(),
+                canonical.display()
+            ),
+            WorkflowNestingError::TooDeep => format!(
+                "node '{node_id}' has 'workflow: {}', which exceeds the maximum 'workflow:' \
+                 nesting depth of {MAX_WORKFLOW_DEPTH}",
+                sub_workflow_path.display()
+            ),
+        }));
         return;
     }
 
@@ -437,7 +441,7 @@ fn lint_sub_workflow(
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
-            visited.insert(canonical.clone());
+            visited.push(canonical);
             // `lint_workflow_contents` pushes straight into `issues`, so
             // without this, a message from `sub_workflow_path`'s own
             // 'nodes:'/'steps:' (e.g. an unused-node warning, whose node ids
@@ -454,7 +458,7 @@ fn lint_sub_workflow(
                     issue.message
                 );
             }
-            visited.remove(&canonical);
+            visited.pop();
         }
     }
 }
@@ -479,20 +483,8 @@ fn lint_agent_contents(
         issues,
     );
 
-    if let Some(entry) = &agent_file.input_schema
-        && let Err(error) = schema::load_schema_value(entry)
-    {
-        issues.push(LintIssue::error(format!(
-            "{context}'s 'input_schema' is invalid: {error:#}"
-        )));
-    }
-    if let Some(entry) = &agent_file.output_schema
-        && let Err(error) = schema::load_schema_value(entry)
-    {
-        issues.push(LintIssue::error(format!(
-            "{context}'s 'output_schema' is invalid: {error:#}"
-        )));
-    }
+    check_schema_entry(context, "input_schema", agent_file.input_schema.as_ref(), issues);
+    check_schema_entry(context, "output_schema", agent_file.output_schema.as_ref(), issues);
     // `structured_output: true` requires `output_schema` (checked at parse
     // time by `agent::parse_agent`), so this is reached only when a
     // `schema_name` (the agent's own, or the "structured_output" default) is
@@ -593,7 +585,7 @@ mod tests {
     fn lint_fixture(wf: &workflow::WorkflowFile, config: Option<&ConfigFile>) -> Vec<LintIssue> {
         let mut ctx = LintCtx::new(config);
         let mut issues = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = Vec::new();
         lint_workflow_contents(wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
         issues
     }
@@ -748,7 +740,7 @@ mod tests {
         );
         let mut ctx = LintCtx::new(None);
         let mut issues = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = Vec::new();
         lint_workflow_contents(&wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
         note_skipped_capability_check(&mut ctx, &mut issues);
         assert!(

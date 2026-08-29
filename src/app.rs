@@ -681,6 +681,33 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 /// runtime error rather than left to overflow the stack or hang.
 pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
 
+/// Why entering a `workflow:` file failed the check below.
+pub(crate) enum WorkflowNestingError {
+    /// The file is already on the call stack.
+    Cycle,
+    /// Entering it would exceed `MAX_WORKFLOW_DEPTH`.
+    TooDeep,
+}
+
+/// Whether entering `canonical` from `active` (every `workflow:` file
+/// currently on the call stack, canonicalized) would create a cycle or
+/// exceed `MAX_WORKFLOW_DEPTH`. Shared by `WorkflowScope::nested` (fails the
+/// whole run) and `lint::lint_sub_workflow` (reports it as one more issue and
+/// keeps linting the rest of the file), so the two can't drift on what counts
+/// as too deep or cyclic.
+pub(crate) fn check_workflow_nesting(
+    active: &[PathBuf],
+    canonical: &Path,
+) -> Result<(), WorkflowNestingError> {
+    if active.iter().any(|path| path == canonical) {
+        return Err(WorkflowNestingError::Cycle);
+    }
+    if active.len() >= MAX_WORKFLOW_DEPTH {
+        return Err(WorkflowNestingError::TooDeep);
+    }
+    Ok(())
+}
+
 /// The loaded config file and the MCP registry for the whole `lait run`
 /// invocation — unlike `WorkflowScope`, neither changes at a `workflow:`
 /// nesting boundary, so the same `&RunEnv` flows unchanged through every
@@ -800,17 +827,17 @@ impl WorkflowScope {
                 resolved_path.display()
             )
         })?;
-        if self.active_paths.contains(&canonical) {
-            bail!(
-                "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
-                relative_path.display(),
-                canonical.display()
-            );
-        }
-        if self.active_paths.len() >= MAX_WORKFLOW_DEPTH {
-            bail!(
-                "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
-            );
+        if let Err(error) = check_workflow_nesting(&self.active_paths, &canonical) {
+            match error {
+                WorkflowNestingError::Cycle => bail!(
+                    "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
+                    relative_path.display(),
+                    canonical.display()
+                ),
+                WorkflowNestingError::TooDeep => bail!(
+                    "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
+                ),
+            }
         }
 
         let mut models = sub_wf.models.clone();
