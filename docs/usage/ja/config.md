@@ -133,3 +133,25 @@ mcp_servers:
   です（前節と同じ規則）。
 - 実際に使われるサーバーだけがその場で接続されます（`mcp:` で名前を挙げていないサーバーは
   起動しません）。
+
+## スキル
+
+`skills:` にスキル Markdown ファイルを登録すると、`default.skills`（チャット）・agent ファイルの
+`skills:`・ワークフローノードの `skills:` から名前で参照して、その内容をシステムプロンプトに
+追記できるようになります。詳しい使い方は [スキルを使う](./skills.md) を参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  model: local
+  skills: [code-review]   # 全経路（チャット / agent / workflow）の最終フォールバック
+
+skills:
+  code-review: skills/code-review.md
+```
+
+- 値はスキル Markdown ファイルへのパス、またはそのファイルを含むディレクトリへのパスです。
+  ディレクトリを指定した場合は、その直下の `SKILL.md` が使われます（Anthropic の Agent Skills の
+  慣習に合わせたもので、既存の `.claude/skills/<name>/` のようなディレクトリをそのまま指せます）。
+- パスは、`mcp_servers:` とは異なり、その場では接続を持たず、実際に使われるたびにファイルを
+  読み直します。

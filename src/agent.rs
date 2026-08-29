@@ -1,11 +1,11 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::{
     cli::ReasoningEffort,
-    llm,
+    frontmatter, llm,
     schema::{self, JsonSchemaEntry},
 };
 
@@ -28,6 +28,9 @@ struct AgentFrontmatter {
     /// this agent may call.
     mcp: Option<Vec<String>>,
     max_tool_rounds: Option<usize>,
+    /// Names of `skills:` entries (from `lait.config.yml`) whose content is
+    /// appended to this agent's system prompt.
+    skills: Option<Vec<String>>,
 }
 
 /// An agent Markdown file: YAML frontmatter (model/reasoning defaults,
@@ -48,6 +51,7 @@ pub(crate) struct AgentFile {
     pub(crate) schema_name: Option<String>,
     pub(crate) mcp: Option<Vec<String>>,
     pub(crate) max_tool_rounds: Option<usize>,
+    pub(crate) skills: Option<Vec<String>>,
     /// The Markdown body, rendered as a handlebars template against the
     /// agent's input (see `crate::template::render`) to produce the system
     /// prompt actually sent to the model.
@@ -80,7 +84,7 @@ pub(crate) fn load_agent(path: &Path) -> Result<AgentFile> {
 }
 
 fn parse_agent(contents: &str) -> Result<AgentFile> {
-    let (frontmatter, body) = split_frontmatter(contents)?;
+    let (frontmatter, body) = frontmatter::split(contents, "agent file")?;
     let frontmatter: AgentFrontmatter =
         serde_yaml::from_str(frontmatter).context("failed to parse frontmatter")?;
 
@@ -112,35 +116,9 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
         schema_name: frontmatter.schema_name,
         mcp: frontmatter.mcp,
         max_tool_rounds: frontmatter.max_tool_rounds,
+        skills: frontmatter.skills,
         system_prompt_template: body.trim().to_owned(),
     })
-}
-
-/// Splits `---\n<frontmatter yaml>\n---\n<body>` into the frontmatter YAML and
-/// the body. The file must start with a `---` delimiter line; the frontmatter
-/// block ends at the next line that is exactly `---`.
-fn split_frontmatter(contents: &str) -> Result<(&str, &str)> {
-    let mut lines = contents.split_inclusive('\n');
-    let first = lines.next().unwrap_or("");
-    if first.trim_end_matches(['\n', '\r']) != "---" {
-        bail!("agent file must start with a '---' frontmatter delimiter");
-    }
-
-    let mut offset = first.len();
-    for line in lines {
-        if line.trim_end_matches(['\n', '\r']) == "---" {
-            let frontmatter_end = offset;
-            let body_start = offset + line.len();
-            return Ok((
-                &contents[first.len()..frontmatter_end],
-                &contents[body_start..],
-            ));
-        }
-        offset += line.len();
-    }
-    Err(anyhow!(
-        "agent file frontmatter has no closing '---' delimiter"
-    ))
 }
 
 #[cfg(test)]

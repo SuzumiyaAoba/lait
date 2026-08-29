@@ -4,11 +4,13 @@ mod agent;
 mod app;
 mod cli;
 mod config;
+mod frontmatter;
 mod jq;
 mod llm;
 mod mcp;
 mod response;
 mod schema;
+mod skill;
 mod template;
 mod workflow;
 

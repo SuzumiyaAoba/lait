@@ -71,6 +71,9 @@ pub(crate) struct WorkflowDefaults {
     /// independently, like `temperature`, not as a whole unit like `retry`.
     pub(crate) mcp: Option<Vec<String>>,
     pub(crate) max_tool_rounds: Option<usize>,
+    /// Fallback `skills` for any node that calls a model (`prompt`/`agent`)
+    /// and doesn't set its own. Falls back independently, like `mcp`.
+    pub(crate) skills: Option<Vec<String>>,
 }
 
 /// A reusable action definition, referenced by id from `steps[].use`. Carries
@@ -168,6 +171,12 @@ pub(crate) struct NodeDefinition {
     /// take before lait errors, when `mcp` (from any fallback layer) names at
     /// least one server. Falls back the same way as `mcp`.
     pub(crate) max_tool_rounds: Option<usize>,
+    /// Names of `skills:` entries (from `lait.config.yml`) whose content is
+    /// appended to this node's system prompt. Only meaningful for a node that
+    /// calls a model (`prompt`/`agent`); falls back to the agent file's own
+    /// `skills:` (for an `agent` node), then to the workflow's
+    /// `default.skills`, the same way as `mcp`.
+    pub(crate) skills: Option<Vec<String>>,
 }
 
 /// A control-flow reference site: one position in a `steps:` list. Carries

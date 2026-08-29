@@ -412,6 +412,38 @@ fn allows_mcp_on_an_agent_node() {
 }
 
 #[test]
+fn rejects_a_workflow_node_with_skills() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    workflow: sub.yml\n    skills: [code-review]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_skills_on_a_jq_only_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    jq: '.'\n    skills: [code-review]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn allows_skills_on_a_prompt_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    skills: [code-review]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_skills_on_an_agent_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    agent: agents/a.md\n    skills: [code-review]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
 fn rejects_a_node_max_tool_rounds_of_zero() {
     let result = parse_workflow(
         "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    max_tool_rounds: 0\nsteps:\n  - use: n\n",

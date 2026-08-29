@@ -352,6 +352,42 @@ steps:
 - 対応モデルは LM Studio 上のツール呼び出し対応モデル（`qwen3` 系など）を想定しています。
   ツール呼び出しに対応していないモデルでは `tool_calls` が一切返らず、ツールは呼ばれません。
 
+## スキルの利用（`skills`）
+
+`prompt`/`agent` を持つノードに `skills:` で `lait.config.yml` の `skills:`（登録方法は
+[設定ファイル](./config.md#スキル) を参照）のエントリ名を並べると、そのノードのシステム
+プロンプトの末尾に、それぞれのスキルファイルの内容が追記されます。詳しくは
+[スキルを使う](./skills.md) を参照してください。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+  skills: [code-review]     # ワークフロー全体の既定
+nodes:
+  review:
+    prompt: "次の差分をレビューしてください。\n{{ input }}"
+    skills: [code-review, style-guide]   # ノードで上書き
+  summarize:
+    agent: agents/summarize.md
+    # skills を書かなければ agent ファイル → default.skills の順にフォールバック
+steps:
+  - use: review
+  - use: summarize
+```
+
+- `skills` は `mcp` と同じ、ノード → （`agent` ノードなら）agent ファイルの frontmatter →
+  ワークフローの `default:` → `lait.config.yml` の `default:` の順にフォールバックします。
+- `skills` は `prompt`/`agent` を持つノードだけに指定できます。データ変換のみの `jq` ノードや
+  `workflow:` ノード（サブワークフロー側の各ノードに指定してください）には指定できません。
+- スキルの内容は、ノードの `prompt`（レンダリング後）や agent ファイルのシステムプロンプトの
+  後に `---` 区切りで追記されます。ノード/agent 自身の指示が優先して読まれるようにするための
+  順序です。
+- スキルファイルの本文は handlebars テンプレートとしてレンダリングされません（`{{ }}` を含む
+  コード例などをそのまま書けます）。
+- `mcp` と異なり `--stream` との併用に制限はありません（スキルは単なる静的な追記であり、
+  ツール呼び出しの仕組みを使わないためです）。
+
 ## ステップ間の値の受け渡し（`{{ steps.<id> }}` / `$steps`）
 
 これまでの `{{ input }}` は「直前のステップの出力」しか参照できませんでしたが、`id` を持つ

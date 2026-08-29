@@ -1,6 +1,8 @@
 mod support;
 
-use support::{MockServer, run_lait_with_stream, without_json_whitespace};
+use support::{
+    ConfigDirectory, MockServer, run_lait_with_stream, test_command, without_json_whitespace,
+};
 
 #[test]
 fn streams_content_deltas_to_stdout() {
@@ -65,6 +67,42 @@ fn fails_when_the_stream_never_produces_content() {
         output
     );
     assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn stream_appends_default_skills_to_the_system_prompt() {
+    let server = MockServer::start_stream(&[
+        r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}"#,
+    ]);
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\ndefault:\n  model: test-model\n  skills: [code-review]\nskills:\n  code-review: skill.md\n",
+        server.base_url
+    ));
+    std::fs::write(
+        config.path().join("skill.md"),
+        "---\n---\nLook for off-by-one errors.\n",
+    )
+    .expect("failed to write test skill file");
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["--stream", "hello"])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "answer");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["messages"][0],
+        serde_json::json!({
+            "role": "system",
+            "content": "## Skill: code-review\n\nLook for off-by-one errors.",
+        })
+    );
 }
 
 #[test]

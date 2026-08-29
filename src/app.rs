@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -16,7 +17,7 @@ use crate::{
     cli::{AgentAction, ChatArgs, Cli, Command, RunArgs},
     cli::{AgentRunArgs, ReasoningEffort},
     config::{self, ConfigFile, ModelMap},
-    jq, llm, mcp, response, schema, template, workflow,
+    jq, llm, mcp, response, schema, skill, template, workflow,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -52,15 +53,16 @@ struct SamplingOverrides {
     max_tokens: Option<u32>,
 }
 
-/// The `mcp`/`max_tool_rounds` knobs a caller may set for a single completion
-/// request, bundled the same way as `SamplingOverrides` and for the same
-/// reason (keeps `resolve_request_settings`'s argument count down; each
-/// field falls back independently to `file_config.default`, not as a whole
-/// unit).
+/// The `mcp`/`max_tool_rounds`/`skills` knobs a caller may set for a single
+/// completion request, bundled the same way as `SamplingOverrides` and for
+/// the same reason (keeps `resolve_request_settings`'s argument count down;
+/// each field falls back independently to `file_config.default`, not as a
+/// whole unit).
 #[derive(Debug, Default, Clone)]
-struct McpOverrides {
+struct CapabilityOverrides {
     mcp: Option<Vec<String>>,
     max_tool_rounds: Option<usize>,
+    skills: Option<Vec<String>>,
 }
 
 /// The model/base-URL/API-key/sampling settings for a single completion
@@ -75,6 +77,29 @@ struct RequestSettings {
     /// like a single-shot request always has.
     mcp: Vec<String>,
     max_tool_rounds: usize,
+    /// Names of `skills:` entries whose content is appended to this
+    /// request's system prompt (see `with_skills`). Empty means no skill
+    /// content is appended.
+    skills: Vec<String>,
+}
+
+/// Combines a caller's own system prompt (an agent's rendered template, or
+/// `None` for a plain `prompt:`/chat call) with a request's rendered skill
+/// content, if any (see `skill::SkillCache::render`). The skill content is
+/// appended after `base`, under a `---` delimiter, so the caller's own
+/// instructions lead and a skill's own Markdown heading structure stays
+/// visually distinct from them. Returns `base` unchanged (borrowed, no copy)
+/// when there's no skill content to append — the common case, since most
+/// requests don't set `skills:`.
+fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<Cow<'a, str>> {
+    match (base, skills_text) {
+        (None, None) => None,
+        (Some(base), None) => Some(Cow::Borrowed(base)),
+        (None, Some(skills_text)) => Some(Cow::Owned(skills_text.to_owned())),
+        (Some(base), Some(skills_text)) => {
+            Some(Cow::Owned(format!("{base}\n\n---\n\n{skills_text}")))
+        }
+    }
 }
 
 impl RequestSettings {
@@ -118,13 +143,21 @@ impl RequestSettings {
     /// format, force schema-conforming output and never emit `tool_calls` at
     /// all, which would silently stop tools from ever firing. See
     /// `docs/usage/ja/mcp.md`.
+    ///
+    /// `self.skills` (resolved against `skill_cache`, `lait.config.yml`'s
+    /// top-level `skills:`) is appended to `system_prompt` before either path
+    /// below ever sees it — see `with_skills`.
     async fn complete(
         &self,
         registry: &mcp::McpRegistry<'_>,
+        skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
     ) -> Result<response::ChatCompletionResponse> {
+        let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
+        let system_prompt = system_prompt.as_deref();
+
         if self.mcp.is_empty() {
             let messages = llm::initial_messages(system_prompt, prompt)?;
             return llm::complete(self.request(response_format, messages, &[])).await;
@@ -189,9 +222,12 @@ impl RequestSettings {
     /// Rejects `self.mcp` being non-empty: a streamed `tool_calls` field
     /// arrives as index-keyed fragments that must be reassembled before they
     /// can be routed to an MCP server, which lait does not yet do (see
-    /// `docs/usage/ja/mcp.md`).
+    /// `docs/usage/ja/mcp.md`). `self.skills` is appended to `system_prompt`
+    /// the same way as in `complete` — skills are static injection, so
+    /// unlike `mcp` they impose no such restriction on streaming.
     async fn complete_stream(
         &self,
+        skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
@@ -201,8 +237,21 @@ impl RequestSettings {
                 "'--stream'/streaming is not supported together with 'mcp:' yet; drop one of them"
             );
         }
-        let messages = llm::initial_messages(system_prompt, prompt)?;
+        let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
+        let messages = llm::initial_messages(system_prompt.as_deref(), prompt)?;
         llm::complete_stream(self.request(response_format, messages, &[])).await
+    }
+
+    /// Shared by `complete`/`complete_stream`: resolves `self.skills` against
+    /// `skill_cache` and appends the result to `system_prompt` — see
+    /// `with_skills`.
+    fn system_prompt_with_skills<'a>(
+        &self,
+        skill_cache: &skill::SkillCache<'_>,
+        system_prompt: Option<&'a str>,
+    ) -> Result<Option<Cow<'a, str>>> {
+        let skills_text = skill_cache.render(&self.skills)?;
+        Ok(with_skills(system_prompt, skills_text.as_deref()))
     }
 }
 
@@ -257,6 +306,7 @@ async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
     registry: &mcp::McpRegistry<'_>,
+    skill_cache: &skill::SkillCache<'_>,
     input: &serde_json::Value,
     prompt: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -275,7 +325,13 @@ async fn call_agent(
         .transpose()?;
 
     let response = settings
-        .complete(registry, Some(&system_prompt), prompt, response_format)
+        .complete(
+            registry,
+            skill_cache,
+            Some(&system_prompt),
+            prompt,
+            response_format,
+        )
         .await?;
     response::render_response(&response, false, false)
 }
@@ -286,17 +342,18 @@ async fn call_agent(
 /// layers every caller shares: the resolved model's own defaults, then
 /// `lait.config.yml`'s `default:` block. `local_models` is the alias map to
 /// check before falling back to `file_config`'s (a workflow's embedded
-/// `models:`, or empty when there is none). `mcp_overrides` follows the same
-/// two-layer fallback (caller's own value, then `file_config.default`) —
-/// there is no per-model-alias `mcp:`, unlike `reasoning_effort`/
-/// `temperature`, since an MCP server has no natural connection to a model
+/// `models:`, or empty when there is none). `capability_overrides`
+/// (`mcp`/`max_tool_rounds`/`skills`) follows the same two-layer fallback
+/// (caller's own value, then `file_config.default`) — there is no
+/// per-model-alias equivalent, unlike `reasoning_effort`/`temperature`, since
+/// neither an MCP server nor a skill has a natural connection to a model
 /// definition.
 fn resolve_request_settings(
     model_name: String,
     overrides: SamplingOverrides,
     base_url_override: Option<String>,
     api_key_override: Option<String>,
-    mcp_overrides: McpOverrides,
+    capability_overrides: CapabilityOverrides,
     local_models: &ModelMap,
     file_config: &ConfigFile,
 ) -> Result<RequestSettings> {
@@ -378,11 +435,11 @@ fn resolve_request_settings(
         &format!("the request for model '{}'", resolved_model.model_id),
     )?;
 
-    let mcp = mcp_overrides
+    let mcp = capability_overrides
         .mcp
         .or_else(|| file_config.default.mcp.clone())
         .unwrap_or_default();
-    let max_tool_rounds = mcp_overrides
+    let max_tool_rounds = capability_overrides
         .max_tool_rounds
         .or(file_config.default.max_tool_rounds);
     llm::validate_max_tool_rounds(
@@ -390,6 +447,10 @@ fn resolve_request_settings(
         &format!("the request for model '{}'", resolved_model.model_id),
     )?;
     let max_tool_rounds = max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
+    let skills = capability_overrides
+        .skills
+        .or_else(|| file_config.default.skills.clone())
+        .unwrap_or_default();
 
     Ok(RequestSettings {
         base_url,
@@ -398,6 +459,7 @@ fn resolve_request_settings(
         sampling,
         mcp,
         max_tool_rounds,
+        skills,
     })
 }
 
@@ -428,9 +490,12 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         },
         chat.base_url.clone(),
         chat.api_key.clone(),
-        McpOverrides {
+        CapabilityOverrides {
             mcp: (!chat.mcp.is_empty()).then(|| chat.mcp.clone()),
             max_tool_rounds: None,
+            // No `--skill` CLI flag: chat only ever gets skills from
+            // `default.skills` in `lait.config.yml` (see `resolve_request_settings`).
+            skills: None,
         },
         &ModelMap::default(),
         &file_config,
@@ -442,16 +507,18 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
+    let skill_cache = skill::SkillCache::new(&file_config.skills);
+
     if chat.stream {
         let stream = settings
-            .complete_stream(None, &prompt, response_format)
+            .complete_stream(&skill_cache, None, &prompt, response_format)
             .await?;
         return stream_to_stdout(stream, chat.show_reasoning).await;
     }
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let response = settings
-        .complete(&registry, None, &prompt, response_format)
+        .complete(&registry, &skill_cache, None, &prompt, response_format)
         .await?;
 
     let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
@@ -495,19 +562,22 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         },
         None,
         None,
-        McpOverrides {
+        CapabilityOverrides {
             mcp: agent_file.mcp.clone(),
             max_tool_rounds: agent_file.max_tool_rounds,
+            skills: agent_file.skills.clone(),
         },
         &ModelMap::default(),
         &file_config,
     )?;
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
+    let skill_cache = skill::SkillCache::new(&file_config.skills);
     let output = call_agent(
         &agent_file,
         &settings,
         &registry,
+        &skill_cache,
         &input,
         &args.input,
         &workflow::StepOutputs::new(),
@@ -531,9 +601,11 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
+    let skill_cache = skill::SkillCache::new(&file_config.skills);
     let env = RunEnv {
         file_config: &file_config,
         registry: &registry,
+        skill_cache: &skill_cache,
     };
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
@@ -563,6 +635,7 @@ const MAX_WORKFLOW_DEPTH: usize = 32;
 struct RunEnv<'a> {
     file_config: &'a ConfigFile,
     registry: &'a mcp::McpRegistry<'a>,
+    skill_cache: &'a skill::SkillCache<'a>,
 }
 
 /// The default model/reasoning-effort, model aliases, and JSON schema
@@ -592,13 +665,14 @@ struct WorkflowScope {
     /// when unset.
     default_retry: Option<workflow::RetryDefinition>,
     default_timeout: Option<u64>,
-    /// Fallback `mcp`/`max_tool_rounds` for a node that doesn't set its own
-    /// (see `resolve_step_settings`). Merged across `workflow:` nesting the
-    /// same way as `default_model`/`default_reasoning_effort`: each falls
-    /// back independently, like `temperature`, not as a whole unit like
-    /// `default_retry`.
+    /// Fallback `mcp`/`max_tool_rounds`/`skills` for a node that doesn't set
+    /// its own (see `resolve_step_settings`). Merged across `workflow:`
+    /// nesting the same way as `default_model`/`default_reasoning_effort`:
+    /// each falls back independently, like `temperature`, not as a whole
+    /// unit like `default_retry`.
     default_mcp: Option<Vec<String>>,
     default_max_tool_rounds: Option<usize>,
+    default_skills: Option<Vec<String>>,
     models: ModelMap,
     json_schemas: schema::JsonSchemaMap,
     /// This scope's own `nodes:` map, resolved by every `steps[].use` in this
@@ -639,6 +713,7 @@ impl WorkflowScope {
             default_timeout: wf.default.timeout,
             default_mcp: wf.default.mcp.clone(),
             default_max_tool_rounds: wf.default.max_tool_rounds,
+            default_skills: wf.default.skills.clone(),
             models: wf.models.clone(),
             json_schemas: wf.json_schemas.clone(),
             nodes: std::mem::take(&mut wf.nodes),
@@ -730,6 +805,11 @@ impl WorkflowScope {
                 .default
                 .max_tool_rounds
                 .or(self.default_max_tool_rounds),
+            default_skills: sub_wf
+                .default
+                .skills
+                .clone()
+                .or_else(|| self.default_skills.clone()),
             models,
             json_schemas,
             nodes: std::mem::take(&mut sub_wf.nodes),
@@ -1413,14 +1493,20 @@ fn resolve_step_settings(
         .max_tool_rounds
         .or_else(|| agent_file.and_then(|agent_file| agent_file.max_tool_rounds))
         .or(scope.default_max_tool_rounds);
+    let skills = node
+        .skills
+        .clone()
+        .or_else(|| agent_file.and_then(|agent_file| agent_file.skills.clone()))
+        .or_else(|| scope.default_skills.clone());
     resolve_request_settings(
         model_name,
         overrides,
         None,
         None,
-        McpOverrides {
+        CapabilityOverrides {
             mcp,
             max_tool_rounds,
+            skills,
         },
         &scope.models,
         file_config,
@@ -1464,6 +1550,7 @@ async fn execute_step(
             &agent_file,
             &settings,
             env.registry,
+            env.skill_cache,
             &input,
             current_input,
             steps_outputs,
@@ -1493,7 +1580,13 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(env.registry, None, &prompt, response_format)
+            .complete(
+                env.registry,
+                env.skill_cache,
+                None,
+                &prompt,
+                response_format,
+            )
             .await
             .with_context(|| format!("step '{label}'"))?;
 
