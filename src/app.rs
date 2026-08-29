@@ -231,8 +231,14 @@ impl RequestSettings {
             return llm::complete(self.request(response_format, messages, &[])).await;
         }
 
-        let mut mcp_tool_set = env.registry.tools(&self.mcp).await?;
-        let mut subagent_tool_set = env.agent_registry.tools(&self.subagents)?;
+        // `agent_registry.tools` is synchronous (it only reads local subagent
+        // files), so joining it with the MCP round trip lets both proceed
+        // together instead of paying the MCP latency before ever touching
+        // disk.
+        let (mut mcp_tool_set, mut subagent_tool_set) =
+            tokio::try_join!(env.registry.tools(&self.mcp), async {
+                env.agent_registry.tools(&self.subagents)
+            },)?;
         for name in subagent_tool_set.names() {
             if mcp_tool_set.contains(name) {
                 bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
@@ -478,8 +484,10 @@ fn subagent_tool_input(
     };
 
     if file.input_schema.is_some() {
-        let prompt = serde_json::to_string(&arguments)
-            .context("failed to serialize subagent tool call arguments")?;
+        let prompt = value_to_input_text(
+            &arguments,
+            "failed to serialize subagent tool call arguments",
+        )?;
         return Ok((arguments, prompt));
     }
 
@@ -515,6 +523,10 @@ fn call_subagent_tool<'a>(
     active_paths: &'a [PathBuf],
 ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
     Box::pin(async move {
+        // `Copy` (it only captures `name: &str`), so it can back every
+        // `with_context` call below without re-typing the same `format!`.
+        let context = || format!("subagent '{name}'");
+
         let loaded = env.agent_registry.load(name)?;
 
         if let Err(error) =
@@ -532,19 +544,12 @@ fn call_subagent_tool<'a>(
             }
         }
 
-        let (input, prompt) = subagent_tool_input(&loaded.file, arguments_json)
-            .with_context(|| format!("subagent '{name}'"))?;
-        loaded
-            .file
-            .validate_input(&input)
-            .with_context(|| format!("subagent '{name}'"))?;
+        let (input, prompt) =
+            subagent_tool_input(&loaded.file, arguments_json).with_context(context)?;
+        loaded.file.validate_input(&input).with_context(context)?;
 
-        let settings = agent_file_settings(
-            &loaded.file,
-            env.file_config,
-            &format!(" for subagent '{name}'"),
-        )
-        .with_context(|| format!("subagent '{name}'"))?;
+        let settings =
+            agent_file_settings(&loaded.file, env.file_config, Some(name)).with_context(context)?;
 
         let mut next_active_paths = active_paths.to_vec();
         next_active_paths.push(loaded.canonical_path.clone());
@@ -559,7 +564,7 @@ fn call_subagent_tool<'a>(
             &next_active_paths,
         )
         .await
-        .with_context(|| format!("subagent '{name}'"))
+        .with_context(context)
     })
 }
 
@@ -702,22 +707,27 @@ fn resolve_request_settings(
 /// `call_subagent_tool` (a subagent invoked as a tool mid-completion), which
 /// both need exactly this: an agent file's *own* settings, independent of
 /// any caller/step context (unlike `resolve_step_settings`, which layers a
-/// workflow node's own overrides on top). `missing_model_subject` names what
-/// a missing-model error is about (e.g. `""` for the top-level agent, or `"
-/// for subagent 'x'"`).
+/// workflow node's own overrides on top). `subagent_name` names what a
+/// missing-model error is about — `None` for the top-level agent, or
+/// `Some("x")` for subagent `x` — built into the error message only if it's
+/// actually needed, so `call_subagent_tool` doesn't pay for a `format!` on
+/// every subagent call just for a message that's read on the rare
+/// missing-model path.
 fn agent_file_settings(
     agent_file: &AgentFile,
     file_config: &ConfigFile,
-    missing_model_subject: &str,
+    subagent_name: Option<&str>,
 ) -> Result<RequestSettings> {
     let model_name = agent_file
         .model
         .clone()
         .or_else(|| file_config.default.model.clone())
         .ok_or_else(|| {
+            let subject = subagent_name
+                .map(|name| format!(" for subagent '{name}'"))
+                .unwrap_or_default();
             anyhow!(
-                "model is required{missing_model_subject}; set it in its frontmatter or \
-                 default.model in {}",
+                "model is required{subject}; set it in its frontmatter or default.model in {}",
                 config::CONFIG_FILE_NAME
             )
         })?;
@@ -829,7 +839,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         .validate_input(&input)
         .with_context(|| format!("agent '{}'", args.file.display()))?;
 
-    let settings = agent_file_settings(&agent_file, &file_config, "")?;
+    let settings = agent_file_settings(&agent_file, &file_config, None)?;
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let skill_cache = skill::SkillCache::new(&file_config.skills);
