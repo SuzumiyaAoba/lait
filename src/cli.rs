@@ -25,6 +25,9 @@ pub(crate) enum Command {
     Run(RunArgs),
     /// Work with agent Markdown files (frontmatter + system prompt template).
     Agent(AgentCommand),
+    /// Statically check workflow (.yml/.yaml) and agent (.md) files for
+    /// structural and reference errors, without running them.
+    Lint(LintArgs),
 }
 
 #[derive(Debug, Args)]
@@ -61,6 +64,15 @@ pub(crate) struct AgentRunArgs {
     /// as-is for a plain `{{ input }}`.
     #[arg(value_name = "INPUT")]
     pub(crate) input: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct LintArgs {
+    /// Paths to workflow YAML files (.yml/.yaml) and/or agent Markdown files
+    /// (.md) to check. Every file is checked even if an earlier one has
+    /// errors.
+    #[arg(value_name = "FILE", required = true)]
+    pub(crate) files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -385,5 +397,52 @@ mod tests {
     fn run_subcommand_requires_file_and_prompt() {
         assert!(Cli::try_parse_from(["lait", "run"]).is_err());
         assert!(Cli::try_parse_from(["lait", "run", "workflow.yml"]).is_err());
+    }
+
+    #[test]
+    fn parses_lint_subcommand_with_a_single_file() {
+        let cli = Cli::try_parse_from(["lait", "lint", "workflow.yml"])
+            .expect("valid lint subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Lint(lint_args)) => {
+                assert_eq!(lint_args.files.len(), 1);
+                assert_eq!(lint_args.files[0].to_str(), Some("workflow.yml"));
+            }
+            _ => panic!("expected the lint subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_lint_subcommand_with_multiple_files() {
+        let cli = Cli::try_parse_from(["lait", "lint", "workflow.yml", "agent.md"])
+            .expect("valid lint subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Lint(lint_args)) => {
+                assert_eq!(
+                    lint_args
+                        .files
+                        .iter()
+                        .filter_map(|path| path.to_str())
+                        .collect::<Vec<_>>(),
+                    vec!["workflow.yml", "agent.md"]
+                );
+            }
+            _ => panic!("expected the lint subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn lint_subcommand_requires_at_least_one_file() {
+        assert!(Cli::try_parse_from(["lait", "lint"]).is_err());
+    }
+
+    #[test]
+    fn lint_subcommand_accepts_global_no_config() {
+        let cli = Cli::try_parse_from(["lait", "lint", "workflow.yml", "--no-config"])
+            .expect("global flags should be accepted after subcommand arguments");
+
+        assert!(cli.no_config);
     }
 }

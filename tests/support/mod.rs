@@ -573,6 +573,15 @@ pub(crate) fn run_lait_agent(agent_path: &Path, input: &str) -> Output {
         .expect("failed to execute lait agent run")
 }
 
+pub(crate) fn run_lait_lint(files: &[&Path]) -> Output {
+    let mut command = test_command();
+    command.arg("lint");
+    for file in files {
+        command.arg(file);
+    }
+    command.output().expect("failed to execute lait lint")
+}
+
 pub(crate) fn without_json_whitespace(value: &str) -> String {
     value
         .chars()

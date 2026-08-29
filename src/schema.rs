@@ -206,7 +206,14 @@ pub(crate) fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat
     build_json_schema(schema, name)
 }
 
-pub(crate) fn build_json_schema(schema: serde_json::Value, name: &str) -> Result<ResponseFormat> {
+/// Checks a Structured Outputs schema `name` (a node/agent's `schema_name`,
+/// defaulting to `"structured_output"`) against the constraints
+/// `build_json_schema` requires but which nothing checks before request time:
+/// 1-64 characters, ASCII letters/digits/underscore/hyphen only. Exposed on
+/// its own (rather than folded back into `build_json_schema`, its only
+/// caller before the linter) so the linter can validate a `schema_name` it
+/// finds statically without also needing the schema body on hand.
+pub(crate) fn validate_schema_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         bail!("JSON schema name must be between 1 and 64 characters: {name:?}");
     }
@@ -218,6 +225,11 @@ pub(crate) fn build_json_schema(schema: serde_json::Value, name: &str) -> Result
             "JSON schema name must contain only ASCII letters, digits, underscores, or hyphens: {name:?}"
         );
     }
+    Ok(())
+}
+
+pub(crate) fn build_json_schema(schema: serde_json::Value, name: &str) -> Result<ResponseFormat> {
+    validate_schema_name(name)?;
 
     Ok(ResponseFormat::JsonSchema {
         json_schema: ResponseFormatJsonSchema {

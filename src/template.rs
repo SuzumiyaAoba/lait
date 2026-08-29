@@ -48,6 +48,22 @@ pub(crate) fn render(
         .with_context(|| format!("failed to render template: {template:?}"))
 }
 
+/// Checks `template`'s handlebars syntax without rendering it (used by the
+/// workflow/agent linter, which has no `input`/`steps` value to render
+/// against yet). This only catches malformed `{{ ... }}`/block syntax; a
+/// reference to an undefined variable, or a bare `{{ input }}` against an
+/// object/array input, is only ever caught by `render`, at actual render time
+/// against real data — a scalar `{{ input }}` (e.g. a first step's `prompt:`
+/// run against a plain-text CLI argument) is perfectly valid, so flagging
+/// every bare `{{ input }}` statically would be a false positive on one of
+/// the most common templates in this codebase's own tests
+/// (`renders_a_bare_input_placeholder_from_a_string`, below).
+pub(crate) fn check_syntax(template: &str) -> Result<()> {
+    handlebars::Template::compile(template)
+        .map(|_| ())
+        .with_context(|| format!("failed to parse template: {template:?}"))
+}
+
 /// Whether `template` contains a bare `{{ input }}` expression (as opposed to
 /// `{{ input.field }}` or a helper call like `{{ json input }}`).
 fn references_bare_input(template: &str) -> bool {
@@ -82,7 +98,7 @@ fn json_helper(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_input, render};
+    use super::{check_syntax, parse_input, references_bare_input, render};
     use serde_json::json;
 
     fn no_steps() -> serde_json::Map<String, serde_json::Value> {
@@ -193,5 +209,41 @@ mod tests {
         assert_eq!(parse_input("Alice"), json!("Alice"));
         assert_eq!(parse_input("42"), json!(42));
         assert_eq!(parse_input(r#"{"a":1}"#), json!({"a": 1}));
+    }
+
+    #[test]
+    fn check_syntax_accepts_a_valid_template() {
+        assert!(check_syntax("summarize: {{ input.city }}").is_ok());
+    }
+
+    #[test]
+    fn check_syntax_accepts_a_template_with_no_placeholders() {
+        assert!(check_syntax("plain text").is_ok());
+    }
+
+    #[test]
+    fn check_syntax_rejects_an_unterminated_placeholder() {
+        assert!(check_syntax("{{ input").is_err());
+    }
+
+    #[test]
+    fn check_syntax_does_not_require_input_or_steps_values() {
+        // Unlike `render`, `check_syntax` never resolves variables against
+        // real data, so a template referencing an undefined variable still
+        // passes a syntax-only check.
+        assert!(check_syntax("{{ nope }}").is_ok());
+    }
+
+    #[test]
+    fn references_bare_input_detects_a_standalone_input_placeholder() {
+        assert!(references_bare_input("{{ input }}"));
+        assert!(references_bare_input("summarize: {{ input }}"));
+    }
+
+    #[test]
+    fn references_bare_input_ignores_field_access_and_helper_calls() {
+        assert!(!references_bare_input("{{ input.city }}"));
+        assert!(!references_bare_input("{{ json input }}"));
+        assert!(!references_bare_input("no placeholder here"));
     }
 }
