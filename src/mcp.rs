@@ -59,6 +59,15 @@ pub(crate) struct ToolSet {
     index: HashMap<String, (String, String)>,
 }
 
+impl ToolSet {
+    /// Whether `qualified_name` (as returned in `tools`) names a tool in this
+    /// set, used by `app::RequestSettings::complete` to route a model's tool
+    /// call between this set and `subagent::ToolSet` when both are in play.
+    pub(crate) fn contains(&self, qualified_name: &str) -> bool {
+        self.index.contains_key(qualified_name)
+    }
+}
+
 impl<'a> McpRegistry<'a> {
     pub(crate) fn new(servers: &'a config::McpServerMap) -> Self {
         Self {
@@ -87,7 +96,7 @@ impl<'a> McpRegistry<'a> {
         let mut index = HashMap::new();
         for (name, server_tools) in per_server {
             for tool in server_tools.iter() {
-                let qualified = qualify_tool_name(&name, &tool.name)?;
+                let qualified = qualify_tool_name("MCP tool", &name, &tool.name)?;
                 if let Some((existing_server, existing_tool)) = index.get(&qualified) {
                     bail!(
                         "MCP tool name collision: '{name}'.'{}' and '{existing_server}'.'{existing_tool}' both qualify to '{qualified}'",
@@ -280,12 +289,17 @@ async fn list_all_tools(connection: &McpConnection) -> Result<Vec<Tool>> {
 }
 
 /// OpenAI function names must match `^[a-zA-Z0-9_-]{1,64}$`. Qualifies
-/// `tool` with its `server` (so two servers' same-named tool don't collide)
-/// by joining them with `__`, replacing any other character with `_`, and
-/// rejecting (rather than truncating, which risks a silent second collision)
-/// a result over 64 characters.
-fn qualify_tool_name(server: &str, tool: &str) -> Result<String> {
-    let raw = format!("{server}__{tool}");
+/// `name` with `prefix` (so two different tools with the same bare name
+/// don't collide) by joining them with `__`, replacing any other character
+/// with `_`, and rejecting (rather than truncating, which risks a silent
+/// second collision) a result over 64 characters. `kind` names what's being
+/// qualified for the error message (e.g. `"MCP tool"`). Shared by MCP tool
+/// names (`prefix` is the server name — see `ToolSet::tools`) and subagent
+/// tool names (`prefix` is the fixed string `"agent"` — see
+/// `subagent::AgentRegistry::tools`), so both sources of dynamically-offered
+/// tools sanitize/length-check their qualified names the same way.
+pub(crate) fn qualify_tool_name(kind: &str, prefix: &str, name: &str) -> Result<String> {
+    let raw = format!("{prefix}__{name}");
     let qualified: String = raw
         .chars()
         .map(|c| {
@@ -298,7 +312,7 @@ fn qualify_tool_name(server: &str, tool: &str) -> Result<String> {
         .collect();
     if qualified.is_empty() || qualified.len() > 64 {
         bail!(
-            "MCP tool name '{qualified}' (from server '{server}', tool '{tool}') is empty or exceeds OpenAI's 64-character function name limit"
+            "{kind} name '{qualified}' (from '{prefix}', '{name}') is empty or exceeds OpenAI's 64-character function name limit"
         );
     }
     Ok(qualified)
@@ -334,7 +348,7 @@ mod tests {
     #[test]
     fn qualifies_a_tool_name_with_its_server() {
         assert_eq!(
-            qualify_tool_name("filesystem", "read_file").unwrap(),
+            qualify_tool_name("MCP tool", "filesystem", "read_file").unwrap(),
             "filesystem__read_file"
         );
     }
@@ -342,7 +356,7 @@ mod tests {
     #[test]
     fn sanitizes_invalid_characters() {
         assert_eq!(
-            qualify_tool_name("my server", "tool.name").unwrap(),
+            qualify_tool_name("MCP tool", "my server", "tool.name").unwrap(),
             "my_server__tool_name"
         );
     }
@@ -350,6 +364,6 @@ mod tests {
     #[test]
     fn rejects_a_name_over_64_characters() {
         let long_tool = "a".repeat(60);
-        assert!(qualify_tool_name("server", &long_tool).is_err());
+        assert!(qualify_tool_name("MCP tool", "server", &long_tool).is_err());
     }
 }

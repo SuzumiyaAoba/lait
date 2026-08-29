@@ -24,6 +24,10 @@ pub(crate) struct ConfigFile {
     /// file/workflow node/`default:` block. See `crate::skill`.
     #[serde(default)]
     pub(crate) skills: SkillMap,
+    /// Named agent Markdown files, referenced by a `subagents:` list on the
+    /// agent file/workflow node/`default:` block. See `crate::subagent`.
+    #[serde(default)]
+    pub(crate) agents: AgentMap,
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
@@ -52,6 +56,10 @@ pub(crate) struct DefaultSettings {
     /// prompt by default, when an agent file/workflow node doesn't set its
     /// own `skills:`. Falls back independently, like `temperature`.
     pub(crate) skills: Option<Vec<String>>,
+    /// Names of `agents:` entries made available as callable subagent tools
+    /// by default, when an agent file/workflow node doesn't set its own
+    /// `subagents:`. Falls back independently, like `temperature`.
+    pub(crate) subagents: Option<Vec<String>>,
 }
 
 /// A map of `mcp_servers:` name to its connection settings, as used by
@@ -150,6 +158,13 @@ impl McpServerConfig {
 /// containing a `SKILL.md`), as used by `lait.config.yml`'s top-level
 /// `skills:`. See `crate::skill::load_skill`.
 pub(crate) type SkillMap = HashMap<String, PathBuf>;
+
+/// A map of `agents:` name to the path of its agent Markdown file, as used by
+/// `lait.config.yml`'s top-level `agents:`. Each named entry can be made
+/// available, via a `subagents:` list, as a tool the model itself may decide
+/// to call mid-completion — unlike `agent:`/`workflow:` workflow nodes, which
+/// wire in a fixed agent call at parse time. See `crate::subagent`.
+pub(crate) type AgentMap = HashMap<String, PathBuf>;
 
 /// A map of model alias to its candidate definitions, as used by both
 /// `lait.config.yml`'s top-level `models:` and a workflow file's `models:`.

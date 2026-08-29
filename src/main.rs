@@ -12,6 +12,7 @@ mod mcp;
 mod response;
 mod schema;
 mod skill;
+mod subagent;
 mod template;
 mod workflow;
 

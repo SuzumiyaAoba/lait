@@ -388,6 +388,53 @@ steps:
 - `mcp` と異なり `--stream` との併用に制限はありません（スキルは単なる静的な追記であり、
   ツール呼び出しの仕組みを使わないためです）。
 
+## サブエージェントの利用（`subagents`）
+
+`prompt`/`agent` を持つノードに `subagents:` で `lait.config.yml` の `agents:`（登録方法は
+[設定ファイル](./config.md#サブエージェント) を参照）のエントリ名を並べると、そのノードのモデル
+呼び出しに、対応するエージェント Markdown ファイルが「サブエージェント」ツールとして渡されます。
+`mcp` と同じ tool loop の仕組みに乗るため、モデルがツール呼び出しを返すたびに lait がそのサブ
+エージェントを実行して結果を受け取り、モデルに返す、というやり取りを最終回答が出るまで自動で
+繰り返します。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+  subagents: [researcher]        # ワークフロー全体の既定
+nodes:
+  triage:
+    prompt: "{{ input }} を調査してください。必要であれば researcher に任せてください。"
+    subagents: [researcher, fact-checker]   # ノードで上書き
+  summarize:
+    agent: agents/summarize.md
+    # subagents を書かなければ agent ファイル → default.subagents の順にフォールバック
+steps:
+  - use: triage
+  - use: summarize
+```
+
+- `subagents` は `mcp`/`skills` と同じ、ノード → （`agent` ノードなら）agent ファイルの
+  frontmatter → ワークフローの `default:` → `lait.config.yml` の `default:` の順にフォールバック
+  します。
+- `subagents` は `prompt`/`agent` を持つノードだけに指定できます。データ変換のみの `jq` ノードや
+  `workflow:` ノード（サブワークフロー側の各ノードに指定してください）には指定できません。
+- モデルに渡すツール名は `agent__<サブエージェント名>`（例: `agent__researcher`）の形に修飾され、
+  `mcp` のツール名（`<サーバー名>__<ツール名>`）と衝突しないようになっています。
+- サブエージェント側の agent ファイルが `input_schema` を持つ場合、モデルの引数はそのスキーマの
+  形そのままサブエージェントの `{{ input }}` になります。`input_schema` を持たない場合は
+  `{ "input": ... }` という汎用の1フィールドのツール引数になり、その `input` の値
+  （文字列ならそのまま、それ以外は JSON テキストとして）がサブエージェントの `{{ input }}` に
+  なります。
+- サブエージェント自身も、自分の frontmatter で `model`/`mcp`/`skills`/`subagents` などを独立に
+  持てます。サブエージェントがさらに別のサブエージェントを呼ぶような入れ子も可能ですが、循環
+  （巡り巡って自分自身を呼ぶ）や過度な深さは `workflow:` の入れ子と同様にエラーになります。
+- `--stream` との併用は `mcp` と同じ理由（ストリームの `tool_calls` を再組み立てする実装が
+  まだない）で未対応です。
+
+それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.md#サブエージェントの利用)
+にもあります。詳しい仕組みは [サブエージェントを使う](./subagents.md) を参照してください。
+
 ## ステップ間の値の受け渡し（`{{ steps.<id> }}` / `$steps`）
 
 これまでの `{{ input }}` は「直前のステップの出力」しか参照できませんでしたが、`id` を持つ

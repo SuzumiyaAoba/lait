@@ -9,6 +9,7 @@
 - [ワークフロー／エージェントファイルの静的チェック（lint）](./lint.md) — `lait lint`、未使用ノードや jq/テンプレート構文エラー、`mcp`/`skills`/`agent`/`workflow` 参照や `schema_name` の事前検出
 - [MCP サーバーのツールを使う](./mcp.md) — `mcp_servers:` の登録、チャット／agent／workflow での `mcp:` 指定、ツール名の修飾、`structured_output`/`--stream` との関係、`max_tool_rounds`
 - [スキルを使う](./skills.md) — `skills:` の登録、agent／workflow での `skills:` 指定、システムプロンプトへの追記のされ方、`mcp`/`--stream`/`structured_output` との違い
+- [サブエージェントを使う](./subagents.md) — `agents:` の登録、チャット／agent／workflow での `subagents:` 指定、ツール名とツール引数の扱い、サブエージェントの入れ子、`agent:`/`workflow:` ノードとの違い
 - [出力例](./output.md) — 標準出力、`--stream`、`--json-schema`、`--json`
 - [トラブルシュート](./troubleshooting.md) — よくあるエラーと対処法
 - [開発](./development.md) — テスト、フォーマット、Lint、ビルド

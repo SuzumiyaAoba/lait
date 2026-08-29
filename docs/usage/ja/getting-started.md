@@ -54,6 +54,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--top-p <FLOAT>` | `LLM_TOP_P` | nucleus sampling の確率質量（`0.0`〜`1.0`）。`--temperature` の代替として使います。未指定時は API リクエストにフィールドを追加しません。 |
 | `--max-tokens <INT>` | `LLM_MAX_TOKENS` | 応答として生成するトークン数の上限（`1`以上）。API へは（非推奨の `max_tokens` ではなく）`max_completion_tokens` として送信されます。未指定時は API リクエストにフィールドを追加しません。 |
 | `--mcp <NAME>` | — | `lait.config.yml` の `mcp_servers:` エントリ名。繰り返し指定可能。指定した MCP サーバーのツールをモデルに渡します（詳細は [MCP サーバーのツールを使う](./mcp.md)）。`--stream` とは同時に指定できません。 |
+| `--subagent <NAME>` | — | `lait.config.yml` の `agents:` エントリ名。繰り返し指定可能。指定したエージェント Markdown ファイルを、モデル自身が呼び出すかどうか判断できる「サブエージェント」ツールとして渡します（詳細は [サブエージェントを使う](./subagents.md)）。`--stream` とは同時に指定できません。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。 |
 
 詳細なオプションは次のコマンドで確認できます。

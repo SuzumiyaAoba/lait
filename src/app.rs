@@ -17,7 +17,7 @@ use crate::{
     cli::{AgentAction, ChatArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, ReasoningEffort},
     config::{self, ConfigFile, ModelMap},
-    jq, lint, llm, mcp, response, schema, skill, template, workflow,
+    jq, lint, llm, mcp, response, schema, skill, subagent, template, workflow,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -108,16 +108,17 @@ struct SamplingOverrides {
     max_tokens: Option<u32>,
 }
 
-/// The `mcp`/`max_tool_rounds`/`skills` knobs a caller may set for a single
-/// completion request, bundled the same way as `SamplingOverrides` and for
-/// the same reason (keeps `resolve_request_settings`'s argument count down;
-/// each field falls back independently to `file_config.default`, not as a
-/// whole unit).
+/// The `mcp`/`max_tool_rounds`/`skills`/`subagents` knobs a caller may set
+/// for a single completion request, bundled the same way as
+/// `SamplingOverrides` and for the same reason (keeps
+/// `resolve_request_settings`'s argument count down; each field falls back
+/// independently to `file_config.default`, not as a whole unit).
 #[derive(Debug, Default, Clone)]
 struct CapabilityOverrides {
     mcp: Option<Vec<String>>,
     max_tool_rounds: Option<usize>,
     skills: Option<Vec<String>>,
+    subagents: Option<Vec<String>>,
 }
 
 /// The model/base-URL/API-key/sampling settings for a single completion
@@ -136,6 +137,11 @@ struct RequestSettings {
     /// request's system prompt (see `with_skills`). Empty means no skill
     /// content is appended.
     skills: Vec<String>,
+    /// Names of `agents:` entries made available as callable subagent tools
+    /// during this request's tool loop. Empty means "no subagent tools" —
+    /// combined with `mcp` the same way in `complete`'s tool loop (empty
+    /// tool sources for both keeps `complete`'s fast, tool-free path).
+    subagents: Vec<String>,
 }
 
 /// Combines a caller's own system prompt (an agent's rendered template, or
@@ -185,12 +191,14 @@ impl RequestSettings {
     }
 
     /// Sends a completion request built from these settings, driving a
-    /// tool-call loop when `self.mcp` names at least one MCP server: each
-    /// round sends the growing message history to the model, and if it comes
-    /// back with `tool_calls`, `registry` executes them and their results are
-    /// appended as `tool`-role messages before the next round. Ends either
-    /// when a round produces no `tool_calls` (the model's final answer) or
-    /// after `self.max_tool_rounds` rounds, whichever comes first.
+    /// tool-call loop when `self.mcp`/`self.subagents` names at least one MCP
+    /// server or subagent: each round sends the growing message history to
+    /// the model, and if it comes back with `tool_calls`, `env.registry`
+    /// (for an MCP tool) or `call_subagent_tool` (for a subagent tool)
+    /// executes them and their results are appended as `tool`-role messages
+    /// before the next round. Ends either when a round produces no
+    /// `tool_calls` (the model's final answer) or after
+    /// `self.max_tool_rounds` rounds, whichever comes first.
     ///
     /// `response_format` is withheld from every round while tools are still
     /// in play and only attached to the final, tool-free round: many
@@ -199,26 +207,50 @@ impl RequestSettings {
     /// all, which would silently stop tools from ever firing. See
     /// `docs/usage/ja/mcp.md`.
     ///
-    /// `self.skills` (resolved against `skill_cache`, `lait.config.yml`'s
+    /// `self.skills` (resolved against `env.skill_cache`, `lait.config.yml`'s
     /// top-level `skills:`) is appended to `system_prompt` before either path
-    /// below ever sees it — see `with_skills`.
+    /// below ever sees it — see `with_skills`. `active_agent_paths` is every
+    /// subagent file currently executing on this call stack (canonicalized);
+    /// pass `&[]` for a top-level call (chat/`lait agent run`/a workflow
+    /// step) and `call_subagent_tool` extends it for a subagent's own
+    /// completion, so a subagent chain that cycles back to itself is caught
+    /// the same way `workflow:` nesting is (see `MAX_SUBAGENT_DEPTH`).
     async fn complete(
         &self,
-        registry: &mcp::McpRegistry<'_>,
-        skill_cache: &skill::SkillCache<'_>,
+        env: &RunEnv<'_>,
+        active_agent_paths: &[PathBuf],
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
     ) -> Result<response::ChatCompletionResponse> {
-        let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
+        let system_prompt = self.system_prompt_with_skills(env.skill_cache, system_prompt)?;
         let system_prompt = system_prompt.as_deref();
 
-        if self.mcp.is_empty() {
+        if self.mcp.is_empty() && self.subagents.is_empty() {
             let messages = llm::initial_messages(system_prompt, prompt)?;
             return llm::complete(self.request(response_format, messages, &[])).await;
         }
 
-        let tool_set = registry.tools(&self.mcp).await?;
+        // `agent_registry.tools` is synchronous (it only reads local subagent
+        // files), so joining it with the MCP round trip lets both proceed
+        // together instead of paying the MCP latency before ever touching
+        // disk.
+        let (mut mcp_tool_set, mut subagent_tool_set) =
+            tokio::try_join!(env.registry.tools(&self.mcp), async {
+                env.agent_registry.tools(&self.subagents)
+            },)?;
+        for name in subagent_tool_set.names() {
+            if mcp_tool_set.contains(name) {
+                bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
+            }
+        }
+        // Only `.contains()`/`.subagent_name()` (which read `.index`, not
+        // `.tools`) are used below, so `.tools` doesn't need to survive past
+        // this merge — moving it out avoids cloning every tool definition
+        // (including its full JSON `parameters`).
+        let mut tools = std::mem::take(&mut mcp_tool_set.tools);
+        tools.extend(std::mem::take(&mut subagent_tool_set.tools));
+
         let mut messages = llm::initial_messages(system_prompt, prompt)?;
 
         let mut round = 0usize;
@@ -231,8 +263,7 @@ impl RequestSettings {
                 );
             }
 
-            let response =
-                llm::complete(self.request(None, messages.clone(), &tool_set.tools)).await?;
+            let response = llm::complete(self.request(None, messages.clone(), &tools)).await?;
 
             let tool_calls = response::first_message(&response)
                 .and_then(|message| message.tool_calls.as_ref())
@@ -259,13 +290,22 @@ impl RequestSettings {
             // in a stable, deterministic order.
             let tool_messages =
                 futures_util::future::try_join_all(tool_calls.iter().map(|tool_call| async {
-                    let result = registry
-                        .call(
-                            &tool_set,
-                            &tool_call.function.name,
+                    let name = &tool_call.function.name;
+                    let result = if mcp_tool_set.contains(name) {
+                        env.registry
+                            .call(&mcp_tool_set, name, &tool_call.function.arguments)
+                            .await?
+                    } else if let Some(subagent_name) = subagent_tool_set.subagent_name(name) {
+                        call_subagent_tool(
+                            subagent_name,
                             &tool_call.function.arguments,
+                            env,
+                            active_agent_paths,
                         )
-                        .await?;
+                        .await?
+                    } else {
+                        bail!("model called unknown tool '{name}'");
+                    };
                     llm::tool_result_message(&tool_call.id, result)
                 }))
                 .await?;
@@ -274,12 +314,13 @@ impl RequestSettings {
     }
 
     /// Like [`RequestSettings::complete`], but requests a streamed response.
-    /// Rejects `self.mcp` being non-empty: a streamed `tool_calls` field
-    /// arrives as index-keyed fragments that must be reassembled before they
-    /// can be routed to an MCP server, which lait does not yet do (see
-    /// `docs/usage/ja/mcp.md`). `self.skills` is appended to `system_prompt`
-    /// the same way as in `complete` — skills are static injection, so
-    /// unlike `mcp` they impose no such restriction on streaming.
+    /// Rejects `self.mcp`/`self.subagents` being non-empty: a streamed
+    /// `tool_calls` field arrives as index-keyed fragments that must be
+    /// reassembled before they can be routed to an MCP server or a subagent,
+    /// which lait does not yet do (see `docs/usage/ja/mcp.md`). `self.skills`
+    /// is appended to `system_prompt` the same way as in `complete` — skills
+    /// are static injection, so unlike `mcp`/`subagents` they impose no such
+    /// restriction on streaming.
     async fn complete_stream(
         &self,
         skill_cache: &skill::SkillCache<'_>,
@@ -290,6 +331,12 @@ impl RequestSettings {
         if !self.mcp.is_empty() {
             bail!(
                 "'--stream'/streaming is not supported together with 'mcp:' yet; drop one of them"
+            );
+        }
+        if !self.subagents.is_empty() {
+            bail!(
+                "'--stream'/streaming is not supported together with 'subagents:' yet; drop one \
+                 of them"
             );
         }
         let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
@@ -356,15 +403,17 @@ async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: boo
 
 /// Renders an agent's system prompt against `input`, calls the model with
 /// `prompt` as the user message, and renders the response. Shared by
-/// `run_agent` and `execute_step`'s agent branch.
+/// `run_agent`, `execute_step`'s agent branch, and `call_subagent_tool`.
+/// `active_agent_paths` is threaded straight through to `settings.complete`
+/// — see its doc comment; every caller but `call_subagent_tool` passes `&[]`.
 async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
-    registry: &mcp::McpRegistry<'_>,
-    skill_cache: &skill::SkillCache<'_>,
+    env: &RunEnv<'_>,
     input: &serde_json::Value,
     prompt: &str,
     steps_outputs: &workflow::StepOutputs,
+    active_agent_paths: &[PathBuf],
 ) -> Result<String> {
     let system_prompt = template::render(&agent_file.system_prompt_template, input, steps_outputs)?;
     let response_format = agent_file
@@ -381,14 +430,142 @@ async fn call_agent(
 
     let response = settings
         .complete(
-            registry,
-            skill_cache,
+            env,
+            active_agent_paths,
             Some(&system_prompt),
             prompt,
             response_format,
         )
         .await?;
     response::render_response(&response, false, false)
+}
+
+/// The maximum recursive subagent-calling depth (a subagent whose own
+/// `subagents:` names another, whose own names another, ...), rejected as a
+/// runtime error the same way `MAX_WORKFLOW_DEPTH` rejects excessive
+/// `workflow:` nesting.
+const MAX_SUBAGENT_DEPTH: usize = 16;
+
+/// Converts a JSON value into raw prompt/tool-input text: a `Value::String`
+/// passes through unquoted (so `{{ input }}` sees the same plain text
+/// everywhere else in the pipeline does), any other value (object, array,
+/// number, ...) is serialized to compact JSON text. `context` names the
+/// caller's own site for the serialization-failure error. Shared by
+/// `run_steps`' `for_each` branch (both the sequential and concurrent
+/// per-item conversion) and `subagent_tool_input` below — the same "is this
+/// already plain text, or does it need to become a JSON text blob" question
+/// both ask.
+fn value_to_input_text(value: &serde_json::Value, context: &'static str) -> Result<String> {
+    match value {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        other => serde_json::to_string(other).context(context),
+    }
+}
+
+/// Unwraps a subagent tool call's raw JSON `arguments` into the `(input,
+/// prompt)` pair `call_agent` needs — the parsed JSON value for `{{
+/// input.field }}` template access, and the raw text sent as the user-role
+/// message. Mirrors `subagent::AgentRegistry::tools`' two parameter shapes:
+/// when `file` declares an `input_schema`, the whole `arguments` object *is*
+/// the subagent's input (its own schema already shaped `parameters`, so
+/// there's nothing to unwrap) and `prompt` is its canonical JSON text;
+/// otherwise `arguments` is the generic `{ "input": ... }` wrapper, and
+/// `input`/`prompt` are read out of its `input` field via
+/// `value_to_input_text`.
+fn subagent_tool_input(
+    file: &AgentFile,
+    arguments_json: &str,
+) -> Result<(serde_json::Value, String)> {
+    let arguments: serde_json::Value = if arguments_json.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(arguments_json)
+            .context("failed to parse subagent tool call arguments as JSON")?
+    };
+
+    if file.input_schema.is_some() {
+        let prompt = value_to_input_text(
+            &arguments,
+            "failed to serialize subagent tool call arguments",
+        )?;
+        return Ok((arguments, prompt));
+    }
+
+    // Moved out (not cloned) when `arguments` is an object, since `arguments`
+    // itself is never used again after this.
+    let input_value = match arguments {
+        serde_json::Value::Object(mut map) => map.remove("input"),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow!("subagent tool call is missing the required 'input' field"))?;
+    let prompt = value_to_input_text(
+        &input_value,
+        "failed to serialize subagent tool call 'input'",
+    )?;
+    Ok((input_value, prompt))
+}
+
+/// Runs subagent `name` (resolved via `env.agent_registry`, an `agents:`
+/// entry) against one tool call's raw JSON `arguments`, recursively driving
+/// its own completion (and, if it declares `subagents:`/`mcp:` of its own,
+/// its own tool loop) to completion, and returns its rendered response text —
+/// the shape a `tool`-role message needs. `active_paths` is every subagent
+/// file already executing on this call stack (canonicalized); calling a
+/// subagent already on it (a cycle) or beyond `MAX_SUBAGENT_DEPTH` is
+/// rejected the same way `WorkflowScope`/`check_workflow_nesting` reject
+/// excessive `workflow:` nesting. Boxed because this is mutually recursive
+/// with `RequestSettings::complete` through `call_agent`, which Rust's
+/// `async fn` cannot size otherwise.
+fn call_subagent_tool<'a>(
+    name: &'a str,
+    arguments_json: &'a str,
+    env: &'a RunEnv<'a>,
+    active_paths: &'a [PathBuf],
+) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+    Box::pin(async move {
+        // `Copy` (it only captures `name: &str`), so it can back every
+        // `with_context` call below without re-typing the same `format!`.
+        let context = || format!("subagent '{name}'");
+
+        let loaded = env.agent_registry.load(name)?;
+
+        if let Err(error) =
+            check_nesting_depth(active_paths, &loaded.canonical_path, MAX_SUBAGENT_DEPTH)
+        {
+            match error {
+                NestingDepthError::Cycle => bail!(
+                    "calling subagent '{name}' would create a cycle ('{}' is already running)",
+                    loaded.canonical_path.display()
+                ),
+                NestingDepthError::TooDeep => bail!(
+                    "calling subagent '{name}' exceeded the maximum subagent nesting depth of \
+                     {MAX_SUBAGENT_DEPTH}"
+                ),
+            }
+        }
+
+        let (input, prompt) =
+            subagent_tool_input(&loaded.file, arguments_json).with_context(context)?;
+        loaded.validate_input(&input).with_context(context)?;
+
+        let settings =
+            agent_file_settings(&loaded.file, env.file_config, Some(name)).with_context(context)?;
+
+        let mut next_active_paths = active_paths.to_vec();
+        next_active_paths.push(loaded.canonical_path.clone());
+
+        call_agent(
+            &loaded.file,
+            &settings,
+            env,
+            &input,
+            &prompt,
+            &workflow::StepOutputs::new(),
+            &next_active_paths,
+        )
+        .await
+        .with_context(context)
+    })
 }
 
 /// Resolves the settings for one completion request. `model_name` and every
@@ -506,6 +683,10 @@ fn resolve_request_settings(
         .skills
         .or_else(|| file_config.default.skills.clone())
         .unwrap_or_default();
+    let subagents = capability_overrides
+        .subagents
+        .or_else(|| file_config.default.subagents.clone())
+        .unwrap_or_default();
 
     Ok(RequestSettings {
         base_url,
@@ -515,7 +696,60 @@ fn resolve_request_settings(
         mcp,
         max_tool_rounds,
         skills,
+        subagents,
     })
+}
+
+/// Resolves an agent file's own `RequestSettings` — its `model` (required,
+/// falling back to `default.model`), sampling overrides, and
+/// `mcp`/`max_tool_rounds`/`skills`/`subagents` — against `file_config`.
+/// Shared by `run_agent` (the top-level `lait agent run` entry point) and
+/// `call_subagent_tool` (a subagent invoked as a tool mid-completion), which
+/// both need exactly this: an agent file's *own* settings, independent of
+/// any caller/step context (unlike `resolve_step_settings`, which layers a
+/// workflow node's own overrides on top). `subagent_name` names what a
+/// missing-model error is about — `None` for the top-level agent, or
+/// `Some("x")` for subagent `x` — built into the error message only if it's
+/// actually needed, so `call_subagent_tool` doesn't pay for a `format!` on
+/// every subagent call just for a message that's read on the rare
+/// missing-model path.
+fn agent_file_settings(
+    agent_file: &AgentFile,
+    file_config: &ConfigFile,
+    subagent_name: Option<&str>,
+) -> Result<RequestSettings> {
+    let model_name = agent_file
+        .model
+        .clone()
+        .or_else(|| file_config.default.model.clone())
+        .ok_or_else(|| {
+            let subject = subagent_name
+                .map(|name| format!(" for subagent '{name}'"))
+                .unwrap_or_default();
+            anyhow!(
+                "model is required{subject}; set it in its frontmatter or default.model in {}",
+                config::CONFIG_FILE_NAME
+            )
+        })?;
+    resolve_request_settings(
+        model_name,
+        SamplingOverrides {
+            reasoning_effort: agent_file.reasoning_effort,
+            temperature: agent_file.temperature,
+            top_p: agent_file.top_p,
+            max_tokens: agent_file.max_tokens,
+        },
+        None,
+        None,
+        CapabilityOverrides {
+            mcp: agent_file.mcp.clone(),
+            max_tool_rounds: agent_file.max_tool_rounds,
+            skills: agent_file.skills.clone(),
+            subagents: agent_file.subagents.clone(),
+        },
+        &ModelMap::default(),
+        file_config,
+    )
 }
 
 async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
@@ -551,6 +785,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
             // No `--skill` CLI flag: chat only ever gets skills from
             // `default.skills` in `lait.config.yml` (see `resolve_request_settings`).
             skills: None,
+            subagents: (!chat.subagent.is_empty()).then(|| chat.subagent.clone()),
         },
         &ModelMap::default(),
         &file_config,
@@ -572,8 +807,15 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     }
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
+    let agent_registry = subagent::AgentRegistry::new(&file_config.agents);
+    let env = RunEnv {
+        file_config: &file_config,
+        registry: &registry,
+        skill_cache: &skill_cache,
+        agent_registry: &agent_registry,
+    };
     let response = settings
-        .complete(&registry, &skill_cache, None, &prompt, response_format)
+        .complete(&env, &[], None, &prompt, response_format)
         .await?;
 
     let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
@@ -597,45 +839,25 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         .validate_input(&input)
         .with_context(|| format!("agent '{}'", args.file.display()))?;
 
-    let model_name = agent_file
-        .model
-        .clone()
-        .or_else(|| file_config.default.model.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "model is required; set it in the agent frontmatter or default.model in {}",
-                config::CONFIG_FILE_NAME
-            )
-        })?;
-    let settings = resolve_request_settings(
-        model_name,
-        SamplingOverrides {
-            reasoning_effort: agent_file.reasoning_effort,
-            temperature: agent_file.temperature,
-            top_p: agent_file.top_p,
-            max_tokens: agent_file.max_tokens,
-        },
-        None,
-        None,
-        CapabilityOverrides {
-            mcp: agent_file.mcp.clone(),
-            max_tool_rounds: agent_file.max_tool_rounds,
-            skills: agent_file.skills.clone(),
-        },
-        &ModelMap::default(),
-        &file_config,
-    )?;
+    let settings = agent_file_settings(&agent_file, &file_config, None)?;
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let skill_cache = skill::SkillCache::new(&file_config.skills);
+    let agent_registry = subagent::AgentRegistry::new(&file_config.agents);
+    let env = RunEnv {
+        file_config: &file_config,
+        registry: &registry,
+        skill_cache: &skill_cache,
+        agent_registry: &agent_registry,
+    };
     let output = call_agent(
         &agent_file,
         &settings,
-        &registry,
-        &skill_cache,
+        &env,
         &input,
         &args.input,
         &workflow::StepOutputs::new(),
+        &[],
     )
     .await
     .with_context(|| format!("agent '{}'", args.file.display()))?;
@@ -657,10 +879,12 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let skill_cache = skill::SkillCache::new(&file_config.skills);
+    let agent_registry = subagent::AgentRegistry::new(&file_config.agents);
     let env = RunEnv {
         file_config: &file_config,
         registry: &registry,
         skill_cache: &skill_cache,
+        agent_registry: &agent_registry,
     };
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
@@ -681,12 +905,35 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 /// runtime error rather than left to overflow the stack or hang.
 pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
 
-/// Why entering a `workflow:` file failed the check below.
-pub(crate) enum WorkflowNestingError {
+/// Why entering a self-referential file (a `workflow:` node or a subagent)
+/// failed `check_nesting_depth` below.
+pub(crate) enum NestingDepthError {
     /// The file is already on the call stack.
     Cycle,
-    /// Entering it would exceed `MAX_WORKFLOW_DEPTH`.
+    /// Entering it would exceed the caller's `max_depth`.
     TooDeep,
+}
+
+/// Whether entering `canonical` from `active` (every file of the same kind
+/// currently on the call stack, canonicalized) would create a cycle or
+/// exceed `max_depth`. The generic core behind `check_workflow_nesting`
+/// (`workflow:` nodes, `max_depth` = `MAX_WORKFLOW_DEPTH`) and
+/// `call_subagent_tool` (`subagents:` calls, `max_depth` =
+/// `MAX_SUBAGENT_DEPTH`), so both kinds of self-referential file nesting
+/// share one cycle/depth-limit check instead of two copies of the same two
+/// comparisons.
+fn check_nesting_depth(
+    active: &[PathBuf],
+    canonical: &Path,
+    max_depth: usize,
+) -> Result<(), NestingDepthError> {
+    if active.iter().any(|path| path == canonical) {
+        return Err(NestingDepthError::Cycle);
+    }
+    if active.len() >= max_depth {
+        return Err(NestingDepthError::TooDeep);
+    }
+    Ok(())
 }
 
 /// Whether entering `canonical` from `active` (every `workflow:` file
@@ -698,26 +945,24 @@ pub(crate) enum WorkflowNestingError {
 pub(crate) fn check_workflow_nesting(
     active: &[PathBuf],
     canonical: &Path,
-) -> Result<(), WorkflowNestingError> {
-    if active.iter().any(|path| path == canonical) {
-        return Err(WorkflowNestingError::Cycle);
-    }
-    if active.len() >= MAX_WORKFLOW_DEPTH {
-        return Err(WorkflowNestingError::TooDeep);
-    }
-    Ok(())
+) -> Result<(), NestingDepthError> {
+    check_nesting_depth(active, canonical, MAX_WORKFLOW_DEPTH)
 }
 
-/// The loaded config file and the MCP registry for the whole `lait run`
-/// invocation — unlike `WorkflowScope`, neither changes at a `workflow:`
-/// nesting boundary, so the same `&RunEnv` flows unchanged through every
-/// `run_steps`/`execute_step_with_retry`/`execute_step` call. Bundled into
-/// one struct (rather than two parameters) purely to keep those functions'
-/// argument counts under clippy's `too_many_arguments` threshold.
+/// The loaded config file, the MCP registry, the skill cache, and the
+/// subagent registry for the whole `lait`/`lait agent run`/`lait run`
+/// invocation — unlike `WorkflowScope`, none of these change at a
+/// `workflow:` nesting boundary, so the same `&RunEnv` flows unchanged
+/// through every `run_steps`/`execute_step_with_retry`/`execute_step` call
+/// (and, for `call_agent`/`RequestSettings::complete`, through a subagent
+/// call's own recursive completion too — see `call_subagent_tool`). Bundled
+/// into one struct (rather than four parameters) purely to keep those
+/// functions' argument counts under clippy's `too_many_arguments` threshold.
 struct RunEnv<'a> {
     file_config: &'a ConfigFile,
     registry: &'a mcp::McpRegistry<'a>,
     skill_cache: &'a skill::SkillCache<'a>,
+    agent_registry: &'a subagent::AgentRegistry<'a>,
 }
 
 /// The default model/reasoning-effort, model aliases, and JSON schema
@@ -747,14 +992,15 @@ struct WorkflowScope {
     /// when unset.
     default_retry: Option<workflow::RetryDefinition>,
     default_timeout: Option<u64>,
-    /// Fallback `mcp`/`max_tool_rounds`/`skills` for a node that doesn't set
-    /// its own (see `resolve_step_settings`). Merged across `workflow:`
-    /// nesting the same way as `default_model`/`default_reasoning_effort`:
-    /// each falls back independently, like `temperature`, not as a whole
-    /// unit like `default_retry`.
+    /// Fallback `mcp`/`max_tool_rounds`/`skills`/`subagents` for a node that
+    /// doesn't set its own (see `resolve_step_settings`). Merged across
+    /// `workflow:` nesting the same way as `default_model`/
+    /// `default_reasoning_effort`: each falls back independently, like
+    /// `temperature`, not as a whole unit like `default_retry`.
     default_mcp: Option<Vec<String>>,
     default_max_tool_rounds: Option<usize>,
     default_skills: Option<Vec<String>>,
+    default_subagents: Option<Vec<String>>,
     models: ModelMap,
     json_schemas: schema::JsonSchemaMap,
     /// This scope's own `nodes:` map, resolved by every `steps[].use` in this
@@ -796,6 +1042,7 @@ impl WorkflowScope {
             default_mcp: wf.default.mcp.clone(),
             default_max_tool_rounds: wf.default.max_tool_rounds,
             default_skills: wf.default.skills.clone(),
+            default_subagents: wf.default.subagents.clone(),
             models: wf.models.clone(),
             json_schemas: wf.json_schemas.clone(),
             nodes: std::mem::take(&mut wf.nodes),
@@ -829,12 +1076,12 @@ impl WorkflowScope {
         })?;
         if let Err(error) = check_workflow_nesting(&self.active_paths, &canonical) {
             match error {
-                WorkflowNestingError::Cycle => bail!(
+                NestingDepthError::Cycle => bail!(
                     "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
                     relative_path.display(),
                     canonical.display()
                 ),
-                WorkflowNestingError::TooDeep => bail!(
+                NestingDepthError::TooDeep => bail!(
                     "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
                 ),
             }
@@ -892,6 +1139,11 @@ impl WorkflowScope {
                 .skills
                 .clone()
                 .or_else(|| self.default_skills.clone()),
+            default_subagents: sub_wf
+                .default
+                .subagents
+                .clone()
+                .or_else(|| self.default_subagents.clone()),
             models,
             json_schemas,
             nodes: std::mem::take(&mut sub_wf.nodes),
@@ -1251,11 +1503,8 @@ fn run_steps<'a>(
                             // used below for results), not re-quoted as JSON, so
                             // `{{ input }}` sees the same unquoted text everywhere else
                             // in the pipeline does.
-                            let item_input = match item {
-                                serde_json::Value::String(text) => text.clone(),
-                                other => serde_json::to_string(other)
-                                    .context("failed to serialize a 'for_each' item")?,
-                            };
+                            let item_input =
+                                value_to_input_text(item, "failed to serialize a 'for_each' item")?;
                             let (result, new_counter, flow, new_steps_outputs) = run_steps(
                                 &for_each.steps,
                                 item_input,
@@ -1289,10 +1538,8 @@ fn run_steps<'a>(
                         );
                         let item_inputs: Vec<String> = items
                             .iter()
-                            .map(|item| match item {
-                                serde_json::Value::String(text) => Ok(text.clone()),
-                                other => serde_json::to_string(other)
-                                    .context("failed to serialize a 'for_each' item"),
+                            .map(|item| {
+                                value_to_input_text(item, "failed to serialize a 'for_each' item")
                             })
                             .collect::<Result<Vec<_>>>()?;
                         let item_prefixes: Vec<String> = (0..item_inputs.len())
@@ -1580,6 +1827,11 @@ fn resolve_step_settings(
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.skills.clone()))
         .or_else(|| scope.default_skills.clone());
+    let subagents = node
+        .subagents
+        .clone()
+        .or_else(|| agent_file.and_then(|agent_file| agent_file.subagents.clone()))
+        .or_else(|| scope.default_subagents.clone());
     resolve_request_settings(
         model_name,
         overrides,
@@ -1589,6 +1841,7 @@ fn resolve_step_settings(
             mcp,
             max_tool_rounds,
             skills,
+            subagents,
         },
         &scope.models,
         file_config,
@@ -1631,11 +1884,11 @@ async fn execute_step(
         call_agent(
             &agent_file,
             &settings,
-            env.registry,
-            env.skill_cache,
+            env,
             &input,
             current_input,
             steps_outputs,
+            &[],
         )
         .await
         .with_context(|| format!("step '{label}'"))?
@@ -1662,13 +1915,7 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(
-                env.registry,
-                env.skill_cache,
-                None,
-                &prompt,
-                response_format,
-            )
+            .complete(env, &[], None, &prompt, response_format)
             .await
             .with_context(|| format!("step '{label}'"))?;
 

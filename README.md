@@ -29,6 +29,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 - [ワークフロー／エージェントファイルの静的チェック（lint）](./docs/usage/ja/lint.md) — `lait lint`、未使用ノードや jq/テンプレート構文エラー、`mcp`/`skills`/`agent`/`workflow` 参照や `schema_name` の事前検出
 - [MCP サーバーのツールを使う](./docs/usage/ja/mcp.md) — `mcp_servers:` の登録、チャット／agent／workflow での `mcp:` 指定、ツール名の修飾、`structured_output`/`--stream` との関係、`max_tool_rounds`
 - [スキルを使う](./docs/usage/ja/skills.md) — `skills:` の登録、agent／workflow での `skills:` 指定、システムプロンプトへの追記のされ方
+- [サブエージェントを使う](./docs/usage/ja/subagents.md) — `agents:` の登録、チャット／agent／workflow での `subagents:` 指定、モデル自身によるサブエージェント呼び出し（tool loop）、サブエージェントの入れ子
 - [出力例](./docs/usage/ja/output.md) — 標準出力、`--stream`、`--json-schema`、`--json`
 - [トラブルシュート](./docs/usage/ja/troubleshooting.md) — よくあるエラーと対処法
 - [開発](./docs/usage/ja/development.md) — テスト、フォーマット、Lint、ビルド

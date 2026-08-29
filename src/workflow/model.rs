@@ -74,6 +74,9 @@ pub(crate) struct WorkflowDefaults {
     /// Fallback `skills` for any node that calls a model (`prompt`/`agent`)
     /// and doesn't set its own. Falls back independently, like `mcp`.
     pub(crate) skills: Option<Vec<String>>,
+    /// Fallback `subagents` for any node that calls a model (`prompt`/
+    /// `agent`) and doesn't set its own. Falls back independently, like `mcp`.
+    pub(crate) subagents: Option<Vec<String>>,
 }
 
 /// A reusable action definition, referenced by id from `steps[].use`. Carries
@@ -177,6 +180,12 @@ pub(crate) struct NodeDefinition {
     /// `skills:` (for an `agent` node), then to the workflow's
     /// `default.skills`, the same way as `mcp`.
     pub(crate) skills: Option<Vec<String>>,
+    /// Names of `agents:` entries (from `lait.config.yml`) made available as
+    /// callable subagent tools during this node's model call. Only
+    /// meaningful for a node that calls a model (`prompt`/`agent`); falls
+    /// back to the agent file's own `subagents:` (for an `agent` node), then
+    /// to the workflow's `default.subagents`, the same way as `mcp`.
+    pub(crate) subagents: Option<Vec<String>>,
 }
 
 /// A control-flow reference site: one position in a `steps:` list. Carries
