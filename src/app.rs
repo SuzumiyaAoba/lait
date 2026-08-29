@@ -22,6 +22,51 @@ use crate::{
 
 const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 
+/// Reads all of stdin into a string, trimming trailing newlines (piped text
+/// almost always ends in one, and a prompt should not).
+fn read_stdin_text() -> Result<String> {
+    use std::io::Read;
+
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .context("failed to read stdin")?;
+    Ok(buffer.trim_end_matches(['\n', '\r']).to_owned())
+}
+
+/// Combines a positional PROMPT/INPUT argument with piped stdin, the shared
+/// rule for chat, `lait run`, and `lait agent run`: a `-` argument reads
+/// stdin as the whole input; otherwise piped stdin (stdin not being a TTY)
+/// is the whole input when no argument is given, or is appended to the
+/// argument as context when one is. Returns `Ok(None)` when there is no
+/// input from either source — each caller reports that with its own message.
+fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
+    use std::io::IsTerminal;
+
+    if positional.as_deref() == Some("-") {
+        return Ok(Some(read_stdin_text()?).filter(|text| !text.trim().is_empty()));
+    }
+    let piped_text = if std::io::stdin().is_terminal() {
+        None
+    } else {
+        // An empty pipe (e.g. `< /dev/null`) counts as no input at all, not
+        // as an empty prompt.
+        Some(read_stdin_text()?).filter(|text| !text.trim().is_empty())
+    };
+    Ok(match (positional, piped_text) {
+        (Some(argument), Some(piped)) => Some(join_prompt_and_context(&argument, &piped)),
+        (Some(argument), None) => Some(argument),
+        (None, piped) => piped,
+    })
+}
+
+/// The prompt shape used when both a PROMPT argument and piped stdin are
+/// present: the instruction first, then the piped text as context, separated
+/// by a blank line (e.g. `git diff | lait "review this change"`).
+fn join_prompt_and_context(prompt: &str, context: &str) -> String {
+    format!("{prompt}\n\n{context}")
+}
+
 /// The maximum number of tool-call round trips a single completion request
 /// may take (see `RequestSettings::complete`) before lait gives up and
 /// errors instead of looping forever on a model that keeps calling tools.
@@ -754,8 +799,10 @@ fn agent_file_settings(
 }
 
 async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
-    let prompt = chat.prompt.clone().ok_or_else(|| {
-        anyhow!("a PROMPT is required; provide one, or use `lait run <FILE> <PROMPT>`")
+    let prompt = resolve_input_with_stdin(chat.prompt.clone())?.ok_or_else(|| {
+        anyhow!(
+            "a PROMPT is required; provide one, pipe input via stdin, or use `lait run <FILE> <PROMPT>`"
+        )
     })?;
 
     let file_config = config::load_config(no_config)?;
@@ -829,6 +876,8 @@ fn announce_named_file(prefix: &str, name: Option<&str>, description: Option<&st
 }
 
 async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
+    let raw_input = resolve_input_with_stdin(args.input.clone())?
+        .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let agent_file = agent::load_agent(&args.file)?;
     let file_config = config::load_config(no_config)?;
 
@@ -838,7 +887,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         agent_file.description.as_deref(),
     );
 
-    let input = template::parse_input(&args.input);
+    let input = template::parse_input(&raw_input);
     agent_file
         .validate_input(&input)
         .with_context(|| format!("agent '{}'", args.file.display()))?;
@@ -851,7 +900,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         &settings,
         &env,
         &input,
-        &args.input,
+        &raw_input,
         &workflow::StepOutputs::new(),
         &[],
     )
@@ -862,6 +911,8 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
 }
 
 async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
+    let prompt = resolve_input_with_stdin(run_args.prompt.clone())?
+        .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
     let mut wf = workflow::load_workflow(&run_args.file)?;
     let file_config = config::load_config(no_config)?;
 
@@ -871,7 +922,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let env = RunEnv::new(&file_config);
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
-        run_args.prompt,
+        prompt,
         &scope,
         &env,
         0,

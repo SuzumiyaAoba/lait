@@ -554,6 +554,35 @@ pub(crate) fn run_lait_with_stream(
     command.output().expect("failed to execute lait")
 }
 
+/// Runs `lait` with `stdin_text` piped into its stdin, plus an optional
+/// PROMPT argument, so tests can exercise the piped-input rules (stdin as
+/// the whole prompt, or appended to an argument as context).
+pub(crate) fn run_lait_with_stdin(
+    base_url: &str,
+    prompt: Option<&str>,
+    stdin_text: &str,
+) -> Output {
+    let mut command = test_command();
+    command.args(["--model", "test-model", "--base-url", base_url]);
+    command.env_remove("LLM_REASONING_EFFORT");
+    if let Some(prompt) = prompt {
+        command.arg(prompt);
+    }
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("failed to spawn lait");
+    child
+        .stdin
+        .take()
+        .expect("child stdin should be piped")
+        .write_all(stdin_text.as_bytes())
+        .expect("failed to write to lait's stdin");
+    child
+        .wait_with_output()
+        .expect("failed to wait for lait to finish")
+}
+
 pub(crate) fn run_lait_workflow(workflow_path: &Path, prompt: &str) -> Output {
     test_command()
         .arg("run")

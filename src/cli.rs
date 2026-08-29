@@ -43,8 +43,10 @@ pub(crate) struct RunArgs {
     pub(crate) file: PathBuf,
 
     /// The initial input passed to the first step's `{{ input }}` placeholder.
+    /// May be omitted when input is piped via stdin (which is then used as the
+    /// input; when both are given, the piped text is appended to PROMPT).
     #[arg(value_name = "PROMPT")]
-    pub(crate) prompt: String,
+    pub(crate) prompt: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -67,9 +69,11 @@ pub(crate) struct AgentRunArgs {
 
     /// The input passed to the agent. Parsed as JSON when possible, so the
     /// system prompt template can access `{{ input.field }}`; otherwise used
-    /// as-is for a plain `{{ input }}`.
+    /// as-is for a plain `{{ input }}`. May be omitted when input is piped
+    /// via stdin (which is then used as the input; when both are given, the
+    /// piped text is appended to INPUT).
     #[arg(value_name = "INPUT")]
-    pub(crate) input: String,
+    pub(crate) input: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -153,7 +157,10 @@ pub(crate) struct ChatArgs {
     #[arg(long = "subagent", value_name = "NAME", conflicts_with = "stream")]
     pub(crate) subagent: Vec<String>,
 
-    /// A single prompt to send as a user message.
+    /// A single prompt to send as a user message. May be omitted when input
+    /// is piped via stdin (which is then sent as the prompt; when both are
+    /// given, the piped text is appended to PROMPT as context). `-` reads
+    /// the prompt from stdin explicitly.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
 }
@@ -370,7 +377,7 @@ mod tests {
         match cli.command {
             Some(Command::Run(run_args)) => {
                 assert_eq!(run_args.file.to_str(), Some("workflow.yml"));
-                assert_eq!(run_args.prompt, "hello world");
+                assert_eq!(run_args.prompt.as_deref(), Some("hello world"));
             }
             _ => panic!("expected the run subcommand to be selected"),
         }
@@ -386,16 +393,25 @@ mod tests {
                 action: AgentAction::Run(run_args),
             })) => {
                 assert_eq!(run_args.file.to_str(), Some("agent.md"));
-                assert_eq!(run_args.input, "hello");
+                assert_eq!(run_args.input.as_deref(), Some("hello"));
             }
             _ => panic!("expected the agent run subcommand to be selected"),
         }
     }
 
     #[test]
-    fn agent_run_subcommand_requires_file_and_input() {
+    fn agent_run_subcommand_requires_a_file_but_not_an_input() {
+        // INPUT is optional at the clap level so it can come from piped
+        // stdin instead; app-level code enforces that one of the two exists.
         assert!(Cli::try_parse_from(["lait", "agent", "run"]).is_err());
-        assert!(Cli::try_parse_from(["lait", "agent", "run", "agent.md"]).is_err());
+        let cli = Cli::try_parse_from(["lait", "agent", "run", "agent.md"])
+            .expect("input-less agent run should still parse");
+        match cli.command {
+            Some(Command::Agent(AgentCommand {
+                action: AgentAction::Run(run_args),
+            })) => assert!(run_args.input.is_none()),
+            _ => panic!("expected the agent run subcommand to be selected"),
+        }
     }
 
     #[test]
@@ -407,9 +423,16 @@ mod tests {
     }
 
     #[test]
-    fn run_subcommand_requires_file_and_prompt() {
+    fn run_subcommand_requires_a_file_but_not_a_prompt() {
+        // PROMPT is optional at the clap level so it can come from piped
+        // stdin instead; app-level code enforces that one of the two exists.
         assert!(Cli::try_parse_from(["lait", "run"]).is_err());
-        assert!(Cli::try_parse_from(["lait", "run", "workflow.yml"]).is_err());
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml"])
+            .expect("prompt-less run should still parse");
+        match cli.command {
+            Some(Command::Run(run_args)) => assert!(run_args.prompt.is_none()),
+            _ => panic!("expected the run subcommand to be selected"),
+        }
     }
 
     #[test]
