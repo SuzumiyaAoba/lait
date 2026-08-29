@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::{
     cli::ModelsArgs,
-    config::{self, ConfigFile, ModelDefinition},
+    config::{self, ConfigFile, ResolvedModel},
     llm,
 };
 
@@ -21,31 +21,44 @@ pub(crate) async fn run(args: ModelsArgs, no_config: bool) -> Result<()> {
     }
 }
 
-/// One `models:` alias row, taken from the alias's first definition — the
-/// only one `config::resolve_model_alias` ever uses.
+/// The `--remote`-less path, callable without an async runtime — see
+/// `app::run_blocking`.
+pub(crate) fn run_local(args: ModelsArgs, no_config: bool) -> Result<()> {
+    let file_config = config::load_config(no_config)?;
+    list_local(&args, &file_config)
+}
+
+/// One `models:` alias row, resolved through the same
+/// `config::resolve_model_alias` a request uses, so the listing can never
+/// disagree with what actually runs.
 struct AliasRow<'a> {
     name: &'a str,
     is_default: bool,
-    definition: &'a ModelDefinition,
-    /// How many further definitions the alias lists beyond the first.
+    resolved: ResolvedModel,
+    /// How many further definitions the alias lists beyond the first (only
+    /// the first ever takes effect — see `config::resolve_model_alias`).
     extra_definitions: usize,
 }
 
 /// Collects the configured aliases sorted by name (the underlying map has no
-/// stable order), marking the one `default.model` names. An alias with an
-/// empty definition list is skipped here — running it would fail anyway, and
-/// a listing should still show the valid rest.
+/// stable order), marking the one `default.model` names. An alias
+/// `resolve_model_alias` rejects (an empty definition list, an empty
+/// model_id) is skipped — running it would fail anyway, and a listing
+/// should still show the valid rest.
 fn alias_rows(file_config: &ConfigFile) -> Vec<AliasRow<'_>> {
     let default_model = file_config.default.model.as_deref();
     let mut rows: Vec<AliasRow<'_>> = file_config
         .models
         .iter()
         .filter_map(|(name, definitions)| {
-            definitions.first().map(|definition| AliasRow {
+            let resolved = config::resolve_model_alias(name, &file_config.models)
+                .ok()
+                .flatten()?;
+            Some(AliasRow {
                 name,
                 is_default: Some(name.as_str()) == default_model,
-                definition,
-                extra_definitions: definitions.len() - 1,
+                resolved,
+                extra_definitions: definitions.len().saturating_sub(1),
             })
         })
         .collect();
@@ -56,18 +69,18 @@ fn alias_rows(file_config: &ConfigFile) -> Vec<AliasRow<'_>> {
 /// The DEFAULTS column: the per-model default parameters that are actually
 /// set, compactly (`reasoning=high temperature=0.7 ...`), or `-` when none
 /// are.
-fn defaults_column(definition: &ModelDefinition) -> String {
+fn defaults_column(resolved: &ResolvedModel) -> String {
     let mut parts = Vec::new();
-    if let Some(effort) = definition.default_reasoning_effort {
+    if let Some(effort) = resolved.reasoning_effort {
         parts.push(format!("reasoning={}", effort.as_str()));
     }
-    if let Some(temperature) = definition.default_temperature {
+    if let Some(temperature) = resolved.temperature {
         parts.push(format!("temperature={temperature}"));
     }
-    if let Some(top_p) = definition.default_top_p {
+    if let Some(top_p) = resolved.top_p {
         parts.push(format!("top_p={top_p}"));
     }
-    if let Some(max_tokens) = definition.default_max_tokens {
+    if let Some(max_tokens) = resolved.max_tokens {
         parts.push(format!("max_tokens={max_tokens}"));
     }
     if parts.is_empty() {
@@ -82,8 +95,7 @@ fn list_local(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
     let default_model = file_config.default.model.as_deref();
     // `default.model` may also name a raw model id rather than an alias;
     // worth saying so instead of leaving the default seemingly unset.
-    let default_is_alias =
-        default_model.is_some_and(|name| rows.iter().any(|row| row.name == name));
+    let default_is_alias = rows.iter().any(|row| row.is_default);
 
     if args.json {
         let models: Vec<serde_json::Value> = rows
@@ -92,13 +104,13 @@ fn list_local(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
                 serde_json::json!({
                     "name": row.name,
                     "default": row.is_default,
-                    "model_id": row.definition.model_id,
-                    "base_url": row.definition.provider.base_url,
-                    "api_key_set": row.definition.provider.api_key.is_some(),
-                    "reasoning_effort": row.definition.default_reasoning_effort.map(|e| e.as_str()),
-                    "temperature": row.definition.default_temperature,
-                    "top_p": row.definition.default_top_p,
-                    "max_tokens": row.definition.default_max_tokens,
+                    "model_id": row.resolved.model_id,
+                    "base_url": row.resolved.base_url,
+                    "api_key_set": row.resolved.api_key.is_some(),
+                    "reasoning_effort": row.resolved.reasoning_effort.map(|e| e.as_str()),
+                    "temperature": row.resolved.temperature,
+                    "top_p": row.resolved.top_p,
+                    "max_tokens": row.resolved.max_tokens,
                     "extra_definitions": row.extra_definitions,
                 })
             })
@@ -141,9 +153,12 @@ fn list_local(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
         }
         table.push([
             name,
-            row.definition.model_id.clone(),
-            row.definition.provider.base_url.clone(),
-            defaults_column(row.definition),
+            row.resolved.model_id.clone(),
+            row.resolved
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "-".to_owned()),
+            defaults_column(&row.resolved),
         ]);
     }
 
@@ -154,17 +169,12 @@ fn list_local(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
         }
     }
     for row in &table {
-        let mut line = String::new();
-        for (index, (cell, width)) in row.iter().zip(widths).enumerate() {
-            if index > 0 {
-                line.push_str("  ");
-            }
-            line.push_str(cell);
-            // The last column needs no padding.
-            if index < row.len() - 1 {
-                line.extend(std::iter::repeat_n(' ', width - cell.chars().count()));
-            }
-        }
+        let line = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, width)| format!("{cell:<width$}"))
+            .collect::<Vec<_>>()
+            .join("  ");
         println!("{}", line.trim_end());
     }
     if default_is_alias {
@@ -188,29 +198,19 @@ struct RemoteModel {
 }
 
 async fn list_remote(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
-    // The same precedence as a completion request's base URL/API key
-    // (CLI/env > config), except model aliases play no part: `--remote`
-    // asks one concrete server.
-    let config_base_url = file_config
-        .base_url
-        .as_deref()
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let base_url = args
-        .base_url
-        .clone()
-        .or(config_base_url)
-        .unwrap_or_else(|| crate::app::DEFAULT_BASE_URL.to_owned());
-    let api_key = match &args.api_key {
-        Some(key) => Some(key.clone()),
-        None => file_config
-            .api_key
-            .as_deref()
-            .map(config::expand_env_placeholders)
-            .transpose()?,
-    };
+    // The same endpoint resolution as a completion request (CLI/env >
+    // config), except model aliases play no part: `--remote` asks one
+    // concrete server, and no API key means no Authorization header rather
+    // than the completion path's dummy key.
+    let (base_url, api_key) = crate::app::resolve_endpoint(
+        args.base_url.clone(),
+        args.api_key.clone(),
+        None,
+        None,
+        file_config,
+    )?;
 
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let url = format!("{base_url}/models");
     let mut request = llm::http_client()
         .get(&url)
         .timeout(std::time::Duration::from_secs(30));

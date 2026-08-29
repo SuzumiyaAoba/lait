@@ -22,7 +22,7 @@ mod workflow;
 fn main() {
     // `.env` must be loaded before `Cli::parse()` runs (clap's `env = ...`
     // fallbacks read the process environment at parse time), so `--no-env`
-    // is detected from the raw command line here; the `ChatArgs` flag of the
+    // is detected from the raw command line here; the `Cli` flag of the
     // same name only exists for `--help` and validation. Everything up to a
     // literal `--` is scanned, matching where clap itself would accept the
     // flag.
@@ -40,6 +40,18 @@ fn main() {
     }
 
     let cli = cli::Cli::parse();
+
+    // The purely local subcommands (completions/man/init/lint/local models)
+    // never await; skip spawning the runtime's worker threads for them —
+    // `lait completions` runs from shell startup files, where that cost is
+    // felt on every new shell.
+    if !app::needs_async_runtime(&cli) {
+        if let Err(error) = app::run_blocking(cli) {
+            exit_with_error(error);
+        }
+        return;
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

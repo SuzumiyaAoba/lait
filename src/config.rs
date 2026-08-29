@@ -177,19 +177,19 @@ pub(crate) type ModelMap = HashMap<String, Vec<ModelDefinition>>;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelDefinition {
-    pub(crate) provider: ProviderConfig,
-    pub(crate) model_id: String,
-    pub(crate) default_reasoning_effort: Option<ReasoningEffort>,
-    pub(crate) default_temperature: Option<f64>,
-    pub(crate) default_top_p: Option<f64>,
-    pub(crate) default_max_tokens: Option<u32>,
+    provider: ProviderConfig,
+    model_id: String,
+    default_reasoning_effort: Option<ReasoningEffort>,
+    default_temperature: Option<f64>,
+    default_top_p: Option<f64>,
+    default_max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProviderConfig {
-    pub(crate) base_url: String,
-    pub(crate) api_key: Option<String>,
+struct ProviderConfig {
+    base_url: String,
+    api_key: Option<String>,
 }
 
 #[derive(Debug)]

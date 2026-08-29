@@ -50,10 +50,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+      # No rust-cache here: GitHub's action cache is ref-scoped, so a cache
+      # saved on one tag can never be restored by the next tag's run — it
+      # would be pure write-only upload time.
 
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -159,12 +158,17 @@ jobs:
     env:
       TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
-      - name: Download build artifacts
+      # Only the checksums are needed, so fetch the small SHA256SUMS the
+      # release job just attached instead of downloading every platform's
+      # full archives as artifacts.
+      - name: Fetch release checksums
         if: env.TAP_TOKEN != ''
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS
 
       - name: Generate and push the formula
         if: env.TAP_TOKEN != ''
@@ -173,7 +177,13 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
-          sha() { cut -d' ' -f1 "dist/lait-v${version}-$1.tar.gz.sha256"; }
+          sha() {
+            local file="lait-v${version}-$1.tar.gz"
+            local hash
+            hash="$(awk -v file="$file" '$2 == file { print $1 }' SHA256SUMS)"
+            [ -n "$hash" ] || { echo "no checksum for $file in SHA256SUMS" >&2; exit 1; }
+            echo "$hash"
+          }
           sha_mac_arm="$(sha aarch64-apple-darwin)"
           sha_mac_x86="$(sha x86_64-apple-darwin)"
           sha_linux="$(sha x86_64-unknown-linux-gnu)"

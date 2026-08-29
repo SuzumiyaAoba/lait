@@ -274,7 +274,9 @@ pub(crate) struct ChatArgs {
 
 impl ReasoningEffort {
     /// The lowercase name used on the CLI and in YAML, for display (e.g.
-    /// `lait models`' DEFAULTS column).
+    /// `lait models`' DEFAULTS column). Must match the `#[value(name)]`
+    /// attributes below — pinned by `as_str_matches_the_clap_value_names`
+    /// (`&'static str` is why this can't just call `to_possible_value`).
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -374,6 +376,22 @@ mod tests {
 
         assert!(!cli.chat.show_reasoning);
         assert_eq!(cli.chat.reasoning_effort, None);
+    }
+
+    #[test]
+    fn as_str_matches_the_clap_value_names() {
+        use clap::ValueEnum;
+
+        for variant in ReasoningEffort::value_variants() {
+            assert_eq!(
+                variant.as_str(),
+                variant
+                    .to_possible_value()
+                    .expect("no reasoning effort variant is skipped")
+                    .get_name(),
+                "ReasoningEffort::as_str drifted from the #[value(name)] attribute"
+            );
+        }
     }
 
     #[test]
