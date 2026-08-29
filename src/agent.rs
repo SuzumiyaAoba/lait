@@ -31,6 +31,9 @@ struct AgentFrontmatter {
     /// Names of `skills:` entries (from `lait.config.yml`) whose content is
     /// appended to this agent's system prompt.
     skills: Option<Vec<String>>,
+    /// Names of `agents:` entries (from `lait.config.yml`) made available as
+    /// callable subagent tools during this agent's tool-call loop.
+    subagents: Option<Vec<String>>,
 }
 
 /// An agent Markdown file: YAML frontmatter (model/reasoning defaults,
@@ -52,6 +55,7 @@ pub(crate) struct AgentFile {
     pub(crate) mcp: Option<Vec<String>>,
     pub(crate) max_tool_rounds: Option<usize>,
     pub(crate) skills: Option<Vec<String>>,
+    pub(crate) subagents: Option<Vec<String>>,
     /// The Markdown body, rendered as a handlebars template against the
     /// agent's input (see `crate::template::render`) to produce the system
     /// prompt actually sent to the model.
@@ -117,6 +121,7 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
         mcp: frontmatter.mcp,
         max_tool_rounds: frontmatter.max_tool_rounds,
         skills: frontmatter.skills,
+        subagents: frontmatter.subagents,
         system_prompt_template: body.trim().to_owned(),
     })
 }
@@ -238,5 +243,21 @@ schema_name: city_fact
     fn rejects_an_out_of_range_temperature() {
         let result = parse_agent("---\ntemperature: 2.5\n---\nbody\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_subagents() {
+        let agent = parse_agent("---\nsubagents: [researcher, writer]\n---\nbody\n")
+            .expect("agent should parse");
+        assert_eq!(
+            agent.subagents.as_deref(),
+            Some(["researcher".to_owned(), "writer".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn leaves_subagents_unset_by_default() {
+        let agent = parse_agent("---\n---\nbody\n").expect("agent should parse");
+        assert!(agent.subagents.is_none());
     }
 }

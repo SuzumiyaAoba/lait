@@ -74,9 +74,9 @@ impl LintReport {
 /// Lints `path` without executing it: a workflow YAML file (`.yml`/`.yaml`)
 /// or an agent Markdown file (`.md`), chosen by extension. `config` is
 /// `Some` only when a `lait.config.yml` was actually found (or an explicit
-/// one loaded); when `None`, `mcp:`/`skills:` name references are not
-/// checked (there is nothing to check them against) and the report notes
-/// that instead of reporting every name as unknown.
+/// one loaded); when `None`, `mcp:`/`skills:`/`subagents:` name references
+/// are not checked (there is nothing to check them against) and the report
+/// notes that instead of reporting every name as unknown.
 ///
 /// This only ever returns `Err` for a file whose type can't be determined; a
 /// file that fails to parse, or that references something that doesn't
@@ -160,7 +160,8 @@ fn lint_agent_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
 fn note_skipped_capability_check(ctx: &mut LintCtx, issues: &mut Vec<LintIssue>) {
     if ctx.skipped_capability_check {
         issues.push(LintIssue::warning(format!(
-            "'mcp'/'skills' names were not checked because no {} was found (or --no-config was used)",
+            "'mcp'/'skills'/'subagents' names were not checked because no {} was found (or \
+             --no-config was used)",
             config::CONFIG_FILE_NAME
         )));
     }
@@ -199,6 +200,12 @@ fn lint_workflow_contents(
     check_skill_names(
         "the workflow's 'default'",
         wf.default.skills.as_deref(),
+        ctx,
+        issues,
+    );
+    check_subagent_names(
+        "the workflow's 'default'",
+        wf.default.subagents.as_deref(),
         ctx,
         issues,
     );
@@ -330,6 +337,7 @@ fn lint_node(
 
     check_mcp_names(&node_context, node.mcp.as_deref(), ctx, issues);
     check_skill_names(&node_context, node.skills.as_deref(), ctx, issues);
+    check_subagent_names(&node_context, node.subagents.as_deref(), ctx, issues);
 
     if let Some(agent_path) = &node.agent {
         // Matches `execute_step`: `agent:` is loaded as given, relative to
@@ -483,8 +491,18 @@ fn lint_agent_contents(
         issues,
     );
 
-    check_schema_entry(context, "input_schema", agent_file.input_schema.as_ref(), issues);
-    check_schema_entry(context, "output_schema", agent_file.output_schema.as_ref(), issues);
+    check_schema_entry(
+        context,
+        "input_schema",
+        agent_file.input_schema.as_ref(),
+        issues,
+    );
+    check_schema_entry(
+        context,
+        "output_schema",
+        agent_file.output_schema.as_ref(),
+        issues,
+    );
     // `structured_output: true` requires `output_schema` (checked at parse
     // time by `agent::parse_agent`), so this is reached only when a
     // `schema_name` (the agent's own, or the "structured_output" default) is
@@ -500,6 +518,7 @@ fn lint_agent_contents(
 
     check_mcp_names(context, agent_file.mcp.as_deref(), ctx, issues);
     check_skill_names(context, agent_file.skills.as_deref(), ctx, issues);
+    check_subagent_names(context, agent_file.subagents.as_deref(), ctx, issues);
 }
 
 fn check_mcp_names(
@@ -531,6 +550,23 @@ fn check_skill_names(
         "skills:",
         names,
         |config, name| config.skills.contains_key(name),
+        ctx,
+        issues,
+    );
+}
+
+fn check_subagent_names(
+    context: &str,
+    names: Option<&[String]>,
+    ctx: &mut LintCtx,
+    issues: &mut Vec<LintIssue>,
+) {
+    check_capability_names(
+        context,
+        "subagent",
+        "agents:",
+        names,
+        |config, name| config.agents.contains_key(name),
         ctx,
         issues,
     );
@@ -734,6 +770,38 @@ mod tests {
     }
 
     #[test]
+    fn flags_an_unknown_subagent_name() {
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    prompt: hi\n    subagents: [nope]\nsteps:\n  - use: a\n",
+        );
+        let issues = lint_fixture(&wf, Some(&empty_config()));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("unknown subagent 'nope'")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_known_subagent_name() {
+        let mut config = empty_config();
+        config
+            .agents
+            .insert("known".to_owned(), PathBuf::from("agents/known.md"));
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
+        );
+        let issues = lint_fixture(&wf, Some(&config));
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.message.contains("subagent")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
     fn skips_mcp_and_skill_checks_and_notes_it_when_there_is_no_config() {
         let wf = parse_workflow_fixture(
             "nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
@@ -842,12 +910,19 @@ mod tests {
 
     impl TempAgentFile {
         fn new(contents: &str) -> Self {
+            // A counter alongside the nanosecond timestamp: `cargo test` runs
+            // these concurrently on multiple threads, and two calls can land
+            // on the same nanosecond on a coarse-resolution clock, which
+            // would otherwise make the second `fs::write` silently overwrite
+            // the first test's file out from under it.
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let unique = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after Unix epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "lait-lint-test-agent-{}-{unique}.md",
+                "lait-lint-test-agent-{}-{unique}-{counter}.md",
                 std::process::id()
             ));
             std::fs::write(&path, contents).expect("failed to write fixture agent file");
@@ -870,6 +945,20 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.message.contains("unknown skill 'nope'")),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn agent_lint_flags_an_unknown_subagent_name() {
+        let agent = TempAgentFile::new("---\nsubagents: [nope]\n---\nbody\n");
+        let report = lint_agent_file(&agent.path, Some(&empty_config()));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("unknown subagent 'nope'")),
             "{:?}",
             report.issues
         );

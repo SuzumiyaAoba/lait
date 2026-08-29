@@ -140,6 +140,13 @@ pub(crate) struct ChatArgs {
     #[arg(long = "mcp", value_name = "NAME", conflicts_with = "stream")]
     pub(crate) mcp: Vec<String>,
 
+    /// Name of an `agents:` entry (from lait.config.yml) made available as a
+    /// callable subagent tool this request may call. Repeatable. Falls back
+    /// to `default.subagents` in lait.config.yml when unset. Incompatible
+    /// with `--stream`, for the same reason as `--mcp`.
+    #[arg(long = "subagent", value_name = "NAME", conflicts_with = "stream")]
+    pub(crate) subagent: Vec<String>,
+
     /// A single prompt to send as a user message.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,

@@ -35,6 +35,8 @@ cargo run -- lint workflow.yml agents/city-fact.md
   `mcp_servers:` に定義されているか
 - `skills:`（ノード・エージェントファイル・`default.skills`）に書いた名前が `lait.config.yml` の
   `skills:` に定義されているか
+- `subagents:`（ノード・エージェントファイル・`default.subagents`）に書いた名前が
+  `lait.config.yml` の `agents:` に定義されているか
 - `agent:` に指定したエージェントファイルが存在し、読み込めるか（`agent:` は `lait run` と同じく
   カレントディレクトリからの相対パスとして解決されます。詳細は
   [エージェント Markdown ファイル（agent.md）](./agent.md) を参照）
@@ -43,9 +45,9 @@ cargo run -- lint workflow.yml agents/city-fact.md
   循環参照（`workflow:` が巡り巡って自分自身を呼ぶ）も検出します
 
 `lait.config.yml` が見つからない場合（カレントディレクトリに存在しない、または `--no-config`
-を指定した場合）は、`mcp:`/`skills:` の名前チェックだけをスキップし、その旨を警告として1行だけ
-表示します（存在しない設定ファイルを前提に、書かれている名前すべてを「未定義」としてエラーに
-することはしません）。
+を指定した場合）は、`mcp:`/`skills:`/`subagents:` の名前チェックだけをスキップし、その旨を警告
+として1行だけ表示します（存在しない設定ファイルを前提に、書かれている名前すべてを「未定義」と
+してエラーにすることはしません）。
 
 ## 出力例
 
@@ -65,4 +67,5 @@ lait: 1 of 2 file(s) had errors
 
 関連: [ワークフロー（workflow.yml）](./workflow.md)、
 [エージェント Markdown ファイル（agent.md）](./agent.md)、
-[MCP サーバーのツールを使う](./mcp.md)、[スキルを使う](./skills.md)
+[MCP サーバーのツールを使う](./mcp.md)、[スキルを使う](./skills.md)、
+[サブエージェントを使う](./subagents.md)

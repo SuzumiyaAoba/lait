@@ -110,6 +110,25 @@ skills: [code-review]
 `skills:` を省略した場合は `lait.config.yml` の `default.skills` にフォールバックします。詳しい
 仕組みは [スキルを使う](./skills.md) を参照してください。
 
+## サブエージェントの利用
+
+frontmatter に `subagents:`（`lait.config.yml` の `agents:` エントリ名のリスト）を指定すると、
+その名前で登録されたエージェント Markdown ファイルが、この agent のモデル自身が呼び出すかどうか
+判断できる「サブエージェント」ツールとして渡されます。MCP ツール（`mcp:`）と同じ tool loop の
+仕組みに乗るため、モデルがツール呼び出しを返すたびに lait がそのサブエージェントを実行し、結果を
+モデルに返す、というやり取りを最終回答が出るまで自動で繰り返します。
+
+```markdown
+---
+model: local
+subagents: [researcher]
+---
+{{ input.task }} について、必要であれば researcher に調査を任せてください。
+```
+
+`subagents:` を省略した場合は `lait.config.yml` の `default.subagents` にフォールバックします。
+詳しい仕組みは [サブエージェントを使う](./subagents.md) を参照してください。
+
 ## ワークフローからエージェントファイルを使う
 
 `workflow.yml` の `nodes:` エントリで `prompt`/`input_schema`/`output_schema`/`schema_name` の
@@ -141,4 +160,4 @@ frontmatter → ワークフローの `default:` の順に、それぞれ独立�
 も `{{ steps.<id> }}` として参照できます（詳細は
 [ワークフロー（workflow.yml）](./workflow.md#ステップ間の値の受け渡し-stepsid---steps) を参照）。
 
-関連: [ワークフロー（workflow.yml）](./workflow.md)
+関連: [ワークフロー（workflow.yml）](./workflow.md)、[サブエージェントを使う](./subagents.md)

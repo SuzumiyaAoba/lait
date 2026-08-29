@@ -155,3 +155,24 @@ skills:
   慣習に合わせたもので、既存の `.claude/skills/<name>/` のようなディレクトリをそのまま指せます）。
 - パスは、`mcp_servers:` とは異なり、その場では接続を持たず、実際に使われるたびにファイルを
   読み直します。
+
+## サブエージェント
+
+`agents:` にエージェント Markdown ファイルを登録すると、`--subagent`（チャット）・agent ファイルの
+`subagents:`・ワークフローノードの `subagents:` から名前で参照して、モデル自身が実行時に呼び出す
+かどうかを判断できる「サブエージェント」ツールとして使えるようになります。詳しい使い方は
+[サブエージェントを使う](./subagents.md) を参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  model: local
+  subagents: [researcher]   # 全経路（チャット / agent / workflow）の最終フォールバック
+
+agents:
+  researcher: agents/researcher.md
+```
+
+- 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
+  そのまま名前を付けて登録します）。
+- パスは、`skills:` と同じく、その場では接続を持たず、実際に使われるたびにファイルを読み直します。
