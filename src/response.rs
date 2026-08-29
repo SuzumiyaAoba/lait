@@ -191,7 +191,11 @@ fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&s
         .ok_or("API response contained no content in its first choice")
 }
 
-fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
+/// The first choice's non-blank reasoning text, preferring the current
+/// `reasoning` field over the legacy `reasoning_content`. Exposed for the
+/// chat `-o` path, which sends reasoning to stderr while the file gets the
+/// body alone.
+pub(crate) fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
     response.choices.first().and_then(|choice| {
         choice
             .message

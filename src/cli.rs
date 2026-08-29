@@ -129,6 +129,20 @@ pub(crate) struct ChatArgs {
     #[arg(long)]
     pub(crate) show_usage: bool,
 
+    /// Write the response body to PATH instead of stdout (`-o -` writes to
+    /// stdout explicitly). With `--json`, the JSON object goes to the file;
+    /// with `--show-reasoning`, reasoning goes to stderr so the file holds
+    /// the body alone. Without `--stream`, the file is only written after
+    /// the request succeeds, so a failed run leaves no empty file behind.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub(crate) output: Option<PathBuf>,
+
+    /// Print nothing but the response body: notes outside it (reasoning
+    /// display, usage display) are suppressed, overriding
+    /// `--show-reasoning`/`--show-usage`.
+    #[arg(long)]
+    pub(crate) quiet: bool,
+
     /// Print the response as JSON.
     #[arg(long, conflicts_with = "stream")]
     pub(crate) json: bool,

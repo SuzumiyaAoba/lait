@@ -515,17 +515,36 @@ impl RequestSettings {
 /// without ever producing content.
 /// Returns the usage carried by the final chunk, when the request asked for
 /// one (see `RequestSettings::complete_stream`'s `include_usage`) and the
-/// server obliged.
-async fn stream_to_stdout(
+/// server obliged. `output_path` redirects the content to a file (`-o`):
+/// the file then holds the body alone, so reasoning deltas — normally
+/// written ahead of the content on stdout — go to stderr instead.
+async fn stream_response(
     mut stream: llm::CompletionStream,
     show_reasoning: bool,
+    output_path: Option<&Path>,
 ) -> Result<Option<response::Usage>> {
     use std::io::Write;
 
-    // Locked once for the stream's whole lifetime: every delta write below
-    // would otherwise re-acquire stdout's mutex, and nothing else prints to
-    // stdout while a response is streaming.
-    let mut stdout = std::io::stdout().lock();
+    // Locked/opened once for the stream's whole lifetime: every delta write
+    // below would otherwise re-acquire stdout's mutex, and nothing else
+    // prints to the content sink while a response is streaming.
+    let mut stdout_lock;
+    let mut file_writer;
+    // Whether reasoning shares the content sink (the stdout presentation:
+    // a `Reasoning:` header, then a blank line before the content).
+    let reasoning_inline = output_path.is_none();
+    let content_sink: &mut dyn Write = match output_path {
+        None => {
+            stdout_lock = std::io::stdout().lock();
+            &mut stdout_lock
+        }
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .with_context(|| format!("failed to create output file '{}'", path.display()))?;
+            file_writer = std::io::BufWriter::new(file);
+            &mut file_writer
+        }
+    };
     let mut wrote_reasoning = false;
     let mut wrote_content = false;
     let mut last_usage = None;
@@ -537,19 +556,26 @@ async fn stream_to_stdout(
         }
         let (content, reasoning) = response::stream_chunk_deltas(&chunk);
         if show_reasoning && let Some(reasoning) = reasoning {
-            if !wrote_reasoning {
-                writeln!(stdout, "Reasoning:")?;
-                wrote_reasoning = true;
+            if reasoning_inline {
+                if !wrote_reasoning {
+                    writeln!(content_sink, "Reasoning:")?;
+                }
+                write!(content_sink, "{reasoning}")?;
+                content_sink.flush()?;
+            } else {
+                if !wrote_reasoning {
+                    eprintln!("Reasoning:");
+                }
+                eprint!("{reasoning}");
             }
-            write!(stdout, "{reasoning}")?;
-            stdout.flush()?;
+            wrote_reasoning = true;
         }
         if let Some(content) = content {
-            if wrote_reasoning && !wrote_content {
-                write!(stdout, "\n\n")?;
+            if reasoning_inline && wrote_reasoning && !wrote_content {
+                write!(content_sink, "\n\n")?;
             }
-            write!(stdout, "{content}")?;
-            stdout.flush()?;
+            write!(content_sink, "{content}")?;
+            content_sink.flush()?;
             wrote_content = true;
         }
     }
@@ -557,7 +583,11 @@ async fn stream_to_stdout(
     if !wrote_content {
         bail!("API response contained no content in its first choice");
     }
-    println!();
+    if !reasoning_inline && wrote_reasoning {
+        eprintln!();
+    }
+    writeln!(content_sink)?;
+    content_sink.flush()?;
     Ok(last_usage)
 }
 
@@ -980,6 +1010,15 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let system_prompt = resolve_system_prompt(&chat, &file_config)?;
     let env = RunEnv::new(&file_config);
 
+    // `--quiet` keeps the response body and drops every note around it.
+    let show_reasoning = chat.show_reasoning && !chat.quiet;
+    let show_usage = chat.show_usage && !chat.quiet;
+    // `-o -` is an explicit "stdout", the same as no `-o` at all.
+    let output_path = chat
+        .output
+        .as_deref()
+        .filter(|path| path.as_os_str() != "-");
+
     if chat.stream {
         let stream = settings
             .complete_stream(
@@ -987,11 +1026,11 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
                 system_prompt.as_deref(),
                 &prompt,
                 response_format,
-                chat.show_usage,
+                show_usage,
             )
             .await?;
-        let usage = stream_to_stdout(stream, chat.show_reasoning).await?;
-        if chat.show_usage {
+        let usage = stream_response(stream, show_reasoning, output_path).await?;
+        if show_usage {
             match usage {
                 Some(usage) => eprintln!("usage: {usage}"),
                 None => eprintln!("usage: (the server reported no usage)"),
@@ -1011,9 +1050,24 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         )
         .await?;
 
-    let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
-    println!("{output}");
-    if chat.show_usage {
+    match output_path {
+        Some(path) => {
+            // The file gets the body alone; reasoning, when requested,
+            // becomes a stderr note like usage.
+            if show_reasoning && let Some(reasoning) = response::response_reasoning(&response) {
+                eprintln!("Reasoning:\n{reasoning}\n");
+            }
+            let mut body = response::render_response(&response, chat.json, false)?;
+            body.push('\n');
+            std::fs::write(path, body)
+                .with_context(|| format!("failed to write the response to '{}'", path.display()))?;
+        }
+        None => {
+            let output = response::render_response(&response, chat.json, show_reasoning)?;
+            println!("{output}");
+        }
+    }
+    if show_usage {
         print_usage_summary(&env.usage);
     }
     Ok(())
