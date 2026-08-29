@@ -14,10 +14,10 @@ use futures_util::{StreamExt, TryStreamExt};
 
 use crate::{
     agent::{self, AgentFile},
-    cli::{AgentAction, ChatArgs, Cli, Command, RunArgs},
+    cli::{AgentAction, ChatArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, ReasoningEffort},
     config::{self, ConfigFile, ModelMap},
-    jq, llm, mcp, response, schema, skill, template, workflow,
+    jq, lint, llm, mcp, response, schema, skill, template, workflow,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -35,8 +35,63 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Agent(agent_command)) => match agent_command.action {
             AgentAction::Run(args) => run_agent(args, cli.no_config).await,
         },
+        Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
         None => run_chat(cli.chat, cli.no_config).await,
     }
+}
+
+/// Statically checks every file in `lint_args.files` (see `lint::lint_file`)
+/// and prints a per-file report to stdout. Runs synchronously — every check
+/// is a local file read/parse, none of it needs the async runtime `run`
+/// otherwise sets up for a model request. Unlike `run_workflow`/`run_agent`,
+/// one bad file doesn't stop the rest: every file is linted and reported
+/// before this returns `Err` (which only happens if at least one file has an
+/// `Error`-level issue, so CI can rely on the exit code).
+fn lint_files(lint_args: LintArgs, no_config: bool) -> Result<()> {
+    // Unlike `config::load_config`, which returns an empty `ConfigFile` both
+    // when `lait.config.yml` is absent and when `--no-config` was passed,
+    // the linter needs to tell "absent/skipped" apart from "present but
+    // empty" so it can skip `mcp:`/`skills:` name checks (and say why)
+    // instead of reporting every referenced name as unknown.
+    let config_present = !no_config && Path::new(config::CONFIG_FILE_NAME).exists();
+    let file_config = config::load_config(no_config)?;
+    let config = config_present.then_some(&file_config);
+
+    let mut failed_files = 0usize;
+    for file in &lint_args.files {
+        // `lint::lint_file` only ever returns `Err` for a file whose type it
+        // can't determine (an unrecognized extension) — treated here as one
+        // more failure to report, not a reason to stop linting the rest of
+        // `lint_args.files`.
+        let report = match lint::lint_file(file, config) {
+            Ok(report) => report,
+            Err(error) => {
+                println!("{}:", file.display());
+                println!("  error: {error:#}");
+                failed_files += 1;
+                continue;
+            }
+        };
+        if report.issues.is_empty() {
+            println!("{}: OK", report.file.display());
+            continue;
+        }
+        println!("{}:", report.file.display());
+        for issue in &report.issues {
+            println!("  {}: {}", issue.severity, issue.message);
+        }
+        if report.has_errors() {
+            failed_files += 1;
+        }
+    }
+
+    if failed_files > 0 {
+        bail!(
+            "{failed_files} of {} file(s) had errors",
+            lint_args.files.len()
+        );
+    }
+    Ok(())
 }
 
 /// The reasoning-effort/temperature/top_p/max_tokens knobs a caller (CLI
@@ -624,7 +679,34 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 /// The maximum `workflow:` nesting depth (a workflow step calling another
 /// workflow file, whose own steps may call another, ...), rejected as a
 /// runtime error rather than left to overflow the stack or hang.
-const MAX_WORKFLOW_DEPTH: usize = 32;
+pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
+
+/// Why entering a `workflow:` file failed the check below.
+pub(crate) enum WorkflowNestingError {
+    /// The file is already on the call stack.
+    Cycle,
+    /// Entering it would exceed `MAX_WORKFLOW_DEPTH`.
+    TooDeep,
+}
+
+/// Whether entering `canonical` from `active` (every `workflow:` file
+/// currently on the call stack, canonicalized) would create a cycle or
+/// exceed `MAX_WORKFLOW_DEPTH`. Shared by `WorkflowScope::nested` (fails the
+/// whole run) and `lint::lint_sub_workflow` (reports it as one more issue and
+/// keeps linting the rest of the file), so the two can't drift on what counts
+/// as too deep or cyclic.
+pub(crate) fn check_workflow_nesting(
+    active: &[PathBuf],
+    canonical: &Path,
+) -> Result<(), WorkflowNestingError> {
+    if active.iter().any(|path| path == canonical) {
+        return Err(WorkflowNestingError::Cycle);
+    }
+    if active.len() >= MAX_WORKFLOW_DEPTH {
+        return Err(WorkflowNestingError::TooDeep);
+    }
+    Ok(())
+}
 
 /// The loaded config file and the MCP registry for the whole `lait run`
 /// invocation — unlike `WorkflowScope`, neither changes at a `workflow:`
@@ -745,17 +827,17 @@ impl WorkflowScope {
                 resolved_path.display()
             )
         })?;
-        if self.active_paths.contains(&canonical) {
-            bail!(
-                "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
-                relative_path.display(),
-                canonical.display()
-            );
-        }
-        if self.active_paths.len() >= MAX_WORKFLOW_DEPTH {
-            bail!(
-                "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
-            );
+        if let Err(error) = check_workflow_nesting(&self.active_paths, &canonical) {
+            match error {
+                WorkflowNestingError::Cycle => bail!(
+                    "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
+                    relative_path.display(),
+                    canonical.display()
+                ),
+                WorkflowNestingError::TooDeep => bail!(
+                    "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
+                ),
+            }
         }
 
         let mut models = sub_wf.models.clone();

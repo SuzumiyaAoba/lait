@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod frontmatter;
 mod jq;
+mod lint;
 mod llm;
 mod mcp;
 mod response;

@@ -182,7 +182,7 @@ impl ConfigDirectory {
     }
 }
 
-fn next_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+pub(crate) fn next_temp_path(prefix: &str, suffix: &str) -> PathBuf {
     let unique_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock should be after Unix epoch")
@@ -571,6 +571,15 @@ pub(crate) fn run_lait_agent(agent_path: &Path, input: &str) -> Output {
         .arg(input)
         .output()
         .expect("failed to execute lait agent run")
+}
+
+pub(crate) fn run_lait_lint(files: &[&Path]) -> Output {
+    let mut command = test_command();
+    command.arg("lint");
+    for file in files {
+        command.arg(file);
+    }
+    command.output().expect("failed to execute lait lint")
 }
 
 pub(crate) fn without_json_whitespace(value: &str) -> String {

@@ -58,6 +58,43 @@ pub(crate) fn apply_one(filter_source: &str, input_json: &str, steps: &Steps) ->
     }
 }
 
+/// Parses and compiles `filter_source` without running it against any input,
+/// to check its syntax statically (used by the workflow/agent linter, which
+/// has no `$steps`/input value at hand yet). Mirrors the parse/compile half
+/// of `run_filter` (kept as its own copy rather than factored out: the
+/// compiled filter's type borrows from the local `arena`, so sharing it back
+/// out to a caller isn't worth the lifetime plumbing for a check that never
+/// needs the result). A filter that only references `$steps` still compiles
+/// here, since `with_global_vars` is declared the same way `run_filter` does.
+pub(crate) fn check_syntax(filter_source: &str) -> Result<()> {
+    let program = File {
+        code: filter_source,
+        path: (),
+    };
+    let defs = jaq_core::defs()
+        .chain(jaq_std::defs())
+        .chain(jaq_json::defs());
+    // `run_filter` leaves this turbofish off: its later `Ctx::<data::JustLut<Val>>`
+    // pins `D` retroactively. `check_syntax` never builds a `Ctx` (it only
+    // compiles, never runs, the filter), so nothing else fixes `D` — spell it
+    // out instead.
+    let funs = jaq_core::funs::<data::JustLut<Val>>()
+        .chain(jaq_std::funs())
+        .chain(jaq_json::funs());
+
+    let loader = Loader::new(defs);
+    let arena = Arena::default();
+    let modules = loader
+        .load(&arena, program)
+        .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
+    Compiler::default()
+        .with_funs(funs)
+        .with_global_vars(["$steps"])
+        .compile(modules)
+        .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
+    Ok(())
+}
+
 fn run_filter(filter_source: &str, input_json: &str, steps: &Steps) -> Result<Vec<Val>> {
     let input = read::parse_single(input_json.as_bytes())
         .map_err(|error| anyhow!("failed to parse jq input as JSON: {error}"))?;
@@ -231,5 +268,28 @@ mod tests {
     #[test]
     fn dollar_steps_is_an_empty_object_when_no_step_output_is_recorded() {
         assert_eq!(apply("$steps", "null", &no_steps()).unwrap(), "{}");
+    }
+
+    #[test]
+    fn check_syntax_accepts_a_valid_filter() {
+        assert!(super::check_syntax(".foo.bar").is_ok());
+    }
+
+    #[test]
+    fn check_syntax_accepts_a_filter_that_references_dollar_steps() {
+        assert!(super::check_syntax("$steps.extract.city").is_ok());
+    }
+
+    #[test]
+    fn check_syntax_rejects_malformed_syntax() {
+        assert!(super::check_syntax(".[").is_err());
+    }
+
+    #[test]
+    fn check_syntax_does_not_require_a_value_to_run_against() {
+        // Unlike `apply`/`apply_bool`, `check_syntax` never parses/evaluates
+        // input, so a filter guaranteed to fail at runtime (dividing by a
+        // field that isn't a number) still passes a syntax-only check.
+        assert!(super::check_syntax(".foo / 0").is_ok());
     }
 }
