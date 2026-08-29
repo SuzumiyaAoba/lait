@@ -40,6 +40,16 @@ pub(crate) enum Command {
     /// Generate a shell completion script on stdout (e.g. `lait completions
     /// zsh > ~/.zfunc/_lait`).
     Completions(CompletionsArgs),
+    /// Generate roff man pages for lait and every subcommand (lait.1,
+    /// lait-run.1, ...).
+    Man(ManArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ManArgs {
+    /// The directory the man pages are written into (created if missing).
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub(crate) dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
