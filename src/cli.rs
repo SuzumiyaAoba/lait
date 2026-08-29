@@ -17,6 +17,12 @@ pub(crate) struct Cli {
     /// Do not read lait.config.yml from the current directory.
     #[arg(long, global = true)]
     pub(crate) no_config: bool,
+
+    /// Do not read a `.env` file from the current directory. (Acted on
+    /// before argument parsing — see `main` — so this declaration only
+    /// provides `--help` output and validation.)
+    #[arg(long, global = true)]
+    pub(crate) no_env: bool,
 }
 
 #[derive(Debug, Subcommand)]
