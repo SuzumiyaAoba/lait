@@ -232,12 +232,13 @@ impl RequestSettings {
         }
 
         // `agent_registry.tools` is synchronous (it only reads local subagent
-        // files), so it's resolved directly rather than joined with the MCP
-        // round trip: a sync call wrapped in `async {}` still runs to
-        // completion on its first poll, so `try_join!`-ing it would buy no
-        // concurrency over calling it here.
-        let mut subagent_tool_set = env.agent_registry.tools(&self.subagents)?;
-        let mut mcp_tool_set = env.registry.tools(&self.mcp).await?;
+        // files), so joining it with the MCP round trip lets both proceed
+        // together instead of paying the MCP latency before ever touching
+        // disk.
+        let (mut mcp_tool_set, mut subagent_tool_set) =
+            tokio::try_join!(env.registry.tools(&self.mcp), async {
+                env.agent_registry.tools(&self.subagents)
+            },)?;
         for name in subagent_tool_set.names() {
             if mcp_tool_set.contains(name) {
                 bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
@@ -909,7 +910,7 @@ pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
 pub(crate) enum NestingDepthError {
     /// The file is already on the call stack.
     Cycle,
-    /// Entering it would exceed `MAX_WORKFLOW_DEPTH`.
+    /// Entering it would exceed the caller's `max_depth`.
     TooDeep,
 }
 
