@@ -256,10 +256,7 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
     }
     validate_max_tool_rounds(node.max_tool_rounds, &description)?;
 
-    let calls_model = node.prompt.is_some()
-        || node.system_prompt.is_some()
-        || node.agent.is_some()
-        || node.workflow.is_some();
+    let calls_model = node.calls_model() || node.workflow.is_some();
     if !calls_model && node.jq.is_none() && node.write_file.is_none() {
         bail!(
             "{description} must have a 'prompt', a 'system_prompt', an 'agent', a 'workflow', a \

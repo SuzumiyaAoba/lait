@@ -228,6 +228,27 @@ pub(crate) struct NodeDefinition {
     pub(crate) subagents: Option<Vec<String>>,
 }
 
+impl NodeDefinition {
+    /// Whether this node sends a user-message prompt to the model: it has a
+    /// `prompt` template to render, or (with `prompt` unset) sends its
+    /// current input unchanged as one — see the doc comment on `prompt`.
+    /// Shared by `execute_step`'s branch dispatch and `calls_model` below, so
+    /// the two stay in sync as fields are added.
+    pub(crate) fn sends_prompt(&self) -> bool {
+        self.prompt.is_some() || self.system_prompt.is_some()
+    }
+
+    /// Whether this node makes its own single model call — `sends_prompt`
+    /// (a `prompt`/`system_prompt` node) or `agent`. `false` for a
+    /// `workflow:` node, whose model calls happen inside the referenced
+    /// workflow's own steps instead; callers that also need to count those
+    /// (e.g. "does this node have any action at all") add
+    /// `|| self.workflow.is_some()` explicitly.
+    pub(crate) fn calls_model(&self) -> bool {
+        self.sends_prompt() || self.agent.is_some()
+    }
+}
+
 /// A control-flow reference site: one position in a `steps:` list. Carries
 /// no action of its own — `use` points at a `NodeDefinition` in the
 /// workflow's `nodes:` map, or one of `switch`/`parallel`/`loop`/`for_each`
