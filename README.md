@@ -68,3 +68,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 - [出力例](./docs/usage/ja/output.md) — 標準出力、`--stream`、`--json-schema`、`--json`
 - [トラブルシュート](./docs/usage/ja/troubleshooting.md) — よくあるエラーと対処法
 - [開発](./docs/usage/ja/development.md) — テスト、フォーマット、Lint、ビルド
+
+## ライセンス
+
+[MIT](./LICENSE)

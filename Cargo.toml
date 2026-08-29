@@ -3,6 +3,7 @@ name = "lait"
 version = "0.2.0"
 edition = "2024"
 description = "Lightweight AI Tool"
+license = "MIT"
 repository = "https://github.com/SuzumiyaAoba/lait"
 rust-version = "1.88"
 

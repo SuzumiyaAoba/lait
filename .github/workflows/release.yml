@@ -75,7 +75,7 @@ jobs:
           archive="lait-v${version}-${{ matrix.target }}"
           mkdir "$archive"
           cp "target/${{ matrix.target }}/release/lait" "$archive/"
-          cp README.md "$archive/"
+          cp README.md LICENSE "$archive/"
           tar -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
 
@@ -87,7 +87,7 @@ jobs:
           $archive = "lait-v$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $archive | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/lait.exe" "$archive/"
-          Copy-Item README.md "$archive/"
+          Copy-Item README.md, LICENSE "$archive/"
           Compress-Archive -Path $archive -DestinationPath "$archive.zip"
           $hash = (Get-FileHash "$archive.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $archive.zip" | Out-File -Encoding ascii "$archive.zip.sha256"
@@ -128,8 +128,6 @@ jobs:
             dist/*.tar.gz dist/*.zip dist/SHA256SUMS
 
   # Publishes the crate when the CRATES_IO_TOKEN secret is configured.
-  # Note: crates.io also requires `license` (or `license-file`) metadata in
-  # Cargo.toml before the first publish can succeed.
   publish-crate:
     name: Publish to crates.io
     needs: release
@@ -186,6 +184,7 @@ jobs:
           class Lait < Formula
             desc "Lightweight AI Tool"
             homepage "https://github.com/SuzumiyaAoba/lait"
+            license "MIT"
             version "${version}"
 
             on_macos do
