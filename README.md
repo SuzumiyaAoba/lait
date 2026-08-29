@@ -57,8 +57,8 @@ makers run -- --model <MODEL_ID> "プロンプト"
 
 詳細な使い方は [docs/usage/ja](./docs/usage/ja/README.md) にまとまっています。
 
-- [はじめに](./docs/usage/ja/getting-started.md) — 必要な環境、LM Studio の準備、CLI 引数と環境変数、ビルドと実行、認証あり／なし
-- [設定ファイル](./docs/usage/ja/config.md) — `lait.config.yml`、モデル定義と alias、設定値の優先順位、`${VAR_NAME}` による環境変数参照
+- [はじめに](./docs/usage/ja/getting-started.md) — 必要な環境、LM Studio の準備、CLI 引数と環境変数、標準入力からのプロンプト（パイプ対応）、`--system`/`--show-usage`/`-o`/`--quiet`、`lait models`/`lait init`/`lait completions`/`lait man`、ビルドと実行、認証あり／なし
+- [設定ファイル](./docs/usage/ja/config.md) — `lait.config.yml`、モデル定義と alias、設定値の優先順位、`${VAR_NAME}` による環境変数参照、`.env` の自動読み込み
 - [ワークフロー（workflow.yml）](./docs/usage/ja/workflow.md) — `nodes:`（何をするか）と `steps:`（どう繋ぐか）の分離とノードの再利用、ワークフロー内でのモデル定義、JSON 出力と `jq` による加工、ファイルへの出力（`write_file`）、ステップ間の値の受け渡し（`{{ steps.<id> }}`/`$steps`）、エラー処理（`retry`/`timeout`/`on_error`、ワークフロー全体の既定値）、条件分岐（`when`/`switch`）、並列実行（`parallel`）、条件ループ（`loop`）、配列反復（`for_each`）、早期終了（`stop`/`break`）、サブワークフロー呼び出し（`workflow`）
 - [エージェント Markdown ファイル（agent.md）](./docs/usage/ja/agent.md) — frontmatter によるエージェント定義、ワークフローからの利用
 - [ワークフロー／エージェントファイルの静的チェック（lint）](./docs/usage/ja/lint.md) — `lait lint`、未使用ノードや jq/テンプレート構文エラー、`mcp`/`skills`/`agent`/`workflow` 参照や `schema_name` の事前検出
