@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
-    app::{MAX_WORKFLOW_DEPTH, WorkflowNestingError, check_workflow_nesting},
+    app::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
     config::{self, ConfigFile},
     jq, schema, template, workflow,
 };
@@ -424,13 +424,13 @@ fn lint_sub_workflow(
     // here the same way it would fail at `run` time.
     if let Err(error) = check_workflow_nesting(visited, &canonical) {
         issues.push(LintIssue::error(match error {
-            WorkflowNestingError::Cycle => format!(
+            NestingDepthError::Cycle => format!(
                 "node '{node_id}' has 'workflow: {}', which would create a cycle ('{}' is \
                  already being linted)",
                 sub_workflow_path.display(),
                 canonical.display()
             ),
-            WorkflowNestingError::TooDeep => format!(
+            NestingDepthError::TooDeep => format!(
                 "node '{node_id}' has 'workflow: {}', which exceeds the maximum 'workflow:' \
                  nesting depth of {MAX_WORKFLOW_DEPTH}",
                 sub_workflow_path.display()

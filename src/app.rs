@@ -232,13 +232,12 @@ impl RequestSettings {
         }
 
         // `agent_registry.tools` is synchronous (it only reads local subagent
-        // files), so joining it with the MCP round trip lets both proceed
-        // together instead of paying the MCP latency before ever touching
-        // disk.
-        let (mut mcp_tool_set, mut subagent_tool_set) =
-            tokio::try_join!(env.registry.tools(&self.mcp), async {
-                env.agent_registry.tools(&self.subagents)
-            },)?;
+        // files), so it's resolved directly rather than joined with the MCP
+        // round trip: a sync call wrapped in `async {}` still runs to
+        // completion on its first poll, so `try_join!`-ing it would buy no
+        // concurrency over calling it here.
+        let mut subagent_tool_set = env.agent_registry.tools(&self.subagents)?;
+        let mut mcp_tool_set = env.registry.tools(&self.mcp).await?;
         for name in subagent_tool_set.names() {
             if mcp_tool_set.contains(name) {
                 bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
@@ -533,11 +532,11 @@ fn call_subagent_tool<'a>(
             check_nesting_depth(active_paths, &loaded.canonical_path, MAX_SUBAGENT_DEPTH)
         {
             match error {
-                WorkflowNestingError::Cycle => bail!(
+                NestingDepthError::Cycle => bail!(
                     "calling subagent '{name}' would create a cycle ('{}' is already running)",
                     loaded.canonical_path.display()
                 ),
-                WorkflowNestingError::TooDeep => bail!(
+                NestingDepthError::TooDeep => bail!(
                     "calling subagent '{name}' exceeded the maximum subagent nesting depth of \
                      {MAX_SUBAGENT_DEPTH}"
                 ),
@@ -546,7 +545,7 @@ fn call_subagent_tool<'a>(
 
         let (input, prompt) =
             subagent_tool_input(&loaded.file, arguments_json).with_context(context)?;
-        loaded.file.validate_input(&input).with_context(context)?;
+        loaded.validate_input(&input).with_context(context)?;
 
         let settings =
             agent_file_settings(&loaded.file, env.file_config, Some(name)).with_context(context)?;
@@ -905,8 +904,9 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 /// runtime error rather than left to overflow the stack or hang.
 pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
 
-/// Why entering a `workflow:` file failed the check below.
-pub(crate) enum WorkflowNestingError {
+/// Why entering a self-referential file (a `workflow:` node or a subagent)
+/// failed `check_nesting_depth` below.
+pub(crate) enum NestingDepthError {
     /// The file is already on the call stack.
     Cycle,
     /// Entering it would exceed `MAX_WORKFLOW_DEPTH`.
@@ -925,12 +925,12 @@ fn check_nesting_depth(
     active: &[PathBuf],
     canonical: &Path,
     max_depth: usize,
-) -> Result<(), WorkflowNestingError> {
+) -> Result<(), NestingDepthError> {
     if active.iter().any(|path| path == canonical) {
-        return Err(WorkflowNestingError::Cycle);
+        return Err(NestingDepthError::Cycle);
     }
     if active.len() >= max_depth {
-        return Err(WorkflowNestingError::TooDeep);
+        return Err(NestingDepthError::TooDeep);
     }
     Ok(())
 }
@@ -944,7 +944,7 @@ fn check_nesting_depth(
 pub(crate) fn check_workflow_nesting(
     active: &[PathBuf],
     canonical: &Path,
-) -> Result<(), WorkflowNestingError> {
+) -> Result<(), NestingDepthError> {
     check_nesting_depth(active, canonical, MAX_WORKFLOW_DEPTH)
 }
 
@@ -1075,12 +1075,12 @@ impl WorkflowScope {
         })?;
         if let Err(error) = check_workflow_nesting(&self.active_paths, &canonical) {
             match error {
-                WorkflowNestingError::Cycle => bail!(
+                NestingDepthError::Cycle => bail!(
                     "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
                     relative_path.display(),
                     canonical.display()
                 ),
-                WorkflowNestingError::TooDeep => bail!(
+                NestingDepthError::TooDeep => bail!(
                     "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
                 ),
             }

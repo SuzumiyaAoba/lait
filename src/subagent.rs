@@ -28,6 +28,21 @@ pub(crate) struct LoadedAgent {
     tool_description: String,
 }
 
+impl LoadedAgent {
+    /// Validates a subagent tool call's `input` against `file.input_schema`,
+    /// using the value already resolved into `tool_parameters` instead of
+    /// re-reading a `file_path:` schema from disk on every call the way
+    /// `AgentFile::validate_input` does — the same repeated I/O
+    /// `tool_parameters` itself was cached to avoid. A no-op when the agent
+    /// has no `input_schema`, mirroring `AgentFile::validate_input`.
+    pub(crate) fn validate_input(&self, input: &serde_json::Value) -> Result<()> {
+        if self.file.input_schema.is_none() {
+            return Ok(());
+        }
+        schema::validate_input_against_schema(&self.tool_parameters, input)
+    }
+}
+
 /// A named agent Markdown file made available as a callable "subagent" tool
 /// (see `agent::load_agent`), resolved from `lait.config.yml`'s top-level
 /// `agents:` map. Mirrors `skill::SkillCache`: agent files are loaded lazily
