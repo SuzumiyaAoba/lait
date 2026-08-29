@@ -79,6 +79,29 @@ pub(crate) struct WorkflowDefaults {
     pub(crate) subagents: Option<Vec<String>>,
 }
 
+impl WorkflowDefaults {
+    /// Merges `self` over `fallback` for a nested `workflow:` scope (see
+    /// `WorkflowScope::nested` in `app.rs`): each field independently keeps
+    /// `self`'s value when set, else takes `fallback`'s. `retry` is one field
+    /// here like any other — it falls back as a whole struct, never merged
+    /// field-by-field (see its own doc above).
+    pub(crate) fn or_fallback(self, fallback: &WorkflowDefaults) -> WorkflowDefaults {
+        WorkflowDefaults {
+            model: self.model.or_else(|| fallback.model.clone()),
+            reasoning_effort: self.reasoning_effort.or(fallback.reasoning_effort),
+            temperature: self.temperature.or(fallback.temperature),
+            top_p: self.top_p.or(fallback.top_p),
+            max_tokens: self.max_tokens.or(fallback.max_tokens),
+            retry: self.retry.or_else(|| fallback.retry.clone()),
+            timeout: self.timeout.or(fallback.timeout),
+            mcp: self.mcp.or_else(|| fallback.mcp.clone()),
+            max_tool_rounds: self.max_tool_rounds.or(fallback.max_tool_rounds),
+            skills: self.skills.or_else(|| fallback.skills.clone()),
+            subagents: self.subagents.or_else(|| fallback.subagents.clone()),
+        }
+    }
+}
+
 /// A reusable action definition, referenced by id from `steps[].use`. Carries
 /// only "what to do" — model call or data transform — never "when"/"how many
 /// times", which lives on the `FlowStep` reference site instead.
