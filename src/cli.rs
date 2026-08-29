@@ -47,6 +47,11 @@ pub(crate) struct RunArgs {
     /// input; when both are given, the piped text is appended to PROMPT).
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+
+    /// Print a per-step and total token usage summary to stderr when the
+    /// workflow finishes (for servers that report usage).
+    #[arg(long)]
+    pub(crate) show_usage: bool,
 }
 
 #[derive(Debug, Args)]
@@ -74,6 +79,11 @@ pub(crate) struct AgentRunArgs {
     /// piped text is appended to INPUT).
     #[arg(value_name = "INPUT")]
     pub(crate) input: Option<String>,
+
+    /// Print a token usage summary to stderr when the agent finishes (for
+    /// servers that report usage).
+    #[arg(long)]
+    pub(crate) show_usage: bool,
 }
 
 #[derive(Debug, Args)]
@@ -112,6 +122,12 @@ pub(crate) struct ChatArgs {
     /// Display the model's reasoning content when the server provides it.
     #[arg(long)]
     pub(crate) show_reasoning: bool,
+
+    /// Print the request's token usage to stderr after the response (so
+    /// piping stdout stays clean). With `--stream`, asks the server for
+    /// `stream_options: {"include_usage": true}`.
+    #[arg(long)]
+    pub(crate) show_usage: bool,
 
     /// Print the response as JSON.
     #[arg(long, conflicts_with = "stream")]

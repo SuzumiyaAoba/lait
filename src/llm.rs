@@ -7,9 +7,9 @@ use async_openai::{
         ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, FunctionCall, ReasoningEffort as OpenAiReasoningEffort,
-        ResponseFormat,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, ChatCompletionTools,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, FunctionCall,
+        ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
     },
 };
 use futures_util::Stream;
@@ -59,6 +59,13 @@ pub(crate) struct CompletionRequest<'a> {
     /// "don't send a `tools:` field at all", not "send an empty list" —
     /// some servers treat the two differently.
     pub(crate) tools: &'a [ChatCompletionTools],
+    /// Ask a streamed response to append a final, choiceless chunk carrying
+    /// the whole request's `usage` (`stream_options: {"include_usage":
+    /// true}`). Only meaningful for [`complete_stream`]; ignored by
+    /// [`complete`], whose response carries `usage` unconditionally. Off by
+    /// default — only set when the caller will actually read the usage, so
+    /// servers that don't know `stream_options` aren't sent one needlessly.
+    pub(crate) stream_include_usage: bool,
 }
 
 /// Builds the initial two-message history shared by every completion request
@@ -192,6 +199,12 @@ fn build_chat_request(
     chat_request.model(request.model_id);
     chat_request.messages(request.messages);
     chat_request.stream(stream);
+    if stream && request.stream_include_usage {
+        chat_request.stream_options(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        });
+    }
     if let Some(reasoning_effort) = request.reasoning_effort {
         chat_request.reasoning_effort(OpenAiReasoningEffort::from(reasoning_effort));
     }

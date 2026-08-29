@@ -67,6 +67,92 @@ fn join_prompt_and_context(prompt: &str, context: &str) -> String {
     format!("{prompt}\n\n{context}")
 }
 
+/// Records each completion request's server-reported token usage under the
+/// label of whatever drove it (a workflow step, an agent, "chat"), so
+/// `--show-usage` can print a per-label and total summary once a run
+/// finishes. Lives in `RunEnv`, so recording must tolerate concurrent
+/// callers (`parallel`/concurrent `for_each` steps record from concurrently
+/// running tasks).
+#[derive(Default)]
+struct UsageTally {
+    events: std::sync::Mutex<Vec<(String, response::Usage)>>,
+}
+
+impl UsageTally {
+    /// Records `response`'s usage under `label`; a no-op when the server
+    /// reported none (absence stays distinguishable from zero in the
+    /// summary).
+    fn record_response(&self, label: &str, response: &response::ChatCompletionResponse) {
+        if let Some(usage) = response.usage {
+            self.events
+                .lock()
+                .expect("usage tally lock should not be poisoned")
+                .push((label.to_owned(), usage));
+        }
+    }
+
+    /// Aggregates recorded events per label (in first-recorded order), plus
+    /// the overall total and request count.
+    fn summarize(
+        &self,
+    ) -> (
+        Vec<(String, response::Usage, usize)>,
+        response::Usage,
+        usize,
+    ) {
+        let events = self
+            .events
+            .lock()
+            .expect("usage tally lock should not be poisoned");
+        let mut per_label: Vec<(String, response::Usage, usize)> = Vec::new();
+        let mut total = response::Usage::default();
+        for (label, usage) in events.iter() {
+            total.add(*usage);
+            match per_label
+                .iter_mut()
+                .find(|(existing, _, _)| existing == label)
+            {
+                Some((_, sum, count)) => {
+                    sum.add(*usage);
+                    *count += 1;
+                }
+                None => per_label.push((label.clone(), *usage, 1)),
+            }
+        }
+        (per_label, total, events.len())
+    }
+}
+
+/// Prints the `--show-usage` summary to stderr: one line for a single-label
+/// run (chat, a lone agent), a per-label breakdown plus total for a
+/// workflow. Usage counts every request made under a label — a tool loop's
+/// rounds, retries, and subagent calls (recorded under their own label) all
+/// count toward what the run actually consumed.
+fn print_usage_summary(tally: &UsageTally) {
+    let (per_label, total, requests) = tally.summarize();
+    if per_label.is_empty() {
+        eprintln!("usage: (the server reported no usage)");
+        return;
+    }
+    if per_label.len() == 1 {
+        eprintln!("usage: {total}{}", requests_suffix(requests));
+        return;
+    }
+    eprintln!("usage:");
+    for (label, usage, count) in &per_label {
+        eprintln!("  {label}: {usage}{}", requests_suffix(*count));
+    }
+    eprintln!("  total: {total}{}", requests_suffix(requests));
+}
+
+fn requests_suffix(count: usize) -> String {
+    if count > 1 {
+        format!(" ({count} requests)")
+    } else {
+        String::new()
+    }
+}
+
 /// The maximum number of tool-call round trips a single completion request
 /// may take (see `RequestSettings::complete`) before lait gives up and
 /// errors instead of looping forever on a model that keeps calling tools.
@@ -232,6 +318,7 @@ impl RequestSettings {
             response_format,
             messages,
             tools,
+            stream_include_usage: false,
         }
     }
 
@@ -260,10 +347,14 @@ impl RequestSettings {
     /// step) and `call_subagent_tool` extends it for a subagent's own
     /// completion, so a subagent chain that cycles back to itself is caught
     /// the same way `workflow:` nesting is (see `MAX_SUBAGENT_DEPTH`).
+    /// `usage_label` names this request in `env.usage`'s `--show-usage`
+    /// summary (a step label, an agent name, `"chat"`); every round of the
+    /// tool loop records under the same label.
     async fn complete(
         &self,
         env: &RunEnv<'_>,
         active_agent_paths: &[PathBuf],
+        usage_label: &str,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
@@ -273,7 +364,9 @@ impl RequestSettings {
 
         if self.mcp.is_empty() && self.subagents.is_empty() {
             let messages = llm::initial_messages(system_prompt, prompt)?;
-            return llm::complete(self.request(response_format, messages, &[])).await;
+            let response = llm::complete(self.request(response_format, messages, &[])).await?;
+            env.usage.record_response(usage_label, &response);
+            return Ok(response);
         }
 
         // `agent_registry.tools` is synchronous (it only reads local subagent
@@ -309,6 +402,7 @@ impl RequestSettings {
             }
 
             let response = llm::complete(self.request(None, messages.clone(), &tools)).await?;
+            env.usage.record_response(usage_label, &response);
 
             let tool_calls = response::first_message(&response)
                 .and_then(|message| message.tool_calls.as_ref())
@@ -321,7 +415,9 @@ impl RequestSettings {
                 // The model stopped calling tools; re-issue the same history
                 // once more with `response_format` attached, now that doing
                 // so can no longer suppress a tool call.
-                return llm::complete(self.request(response_format, messages, &[])).await;
+                let response = llm::complete(self.request(response_format, messages, &[])).await?;
+                env.usage.record_response(usage_label, &response);
+                return Ok(response);
             };
 
             let content = response::first_message(&response).and_then(|message| message.content());
@@ -366,12 +462,16 @@ impl RequestSettings {
     /// is appended to `system_prompt` the same way as in `complete` — skills
     /// are static injection, so unlike `mcp`/`subagents` they impose no such
     /// restriction on streaming.
+    /// `include_usage` asks the server for a final usage chunk (see
+    /// `llm::CompletionRequest::stream_include_usage`); set it only when the
+    /// caller will actually display it (`--show-usage`).
     async fn complete_stream(
         &self,
         skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
+        include_usage: bool,
     ) -> Result<llm::CompletionStream> {
         if !self.mcp.is_empty() {
             bail!(
@@ -386,7 +486,9 @@ impl RequestSettings {
         }
         let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
         let messages = llm::initial_messages(system_prompt.as_deref(), prompt)?;
-        llm::complete_stream(self.request(response_format, messages, &[])).await
+        let mut request = self.request(response_format, messages, &[]);
+        request.stream_include_usage = include_usage;
+        llm::complete_stream(request).await
     }
 
     /// Shared by `complete`/`complete_stream`: resolves `self.skills` against
@@ -411,7 +513,13 @@ impl RequestSettings {
 /// are dropped when `show_reasoning` is unset, same as the non-streaming
 /// path. Fails, like `response::response_content`, if the stream ends
 /// without ever producing content.
-async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: bool) -> Result<()> {
+/// Returns the usage carried by the final chunk, when the request asked for
+/// one (see `RequestSettings::complete_stream`'s `include_usage`) and the
+/// server obliged.
+async fn stream_to_stdout(
+    mut stream: llm::CompletionStream,
+    show_reasoning: bool,
+) -> Result<Option<response::Usage>> {
     use std::io::Write;
 
     // Locked once for the stream's whole lifetime: every delta write below
@@ -420,9 +528,13 @@ async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: boo
     let mut stdout = std::io::stdout().lock();
     let mut wrote_reasoning = false;
     let mut wrote_content = false;
+    let mut last_usage = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        if let Some(usage) = chunk.usage {
+            last_usage = Some(usage);
+        }
         let (content, reasoning) = response::stream_chunk_deltas(&chunk);
         if show_reasoning && let Some(reasoning) = reasoning {
             if !wrote_reasoning {
@@ -446,7 +558,7 @@ async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: boo
         bail!("API response contained no content in its first choice");
     }
     println!();
-    Ok(())
+    Ok(last_usage)
 }
 
 /// Renders an agent's system prompt against `input`, calls the model with
@@ -454,10 +566,12 @@ async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: boo
 /// `run_agent`, `execute_step`'s agent branch, and `call_subagent_tool`.
 /// `active_agent_paths` is threaded straight through to `settings.complete`
 /// — see its doc comment; every caller but `call_subagent_tool` passes `&[]`.
+#[allow(clippy::too_many_arguments)]
 async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
     env: &RunEnv<'_>,
+    usage_label: &str,
     input: &serde_json::Value,
     prompt: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -480,6 +594,7 @@ async fn call_agent(
         .complete(
             env,
             active_agent_paths,
+            usage_label,
             Some(&system_prompt),
             prompt,
             response_format,
@@ -606,6 +721,7 @@ fn call_subagent_tool<'a>(
             &loaded.file,
             &settings,
             env,
+            &format!("subagent '{name}'"),
             &input,
             &prompt,
             &workflow::StepOutputs::new(),
@@ -871,15 +987,24 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
                 system_prompt.as_deref(),
                 &prompt,
                 response_format,
+                chat.show_usage,
             )
             .await?;
-        return stream_to_stdout(stream, chat.show_reasoning).await;
+        let usage = stream_to_stdout(stream, chat.show_reasoning).await?;
+        if chat.show_usage {
+            match usage {
+                Some(usage) => eprintln!("usage: {usage}"),
+                None => eprintln!("usage: (the server reported no usage)"),
+            }
+        }
+        return Ok(());
     }
 
     let response = settings
         .complete(
             &env,
             &[],
+            "chat",
             system_prompt.as_deref(),
             &prompt,
             response_format,
@@ -888,6 +1013,9 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
 
     let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
     println!("{output}");
+    if chat.show_usage {
+        print_usage_summary(&env.usage);
+    }
     Ok(())
 }
 
@@ -923,10 +1051,15 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     let settings = agent_file_settings(&agent_file, &file_config, None)?;
 
     let env = RunEnv::new(&file_config);
+    let usage_label = agent_file
+        .name
+        .clone()
+        .unwrap_or_else(|| args.file.display().to_string());
     let output = call_agent(
         &agent_file,
         &settings,
         &env,
+        &usage_label,
         &input,
         &raw_input,
         &workflow::StepOutputs::new(),
@@ -935,6 +1068,9 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     .await
     .with_context(|| format!("agent '{}'", args.file.display()))?;
     println!("{output}");
+    if args.show_usage {
+        print_usage_summary(&env.usage);
+    }
     Ok(())
 }
 
@@ -959,6 +1095,9 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     )
     .await?;
     println!("{current_input}");
+    if run_args.show_usage {
+        print_usage_summary(&env.usage);
+    }
     Ok(())
 }
 
@@ -1025,6 +1164,10 @@ struct RunEnv<'a> {
     registry: mcp::McpRegistry<'a>,
     skill_cache: skill::SkillCache<'a>,
     agent_registry: subagent::AgentRegistry<'a>,
+    /// Every completion request's server-reported token usage, recorded by
+    /// `RequestSettings::complete` and summarized when `--show-usage` asks
+    /// for it.
+    usage: UsageTally,
 }
 
 impl<'a> RunEnv<'a> {
@@ -1037,6 +1180,7 @@ impl<'a> RunEnv<'a> {
             registry: mcp::McpRegistry::new(&file_config.mcp_servers),
             skill_cache: skill::SkillCache::new(&file_config.skills),
             agent_registry: subagent::AgentRegistry::new(&file_config.agents),
+            usage: UsageTally::default(),
         }
     }
 }
@@ -1884,6 +2028,7 @@ async fn execute_step(
             agent_file,
             &settings,
             env,
+            label,
             &input,
             current_input,
             steps_outputs,
@@ -1914,7 +2059,7 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(env, &[], None, &prompt, response_format)
+            .complete(env, &[], label, None, &prompt, response_format)
             .await
             .with_context(|| format!("step '{label}'"))?;
 
