@@ -182,7 +182,7 @@ impl ConfigDirectory {
     }
 }
 
-fn next_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+pub(crate) fn next_temp_path(prefix: &str, suffix: &str) -> PathBuf {
     let unique_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock should be after Unix epoch")

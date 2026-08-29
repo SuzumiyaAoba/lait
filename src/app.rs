@@ -679,7 +679,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 /// The maximum `workflow:` nesting depth (a workflow step calling another
 /// workflow file, whose own steps may call another, ...), rejected as a
 /// runtime error rather than left to overflow the stack or hang.
-const MAX_WORKFLOW_DEPTH: usize = 32;
+pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
 
 /// The loaded config file and the MCP registry for the whole `lait run`
 /// invocation — unlike `WorkflowScope`, neither changes at a `workflow:`

@@ -1,6 +1,8 @@
 mod support;
 
-use support::{AgentMarkdownFile, ConfigDirectory, WorkflowFile, run_lait_lint, test_command};
+use support::{
+    AgentMarkdownFile, ConfigDirectory, WorkflowFile, next_temp_path, run_lait_lint, test_command,
+};
 
 #[test]
 fn lint_reports_ok_for_a_valid_workflow_file() {
@@ -181,15 +183,7 @@ fn lint_checks_every_file_even_after_an_earlier_one_fails() {
 
 #[test]
 fn lint_rejects_an_unrecognized_file_extension() {
-    let unique = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let path = std::env::temp_dir().join(format!("lait-test-lint-{unique}.txt"));
+    let path = next_temp_path("lait-test-lint", ".txt");
     std::fs::write(&path, "irrelevant").expect("failed to write fixture file");
 
     let output = run_lait_lint(&[&path]);
@@ -209,16 +203,8 @@ fn lint_rejects_an_unrecognized_file_extension() {
 
 #[test]
 fn lint_detects_a_workflow_call_cycle() {
-    let unique = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let a_path = std::env::temp_dir().join(format!("lait-test-lint-cycle-a-{unique}.yml"));
-    let b_path = std::env::temp_dir().join(format!("lait-test-lint-cycle-b-{unique}.yml"));
+    let a_path = next_temp_path("lait-test-lint-cycle-a", ".yml");
+    let b_path = next_temp_path("lait-test-lint-cycle-b", ".yml");
 
     std::fs::write(
         &a_path,

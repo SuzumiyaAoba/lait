@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
+    app::MAX_WORKFLOW_DEPTH,
     config::{self, ConfigFile},
     jq, schema, template, workflow,
 };
@@ -102,12 +103,18 @@ struct LintCtx<'a> {
     skipped_capability_check: bool,
 }
 
+impl<'a> LintCtx<'a> {
+    fn new(config: Option<&'a ConfigFile>) -> Self {
+        Self {
+            config,
+            skipped_capability_check: false,
+        }
+    }
+}
+
 fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
     let mut issues = Vec::new();
-    let mut ctx = LintCtx {
-        config,
-        skipped_capability_check: false,
-    };
+    let mut ctx = LintCtx::new(config);
 
     match workflow::load_workflow(path) {
         Err(error) => issues.push(LintIssue::error(format!("{error:#}"))),
@@ -136,10 +143,7 @@ fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
 
 fn lint_agent_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
     let mut issues = Vec::new();
-    let mut ctx = LintCtx {
-        config,
-        skipped_capability_check: false,
-    };
+    let mut ctx = LintCtx::new(config);
 
     match agent::load_agent(path) {
         Err(error) => issues.push(LintIssue::error(format!("{error:#}"))),
@@ -411,6 +415,17 @@ fn lint_sub_workflow(
         )));
         return;
     }
+    // Mirrors `WorkflowScope::nested`'s cap, so a non-cyclic but arbitrarily
+    // deep `workflow:` chain is flagged here the same way it would fail at
+    // `run` time, rather than recursing without bound.
+    if visited.len() >= MAX_WORKFLOW_DEPTH {
+        issues.push(LintIssue::error(format!(
+            "node '{node_id}' has 'workflow: {}', which exceeds the maximum 'workflow:' nesting \
+             depth of {MAX_WORKFLOW_DEPTH}",
+            sub_workflow_path.display()
+        )));
+        return;
+    }
 
     match workflow::load_workflow(&resolved) {
         Err(error) => issues.push(LintIssue::error(format!(
@@ -501,28 +516,46 @@ fn check_mcp_names(
     ctx: &mut LintCtx,
     issues: &mut Vec<LintIssue>,
 ) {
-    let Some(names) = names else { return };
-    if names.is_empty() {
-        return;
-    }
-    let Some(config) = ctx.config else {
-        ctx.skipped_capability_check = true;
-        return;
-    };
-    for name in names {
-        if !config.mcp_servers.contains_key(name) {
-            issues.push(LintIssue::error(format!(
-                "{context} references unknown MCP server '{name}'; define it under \
-                 'mcp_servers:' in {}",
-                config::CONFIG_FILE_NAME
-            )));
-        }
-    }
+    check_capability_names(
+        context,
+        "MCP server",
+        "mcp_servers:",
+        names,
+        |config, name| config.mcp_servers.contains_key(name),
+        ctx,
+        issues,
+    );
 }
 
 fn check_skill_names(
     context: &str,
     names: Option<&[String]>,
+    ctx: &mut LintCtx,
+    issues: &mut Vec<LintIssue>,
+) {
+    check_capability_names(
+        context,
+        "skill",
+        "skills:",
+        names,
+        |config, name| config.skills.contains_key(name),
+        ctx,
+        issues,
+    );
+}
+
+/// Shared by `check_mcp_names`/`check_skill_names`: both look up a list of
+/// names against a map defined in `config` (`skipping`, and noting once, when
+/// there is no `config` to check against at all), differing only in which map
+/// they check and how they name it in an issue's message. `contains` decides
+/// whether a name is defined (`|config, name| config.mcp_servers...`/
+/// `config.skills...`); `field` is the `lait.config.yml` key to point at.
+fn check_capability_names(
+    context: &str,
+    kind: &str,
+    field: &str,
+    names: Option<&[String]>,
+    contains: impl Fn(&ConfigFile, &str) -> bool,
     ctx: &mut LintCtx,
     issues: &mut Vec<LintIssue>,
 ) {
@@ -535,9 +568,9 @@ fn check_skill_names(
         return;
     };
     for name in names {
-        if !config.skills.contains_key(name) {
+        if !contains(config, name) {
             issues.push(LintIssue::error(format!(
-                "{context} references unknown skill '{name}'; define it under 'skills:' in {}",
+                "{context} references unknown {kind} '{name}'; define it under '{field}' in {}",
                 config::CONFIG_FILE_NAME
             )));
         }
@@ -558,10 +591,7 @@ mod tests {
     }
 
     fn lint_fixture(wf: &workflow::WorkflowFile, config: Option<&ConfigFile>) -> Vec<LintIssue> {
-        let mut ctx = LintCtx {
-            config,
-            skipped_capability_check: false,
-        };
+        let mut ctx = LintCtx::new(config);
         let mut issues = Vec::new();
         let mut visited = HashSet::new();
         lint_workflow_contents(wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
@@ -716,10 +746,7 @@ mod tests {
         let wf = parse_workflow_fixture(
             "nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
         );
-        let mut ctx = LintCtx {
-            config: None,
-            skipped_capability_check: false,
-        };
+        let mut ctx = LintCtx::new(None);
         let mut issues = Vec::new();
         let mut visited = HashSet::new();
         lint_workflow_contents(&wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
