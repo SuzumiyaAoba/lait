@@ -4,9 +4,44 @@ Lightweight AI Tool (lait) は、YAML で定義したハーネス、Agent Loop�
 
 `lait` は `async-openai` を使って OpenAI Compatible API に接続し、単体のプロンプトをチャット補完として送信する CLI です。LM Studio のローカルサーバーを利用した動作確認や、LLM API 接続のサンプルとして使えます。
 
+## インストール
+
+### バイナリ（GitHub Releases）
+
+[Releases](https://github.com/SuzumiyaAoba/lait/releases) から各プラットフォーム（macOS arm64/x86_64、Linux gnu/musl、Windows）のアーカイブをダウンロードし、`lait`（Windows は `lait.exe`）をパスの通った場所に置いてください。`v*` タグの push で自動的にビルド・添付されます。
+
+### cargo binstall
+
+```sh
+cargo binstall lait
+```
+
+（crates.io への publish 後に利用できます。Releases のアーカイブをそのまま利用するため Rust のビルドは不要です。）
+
+### Homebrew
+
+```sh
+brew install SuzumiyaAoba/tap/lait
+```
+
+（tap の formula はリリース時に自動更新されます。）
+
+### ソースからビルド
+
+```sh
+cargo install --git https://github.com/SuzumiyaAoba/lait
+```
+
+インストール後、シェル補完と man ページは `lait` 自身で生成できます。
+
+```sh
+lait completions zsh > ~/.zfunc/_lait   # bash / zsh / fish / powershell / elvish
+lait man --dir ~/.local/share/man/man1  # lait.1, lait-run.1, ...
+```
+
 ## クイックスタート
 
-- Rust stable と `rustfmt`/`clippy`（`rust-toolchain.toml` により自動的に指定されます）が必要です。
+- 開発には Rust stable と `rustfmt`/`clippy`（`rust-toolchain.toml` により自動的に指定されます）が必要です。
 
 ```sh
 cargo run -- --model <MODEL_ID_OR_ALIAS> "プロンプト"

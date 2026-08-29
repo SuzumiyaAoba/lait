@@ -1,9 +1,20 @@
 [package]
 name = "lait"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Lightweight AI Tool"
+repository = "https://github.com/SuzumiyaAoba/lait"
 rust-version = "1.88"
+
+# `cargo binstall lait` resolves release artifacts through this metadata
+# (the release workflow names its archives to match).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1"
