@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -85,13 +86,16 @@ fn format_skill(skill: &SkillFile) -> String {
 /// `render()` call after the first for a given name reuses this instead of
 /// re-reading and re-parsing the file (which a `for_each`/`loop` node with
 /// `skills:` set would otherwise do on every iteration). `render`/`section`
-/// are synchronous and never called from a spawned task, so a plain
-/// `RefCell` (no locking, no `Arc`) is enough — unlike `mcp::McpRegistry`'s
-/// cache, which really does need `tokio::sync::Mutex` because connecting is
-/// async I/O that can interleave.
+/// never hold a borrow across an `.await` (there is no `.await` in either),
+/// so a plain `RefCell` (no locking) is safe even when `SkillCache` is
+/// shared across concurrent `parallel:`/`for_each:` branches racing within
+/// the same task — unlike `mcp::McpRegistry`'s cache, which really does need
+/// `tokio::sync::Mutex` because connecting is async I/O that can interleave.
+/// The cached value is an `Rc<String>` rather than a bare `String` so a
+/// cache hit is a refcount bump, not a clone of the skill's Markdown body.
 pub(crate) struct SkillCache<'a> {
     skills_map: &'a config::SkillMap,
-    sections: RefCell<HashMap<String, String>>,
+    sections: RefCell<HashMap<String, Rc<String>>>,
 }
 
 impl<'a> SkillCache<'a> {
@@ -124,13 +128,18 @@ impl<'a> SkillCache<'a> {
         let sections = names
             .iter()
             .map(|name| self.section(name))
-            .collect::<Result<Vec<String>>>()?;
-        Ok(Some(sections.join("\n\n")))
+            .collect::<Result<Vec<Rc<String>>>>()?;
+        let joined = sections
+            .iter()
+            .map(|section| section.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Ok(Some(joined))
     }
 
-    fn section(&self, name: &str) -> Result<String> {
+    fn section(&self, name: &str) -> Result<Rc<String>> {
         if let Some(cached) = self.sections.borrow().get(name) {
-            return Ok(cached.clone());
+            return Ok(Rc::clone(cached));
         }
         let configured_path = self.skills_map.get(name).ok_or_else(|| {
             anyhow!(
@@ -139,10 +148,10 @@ impl<'a> SkillCache<'a> {
             )
         })?;
         let skill = load_skill(name, configured_path)?;
-        let section = format_skill(&skill);
+        let section = Rc::new(format_skill(&skill));
         self.sections
             .borrow_mut()
-            .insert(name.to_owned(), section.clone());
+            .insert(name.to_owned(), Rc::clone(&section));
         Ok(section)
     }
 }
