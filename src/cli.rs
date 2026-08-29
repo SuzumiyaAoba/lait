@@ -34,6 +34,29 @@ pub(crate) enum Command {
     /// Statically check workflow (.yml/.yaml) and agent (.md) files for
     /// structural and reference errors, without running them.
     Lint(LintArgs),
+    /// List the model aliases configured in lait.config.yml, or the models
+    /// the server itself offers with `--remote`.
+    Models(ModelsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ModelsArgs {
+    /// Ask the configured (or `--base-url`) server for its available models
+    /// (`GET /v1/models`) instead of listing configured aliases.
+    #[arg(long)]
+    pub(crate) remote: bool,
+
+    /// Print machine-readable JSON instead of a table.
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// The OpenAI-compatible API base URL to query with `--remote`.
+    #[arg(long, env = "OPENAI_BASE_URL")]
+    pub(crate) base_url: Option<String>,
+
+    /// The API key sent with `--remote`. LM Studio does not require one.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    pub(crate) api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +226,21 @@ pub(crate) struct ChatArgs {
     /// the prompt from stdin explicitly.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+}
+
+impl ReasoningEffort {
+    /// The lowercase name used on the CLI and in YAML, for display (e.g.
+    /// `lait models`' DEFAULTS column).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]

@@ -10,6 +10,7 @@ mod jq;
 mod lint;
 mod llm;
 mod mcp;
+mod models;
 mod response;
 mod schema;
 mod skill;

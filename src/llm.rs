@@ -235,6 +235,13 @@ fn build_chat_request(
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(reqwest::Client::new);
 
+/// The shared HTTP client, for API calls outside the chat completions path
+/// (`lait models --remote`'s `GET /v1/models`), so they reuse the same
+/// connection pool completions do.
+pub(crate) fn http_client() -> reqwest::Client {
+    HTTP_CLIENT.clone()
+}
+
 /// Builds the API client [`complete`] and [`complete_stream`] share, wiring
 /// the request's base URL/API key to the shared `HTTP_CLIENT`.
 fn client(base_url: &str, api_key: &str) -> Client<OpenAIConfig> {

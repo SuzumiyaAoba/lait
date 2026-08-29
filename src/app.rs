@@ -20,7 +20,7 @@ use crate::{
     jq, lint, llm, mcp, response, schema, skill, subagent, template, workflow,
 };
 
-const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// Reads all of stdin into a string, trimming trailing newlines (piped text
 /// almost always ends in one, and a prompt should not).
@@ -167,6 +167,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             AgentAction::Run(args) => run_agent(args, cli.no_config).await,
         },
         Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
+        Some(Command::Models(models_args)) => crate::models::run(models_args, cli.no_config).await,
         None => run_chat(cli.chat, cli.no_config).await,
     }
 }

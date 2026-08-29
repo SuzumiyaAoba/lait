@@ -15,7 +15,7 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) default: DefaultSettings,
     #[serde(default)]
-    models: ModelMap,
+    pub(crate) models: ModelMap,
     /// Named MCP servers, referenced by a `mcp:` list on the CLI/agent
     /// file/workflow node/`default:` block. See `crate::mcp::McpRegistry`.
     #[serde(default)]
@@ -177,19 +177,19 @@ pub(crate) type ModelMap = HashMap<String, Vec<ModelDefinition>>;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelDefinition {
-    provider: ProviderConfig,
-    model_id: String,
-    default_reasoning_effort: Option<ReasoningEffort>,
-    default_temperature: Option<f64>,
-    default_top_p: Option<f64>,
-    default_max_tokens: Option<u32>,
+    pub(crate) provider: ProviderConfig,
+    pub(crate) model_id: String,
+    pub(crate) default_reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) default_temperature: Option<f64>,
+    pub(crate) default_top_p: Option<f64>,
+    pub(crate) default_max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProviderConfig {
-    base_url: String,
-    api_key: Option<String>,
+pub(crate) struct ProviderConfig {
+    pub(crate) base_url: String,
+    pub(crate) api_key: Option<String>,
 }
 
 #[derive(Debug)]
