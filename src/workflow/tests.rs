@@ -484,11 +484,24 @@ fn rejects_a_workflow_node_with_system_prompt() {
 }
 
 #[test]
-fn rejects_system_prompt_on_a_jq_only_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    jq: '.'\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+fn allows_a_system_prompt_only_node_with_no_prompt() {
+    let workflow = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    )
+    .expect("workflow should parse");
+    assert!(workflow.nodes["n"].prompt.is_none());
+    assert_eq!(
+        workflow.nodes["n"].system_prompt.as_deref(),
+        Some("be terse")
     );
-    assert!(result.is_err());
+}
+
+#[test]
+fn allows_system_prompt_together_with_jq_as_a_model_calling_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    jq: '.'\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
 }
 
 #[test]

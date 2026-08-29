@@ -129,17 +129,20 @@ pub(crate) struct NodeDefinition {
     /// model call. Falls back independently to `default.max_tokens`, like
     /// `temperature`.
     pub(crate) max_tokens: Option<u32>,
-    /// The prompt template sent to the model. A node without a `prompt` and
-    /// without an `agent` does not call the model at all; it must then have a
-    /// `jq` filter, making it a data-only transformation node. Mutually
-    /// exclusive with `agent`.
+    /// The user-message prompt template sent to the model. When unset but
+    /// `system_prompt` is set, the node's current input is sent unchanged (no
+    /// template rendering) as the user message instead, the same way an
+    /// `agent` node passes its current input straight through. A node with
+    /// neither `prompt` nor `system_prompt` and without an `agent` does not
+    /// call the model at all; it must then have a `jq` filter, making it a
+    /// data-only transformation node. Mutually exclusive with `agent`.
     pub(crate) prompt: Option<String>,
     /// A system prompt template, rendered the same way as `prompt` (see
     /// `template::render`) and sent ahead of it as the system message. Falls
     /// back to the workflow's `default.system_prompt` when unset, the same
-    /// way as `skills`. Only meaningful together with `prompt`: an `agent`
-    /// node already has its own system prompt (the agent file's body), so
-    /// `system_prompt` is rejected alongside `agent`.
+    /// way as `skills`. An `agent` node already has its own system prompt
+    /// (the agent file's body), so `system_prompt` is rejected alongside
+    /// `agent`.
     pub(crate) system_prompt: Option<String>,
     /// Path to an agent Markdown file (see `agent::load_agent`) whose system
     /// prompt, model/reasoning defaults, and input/output schema drive this

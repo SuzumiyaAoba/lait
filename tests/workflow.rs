@@ -372,6 +372,43 @@ steps:
 }
 
 #[test]
+fn a_node_with_no_prompt_sends_the_current_input_unchanged_as_the_user_message() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  echo:
+    system_prompt: "Reply in French."
+steps:
+  - use: echo
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, r#"{"not":"json-safe for a bare template"}"#);
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "Reply in French."},
+            {"role": "user", "content": r#"{"not":"json-safe for a bare template"}"#},
+        ])
+    );
+}
+
+#[test]
 fn step_requests_structured_output_and_extracts_a_field_with_jq() {
     let schema = JsonSchemaFile::new(
         r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,

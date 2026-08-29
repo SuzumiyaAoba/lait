@@ -2016,7 +2016,7 @@ async fn execute_step_with_retry(
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
-    let calls_model = node.prompt.is_some() || node.agent.is_some();
+    let calls_model = node.prompt.is_some() || node.system_prompt.is_some() || node.agent.is_some();
     let effective_retry = node.retry.as_ref().or(calls_model
         .then_some(scope.defaults.retry.as_ref())
         .flatten());
@@ -2229,7 +2229,7 @@ async fn execute_step(
         )
         .await
         .with_context(|| format!("step '{label}'"))?
-    } else if let Some(prompt_template) = &node.prompt {
+    } else if node.prompt.is_some() || node.system_prompt.is_some() {
         let settings = resolve_step_settings(node, scope, env.file_config, None, label)?
             .with_usage_label(label);
 
@@ -2249,8 +2249,15 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let input = template::parse_input(current_input);
-        let prompt = template::render(prompt_template, &input, steps_outputs)
-            .with_context(|| format!("step '{label}'"))?;
+        // A `system_prompt`-only node (no `prompt`) sends the current input
+        // unchanged as the user message, the same way an `agent` node's
+        // `current_input` passes straight through `call_agent` without going
+        // through `template::render`.
+        let prompt = match &node.prompt {
+            Some(prompt_template) => template::render(prompt_template, &input, steps_outputs)
+                .with_context(|| format!("step '{label}'"))?,
+            None => current_input.to_owned(),
+        };
         let system_prompt = node
             .system_prompt
             .as_deref()
