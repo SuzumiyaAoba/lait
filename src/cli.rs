@@ -43,6 +43,30 @@ pub(crate) enum Command {
     /// Generate roff man pages for lait and every subcommand (lait.1,
     /// lait-run.1, ...).
     Man(ManArgs),
+    /// Generate starter files: `lait init` writes a minimal lait.config.yml,
+    /// `lait init workflow [PATH]` / `lait init agent [PATH]` write commented
+    /// workflow.yml / agent.md scaffolds.
+    Init(InitArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct InitArgs {
+    /// What to generate; omit for lait.config.yml in the current directory.
+    #[arg(value_enum, value_name = "KIND")]
+    pub(crate) kind: Option<InitKind>,
+
+    /// Where to write the generated file (defaults: workflow.yml /
+    /// agent.md). Only valid with a KIND — the config file's name is fixed.
+    #[arg(value_name = "PATH", requires = "kind")]
+    pub(crate) path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum InitKind {
+    /// A workflow YAML scaffold (`nodes:` + `steps:`).
+    Workflow,
+    /// An agent Markdown scaffold (frontmatter + system prompt).
+    Agent,
 }
 
 #[derive(Debug, Args)]

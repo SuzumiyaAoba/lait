@@ -173,6 +173,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
+        Some(Command::Init(init_args)) => crate::init::run(init_args),
         None => run_chat(cli.chat, cli.no_config).await,
     }
 }
