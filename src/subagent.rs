@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
@@ -8,24 +13,23 @@ use crate::{
     config, mcp, schema,
 };
 
-/// One `agents:` entry, loaded and canonicalized once then cached for the
-/// registry's lifetime (see `AgentRegistry`). `canonical_path` is kept
-/// alongside `file` because a recursive subagent call (a subagent whose own
-/// `subagents:` names another) needs it to detect a cycle or excessive
-/// nesting the same way `WorkflowScope`/`check_workflow_nesting` do for
-/// `workflow:` nodes — see `app::call_subagent_tool`. `tool_parameters`/
-/// `tool_description` are resolved once here too (not rebuilt by
-/// `AgentRegistry::tools` on every call): `tool_parameters` resolves
+/// One agent file (an `agents:` entry, or a workflow node's `agent:` path),
+/// loaded and canonicalized once then cached for the registry's lifetime
+/// (see `AgentRegistry`). `canonical_path` is kept alongside `file` because
+/// a recursive subagent call (a subagent whose own `subagents:` names
+/// another) needs it to detect a cycle or excessive nesting the same way
+/// `WorkflowScope`/`check_workflow_nesting` do for `workflow:` nodes — see
+/// `app::call_subagent_tool`. `tool_parameters` is resolved once here too
+/// (not rebuilt by `AgentRegistry::tools` on every call): it resolves
 /// `file.input_schema`, which for a `file_path:` entry means reading and
 /// parsing a JSON file — real I/O that a `for_each`/`loop` workflow node
-/// with `subagents:` set would otherwise repeat on every iteration, the same
-/// waste `mcp::McpRegistry`'s own `tool_lists` cache avoids for MCP tools.
+/// would otherwise repeat on every iteration, the same waste
+/// `mcp::McpRegistry`'s own `tool_lists` cache avoids for MCP tools.
 #[derive(Debug)]
 pub(crate) struct LoadedAgent {
     pub(crate) file: AgentFile,
     pub(crate) canonical_path: PathBuf,
     tool_parameters: serde_json::Value,
-    tool_description: String,
 }
 
 impl LoadedAgent {
@@ -43,20 +47,24 @@ impl LoadedAgent {
     }
 }
 
-/// A named agent Markdown file made available as a callable "subagent" tool
-/// (see `agent::load_agent`), resolved from `lait.config.yml`'s top-level
-/// `agents:` map. Mirrors `skill::SkillCache`: agent files are loaded lazily
-/// (parsing never sees the config file) and cached for the registry's
-/// lifetime, since a subagent's definition doesn't change over the course of
-/// one `lait run`/`lait agent run`/chat invocation. Uses `RefCell`/`Rc`
+/// The agent files in play for one `lait run`/`lait agent run`/chat
+/// invocation: named `agents:` entries made available as callable "subagent"
+/// tools (see `AgentRegistry::tools`), and workflow nodes' own `agent:`
+/// paths (see `AgentRegistry::load_path`), both loaded through the same
+/// cache. Mirrors `skill::SkillCache`: agent files are loaded lazily
+/// (parsing never sees the config file) and cached by their configured path
+/// for the registry's lifetime, since an agent file's content doesn't change
+/// over the course of one invocation — without this, a `for_each`/`loop`
+/// node with `agent:` set would re-read and re-parse the same file (and its
+/// `file_path:` input schema) on every iteration. Uses `RefCell`/`Rc`
 /// rather than `tokio::sync::Mutex`/`Arc` like `mcp::McpRegistry`, for the
 /// same reason as `SkillCache`: loading a file is synchronous, so there is no
 /// `.await` to interleave across when `parallel:`/`for_each:` branches (or
 /// concurrent tool calls within one round — see
-/// `app::RequestSettings::complete`) race on the same name.
+/// `app::RequestSettings::complete`) race on the same path.
 pub(crate) struct AgentRegistry<'a> {
     agents_map: &'a config::AgentMap,
-    loaded: RefCell<HashMap<String, Rc<LoadedAgent>>>,
+    loaded: RefCell<HashMap<PathBuf, Rc<LoadedAgent>>>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request's
@@ -95,32 +103,36 @@ impl<'a> AgentRegistry<'a> {
         }
     }
 
-    /// Returns `name`'s `LoadedAgent`, loading (and canonicalizing) it, and
-    /// resolving its tool `parameters`/`description`, on first use, then
-    /// caching the result for the registry's lifetime. A named subagent's
-    /// declared `input_schema` (if any) becomes the tool's `parameters`
-    /// verbatim, so the model's arguments pass straight through as the
-    /// subagent's own structured input; a subagent with no `input_schema`
-    /// gets a generic single-field `{ "input": ... }` schema instead — see
-    /// `app::subagent_tool_input`, the matching unwrap logic on the call
-    /// side.
+    /// Returns the named subagent's `LoadedAgent`, resolving `name` against
+    /// the `agents:` map and loading its file through `load_path`'s cache.
     pub(crate) fn load(&self, name: &str) -> Result<Rc<LoadedAgent>> {
-        if let Some(cached) = self.loaded.borrow().get(name) {
-            return Ok(Rc::clone(cached));
-        }
         let path = self.agents_map.get(name).ok_or_else(|| {
             anyhow!(
                 "unknown subagent '{name}'; define it under 'agents:' in {}",
                 config::CONFIG_FILE_NAME
             )
         })?;
+        self.load_path(path)
+            .with_context(|| format!("subagent '{name}'"))
+    }
+
+    /// Returns the `LoadedAgent` for the agent file at `path` (as configured
+    /// — the same path spelling always hits the same cache entry), loading
+    /// and canonicalizing it, and resolving its tool `parameters`, on first
+    /// use, then caching the result for the registry's lifetime. An agent's
+    /// declared `input_schema` (if any) becomes the tool's `parameters`
+    /// verbatim, so the model's arguments pass straight through as the
+    /// subagent's own structured input; an agent with no `input_schema` gets
+    /// a generic single-field `{ "input": ... }` schema instead — see
+    /// `app::subagent_tool_input`, the matching unwrap logic on the call
+    /// side.
+    pub(crate) fn load_path(&self, path: &Path) -> Result<Rc<LoadedAgent>> {
+        if let Some(cached) = self.loaded.borrow().get(path) {
+            return Ok(Rc::clone(cached));
+        }
         let file = agent::load_agent(path)?;
-        let canonical_path = std::fs::canonicalize(path).with_context(|| {
-            format!(
-                "failed to resolve subagent '{name}' file path '{}'",
-                path.display()
-            )
-        })?;
+        let canonical_path = std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve agent file path '{}'", path.display()))?;
         let tool_parameters = match &file.input_schema {
             Some(entry) => schema::load_schema_value(entry)?,
             None => serde_json::json!({
@@ -135,19 +147,14 @@ impl<'a> AgentRegistry<'a> {
                 "required": ["input"],
             }),
         };
-        let tool_description = file
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("Runs the '{name}' subagent for a delegated task."));
         let loaded = Rc::new(LoadedAgent {
             file,
             canonical_path,
             tool_parameters,
-            tool_description,
         });
         self.loaded
             .borrow_mut()
-            .insert(name.to_owned(), Rc::clone(&loaded));
+            .insert(path.to_path_buf(), Rc::clone(&loaded));
         Ok(loaded)
     }
 
@@ -163,10 +170,15 @@ impl<'a> AgentRegistry<'a> {
             if index.contains_key(&qualified) {
                 bail!("duplicate subagent name '{name}' in 'subagents:'");
             }
+            let description = loaded
+                .file
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("Runs the '{name}' subagent for a delegated task."));
             tools.push(ChatCompletionTools::Function(ChatCompletionTool {
                 function: FunctionObject {
                     name: qualified.clone(),
-                    description: Some(loaded.tool_description.clone()),
+                    description: Some(description),
                     parameters: Some(loaded.tool_parameters.clone()),
                     strict: None,
                 },

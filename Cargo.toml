@@ -15,6 +15,7 @@ http = "1"
 jaq-core = "3.1.0"
 jaq-json = "2.0.2"
 jaq-std = "3.0.2"
+reqwest = { version = "0.13", default-features = false }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -98,7 +98,7 @@ pub(crate) fn check_syntax(filter_source: &str) -> Result<()> {
 fn run_filter(filter_source: &str, input_json: &str, steps: &Steps) -> Result<Vec<Val>> {
     let input = read::parse_single(input_json.as_bytes())
         .map_err(|error| anyhow!("failed to parse jq input as JSON: {error}"))?;
-    let steps_json = serde_json::to_string(&serde_json::Value::Object(steps.clone()))
+    let steps_json = serde_json::to_string(steps)
         .map_err(|error| anyhow!("failed to serialize named step outputs for '$steps': {error}"))?;
     let steps_val = read::parse_single(steps_json.as_bytes())
         .map_err(|error| anyhow!("failed to parse named step outputs as JSON: {error}"))?;

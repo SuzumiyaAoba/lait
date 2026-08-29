@@ -369,7 +369,10 @@ impl RequestSettings {
 async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: bool) -> Result<()> {
     use std::io::Write;
 
-    let mut stdout = std::io::stdout();
+    // Locked once for the stream's whole lifetime: every delta write below
+    // would otherwise re-acquire stdout's mutex, and nothing else prints to
+    // stdout while a response is streaming.
+    let mut stdout = std::io::stdout().lock();
     let mut wrote_reasoning = false;
     let mut wrote_content = false;
 
@@ -1566,6 +1569,13 @@ fn run_steps<'a>(
     })
 }
 
+/// The upper bound on a single wait between retry attempts (see
+/// `execute_step_with_retry`): a `retry` whose `delay_seconds`/`backoff`
+/// (validated non-negative and finite by `workflow::validate`, but free to
+/// grow exponentially) would wait longer than this waits this long instead —
+/// a bounded, predictable worst case rather than an arbitrarily long hang.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
+
 /// Runs `execute_step`, applying an effective timeout to each attempt and
 /// retrying per an effective `retry` on failure (a timed-out attempt counts
 /// as a failure). "Effective" means the node's own `retry`/`timeout` if set,
@@ -1608,7 +1618,8 @@ async fn execute_step_with_retry(
         effective_retry
             .and_then(|retry| retry.delay_seconds)
             .unwrap_or(0),
-    );
+    )
+    .min(MAX_RETRY_DELAY);
 
     let mut attempt = 0usize;
     loop {
@@ -1659,7 +1670,13 @@ async fn execute_step_with_retry(
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                delay = Duration::from_secs_f64((delay.as_secs_f64() * backoff).max(0.0));
+                // `try_from_secs_f64` + the `MAX_RETRY_DELAY` clamp keep an
+                // exponentially growing (or pathological) delay from
+                // overflowing `Duration` — `Duration::from_secs_f64` would
+                // panic there instead of just waiting the capped hour.
+                delay = Duration::try_from_secs_f64((delay.as_secs_f64() * backoff).max(0.0))
+                    .unwrap_or(MAX_RETRY_DELAY)
+                    .min(MAX_RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
@@ -1766,19 +1783,26 @@ async fn execute_step(
     }
 
     let mut step_output = if let Some(agent_path) = &node.agent {
-        let agent_file =
-            agent::load_agent(agent_path).with_context(|| format!("step '{label}'"))?;
+        // Loaded through the registry's path cache (not `agent::load_agent`
+        // directly) so a `for_each`/`loop` body re-running this node reuses
+        // the parsed file and its resolved input schema instead of re-reading
+        // both from disk on every iteration.
+        let loaded = env
+            .agent_registry
+            .load_path(agent_path)
+            .with_context(|| format!("step '{label}'"))?;
+        let agent_file = &loaded.file;
 
         let input = template::parse_input(current_input);
-        agent_file
+        loaded
             .validate_input(&input)
             .with_context(|| format!("step '{label}'"))?;
 
         let settings =
-            resolve_step_settings(node, scope, env.file_config, Some(&agent_file), label)?;
+            resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?;
 
         call_agent(
-            &agent_file,
+            agent_file,
             &settings,
             env,
             &input,
