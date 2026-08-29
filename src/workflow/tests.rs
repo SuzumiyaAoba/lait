@@ -1938,6 +1938,43 @@ steps:
 }
 
 #[test]
+fn rejects_a_retry_with_a_negative_backoff() {
+    let result = parse_workflow(
+        r#"
+nodes:
+  n:
+    prompt: "{{ input }}"
+    retry:
+      max_attempts: 2
+      backoff: -1.0
+steps:
+  - use: n
+"#,
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("backoff"), "error was: {error}");
+}
+
+#[test]
+fn rejects_a_retry_with_a_non_finite_backoff() {
+    let result = parse_workflow(
+        r#"
+default:
+  retry:
+    max_attempts: 2
+    backoff: .inf
+nodes:
+  n:
+    prompt: "{{ input }}"
+steps:
+  - use: n
+"#,
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("backoff"), "error was: {error}");
+}
+
+#[test]
 fn rejects_a_workflow_default_timeout_of_zero() {
     let result = parse_workflow(
         r#"

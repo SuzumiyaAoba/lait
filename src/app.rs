@@ -223,7 +223,7 @@ impl RequestSettings {
         prompt: &str,
         response_format: Option<ResponseFormat>,
     ) -> Result<response::ChatCompletionResponse> {
-        let system_prompt = self.system_prompt_with_skills(env.skill_cache, system_prompt)?;
+        let system_prompt = self.system_prompt_with_skills(&env.skill_cache, system_prompt)?;
         let system_prompt = system_prompt.as_deref();
 
         if self.mcp.is_empty() && self.subagents.is_empty() {
@@ -369,7 +369,10 @@ impl RequestSettings {
 async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: bool) -> Result<()> {
     use std::io::Write;
 
-    let mut stdout = std::io::stdout();
+    // Locked once for the stream's whole lifetime: every delta write below
+    // would otherwise re-acquire stdout's mutex, and nothing else prints to
+    // stdout while a response is streaming.
+    let mut stdout = std::io::stdout().lock();
     let mut wrote_reasoning = false;
     let mut wrote_content = false;
 
@@ -660,11 +663,12 @@ fn resolve_request_settings(
     // than e.g. the alias) since that identifies the request uniformly
     // whether the value came from a `models:` entry, `default:`, or an
     // override — all of which have already been merged by this point.
+    let request_context = format!("the request for model '{}'", resolved_model.model_id);
     llm::validate_sampling_params(
         sampling.temperature,
         sampling.top_p,
         sampling.max_tokens,
-        &format!("the request for model '{}'", resolved_model.model_id),
+        &request_context,
     )?;
 
     let mcp = capability_overrides
@@ -674,10 +678,7 @@ fn resolve_request_settings(
     let max_tool_rounds = capability_overrides
         .max_tool_rounds
         .or(file_config.default.max_tool_rounds);
-    llm::validate_max_tool_rounds(
-        max_tool_rounds,
-        &format!("the request for model '{}'", resolved_model.model_id),
-    )?;
+    llm::validate_max_tool_rounds(max_tool_rounds, &request_context)?;
     let max_tool_rounds = max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
     let skills = capability_overrides
         .skills
@@ -797,23 +798,15 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
-    let skill_cache = skill::SkillCache::new(&file_config.skills);
+    let env = RunEnv::new(&file_config);
 
     if chat.stream {
         let stream = settings
-            .complete_stream(&skill_cache, None, &prompt, response_format)
+            .complete_stream(&env.skill_cache, None, &prompt, response_format)
             .await?;
         return stream_to_stdout(stream, chat.show_reasoning).await;
     }
 
-    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
-    let agent_registry = subagent::AgentRegistry::new(&file_config.agents);
-    let env = RunEnv {
-        file_config: &file_config,
-        registry: &registry,
-        skill_cache: &skill_cache,
-        agent_registry: &agent_registry,
-    };
     let response = settings
         .complete(&env, &[], None, &prompt, response_format)
         .await?;
@@ -823,16 +816,27 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     Ok(())
 }
 
+/// Prints the `<prefix> name: description` announcement line shared by
+/// `run_agent`/`run_workflow` (prefix `==>`) and `execute_step`'s `workflow:`
+/// branch (a progress-indented `->`): nothing when `name` is unset, and no
+/// trailing `:` when `description` is.
+fn announce_named_file(prefix: &str, name: Option<&str>, description: Option<&str>) {
+    let Some(name) = name else { return };
+    match description {
+        Some(description) => eprintln!("{prefix} {name}: {description}"),
+        None => eprintln!("{prefix} {name}"),
+    }
+}
+
 async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     let agent_file = agent::load_agent(&args.file)?;
     let file_config = config::load_config(no_config)?;
 
-    if let Some(name) = &agent_file.name {
-        match &agent_file.description {
-            Some(description) => eprintln!("==> {name}: {description}"),
-            None => eprintln!("==> {name}"),
-        }
-    }
+    announce_named_file(
+        "==>",
+        agent_file.name.as_deref(),
+        agent_file.description.as_deref(),
+    );
 
     let input = template::parse_input(&args.input);
     agent_file
@@ -841,15 +845,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
 
     let settings = agent_file_settings(&agent_file, &file_config, None)?;
 
-    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
-    let skill_cache = skill::SkillCache::new(&file_config.skills);
-    let agent_registry = subagent::AgentRegistry::new(&file_config.agents);
-    let env = RunEnv {
-        file_config: &file_config,
-        registry: &registry,
-        skill_cache: &skill_cache,
-        agent_registry: &agent_registry,
-    };
+    let env = RunEnv::new(&file_config);
     let output = call_agent(
         &agent_file,
         &settings,
@@ -869,23 +865,10 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let mut wf = workflow::load_workflow(&run_args.file)?;
     let file_config = config::load_config(no_config)?;
 
-    if let Some(name) = &wf.name {
-        match &wf.description {
-            Some(description) => eprintln!("==> {name}: {description}"),
-            None => eprintln!("==> {name}"),
-        }
-    }
+    announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
-    let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
-    let skill_cache = skill::SkillCache::new(&file_config.skills);
-    let agent_registry = subagent::AgentRegistry::new(&file_config.agents);
-    let env = RunEnv {
-        file_config: &file_config,
-        registry: &registry,
-        skill_cache: &skill_cache,
-        agent_registry: &agent_registry,
-    };
+    let env = RunEnv::new(&file_config);
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
         run_args.prompt,
@@ -960,9 +943,23 @@ pub(crate) fn check_workflow_nesting(
 /// functions' argument counts under clippy's `too_many_arguments` threshold.
 struct RunEnv<'a> {
     file_config: &'a ConfigFile,
-    registry: &'a mcp::McpRegistry<'a>,
-    skill_cache: &'a skill::SkillCache<'a>,
-    agent_registry: &'a subagent::AgentRegistry<'a>,
+    registry: mcp::McpRegistry<'a>,
+    skill_cache: skill::SkillCache<'a>,
+    agent_registry: subagent::AgentRegistry<'a>,
+}
+
+impl<'a> RunEnv<'a> {
+    /// Builds the registries/cache over `file_config`'s named entries. Cheap:
+    /// each one only borrows its config map — MCP connections, skill files,
+    /// and agent files are all loaded lazily on first use.
+    fn new(file_config: &'a ConfigFile) -> Self {
+        Self {
+            file_config,
+            registry: mcp::McpRegistry::new(&file_config.mcp_servers),
+            skill_cache: skill::SkillCache::new(&file_config.skills),
+            agent_registry: subagent::AgentRegistry::new(&file_config.agents),
+        }
+    }
 }
 
 /// The default model/reasoning-effort, model aliases, and JSON schema
@@ -975,32 +972,12 @@ struct RunEnv<'a> {
 /// executing (canonicalized), to reject a `workflow:` cycle and to cap
 /// nesting depth at `MAX_WORKFLOW_DEPTH`.
 struct WorkflowScope {
-    default_model: Option<String>,
-    default_reasoning_effort: Option<ReasoningEffort>,
-    /// Fallback sampling `temperature`/`top_p`/`max_tokens`, merged across
-    /// `workflow:` nesting the same way as `default_model`/
-    /// `default_reasoning_effort` (each falls back independently, not as a
-    /// whole unit like `default_retry`).
-    default_temperature: Option<f64>,
-    default_top_p: Option<f64>,
-    default_max_tokens: Option<u32>,
-    /// Fallback `retry`/`timeout` for a step that calls a model
-    /// (`prompt`/`agent`) and doesn't set its own (see
-    /// `execute_step_with_retry`). Merged across `workflow:` nesting the same
-    /// way as `default_model`/`default_reasoning_effort`: a sub-workflow's own
-    /// `default.retry`/`default.timeout` wins, falling back to its caller's
-    /// when unset.
-    default_retry: Option<workflow::RetryDefinition>,
-    default_timeout: Option<u64>,
-    /// Fallback `mcp`/`max_tool_rounds`/`skills`/`subagents` for a node that
-    /// doesn't set its own (see `resolve_step_settings`). Merged across
-    /// `workflow:` nesting the same way as `default_model`/
-    /// `default_reasoning_effort`: each falls back independently, like
-    /// `temperature`, not as a whole unit like `default_retry`.
-    default_mcp: Option<Vec<String>>,
-    default_max_tool_rounds: Option<usize>,
-    default_skills: Option<Vec<String>>,
-    default_subagents: Option<Vec<String>>,
+    /// The `default:` block in effect for this scope's steps. Merged across
+    /// `workflow:` nesting field by field — a sub-workflow's own entry wins,
+    /// falling back to its caller's when unset (see
+    /// `workflow::WorkflowDefaults::or_fallback`); only `retry` falls back as
+    /// a whole struct rather than field-by-field.
+    defaults: workflow::WorkflowDefaults,
     models: ModelMap,
     json_schemas: schema::JsonSchemaMap,
     /// This scope's own `nodes:` map, resolved by every `steps[].use` in this
@@ -1017,8 +994,8 @@ struct WorkflowScope {
 
 impl WorkflowScope {
     /// The scope for the workflow file passed on the command line. Takes
-    /// `wf.nodes` by move (via `mem::take`) rather than cloning it: `wf`'s
-    /// `nodes` map is never read again after this call, only `wf.steps`
+    /// `wf.default`/`wf.nodes` by move (via `mem::take`) rather than cloning
+    /// them: neither is ever read again after this call, only `wf.steps`
     /// (see `run_workflow`).
     fn top_level(wf: &mut workflow::WorkflowFile, file_path: &Path) -> Result<Self> {
         let canonical = std::fs::canonicalize(file_path).with_context(|| {
@@ -1032,17 +1009,7 @@ impl WorkflowScope {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         Ok(Self {
-            default_model: wf.default.model.clone(),
-            default_reasoning_effort: wf.default.reasoning_effort,
-            default_temperature: wf.default.temperature,
-            default_top_p: wf.default.top_p,
-            default_max_tokens: wf.default.max_tokens,
-            default_retry: wf.default.retry.clone(),
-            default_timeout: wf.default.timeout,
-            default_mcp: wf.default.mcp.clone(),
-            default_max_tool_rounds: wf.default.max_tool_rounds,
-            default_skills: wf.default.skills.clone(),
-            default_subagents: wf.default.subagents.clone(),
+            defaults: std::mem::take(&mut wf.default),
             models: wf.models.clone(),
             json_schemas: wf.json_schemas.clone(),
             nodes: std::mem::take(&mut wf.nodes),
@@ -1055,9 +1022,9 @@ impl WorkflowScope {
     /// `relative_path` (as given in the node) against this scope's
     /// `base_dir`, merges `sub_wf`'s `default`/`models`/`json_schemas` over
     /// this scope's (the sub-workflow's own entries win; an entry it doesn't
-    /// define falls back to this scope's), takes `sub_wf`'s `nodes:` outright
-    /// by move (no fallback — see `WorkflowScope::nodes` — and `sub_wf.nodes`
-    /// is never read again after this call, only `sub_wf.steps`), and
+    /// define falls back to this scope's), takes `sub_wf`'s `default`/`nodes:`
+    /// by move (`nodes` gets no fallback — see `WorkflowScope::nodes` — and
+    /// neither is ever read again after this call, only `sub_wf.steps`), and
     /// extends the cycle/depth bookkeeping. Fails if `relative_path`
     /// resolves to a workflow file already executing (a cycle) or nesting
     /// has reached `MAX_WORKFLOW_DEPTH`.
@@ -1107,43 +1074,7 @@ impl WorkflowScope {
             .unwrap_or_else(|| PathBuf::from("."));
 
         Ok(Self {
-            default_model: sub_wf
-                .default
-                .model
-                .clone()
-                .or_else(|| self.default_model.clone()),
-            default_reasoning_effort: sub_wf
-                .default
-                .reasoning_effort
-                .or(self.default_reasoning_effort),
-            default_temperature: sub_wf.default.temperature.or(self.default_temperature),
-            default_top_p: sub_wf.default.top_p.or(self.default_top_p),
-            default_max_tokens: sub_wf.default.max_tokens.or(self.default_max_tokens),
-            default_retry: sub_wf
-                .default
-                .retry
-                .clone()
-                .or_else(|| self.default_retry.clone()),
-            default_timeout: sub_wf.default.timeout.or(self.default_timeout),
-            default_mcp: sub_wf
-                .default
-                .mcp
-                .clone()
-                .or_else(|| self.default_mcp.clone()),
-            default_max_tool_rounds: sub_wf
-                .default
-                .max_tool_rounds
-                .or(self.default_max_tool_rounds),
-            default_skills: sub_wf
-                .default
-                .skills
-                .clone()
-                .or_else(|| self.default_skills.clone()),
-            default_subagents: sub_wf
-                .default
-                .subagents
-                .clone()
-                .or_else(|| self.default_subagents.clone()),
+            defaults: std::mem::take(&mut sub_wf.default).or_fallback(&self.defaults),
             models,
             json_schemas,
             nodes: std::mem::take(&mut sub_wf.nodes),
@@ -1363,75 +1294,45 @@ fn run_steps<'a>(
                     // sequentially, so a single growing counter reflects real execution
                     // order.
                     let mut loop_counter = counter;
-                    if let Some(while_cond) = &loop_def.r#while {
-                        let mut iterations_run = 0usize;
-                        loop {
-                            let should_continue =
-                                workflow::eval_when(while_cond, &iteration_input, &steps_outputs)
-                                    .with_context(|| format!("step '{label}'"))?;
-                            if !should_continue {
-                                break;
-                            }
-                            if iterations_run >= max_iterations {
-                                bail!(
-                                    "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'while'"
-                                );
-                            }
-                            iterations_run += 1;
-                            eprintln!(
-                                "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
-                            );
-                            let (result, new_counter, flow, new_steps_outputs) = run_steps(
-                                &loop_def.steps,
-                                iteration_input.clone(),
-                                scope,
-                                env,
-                                loop_counter,
-                                progress_prefix,
-                                steps_outputs.clone(),
-                            )
-                            .await?;
-                            iteration_input = result;
-                            loop_counter = new_counter;
-                            steps_outputs = new_steps_outputs;
-                            match flow {
-                                Flow::Continue => {}
-                                Flow::Break => break,
-                                Flow::Stop => {
-                                    return Ok((
-                                        iteration_input,
-                                        loop_counter,
-                                        Flow::Stop,
-                                        steps_outputs,
-                                    ));
-                                }
-                            }
+                    let mut iterations_run = 0usize;
+                    // One driver for both condition kinds (`validate_steps`
+                    // guarantees exactly one is set): `while` is checked before
+                    // each iteration (so the body may run zero times), `until`
+                    // after each one (so it always runs at least once). An
+                    // explicit `break: true` ends the loop like a satisfied
+                    // condition; exhausting `max_iterations` instead breaks
+                    // with `satisfied` = false, an error either way.
+                    let satisfied = loop {
+                        if let Some(while_cond) = &loop_def.r#while
+                            && !workflow::eval_when(while_cond, &iteration_input, &steps_outputs)
+                                .with_context(|| format!("step '{label}'"))?
+                        {
+                            break true;
                         }
-                    } else {
-                        let until_cond = loop_def.until.as_ref().expect(
-                            "loop.until is required by validate_steps when 'while' is unset",
+                        if iterations_run >= max_iterations {
+                            break false;
+                        }
+                        iterations_run += 1;
+                        eprintln!(
+                            "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
                         );
-                        let mut iterations_run = 0usize;
-                        let mut satisfied = false;
-                        while iterations_run < max_iterations {
-                            iterations_run += 1;
-                            eprintln!(
-                                "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
-                            );
-                            let (result, new_counter, flow, new_steps_outputs) = run_steps(
-                                &loop_def.steps,
-                                iteration_input.clone(),
-                                scope,
-                                env,
-                                loop_counter,
-                                progress_prefix,
-                                steps_outputs.clone(),
-                            )
-                            .await?;
-                            iteration_input = result;
-                            loop_counter = new_counter;
-                            steps_outputs = new_steps_outputs;
-                            if flow == Flow::Stop {
+                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                            &loop_def.steps,
+                            iteration_input.clone(),
+                            scope,
+                            env,
+                            loop_counter,
+                            progress_prefix,
+                            steps_outputs.clone(),
+                        )
+                        .await?;
+                        iteration_input = result;
+                        loop_counter = new_counter;
+                        steps_outputs = new_steps_outputs;
+                        match flow {
+                            Flow::Continue => {}
+                            Flow::Break => break true,
+                            Flow::Stop => {
                                 return Ok((
                                     iteration_input,
                                     loop_counter,
@@ -1439,25 +1340,23 @@ fn run_steps<'a>(
                                     steps_outputs,
                                 ));
                             }
-                            if flow == Flow::Break {
-                                // An explicit `break: true` ends the loop like a
-                                // satisfied `until`, not like exhausting
-                                // `max_iterations`.
-                                satisfied = true;
-                                break;
-                            }
-                            satisfied =
-                                workflow::eval_when(until_cond, &iteration_input, &steps_outputs)
-                                    .with_context(|| format!("step '{label}'"))?;
-                            if satisfied {
-                                break;
-                            }
                         }
-                        if !satisfied {
-                            bail!(
-                                "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying 'until'"
-                            );
+                        if let Some(until_cond) = &loop_def.until
+                            && workflow::eval_when(until_cond, &iteration_input, &steps_outputs)
+                                .with_context(|| format!("step '{label}'"))?
+                        {
+                            break true;
                         }
+                    };
+                    if !satisfied {
+                        let condition = if loop_def.r#while.is_some() {
+                            "while"
+                        } else {
+                            "until"
+                        };
+                        bail!(
+                            "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying '{condition}'"
+                        );
                     }
                     current_input = iteration_input;
                     counter = loop_counter;
@@ -1670,11 +1569,18 @@ fn run_steps<'a>(
     })
 }
 
+/// The upper bound on a single wait between retry attempts (see
+/// `execute_step_with_retry`): a `retry` whose `delay_seconds`/`backoff`
+/// (validated non-negative and finite by `workflow::validate`, but free to
+/// grow exponentially) would wait longer than this waits this long instead —
+/// a bounded, predictable worst case rather than an arbitrarily long hang.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
+
 /// Runs `execute_step`, applying an effective timeout to each attempt and
 /// retrying per an effective `retry` on failure (a timed-out attempt counts
 /// as a failure). "Effective" means the node's own `retry`/`timeout` if set,
-/// else `scope`'s `default_retry`/`default_timeout` (see
-/// `WorkflowScope::default_retry`) — but only for a node that calls a model
+/// else `scope`'s `defaults.retry`/`defaults.timeout` (see
+/// `WorkflowScope::defaults`) — but only for a node that calls a model
 /// (`prompt`/`agent`): a `jq`-only or `workflow:` node never falls back to
 /// the workflow default (a `workflow:` node's own `retry`/`timeout` are
 /// rejected by `validate::validate_node` in favor of the sub-workflow's own
@@ -1696,11 +1602,11 @@ async fn execute_step_with_retry(
 ) -> Result<String> {
     let calls_model = node.prompt.is_some() || node.agent.is_some();
     let effective_retry = node.retry.as_ref().or(calls_model
-        .then_some(scope.default_retry.as_ref())
+        .then_some(scope.defaults.retry.as_ref())
         .flatten());
     let effective_timeout = node
         .timeout
-        .or(calls_model.then_some(scope.default_timeout).flatten());
+        .or(calls_model.then_some(scope.defaults.timeout).flatten());
 
     let max_attempts = effective_retry
         .and_then(|retry| retry.max_attempts)
@@ -1712,7 +1618,8 @@ async fn execute_step_with_retry(
         effective_retry
             .and_then(|retry| retry.delay_seconds)
             .unwrap_or(0),
-    );
+    )
+    .min(MAX_RETRY_DELAY);
 
     let mut attempt = 0usize;
     loop {
@@ -1763,7 +1670,13 @@ async fn execute_step_with_retry(
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                delay = Duration::from_secs_f64((delay.as_secs_f64() * backoff).max(0.0));
+                // `try_from_secs_f64` + the `MAX_RETRY_DELAY` clamp keep an
+                // exponentially growing (or pathological) delay from
+                // overflowing `Duration` — `Duration::from_secs_f64` would
+                // panic there instead of just waiting the capped hour.
+                delay = Duration::try_from_secs_f64((delay.as_secs_f64() * backoff).max(0.0))
+                    .unwrap_or(MAX_RETRY_DELAY)
+                    .min(MAX_RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
@@ -1787,7 +1700,7 @@ fn resolve_step_settings(
         .model
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.model.clone()))
-        .or_else(|| scope.default_model.clone())
+        .or_else(|| scope.defaults.model.clone())
         .ok_or_else(|| {
             anyhow!(
                 "model is required for step '{label}'; set it on the node,{} the workflow's default.model, or in {}",
@@ -1799,39 +1712,39 @@ fn resolve_step_settings(
         reasoning_effort: node
             .reasoning_effort
             .or(agent_file.and_then(|agent_file| agent_file.reasoning_effort))
-            .or(scope.default_reasoning_effort),
+            .or(scope.defaults.reasoning_effort),
         temperature: node
             .temperature
             .or(agent_file.and_then(|agent_file| agent_file.temperature))
-            .or(scope.default_temperature),
+            .or(scope.defaults.temperature),
         top_p: node
             .top_p
             .or(agent_file.and_then(|agent_file| agent_file.top_p))
-            .or(scope.default_top_p),
+            .or(scope.defaults.top_p),
         max_tokens: node
             .max_tokens
             .or(agent_file.and_then(|agent_file| agent_file.max_tokens))
-            .or(scope.default_max_tokens),
+            .or(scope.defaults.max_tokens),
     };
     let mcp = node
         .mcp
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.mcp.clone()))
-        .or_else(|| scope.default_mcp.clone());
+        .or_else(|| scope.defaults.mcp.clone());
     let max_tool_rounds = node
         .max_tool_rounds
         .or_else(|| agent_file.and_then(|agent_file| agent_file.max_tool_rounds))
-        .or(scope.default_max_tool_rounds);
+        .or(scope.defaults.max_tool_rounds);
     let skills = node
         .skills
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.skills.clone()))
-        .or_else(|| scope.default_skills.clone());
+        .or_else(|| scope.defaults.skills.clone());
     let subagents = node
         .subagents
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.subagents.clone()))
-        .or_else(|| scope.default_subagents.clone());
+        .or_else(|| scope.defaults.subagents.clone());
     resolve_request_settings(
         model_name,
         overrides,
@@ -1870,19 +1783,26 @@ async fn execute_step(
     }
 
     let mut step_output = if let Some(agent_path) = &node.agent {
-        let agent_file =
-            agent::load_agent(agent_path).with_context(|| format!("step '{label}'"))?;
+        // Loaded through the registry's path cache (not `agent::load_agent`
+        // directly) so a `for_each`/`loop` body re-running this node reuses
+        // the parsed file and its resolved input schema instead of re-reading
+        // both from disk on every iteration.
+        let loaded = env
+            .agent_registry
+            .load_path(agent_path)
+            .with_context(|| format!("step '{label}'"))?;
+        let agent_file = &loaded.file;
 
         let input = template::parse_input(current_input);
-        agent_file
+        loaded
             .validate_input(&input)
             .with_context(|| format!("step '{label}'"))?;
 
         let settings =
-            resolve_step_settings(node, scope, env.file_config, Some(&agent_file), label)?;
+            resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?;
 
         call_agent(
-            &agent_file,
+            agent_file,
             &settings,
             env,
             &input,
@@ -1926,12 +1846,11 @@ async fn execute_step(
         let mut sub_wf =
             workflow::load_workflow(&resolved_path).with_context(|| format!("step '{label}'"))?;
         let sub_scope = scope.nested(sub_workflow_path, &mut sub_wf, label)?;
-        if let Some(name) = &sub_wf.name {
-            match &sub_wf.description {
-                Some(description) => eprintln!("{progress_prefix}    -> {name}: {description}"),
-                None => eprintln!("{progress_prefix}    -> {name}"),
-            }
-        }
+        announce_named_file(
+            &format!("{progress_prefix}    ->"),
+            sub_wf.name.as_deref(),
+            sub_wf.description.as_deref(),
+        );
         // Isolated like an `agent:` call, not threaded like a `switch` case:
         // the sub-workflow is a separate file with its own step ids, so it
         // starts with an empty `steps_outputs` and its Flow (whether it

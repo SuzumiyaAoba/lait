@@ -478,15 +478,26 @@ fn validate_for_each(
 }
 
 /// Validates a `retry` block (a node's own, or the workflow's
-/// `default.retry`): `max_attempts` is required and must be at least 1.
-/// `description` names what's being validated (e.g. `"node 'foo'"` or
-/// `"the workflow's 'default.retry'"`) for the error message.
+/// `default.retry`): `max_attempts` is required and must be at least 1, and
+/// `backoff` (when set) must be a finite number of at least 0 — YAML happily
+/// parses `.inf`/`.nan`/a negative multiplier, none of which describe a real
+/// retry schedule. `description` names what's being validated (e.g. `"node
+/// 'foo'"` or `"the workflow's 'default.retry'"`) for the error message.
 fn validate_retry(retry: &RetryDefinition, description: &str) -> Result<()> {
     match retry.max_attempts {
         None => bail!("{description} has 'retry' with no 'max_attempts' (required)"),
         Some(0) => bail!("{description} has 'retry' with 'max_attempts: 0'; it must be at least 1"),
-        Some(_) => Ok(()),
+        Some(_) => {}
     }
+    if let Some(backoff) = retry.backoff
+        && !(backoff.is_finite() && backoff >= 0.0)
+    {
+        bail!(
+            "{description} has 'retry' with 'backoff: {backoff}'; it must be a finite number of \
+             at least 0"
+        );
+    }
+    Ok(())
 }
 
 /// Validates a `timeout` value (a node's own, or the workflow's

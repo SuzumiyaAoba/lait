@@ -1,6 +1,8 @@
+use std::sync::LazyLock;
+
 use anyhow::{Context, Result, bail};
 use handlebars::{Handlebars, Helper, HelperResult, Output, RenderContext, RenderErrorReason};
-use serde_json::json;
+use serde::Serialize;
 
 /// Parses a raw string as JSON when possible; falls back to a JSON string
 /// holding the raw value unchanged (so a plain-text `{{ input }}` render is
@@ -39,13 +41,30 @@ pub(crate) fn render(
         );
     }
 
+    HANDLEBARS
+        .render_template(template, &TemplateData { input, steps })
+        .with_context(|| format!("failed to render template: {template:?}"))
+}
+
+/// The registry every `render` call shares: nothing about it depends on the
+/// template or data being rendered (strict mode, no escaping, the `json`
+/// helper), so it is built once instead of re-registered per call.
+static HANDLEBARS: LazyLock<Handlebars<'static>> = LazyLock::new(|| {
     let mut handlebars = Handlebars::new();
     handlebars.set_strict_mode(true);
     handlebars.register_escape_fn(handlebars::no_escape);
     handlebars.register_helper("json", Box::new(json_helper));
     handlebars
-        .render_template(template, &json!({ "input": input, "steps": steps }))
-        .with_context(|| format!("failed to render template: {template:?}"))
+});
+
+/// The `{ input, steps }` root object a template renders against, borrowing
+/// both values: handlebars only needs something `Serialize`, so this avoids
+/// deep-cloning the input and every recorded step output into a fresh
+/// `serde_json::Value` on every render (which a `json!` literal would do).
+#[derive(Serialize)]
+struct TemplateData<'a> {
+    input: &'a serde_json::Value,
+    steps: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 /// Checks `template`'s handlebars syntax without rendering it (used by the

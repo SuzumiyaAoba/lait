@@ -213,12 +213,26 @@ fn build_chat_request(
     Ok(chat_request.build()?)
 }
 
-pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompletionResponse> {
-    let config = OpenAIConfig::new()
-        .with_api_base(request.base_url)
-        .with_api_key(request.api_key);
-    let client = Client::with_config(config);
+/// The one HTTP client every completion request goes through. reqwest pools
+/// connections per (scheme, host) inside a client, so sharing one across a
+/// tool loop's rounds, a workflow's steps, and retries reuses live
+/// connections instead of paying a fresh TCP (and, for HTTPS, TLS) handshake
+/// per request — `Client::with_config` alone would build a new pool each
+/// call.
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
 
+/// Builds the API client [`complete`] and [`complete_stream`] share, wiring
+/// the request's base URL/API key to the shared `HTTP_CLIENT`.
+fn client(base_url: &str, api_key: &str) -> Client<OpenAIConfig> {
+    let config = OpenAIConfig::new()
+        .with_api_base(base_url)
+        .with_api_key(api_key);
+    Client::with_config(config).with_http_client(HTTP_CLIENT.clone())
+}
+
+pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompletionResponse> {
+    let client = client(request.base_url, request.api_key);
     let chat_request = build_chat_request(request, false)?;
     let response: ChatCompletionResponse = client.chat().create_byot(chat_request).await?;
     Ok(response)
@@ -227,11 +241,7 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
 /// Like [`complete`], but requests `stream: true` and returns the parsed SSE
 /// stream of response chunks instead of waiting for the full response.
 pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<CompletionStream> {
-    let config = OpenAIConfig::new()
-        .with_api_base(request.base_url)
-        .with_api_key(request.api_key);
-    let client = Client::with_config(config);
-
+    let client = client(request.base_url, request.api_key);
     let chat_request = build_chat_request(request, true)?;
     let stream = client.chat().create_stream_byot(chat_request).await?;
     Ok(stream)

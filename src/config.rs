@@ -228,6 +228,14 @@ pub(crate) fn resolve_model_alias(
 }
 
 pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
+    // Catches an empty/whitespace `model:` from any layer (an agent file's
+    // frontmatter, a workflow's `default.model`, a node's own `model:`) that
+    // would otherwise pass straight through as an empty `model` request
+    // field; the chat entry point filters empty names out before ever
+    // resolving, but the file-sourced layers have no other check.
+    if model_name.trim().is_empty() {
+        bail!("model name must not be empty");
+    }
     if let Some(resolved) = resolve_model_alias(&model_name, &config.models)? {
         return Ok(resolved);
     }
@@ -320,8 +328,23 @@ pub(crate) fn load_config(no_config: bool) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
-    use super::{McpServerConfig, McpTransport, expand_with};
+    use super::{ConfigFile, McpServerConfig, McpTransport, expand_with, resolve_model};
     use std::collections::HashMap;
+
+    #[test]
+    fn resolve_model_rejects_an_empty_model_name() {
+        let config = ConfigFile::default();
+        assert!(resolve_model(String::new(), &config).is_err());
+        assert!(resolve_model("   ".to_owned(), &config).is_err());
+    }
+
+    #[test]
+    fn resolve_model_passes_an_unaliased_name_through() {
+        let config = ConfigFile::default();
+        let resolved = resolve_model("some-model".to_owned(), &config).unwrap();
+        assert_eq!(resolved.model_id, "some-model");
+        assert!(resolved.base_url.is_none());
+    }
 
     fn lookup_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = vars
