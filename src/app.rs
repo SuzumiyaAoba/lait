@@ -231,17 +231,19 @@ impl RequestSettings {
             return llm::complete(self.request(response_format, messages, &[])).await;
         }
 
-        let mcp_tool_set = env.registry.tools(&self.mcp).await?;
-        let subagent_tool_set = env.agent_registry.tools(&self.subagents)?;
+        let mut mcp_tool_set = env.registry.tools(&self.mcp).await?;
+        let mut subagent_tool_set = env.agent_registry.tools(&self.subagents)?;
         for name in subagent_tool_set.names() {
             if mcp_tool_set.contains(name) {
                 bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
             }
         }
-        let mut tools: Vec<ChatCompletionTools> =
-            Vec::with_capacity(mcp_tool_set.tools.len() + subagent_tool_set.tools.len());
-        tools.extend(mcp_tool_set.tools.iter().cloned());
-        tools.extend(subagent_tool_set.tools.iter().cloned());
+        // Only `.contains()`/`.subagent_name()` (which read `.index`, not
+        // `.tools`) are used below, so `.tools` doesn't need to survive past
+        // this merge — moving it out avoids cloning every tool definition
+        // (including its full JSON `parameters`).
+        let mut tools = std::mem::take(&mut mcp_tool_set.tools);
+        tools.extend(std::mem::take(&mut subagent_tool_set.tools));
 
         let mut messages = llm::initial_messages(system_prompt, prompt)?;
 
@@ -438,6 +440,22 @@ async fn call_agent(
 /// `workflow:` nesting.
 const MAX_SUBAGENT_DEPTH: usize = 16;
 
+/// Converts a JSON value into raw prompt/tool-input text: a `Value::String`
+/// passes through unquoted (so `{{ input }}` sees the same plain text
+/// everywhere else in the pipeline does), any other value (object, array,
+/// number, ...) is serialized to compact JSON text. `context` names the
+/// caller's own site for the serialization-failure error. Shared by
+/// `run_steps`' `for_each` branch (both the sequential and concurrent
+/// per-item conversion) and `subagent_tool_input` below — the same "is this
+/// already plain text, or does it need to become a JSON text blob" question
+/// both ask.
+fn value_to_input_text(value: &serde_json::Value, context: &'static str) -> Result<String> {
+    match value {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        other => serde_json::to_string(other).context(context),
+    }
+}
+
 /// Unwraps a subagent tool call's raw JSON `arguments` into the `(input,
 /// prompt)` pair `call_agent` needs — the parsed JSON value for `{{
 /// input.field }}` template access, and the raw text sent as the user-role
@@ -446,9 +464,8 @@ const MAX_SUBAGENT_DEPTH: usize = 16;
 /// the subagent's input (its own schema already shaped `parameters`, so
 /// there's nothing to unwrap) and `prompt` is its canonical JSON text;
 /// otherwise `arguments` is the generic `{ "input": ... }` wrapper, and
-/// `input`/`prompt` are read out of its `input` field the same way a
-/// `for_each` item is converted (a JSON string passed through raw, anything
-/// else serialized to JSON text) — see `run_steps`' `for_each` branch.
+/// `input`/`prompt` are read out of its `input` field via
+/// `value_to_input_text`.
 fn subagent_tool_input(
     file: &AgentFile,
     arguments_json: &str,
@@ -466,15 +483,17 @@ fn subagent_tool_input(
         return Ok((arguments, prompt));
     }
 
-    let input_value = arguments
-        .get("input")
-        .cloned()
-        .ok_or_else(|| anyhow!("subagent tool call is missing the required 'input' field"))?;
-    let prompt = match &input_value {
-        serde_json::Value::String(text) => text.clone(),
-        other => serde_json::to_string(other)
-            .context("failed to serialize subagent tool call 'input'")?,
-    };
+    // Moved out (not cloned) when `arguments` is an object, since `arguments`
+    // itself is never used again after this.
+    let input_value = match arguments {
+        serde_json::Value::Object(mut map) => map.remove("input"),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow!("subagent tool call is missing the required 'input' field"))?;
+    let prompt = value_to_input_text(
+        &input_value,
+        "failed to serialize subagent tool call 'input'",
+    )?;
     Ok((input_value, prompt))
 }
 
@@ -498,20 +517,19 @@ fn call_subagent_tool<'a>(
     Box::pin(async move {
         let loaded = env.agent_registry.load(name)?;
 
-        if active_paths
-            .iter()
-            .any(|path| path == &loaded.canonical_path)
+        if let Err(error) =
+            check_nesting_depth(active_paths, &loaded.canonical_path, MAX_SUBAGENT_DEPTH)
         {
-            bail!(
-                "calling subagent '{name}' would create a cycle ('{}' is already running)",
-                loaded.canonical_path.display()
-            );
-        }
-        if active_paths.len() >= MAX_SUBAGENT_DEPTH {
-            bail!(
-                "calling subagent '{name}' exceeded the maximum subagent nesting depth of \
-                 {MAX_SUBAGENT_DEPTH}"
-            );
+            match error {
+                WorkflowNestingError::Cycle => bail!(
+                    "calling subagent '{name}' would create a cycle ('{}' is already running)",
+                    loaded.canonical_path.display()
+                ),
+                WorkflowNestingError::TooDeep => bail!(
+                    "calling subagent '{name}' exceeded the maximum subagent nesting depth of \
+                     {MAX_SUBAGENT_DEPTH}"
+                ),
+            }
         }
 
         let (input, prompt) = subagent_tool_input(&loaded.file, arguments_json)
@@ -521,36 +539,10 @@ fn call_subagent_tool<'a>(
             .validate_input(&input)
             .with_context(|| format!("subagent '{name}'"))?;
 
-        let model_name = loaded
-            .file
-            .model
-            .clone()
-            .or_else(|| env.file_config.default.model.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "model is required for subagent '{name}'; set it in its frontmatter or \
-                     default.model in {}",
-                    config::CONFIG_FILE_NAME
-                )
-            })?;
-        let settings = resolve_request_settings(
-            model_name,
-            SamplingOverrides {
-                reasoning_effort: loaded.file.reasoning_effort,
-                temperature: loaded.file.temperature,
-                top_p: loaded.file.top_p,
-                max_tokens: loaded.file.max_tokens,
-            },
-            None,
-            None,
-            CapabilityOverrides {
-                mcp: loaded.file.mcp.clone(),
-                max_tool_rounds: loaded.file.max_tool_rounds,
-                skills: loaded.file.skills.clone(),
-                subagents: loaded.file.subagents.clone(),
-            },
-            &ModelMap::default(),
+        let settings = agent_file_settings(
+            &loaded.file,
             env.file_config,
+            &format!(" for subagent '{name}'"),
         )
         .with_context(|| format!("subagent '{name}'"))?;
 
@@ -703,6 +695,53 @@ fn resolve_request_settings(
     })
 }
 
+/// Resolves an agent file's own `RequestSettings` — its `model` (required,
+/// falling back to `default.model`), sampling overrides, and
+/// `mcp`/`max_tool_rounds`/`skills`/`subagents` — against `file_config`.
+/// Shared by `run_agent` (the top-level `lait agent run` entry point) and
+/// `call_subagent_tool` (a subagent invoked as a tool mid-completion), which
+/// both need exactly this: an agent file's *own* settings, independent of
+/// any caller/step context (unlike `resolve_step_settings`, which layers a
+/// workflow node's own overrides on top). `missing_model_subject` names what
+/// a missing-model error is about (e.g. `""` for the top-level agent, or `"
+/// for subagent 'x'"`).
+fn agent_file_settings(
+    agent_file: &AgentFile,
+    file_config: &ConfigFile,
+    missing_model_subject: &str,
+) -> Result<RequestSettings> {
+    let model_name = agent_file
+        .model
+        .clone()
+        .or_else(|| file_config.default.model.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "model is required{missing_model_subject}; set it in its frontmatter or \
+                 default.model in {}",
+                config::CONFIG_FILE_NAME
+            )
+        })?;
+    resolve_request_settings(
+        model_name,
+        SamplingOverrides {
+            reasoning_effort: agent_file.reasoning_effort,
+            temperature: agent_file.temperature,
+            top_p: agent_file.top_p,
+            max_tokens: agent_file.max_tokens,
+        },
+        None,
+        None,
+        CapabilityOverrides {
+            mcp: agent_file.mcp.clone(),
+            max_tool_rounds: agent_file.max_tool_rounds,
+            skills: agent_file.skills.clone(),
+            subagents: agent_file.subagents.clone(),
+        },
+        &ModelMap::default(),
+        file_config,
+    )
+}
+
 async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let prompt = chat.prompt.clone().ok_or_else(|| {
         anyhow!("a PROMPT is required; provide one, or use `lait run <FILE> <PROMPT>`")
@@ -790,35 +829,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         .validate_input(&input)
         .with_context(|| format!("agent '{}'", args.file.display()))?;
 
-    let model_name = agent_file
-        .model
-        .clone()
-        .or_else(|| file_config.default.model.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "model is required; set it in the agent frontmatter or default.model in {}",
-                config::CONFIG_FILE_NAME
-            )
-        })?;
-    let settings = resolve_request_settings(
-        model_name,
-        SamplingOverrides {
-            reasoning_effort: agent_file.reasoning_effort,
-            temperature: agent_file.temperature,
-            top_p: agent_file.top_p,
-            max_tokens: agent_file.max_tokens,
-        },
-        None,
-        None,
-        CapabilityOverrides {
-            mcp: agent_file.mcp.clone(),
-            max_tool_rounds: agent_file.max_tool_rounds,
-            skills: agent_file.skills.clone(),
-            subagents: agent_file.subagents.clone(),
-        },
-        &ModelMap::default(),
-        &file_config,
-    )?;
+    let settings = agent_file_settings(&agent_file, &file_config, "")?;
 
     let registry = mcp::McpRegistry::new(&file_config.mcp_servers);
     let skill_cache = skill::SkillCache::new(&file_config.skills);
@@ -892,6 +903,28 @@ pub(crate) enum WorkflowNestingError {
     TooDeep,
 }
 
+/// Whether entering `canonical` from `active` (every file of the same kind
+/// currently on the call stack, canonicalized) would create a cycle or
+/// exceed `max_depth`. The generic core behind `check_workflow_nesting`
+/// (`workflow:` nodes, `max_depth` = `MAX_WORKFLOW_DEPTH`) and
+/// `call_subagent_tool` (`subagents:` calls, `max_depth` =
+/// `MAX_SUBAGENT_DEPTH`), so both kinds of self-referential file nesting
+/// share one cycle/depth-limit check instead of two copies of the same two
+/// comparisons.
+fn check_nesting_depth(
+    active: &[PathBuf],
+    canonical: &Path,
+    max_depth: usize,
+) -> Result<(), WorkflowNestingError> {
+    if active.iter().any(|path| path == canonical) {
+        return Err(WorkflowNestingError::Cycle);
+    }
+    if active.len() >= max_depth {
+        return Err(WorkflowNestingError::TooDeep);
+    }
+    Ok(())
+}
+
 /// Whether entering `canonical` from `active` (every `workflow:` file
 /// currently on the call stack, canonicalized) would create a cycle or
 /// exceed `MAX_WORKFLOW_DEPTH`. Shared by `WorkflowScope::nested` (fails the
@@ -902,13 +935,7 @@ pub(crate) fn check_workflow_nesting(
     active: &[PathBuf],
     canonical: &Path,
 ) -> Result<(), WorkflowNestingError> {
-    if active.iter().any(|path| path == canonical) {
-        return Err(WorkflowNestingError::Cycle);
-    }
-    if active.len() >= MAX_WORKFLOW_DEPTH {
-        return Err(WorkflowNestingError::TooDeep);
-    }
-    Ok(())
+    check_nesting_depth(active, canonical, MAX_WORKFLOW_DEPTH)
 }
 
 /// The loaded config file, the MCP registry, the skill cache, and the
@@ -1465,11 +1492,8 @@ fn run_steps<'a>(
                             // used below for results), not re-quoted as JSON, so
                             // `{{ input }}` sees the same unquoted text everywhere else
                             // in the pipeline does.
-                            let item_input = match item {
-                                serde_json::Value::String(text) => text.clone(),
-                                other => serde_json::to_string(other)
-                                    .context("failed to serialize a 'for_each' item")?,
-                            };
+                            let item_input =
+                                value_to_input_text(item, "failed to serialize a 'for_each' item")?;
                             let (result, new_counter, flow, new_steps_outputs) = run_steps(
                                 &for_each.steps,
                                 item_input,
@@ -1503,10 +1527,8 @@ fn run_steps<'a>(
                         );
                         let item_inputs: Vec<String> = items
                             .iter()
-                            .map(|item| match item {
-                                serde_json::Value::String(text) => Ok(text.clone()),
-                                other => serde_json::to_string(other)
-                                    .context("failed to serialize a 'for_each' item"),
+                            .map(|item| {
+                                value_to_input_text(item, "failed to serialize a 'for_each' item")
                             })
                             .collect::<Result<Vec<_>>>()?;
                         let item_prefixes: Vec<String> = (0..item_inputs.len())
