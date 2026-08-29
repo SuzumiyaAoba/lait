@@ -99,6 +99,16 @@ pub(crate) struct ChatArgs {
     #[arg(long, env = "OPENAI_API_KEY")]
     pub(crate) api_key: Option<String>,
 
+    /// A system prompt to send ahead of the user prompt. Falls back to
+    /// `default.system` in lait.config.yml when neither this nor
+    /// `--system-file` is given.
+    #[arg(long, value_name = "TEXT", conflicts_with = "system_file")]
+    pub(crate) system: Option<String>,
+
+    /// Read the system prompt from FILE instead of the command line.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) system_file: Option<PathBuf>,
+
     /// Display the model's reasoning content when the server provides it.
     #[arg(long)]
     pub(crate) show_reasoning: bool,

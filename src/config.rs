@@ -38,6 +38,10 @@ pub(crate) struct ConfigFile {
 pub(crate) struct DefaultSettings {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// A fallback system prompt for chat mode, used when neither `--system`
+    /// nor `--system-file` is given. Agent files and workflow nodes bring
+    /// their own system prompts and never read this.
+    pub(crate) system: Option<String>,
     /// Fallback sampling `temperature`/`top_p`/`max_tokens`, each falling back
     /// independently (unlike `WorkflowDefaults::retry`, which falls back as a
     /// whole unit) when a step/CLI invocation doesn't set its own.

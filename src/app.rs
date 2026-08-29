@@ -798,6 +798,22 @@ fn agent_file_settings(
     )
 }
 
+/// Resolves chat mode's system prompt: `--system` text, else `--system-file`
+/// contents, else `default.system` from lait.config.yml (`--system` and
+/// `--system-file` conflict at the clap level, so their order here never
+/// actually decides anything).
+fn resolve_system_prompt(chat: &ChatArgs, file_config: &ConfigFile) -> Result<Option<String>> {
+    if let Some(text) = &chat.system {
+        return Ok(Some(text.clone()));
+    }
+    if let Some(path) = &chat.system_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read system prompt file '{}'", path.display()))?;
+        return Ok(Some(text.trim_end().to_owned()));
+    }
+    Ok(file_config.default.system.clone())
+}
+
 async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let prompt = resolve_input_with_stdin(chat.prompt.clone())?.ok_or_else(|| {
         anyhow!(
@@ -845,17 +861,29 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
+    let system_prompt = resolve_system_prompt(&chat, &file_config)?;
     let env = RunEnv::new(&file_config);
 
     if chat.stream {
         let stream = settings
-            .complete_stream(&env.skill_cache, None, &prompt, response_format)
+            .complete_stream(
+                &env.skill_cache,
+                system_prompt.as_deref(),
+                &prompt,
+                response_format,
+            )
             .await?;
         return stream_to_stdout(stream, chat.show_reasoning).await;
     }
 
     let response = settings
-        .complete(&env, &[], None, &prompt, response_format)
+        .complete(
+            &env,
+            &[],
+            system_prompt.as_deref(),
+            &prompt,
+            response_format,
+        )
         .await?;
 
     let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
