@@ -17,6 +17,12 @@ pub(crate) struct Cli {
     /// Do not read lait.config.yml from the current directory.
     #[arg(long, global = true)]
     pub(crate) no_config: bool,
+
+    /// Do not read a `.env` file from the current directory. (Acted on
+    /// before argument parsing — see `main` — so this declaration only
+    /// provides `--help` output and validation.)
+    #[arg(long, global = true)]
+    pub(crate) no_env: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -28,6 +34,73 @@ pub(crate) enum Command {
     /// Statically check workflow (.yml/.yaml) and agent (.md) files for
     /// structural and reference errors, without running them.
     Lint(LintArgs),
+    /// List the model aliases configured in lait.config.yml, or the models
+    /// the server itself offers with `--remote`.
+    Models(ModelsArgs),
+    /// Generate a shell completion script on stdout (e.g. `lait completions
+    /// zsh > ~/.zfunc/_lait`).
+    Completions(CompletionsArgs),
+    /// Generate roff man pages for lait and every subcommand (lait.1,
+    /// lait-run.1, ...).
+    Man(ManArgs),
+    /// Generate starter files: `lait init` writes a minimal lait.config.yml,
+    /// `lait init workflow [PATH]` / `lait init agent [PATH]` write commented
+    /// workflow.yml / agent.md scaffolds.
+    Init(InitArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct InitArgs {
+    /// What to generate; omit for lait.config.yml in the current directory.
+    #[arg(value_enum, value_name = "KIND")]
+    pub(crate) kind: Option<InitKind>,
+
+    /// Where to write the generated file (defaults: workflow.yml /
+    /// agent.md). Only valid with a KIND — the config file's name is fixed.
+    #[arg(value_name = "PATH", requires = "kind")]
+    pub(crate) path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum InitKind {
+    /// A workflow YAML scaffold (`nodes:` + `steps:`).
+    Workflow,
+    /// An agent Markdown scaffold (frontmatter + system prompt).
+    Agent,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ManArgs {
+    /// The directory the man pages are written into (created if missing).
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub(crate) dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CompletionsArgs {
+    /// The shell to generate a completion script for.
+    #[arg(value_enum, value_name = "SHELL")]
+    pub(crate) shell: clap_complete::Shell,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ModelsArgs {
+    /// Ask the configured (or `--base-url`) server for its available models
+    /// (`GET /v1/models`) instead of listing configured aliases.
+    #[arg(long)]
+    pub(crate) remote: bool,
+
+    /// Print machine-readable JSON instead of a table.
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// The OpenAI-compatible API base URL to query with `--remote`.
+    #[arg(long, env = "OPENAI_BASE_URL")]
+    pub(crate) base_url: Option<String>,
+
+    /// The API key sent with `--remote`. LM Studio does not require one.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    pub(crate) api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -37,8 +110,15 @@ pub(crate) struct RunArgs {
     pub(crate) file: PathBuf,
 
     /// The initial input passed to the first step's `{{ input }}` placeholder.
+    /// May be omitted when input is piped via stdin (which is then used as the
+    /// input; when both are given, the piped text is appended to PROMPT).
     #[arg(value_name = "PROMPT")]
-    pub(crate) prompt: String,
+    pub(crate) prompt: Option<String>,
+
+    /// Print a per-step and total token usage summary to stderr when the
+    /// workflow finishes (for servers that report usage).
+    #[arg(long)]
+    pub(crate) show_usage: bool,
 }
 
 #[derive(Debug, Args)]
@@ -61,9 +141,16 @@ pub(crate) struct AgentRunArgs {
 
     /// The input passed to the agent. Parsed as JSON when possible, so the
     /// system prompt template can access `{{ input.field }}`; otherwise used
-    /// as-is for a plain `{{ input }}`.
+    /// as-is for a plain `{{ input }}`. May be omitted when input is piped
+    /// via stdin (which is then used as the input; when both are given, the
+    /// piped text is appended to INPUT).
     #[arg(value_name = "INPUT")]
-    pub(crate) input: String,
+    pub(crate) input: Option<String>,
+
+    /// Print a token usage summary to stderr when the agent finishes (for
+    /// servers that report usage).
+    #[arg(long)]
+    pub(crate) show_usage: bool,
 }
 
 #[derive(Debug, Args)]
@@ -89,9 +176,39 @@ pub(crate) struct ChatArgs {
     #[arg(long, env = "OPENAI_API_KEY")]
     pub(crate) api_key: Option<String>,
 
+    /// A system prompt to send ahead of the user prompt. Falls back to
+    /// `default.system` in lait.config.yml when neither this nor
+    /// `--system-file` is given.
+    #[arg(long, value_name = "TEXT", conflicts_with = "system_file")]
+    pub(crate) system: Option<String>,
+
+    /// Read the system prompt from FILE instead of the command line.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) system_file: Option<PathBuf>,
+
     /// Display the model's reasoning content when the server provides it.
     #[arg(long)]
     pub(crate) show_reasoning: bool,
+
+    /// Print the request's token usage to stderr after the response (so
+    /// piping stdout stays clean). With `--stream`, asks the server for
+    /// `stream_options: {"include_usage": true}`.
+    #[arg(long)]
+    pub(crate) show_usage: bool,
+
+    /// Write the response body to PATH instead of stdout (`-o -` writes to
+    /// stdout explicitly). With `--json`, the JSON object goes to the file;
+    /// with `--show-reasoning`, reasoning goes to stderr so the file holds
+    /// the body alone. Without `--stream`, the file is only written after
+    /// the request succeeds, so a failed run leaves no empty file behind.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub(crate) output: Option<PathBuf>,
+
+    /// Print nothing but the response body: notes outside it (reasoning
+    /// display, usage display) are suppressed, overriding
+    /// `--show-reasoning`/`--show-usage`.
+    #[arg(long)]
+    pub(crate) quiet: bool,
 
     /// Print the response as JSON.
     #[arg(long, conflicts_with = "stream")]
@@ -147,9 +264,29 @@ pub(crate) struct ChatArgs {
     #[arg(long = "subagent", value_name = "NAME", conflicts_with = "stream")]
     pub(crate) subagent: Vec<String>,
 
-    /// A single prompt to send as a user message.
+    /// A single prompt to send as a user message. May be omitted when input
+    /// is piped via stdin (which is then sent as the prompt; when both are
+    /// given, the piped text is appended to PROMPT as context). `-` reads
+    /// the prompt from stdin explicitly.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+}
+
+impl ReasoningEffort {
+    /// The lowercase name used on the CLI and in YAML, for display (e.g.
+    /// `lait models`' DEFAULTS column). Must match the `#[value(name)]`
+    /// attributes below — pinned by `as_str_matches_the_clap_value_names`
+    /// (`&'static str` is why this can't just call `to_possible_value`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -239,6 +376,22 @@ mod tests {
 
         assert!(!cli.chat.show_reasoning);
         assert_eq!(cli.chat.reasoning_effort, None);
+    }
+
+    #[test]
+    fn as_str_matches_the_clap_value_names() {
+        use clap::ValueEnum;
+
+        for variant in ReasoningEffort::value_variants() {
+            assert_eq!(
+                variant.as_str(),
+                variant
+                    .to_possible_value()
+                    .expect("no reasoning effort variant is skipped")
+                    .get_name(),
+                "ReasoningEffort::as_str drifted from the #[value(name)] attribute"
+            );
+        }
     }
 
     #[test]
@@ -364,7 +517,7 @@ mod tests {
         match cli.command {
             Some(Command::Run(run_args)) => {
                 assert_eq!(run_args.file.to_str(), Some("workflow.yml"));
-                assert_eq!(run_args.prompt, "hello world");
+                assert_eq!(run_args.prompt.as_deref(), Some("hello world"));
             }
             _ => panic!("expected the run subcommand to be selected"),
         }
@@ -380,16 +533,25 @@ mod tests {
                 action: AgentAction::Run(run_args),
             })) => {
                 assert_eq!(run_args.file.to_str(), Some("agent.md"));
-                assert_eq!(run_args.input, "hello");
+                assert_eq!(run_args.input.as_deref(), Some("hello"));
             }
             _ => panic!("expected the agent run subcommand to be selected"),
         }
     }
 
     #[test]
-    fn agent_run_subcommand_requires_file_and_input() {
+    fn agent_run_subcommand_requires_a_file_but_not_an_input() {
+        // INPUT is optional at the clap level so it can come from piped
+        // stdin instead; app-level code enforces that one of the two exists.
         assert!(Cli::try_parse_from(["lait", "agent", "run"]).is_err());
-        assert!(Cli::try_parse_from(["lait", "agent", "run", "agent.md"]).is_err());
+        let cli = Cli::try_parse_from(["lait", "agent", "run", "agent.md"])
+            .expect("input-less agent run should still parse");
+        match cli.command {
+            Some(Command::Agent(AgentCommand {
+                action: AgentAction::Run(run_args),
+            })) => assert!(run_args.input.is_none()),
+            _ => panic!("expected the agent run subcommand to be selected"),
+        }
     }
 
     #[test]
@@ -401,9 +563,16 @@ mod tests {
     }
 
     #[test]
-    fn run_subcommand_requires_file_and_prompt() {
+    fn run_subcommand_requires_a_file_but_not_a_prompt() {
+        // PROMPT is optional at the clap level so it can come from piped
+        // stdin instead; app-level code enforces that one of the two exists.
         assert!(Cli::try_parse_from(["lait", "run"]).is_err());
-        assert!(Cli::try_parse_from(["lait", "run", "workflow.yml"]).is_err());
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml"])
+            .expect("prompt-less run should still parse");
+        match cli.command {
+            Some(Command::Run(run_args)) => assert!(run_args.prompt.is_none()),
+            _ => panic!("expected the run subcommand to be selected"),
+        }
     }
 
     #[test]

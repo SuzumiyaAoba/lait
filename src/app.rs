@@ -20,7 +20,136 @@ use crate::{
     jq, lint, llm, mcp, response, schema, skill, subagent, template, workflow,
 };
 
-const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+
+/// Reads all of stdin into a string, trimming trailing newlines (piped text
+/// almost always ends in one, and a prompt should not).
+fn read_stdin_text() -> Result<String> {
+    use std::io::Read;
+
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .context("failed to read stdin")?;
+    Ok(buffer.trim_end_matches(['\n', '\r']).to_owned())
+}
+
+/// Combines a positional PROMPT/INPUT argument with piped stdin, the shared
+/// rule for chat, `lait run`, and `lait agent run`: a `-` argument reads
+/// stdin as the whole input; otherwise piped stdin (stdin not being a TTY)
+/// is the whole input when no argument is given, or is appended to the
+/// argument as context when one is. Returns `Ok(None)` when there is no
+/// input from either source — each caller reports that with its own message.
+fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
+    use std::io::IsTerminal;
+
+    if positional.as_deref() == Some("-") {
+        return Ok(Some(read_stdin_text()?).filter(|text| !text.trim().is_empty()));
+    }
+    let piped_text = if std::io::stdin().is_terminal() {
+        None
+    } else {
+        // An empty pipe (e.g. `< /dev/null`) counts as no input at all, not
+        // as an empty prompt.
+        Some(read_stdin_text()?).filter(|text| !text.trim().is_empty())
+    };
+    Ok(match (positional, piped_text) {
+        // Both given: the instruction first, then the piped text as context,
+        // separated by a blank line (e.g. `git diff | lait "review this"`).
+        (Some(argument), Some(piped)) => Some(format!("{argument}\n\n{piped}")),
+        (Some(argument), None) => Some(argument),
+        (None, piped) => piped,
+    })
+}
+
+/// Records each completion request's server-reported token usage under the
+/// label of whatever drove it (a workflow step, an agent, "chat"), so
+/// `--show-usage` can print a per-label and total summary once a run
+/// finishes. Lives in `RunEnv`, so recording must tolerate concurrent
+/// callers (`parallel`/concurrent `for_each` steps record from concurrently
+/// running tasks).
+#[derive(Default)]
+struct UsageTally {
+    events: std::sync::Mutex<Vec<(String, response::Usage)>>,
+}
+
+impl UsageTally {
+    /// Records `usage` under `label`.
+    fn record(&self, label: &str, usage: response::Usage) {
+        self.events
+            .lock()
+            .expect("usage tally lock should not be poisoned")
+            .push((label.to_owned(), usage));
+    }
+
+    /// Records `response`'s usage under `label`; a no-op when the server
+    /// reported none (absence stays distinguishable from zero in the
+    /// summary).
+    fn record_response(&self, label: &str, response: &response::ChatCompletionResponse) {
+        if let Some(usage) = response.usage {
+            self.record(label, usage);
+        }
+    }
+
+    /// Aggregates recorded events per label, in first-recorded order, as
+    /// `(label, summed usage, request count)`.
+    fn summarize(&self) -> Vec<(String, response::Usage, usize)> {
+        let events = self
+            .events
+            .lock()
+            .expect("usage tally lock should not be poisoned");
+        let mut per_label: Vec<(String, response::Usage, usize)> = Vec::new();
+        for (label, usage) in events.iter() {
+            match per_label
+                .iter_mut()
+                .find(|(existing, _, _)| existing == label)
+            {
+                Some((_, sum, count)) => {
+                    sum.add(*usage);
+                    *count += 1;
+                }
+                None => per_label.push((label.clone(), *usage, 1)),
+            }
+        }
+        per_label
+    }
+}
+
+/// Prints the `--show-usage` summary to stderr: one line for a single-label
+/// run (chat, a lone agent), a per-label breakdown plus total for a
+/// workflow. Usage counts every request made under a label — a tool loop's
+/// rounds, retries, and subagent calls (recorded under their own label) all
+/// count toward what the run actually consumed.
+fn print_usage_summary(tally: &UsageTally) {
+    let per_label = tally.summarize();
+    if per_label.is_empty() {
+        eprintln!("usage: (the server reported no usage)");
+        return;
+    }
+    let mut total = response::Usage::default();
+    let mut requests = 0usize;
+    for (_, usage, count) in &per_label {
+        total.add(*usage);
+        requests += count;
+    }
+    if per_label.len() == 1 {
+        eprintln!("usage: {total}{}", requests_suffix(requests));
+        return;
+    }
+    eprintln!("usage:");
+    for (label, usage, count) in &per_label {
+        eprintln!("  {label}: {usage}{}", requests_suffix(*count));
+    }
+    eprintln!("  total: {total}{}", requests_suffix(requests));
+}
+
+fn requests_suffix(count: usize) -> String {
+    if count > 1 {
+        format!(" ({count} requests)")
+    } else {
+        String::new()
+    }
+}
 
 /// The maximum number of tool-call round trips a single completion request
 /// may take (see `RequestSettings::complete`) before lait gives up and
@@ -36,8 +165,102 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             AgentAction::Run(args) => run_agent(args, cli.no_config).await,
         },
         Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
+        Some(Command::Models(models_args)) => crate::models::run(models_args, cli.no_config).await,
+        Some(Command::Completions(completions_args)) => {
+            generate_completions(completions_args);
+            Ok(())
+        }
+        Some(Command::Man(man_args)) => generate_man_pages(man_args),
+        Some(Command::Init(init_args)) => crate::init::run(init_args),
         None => run_chat(cli.chat, cli.no_config).await,
     }
+}
+
+/// Whether `cli`'s command awaits anything (a model request, MCP). `main`
+/// consults this before building the tokio runtime, so the purely local
+/// subcommands — `completions` in particular, which shell startup files run
+/// on every new shell — skip spawning worker threads and go through
+/// `run_blocking` instead. Every command still works through `run`, so a
+/// drift in this classification costs only startup time, never correctness.
+pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
+    match &cli.command {
+        Some(Command::Lint(_) | Command::Completions(_) | Command::Man(_) | Command::Init(_)) => {
+            false
+        }
+        Some(Command::Models(models_args)) => models_args.remote,
+        Some(Command::Run(_) | Command::Agent(_)) | None => true,
+    }
+}
+
+/// Runs the commands `needs_async_runtime` classifies as synchronous,
+/// without any async runtime behind them.
+pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
+    match cli.command {
+        Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
+        Some(Command::Models(models_args)) => {
+            if models_args.remote {
+                bail!("internal error: `models --remote` must run on the async path");
+            }
+            crate::models::run_local(models_args, cli.no_config)
+        }
+        Some(Command::Completions(completions_args)) => {
+            generate_completions(completions_args);
+            Ok(())
+        }
+        Some(Command::Man(man_args)) => generate_man_pages(man_args),
+        Some(Command::Init(init_args)) => crate::init::run(init_args),
+        Some(Command::Run(_) | Command::Agent(_)) | None => {
+            bail!("internal error: an async command reached run_blocking")
+        }
+    }
+}
+
+/// Writes the completion script for the requested shell to stdout, derived
+/// from the same clap `Command` tree `--help` is.
+fn generate_completions(args: crate::cli::CompletionsArgs) {
+    let mut command = <Cli as clap::CommandFactory>::command();
+    clap_complete::generate(args.shell, &mut command, "lait", &mut std::io::stdout());
+}
+
+/// Writes a man page for lait and one per (sub)subcommand into `args.dir`,
+/// derived from the same clap `Command` tree `--help` is. Pages are named
+/// the conventional way (`lait.1`, `lait-run.1`, `lait-agent-run.1`, ...).
+fn generate_man_pages(args: crate::cli::ManArgs) -> Result<()> {
+    std::fs::create_dir_all(&args.dir).with_context(|| {
+        format!(
+            "failed to create man page directory '{}'",
+            args.dir.display()
+        )
+    })?;
+    let mut command = <Cli as clap::CommandFactory>::command();
+    // Propagates global flags into subcommands so their pages show them.
+    command.build();
+    let count = render_man_pages(&args.dir, &command, "lait")?;
+    eprintln!("generated {count} man page(s) in '{}'", args.dir.display());
+    Ok(())
+}
+
+/// Renders `command`'s own page as `<name>.1` under `dir`, then recurses
+/// into its subcommands as `<name>-<subcommand>.1`, returning how many pages
+/// were written. The auto-generated `help` subcommand gets no page.
+fn render_man_pages(dir: &Path, command: &clap::Command, name: &str) -> Result<usize> {
+    let page = clap_mangen::Man::new(command.clone().name(name.to_owned()));
+    let mut buffer = Vec::new();
+    page.render(&mut buffer)
+        .with_context(|| format!("failed to render the man page for '{name}'"))?;
+    let path = dir.join(format!("{name}.1"));
+    std::fs::write(&path, buffer)
+        .with_context(|| format!("failed to write man page '{}'", path.display()))?;
+
+    let mut count = 1;
+    for subcommand in command.get_subcommands() {
+        if subcommand.get_name() == "help" {
+            continue;
+        }
+        let full_name = format!("{name}-{}", subcommand.get_name());
+        count += render_man_pages(dir, subcommand, &full_name)?;
+    }
+    Ok(count)
 }
 
 /// Statically checks every file in `lint_args.files` (see `lint::lint_file`)
@@ -142,6 +365,12 @@ struct RequestSettings {
     /// combined with `mcp` the same way in `complete`'s tool loop (empty
     /// tool sources for both keeps `complete`'s fast, tool-free path).
     subagents: Vec<String>,
+    /// Names these settings' requests in `env.usage`'s `--show-usage`
+    /// summary (a step label, an agent name, `"chat"`); every round of a
+    /// tool loop records under the same label. Set via `with_usage_label`
+    /// right after resolving, where the caller still knows what it is
+    /// resolving for.
+    usage_label: String,
 }
 
 /// Combines a caller's own system prompt (an agent's rendered template, or
@@ -164,6 +393,12 @@ fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<C
 }
 
 impl RequestSettings {
+    /// Sets `usage_label` — see that field's doc comment.
+    fn with_usage_label(mut self, label: impl Into<String>) -> Self {
+        self.usage_label = label.into();
+        self
+    }
+
     /// Builds an `llm::CompletionRequest` from these settings plus the
     /// per-call `response_format`/`messages`/`tools`. The `base_url`/
     /// `api_key`/`model_id`/sampling fields are the same for every request
@@ -187,6 +422,7 @@ impl RequestSettings {
             response_format,
             messages,
             tools,
+            stream_include_usage: false,
         }
     }
 
@@ -228,7 +464,9 @@ impl RequestSettings {
 
         if self.mcp.is_empty() && self.subagents.is_empty() {
             let messages = llm::initial_messages(system_prompt, prompt)?;
-            return llm::complete(self.request(response_format, messages, &[])).await;
+            return self
+                .complete_recorded(env, response_format, messages, &[])
+                .await;
         }
 
         // `agent_registry.tools` is synchronous (it only reads local subagent
@@ -263,7 +501,9 @@ impl RequestSettings {
                 );
             }
 
-            let response = llm::complete(self.request(None, messages.clone(), &tools)).await?;
+            let response = self
+                .complete_recorded(env, None, messages.clone(), &tools)
+                .await?;
 
             let tool_calls = response::first_message(&response)
                 .and_then(|message| message.tool_calls.as_ref())
@@ -276,7 +516,9 @@ impl RequestSettings {
                 // The model stopped calling tools; re-issue the same history
                 // once more with `response_format` attached, now that doing
                 // so can no longer suppress a tool call.
-                return llm::complete(self.request(response_format, messages, &[])).await;
+                return self
+                    .complete_recorded(env, response_format, messages, &[])
+                    .await;
             };
 
             let content = response::first_message(&response).and_then(|message| message.content());
@@ -313,6 +555,22 @@ impl RequestSettings {
         }
     }
 
+    /// The one way `complete` sends a request: builds it via `request`,
+    /// awaits it, and records the response's usage under
+    /// `self.usage_label` — so no future call site can forget the recording
+    /// and skew `--show-usage`.
+    async fn complete_recorded(
+        &self,
+        env: &RunEnv<'_>,
+        response_format: Option<ResponseFormat>,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &[ChatCompletionTools],
+    ) -> Result<response::ChatCompletionResponse> {
+        let response = llm::complete(self.request(response_format, messages, tools)).await?;
+        env.usage.record_response(&self.usage_label, &response);
+        Ok(response)
+    }
+
     /// Like [`RequestSettings::complete`], but requests a streamed response.
     /// Rejects `self.mcp`/`self.subagents` being non-empty: a streamed
     /// `tool_calls` field arrives as index-keyed fragments that must be
@@ -321,12 +579,16 @@ impl RequestSettings {
     /// is appended to `system_prompt` the same way as in `complete` — skills
     /// are static injection, so unlike `mcp`/`subagents` they impose no such
     /// restriction on streaming.
+    /// `include_usage` asks the server for a final usage chunk (see
+    /// `llm::CompletionRequest::stream_include_usage`); set it only when the
+    /// caller will actually display it (`--show-usage`).
     async fn complete_stream(
         &self,
         skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&str>,
         prompt: &str,
         response_format: Option<ResponseFormat>,
+        include_usage: bool,
     ) -> Result<llm::CompletionStream> {
         if !self.mcp.is_empty() {
             bail!(
@@ -341,7 +603,9 @@ impl RequestSettings {
         }
         let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
         let messages = llm::initial_messages(system_prompt.as_deref(), prompt)?;
-        llm::complete_stream(self.request(response_format, messages, &[])).await
+        let mut request = self.request(response_format, messages, &[]);
+        request.stream_include_usage = include_usage;
+        llm::complete_stream(request).await
     }
 
     /// Shared by `complete`/`complete_stream`: resolves `self.skills` against
@@ -366,33 +630,74 @@ impl RequestSettings {
 /// are dropped when `show_reasoning` is unset, same as the non-streaming
 /// path. Fails, like `response::response_content`, if the stream ends
 /// without ever producing content.
-async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: bool) -> Result<()> {
+/// Returns the usage carried by the final chunk, when the request asked for
+/// one (see `RequestSettings::complete_stream`'s `include_usage`) and the
+/// server obliged. `output_path` redirects the content to a file (`-o`):
+/// the file then holds the body alone, so reasoning deltas — normally
+/// written ahead of the content on stdout — go to stderr instead.
+async fn stream_response(
+    mut stream: llm::CompletionStream,
+    show_reasoning: bool,
+    output_path: Option<&Path>,
+) -> Result<Option<response::Usage>> {
     use std::io::Write;
 
-    // Locked once for the stream's whole lifetime: every delta write below
-    // would otherwise re-acquire stdout's mutex, and nothing else prints to
-    // stdout while a response is streaming.
-    let mut stdout = std::io::stdout().lock();
+    // Locked/opened once for the stream's whole lifetime: every delta write
+    // below would otherwise re-acquire stdout's mutex, and nothing else
+    // prints to the content sink while a response is streaming.
+    let mut stdout_lock;
+    let mut file_writer;
+    // Whether reasoning shares the content sink (the stdout presentation:
+    // a `Reasoning:` header, then a blank line before the content).
+    let reasoning_inline = output_path.is_none();
+    let content_sink: &mut dyn Write = match output_path {
+        None => {
+            stdout_lock = std::io::stdout().lock();
+            &mut stdout_lock
+        }
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .with_context(|| format!("failed to create output file '{}'", path.display()))?;
+            file_writer = std::io::BufWriter::new(file);
+            &mut file_writer
+        }
+    };
     let mut wrote_reasoning = false;
     let mut wrote_content = false;
+    let mut last_usage = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        if let Some(usage) = chunk.usage {
+            last_usage = Some(usage);
+        }
         let (content, reasoning) = response::stream_chunk_deltas(&chunk);
         if show_reasoning && let Some(reasoning) = reasoning {
-            if !wrote_reasoning {
-                writeln!(stdout, "Reasoning:")?;
-                wrote_reasoning = true;
+            if reasoning_inline {
+                if !wrote_reasoning {
+                    writeln!(content_sink, "Reasoning:")?;
+                }
+                write!(content_sink, "{reasoning}")?;
+                content_sink.flush()?;
+            } else {
+                if !wrote_reasoning {
+                    eprintln!("Reasoning:");
+                }
+                eprint!("{reasoning}");
             }
-            write!(stdout, "{reasoning}")?;
-            stdout.flush()?;
+            wrote_reasoning = true;
         }
         if let Some(content) = content {
-            if wrote_reasoning && !wrote_content {
-                write!(stdout, "\n\n")?;
+            if reasoning_inline && wrote_reasoning && !wrote_content {
+                write!(content_sink, "\n\n")?;
             }
-            write!(stdout, "{content}")?;
-            stdout.flush()?;
+            write!(content_sink, "{content}")?;
+            // Only the live stdout display needs each delta pushed out
+            // immediately; a `-o` file's `BufWriter` batches until the final
+            // flush below instead of paying a syscall per delta.
+            if reasoning_inline {
+                content_sink.flush()?;
+            }
             wrote_content = true;
         }
     }
@@ -400,8 +705,12 @@ async fn stream_to_stdout(mut stream: llm::CompletionStream, show_reasoning: boo
     if !wrote_content {
         bail!("API response contained no content in its first choice");
     }
-    println!();
-    Ok(())
+    if !reasoning_inline && wrote_reasoning {
+        eprintln!();
+    }
+    writeln!(content_sink)?;
+    content_sink.flush()?;
+    Ok(last_usage)
 }
 
 /// Renders an agent's system prompt against `input`, calls the model with
@@ -551,8 +860,9 @@ fn call_subagent_tool<'a>(
             subagent_tool_input(&loaded.file, arguments_json).with_context(context)?;
         loaded.validate_input(&input).with_context(context)?;
 
-        let settings =
-            agent_file_settings(&loaded.file, env.file_config, Some(name)).with_context(context)?;
+        let settings = agent_file_settings(&loaded.file, env.file_config, Some(name))
+            .with_context(context)?
+            .with_usage_label(format!("subagent '{name}'"));
 
         let mut next_active_paths = active_paths.to_vec();
         next_active_paths.push(loaded.canonical_path.clone());
@@ -596,48 +906,20 @@ fn resolve_request_settings(
         Some(resolved) => resolved,
         None => config::resolve_model(model_name, file_config)?,
     };
-    // `${VAR}` placeholders are only expanded in values sourced from
-    // `lait.config.yml`/a workflow's `models:` (see
-    // `config::expand_env_placeholders`), never in a `--base-url`/`--api-key`
-    // CLI override, which the shell already expands on its own.
-    let resolved_base_url = resolved_model
-        .base_url
-        .as_deref()
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let config_base_url = file_config
-        .base_url
-        .as_deref()
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let base_url = base_url_override
-        .or(resolved_base_url)
-        .or(config_base_url)
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
-    let base_url = base_url.trim_end_matches('/').to_owned();
-    if base_url.is_empty() {
-        return Err(anyhow!("base URL must not be empty"));
-    }
-    let resolved_api_key = resolved_model
-        .api_key
-        .as_deref()
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let config_api_key = file_config
-        .api_key
-        .as_deref()
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let api_key = api_key_override
-        .or(resolved_api_key)
-        .or(config_api_key)
-        .unwrap_or_else(|| {
-            // async-openai always builds an Authorization header from its config.
-            // LM Studio ignores the value, so use a non-empty dummy key when no
-            // key was supplied instead of making local requests fail on an empty
-            // header value.
-            "lm-studio".to_owned()
-        });
+    let (base_url, api_key) = resolve_endpoint(
+        base_url_override,
+        api_key_override,
+        resolved_model.base_url.as_deref(),
+        resolved_model.api_key.as_deref(),
+        file_config,
+    )?;
+    let api_key = api_key.unwrap_or_else(|| {
+        // async-openai always builds an Authorization header from its config.
+        // LM Studio ignores the value, so use a non-empty dummy key when no
+        // key was supplied instead of making local requests fail on an empty
+        // header value.
+        "lm-studio".to_owned()
+    });
     let sampling = SamplingOverrides {
         reasoning_effort: overrides
             .reasoning_effort
@@ -698,7 +980,52 @@ fn resolve_request_settings(
         max_tool_rounds,
         skills,
         subagents,
+        usage_label: String::new(),
     })
+}
+
+/// Resolves the endpoint a request goes to from the three layers every
+/// caller shares — explicit override > model-definition value > config
+/// top-level — falling back to `DEFAULT_BASE_URL`, normalizing the trailing
+/// slash, and rejecting an empty base URL. `${VAR}` placeholders are only
+/// expanded in the config-sourced layers (see
+/// `config::expand_env_placeholders`), never in an override, which the
+/// shell already expands on its own. The API key comes back as `None` when
+/// no layer sets one — `resolve_request_settings` substitutes its dummy
+/// key, `lait models --remote` sends no Authorization header at all.
+pub(crate) fn resolve_endpoint(
+    base_url_override: Option<String>,
+    api_key_override: Option<String>,
+    model_base_url: Option<&str>,
+    model_api_key: Option<&str>,
+    file_config: &ConfigFile,
+) -> Result<(String, Option<String>)> {
+    let model_base_url = model_base_url
+        .map(config::expand_env_placeholders)
+        .transpose()?;
+    let config_base_url = file_config
+        .base_url
+        .as_deref()
+        .map(config::expand_env_placeholders)
+        .transpose()?;
+    let base_url = base_url_override
+        .or(model_base_url)
+        .or(config_base_url)
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let base_url = base_url.trim_end_matches('/').to_owned();
+    if base_url.is_empty() {
+        return Err(anyhow!("base URL must not be empty"));
+    }
+    let model_api_key = model_api_key
+        .map(config::expand_env_placeholders)
+        .transpose()?;
+    let config_api_key = file_config
+        .api_key
+        .as_deref()
+        .map(config::expand_env_placeholders)
+        .transpose()?;
+    let api_key = api_key_override.or(model_api_key).or(config_api_key);
+    Ok((base_url, api_key))
 }
 
 /// Resolves an agent file's own `RequestSettings` — its `model` (required,
@@ -753,9 +1080,27 @@ fn agent_file_settings(
     )
 }
 
+/// Resolves chat mode's system prompt: `--system` text, else `--system-file`
+/// contents, else `default.system` from lait.config.yml (`--system` and
+/// `--system-file` conflict at the clap level, so their order here never
+/// actually decides anything).
+fn resolve_system_prompt(chat: &ChatArgs, file_config: &ConfigFile) -> Result<Option<String>> {
+    if let Some(text) = &chat.system {
+        return Ok(Some(text.clone()));
+    }
+    if let Some(path) = &chat.system_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read system prompt file '{}'", path.display()))?;
+        return Ok(Some(text.trim_end().to_owned()));
+    }
+    Ok(file_config.default.system.clone())
+}
+
 async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
-    let prompt = chat.prompt.clone().ok_or_else(|| {
-        anyhow!("a PROMPT is required; provide one, or use `lait run <FILE> <PROMPT>`")
+    let prompt = resolve_input_with_stdin(chat.prompt.clone())?.ok_or_else(|| {
+        anyhow!(
+            "a PROMPT is required; provide one, pipe input via stdin, or use `lait run <FILE> <PROMPT>`"
+        )
     })?;
 
     let file_config = config::load_config(no_config)?;
@@ -790,7 +1135,8 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         },
         &ModelMap::default(),
         &file_config,
-    )?;
+    )?
+    .with_usage_label("chat");
 
     let response_format = chat
         .json_schema
@@ -798,21 +1144,71 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
+    let system_prompt = resolve_system_prompt(&chat, &file_config)?;
     let env = RunEnv::new(&file_config);
+
+    // `--quiet` keeps the response body and drops every note around it.
+    let show_reasoning = chat.show_reasoning && !chat.quiet;
+    let show_usage = chat.show_usage && !chat.quiet;
+    // `-o -` is an explicit "stdout", the same as no `-o` at all.
+    let output_path = chat
+        .output
+        .as_deref()
+        .filter(|path| path.as_os_str() != "-");
 
     if chat.stream {
         let stream = settings
-            .complete_stream(&env.skill_cache, None, &prompt, response_format)
+            .complete_stream(
+                &env.skill_cache,
+                system_prompt.as_deref(),
+                &prompt,
+                response_format,
+                show_usage,
+            )
             .await?;
-        return stream_to_stdout(stream, chat.show_reasoning).await;
+        let usage = stream_response(stream, show_reasoning, output_path).await?;
+        if show_usage {
+            // Streamed usage arrives on the final chunk rather than through
+            // `complete`; feed it into the same tally so both chat paths
+            // share one summary format.
+            if let Some(usage) = usage {
+                env.usage.record(&settings.usage_label, usage);
+            }
+            print_usage_summary(&env.usage);
+        }
+        return Ok(());
     }
 
     let response = settings
-        .complete(&env, &[], None, &prompt, response_format)
+        .complete(
+            &env,
+            &[],
+            system_prompt.as_deref(),
+            &prompt,
+            response_format,
+        )
         .await?;
 
-    let output = response::render_response(&response, chat.json, chat.show_reasoning)?;
-    println!("{output}");
+    match output_path {
+        Some(path) => {
+            // The file gets the body alone; reasoning, when requested,
+            // becomes a stderr note like usage.
+            if show_reasoning && let Some(reasoning) = response::response_reasoning(&response) {
+                eprintln!("Reasoning:\n{reasoning}\n");
+            }
+            let mut body = response::render_response(&response, chat.json, false)?;
+            body.push('\n');
+            std::fs::write(path, body)
+                .with_context(|| format!("failed to write the response to '{}'", path.display()))?;
+        }
+        None => {
+            let output = response::render_response(&response, chat.json, show_reasoning)?;
+            println!("{output}");
+        }
+    }
+    if show_usage {
+        print_usage_summary(&env.usage);
+    }
     Ok(())
 }
 
@@ -829,6 +1225,8 @@ fn announce_named_file(prefix: &str, name: Option<&str>, description: Option<&st
 }
 
 async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
+    let raw_input = resolve_input_with_stdin(args.input.clone())?
+        .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let agent_file = agent::load_agent(&args.file)?;
     let file_config = config::load_config(no_config)?;
 
@@ -838,12 +1236,17 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         agent_file.description.as_deref(),
     );
 
-    let input = template::parse_input(&args.input);
+    let input = template::parse_input(&raw_input);
     agent_file
         .validate_input(&input)
         .with_context(|| format!("agent '{}'", args.file.display()))?;
 
-    let settings = agent_file_settings(&agent_file, &file_config, None)?;
+    let usage_label = agent_file
+        .name
+        .clone()
+        .unwrap_or_else(|| args.file.display().to_string());
+    let settings =
+        agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
     let env = RunEnv::new(&file_config);
     let output = call_agent(
@@ -851,17 +1254,22 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         &settings,
         &env,
         &input,
-        &args.input,
+        &raw_input,
         &workflow::StepOutputs::new(),
         &[],
     )
     .await
     .with_context(|| format!("agent '{}'", args.file.display()))?;
     println!("{output}");
+    if args.show_usage {
+        print_usage_summary(&env.usage);
+    }
     Ok(())
 }
 
 async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
+    let prompt = resolve_input_with_stdin(run_args.prompt.clone())?
+        .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
     let mut wf = workflow::load_workflow(&run_args.file)?;
     let file_config = config::load_config(no_config)?;
 
@@ -871,7 +1279,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let env = RunEnv::new(&file_config);
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
-        run_args.prompt,
+        prompt,
         &scope,
         &env,
         0,
@@ -880,6 +1288,9 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     )
     .await?;
     println!("{current_input}");
+    if run_args.show_usage {
+        print_usage_summary(&env.usage);
+    }
     Ok(())
 }
 
@@ -946,6 +1357,10 @@ struct RunEnv<'a> {
     registry: mcp::McpRegistry<'a>,
     skill_cache: skill::SkillCache<'a>,
     agent_registry: subagent::AgentRegistry<'a>,
+    /// Every completion request's server-reported token usage, recorded by
+    /// `RequestSettings::complete` and summarized when `--show-usage` asks
+    /// for it.
+    usage: UsageTally,
 }
 
 impl<'a> RunEnv<'a> {
@@ -958,6 +1373,7 @@ impl<'a> RunEnv<'a> {
             registry: mcp::McpRegistry::new(&file_config.mcp_servers),
             skill_cache: skill::SkillCache::new(&file_config.skills),
             agent_registry: subagent::AgentRegistry::new(&file_config.agents),
+            usage: UsageTally::default(),
         }
     }
 }
@@ -1799,7 +2215,8 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let settings =
-            resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?;
+            resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?
+                .with_usage_label(label);
 
         call_agent(
             agent_file,
@@ -1813,7 +2230,8 @@ async fn execute_step(
         .await
         .with_context(|| format!("step '{label}'"))?
     } else if let Some(prompt_template) = &node.prompt {
-        let settings = resolve_step_settings(node, scope, env.file_config, None, label)?;
+        let settings = resolve_step_settings(node, scope, env.file_config, None, label)?
+            .with_usage_label(label);
 
         let response_format = node
             .output_schema

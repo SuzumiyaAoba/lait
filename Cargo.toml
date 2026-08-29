@@ -1,14 +1,28 @@
 [package]
 name = "lait"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Lightweight AI Tool"
+license = "MIT"
+repository = "https://github.com/SuzumiyaAoba/lait"
 rust-version = "1.88"
+
+# `cargo binstall lait` resolves release artifacts through this metadata
+# (the release workflow names its archives to match).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1"
 async-openai = { version = "0.41.3", default-features = false, features = ["byot", "chat-completion", "rustls"] }
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive", "env", "string"] }
+clap_complete = "4.6.9"
+clap_mangen = "0.3.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 handlebars = "6.4.4"
 http = "1"

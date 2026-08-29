@@ -15,10 +15,13 @@ default:
   temperature: 0.7
   top_p: 0.9
   max_tokens: 512
+  system: あなたは有能なアシスタントです。
 ```
 
 `default:` には `model`/`reasoning_effort` に加えて、サンプリングパラメータ `temperature`
-（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）も指定できます。CLI の
+（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）も指定できます。
+`system` はチャットモードの既定システムプロンプトで、CLI の `--system`/`--system-file` が
+優先されます（システムプロンプトを自前で持つ agent／workflow はこの値を参照しません）。CLI の
 `--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独立してフォールバックします
 （`reasoning_effort` と同じ仕組みで、`retry` のようなブロック単位のフォールバックではありません）。
 
@@ -97,6 +100,24 @@ models:
 - この展開は設定ファイル（`lait.config.yml`、および後述するワークフローファイルの `models:`/
   トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
+
+## `.env` ファイルの自動読み込み
+
+起動時にカレントディレクトリの `.env` ファイルが自動で読み込まれ、**未設定の環境変数のみ**が
+補完されます（シェルで export 済みの変数が常に優先されます）。読み込まれた値は、CLI 引数の
+環境変数フォールバック（`OPENAI_API_KEY` など）と `${VAR_NAME}` 展開の両方から参照できます。
+
+```sh
+# .env
+OPENAI_API_KEY=sk-...
+CLOUD_API_KEY="quoted value"   # コメント
+export HOST=api.example.com    # export プレフィックスも可
+```
+
+- `.env` が存在しない場合は何もしません。壊れた行がある場合は行番号付きのエラーになります。
+- 値は `'...'`（そのまま）・`"..."`（`\n` などのエスケープ対応）・裸のいずれでも書けます。
+  複数行の値には対応していません。
+- `--no-env` フラグで読み込みを無効化できます。
 
 ## MCP サーバー
 

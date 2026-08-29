@@ -4,6 +4,45 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatCompletionResponse {
     choices: Vec<ChatCompletionChoice>,
+    /// The token counts the server reported for this request, when it did —
+    /// OpenAI-compatible servers are not obliged to, so every consumer
+    /// treats `None` as "not reported" rather than zero.
+    #[serde(default)]
+    pub(crate) usage: Option<Usage>,
+}
+
+/// The `usage` object of a chat completion response (or of a streamed
+/// response's final chunk, when `stream_options: {"include_usage": true}`
+/// was requested). Fields default to 0 individually so a server reporting
+/// only some of them still parses.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct Usage {
+    #[serde(default)]
+    pub(crate) prompt_tokens: u64,
+    #[serde(default)]
+    pub(crate) completion_tokens: u64,
+    #[serde(default)]
+    pub(crate) total_tokens: u64,
+}
+
+impl Usage {
+    /// Accumulates `other` into `self`, for summing usage across a tool
+    /// loop's rounds or a workflow's steps.
+    pub(crate) fn add(&mut self, other: Usage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+}
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prompt={} completion={} total={}",
+            self.prompt_tokens, self.completion_tokens, self.total_tokens
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +83,9 @@ pub(crate) struct ToolCallFunction {
 struct JsonOutput<'a> {
     content: &'a str,
     reasoning: Option<&'a str>,
+    /// Always present in `--json` output (as `null` when the server did not
+    /// report usage), so scripts can rely on the key existing.
+    usage: Option<Usage>,
 }
 
 /// A single `chat.completion.chunk` from a streamed (`stream: true`)
@@ -54,6 +96,11 @@ struct JsonOutput<'a> {
 pub(crate) struct ChatCompletionStreamChunk {
     #[serde(default)]
     choices: Vec<ChatCompletionStreamChoice>,
+    /// Set only on the final, choiceless chunk when the request asked for
+    /// `stream_options: {"include_usage": true}` (see
+    /// `llm::CompletionRequest::stream_include_usage`).
+    #[serde(default)]
+    pub(crate) usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,7 +156,11 @@ pub(crate) fn render_response(
     let reasoning = response_reasoning(response);
 
     if as_json {
-        Ok(serde_json::to_string(&JsonOutput { content, reasoning })?)
+        Ok(serde_json::to_string(&JsonOutput {
+            content,
+            reasoning,
+            usage: response.usage,
+        })?)
     } else {
         Ok(format_response(content, reasoning, show_reasoning))
     }
@@ -140,7 +191,11 @@ fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&s
         .ok_or("API response contained no content in its first choice")
 }
 
-fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
+/// The first choice's non-blank reasoning text, preferring the current
+/// `reasoning` field over the legacy `reasoning_content`. Exposed for the
+/// chat `-o` path, which sends reasoning to stderr while the file gets the
+/// body alone.
+pub(crate) fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
     response.choices.first().and_then(|choice| {
         choice
             .message

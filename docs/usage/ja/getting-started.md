@@ -55,7 +55,38 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--max-tokens <INT>` | `LLM_MAX_TOKENS` | 応答として生成するトークン数の上限（`1`以上）。API へは（非推奨の `max_tokens` ではなく）`max_completion_tokens` として送信されます。未指定時は API リクエストにフィールドを追加しません。 |
 | `--mcp <NAME>` | — | `lait.config.yml` の `mcp_servers:` エントリ名。繰り返し指定可能。指定した MCP サーバーのツールをモデルに渡します（詳細は [MCP サーバーのツールを使う](./mcp.md)）。`--stream` とは同時に指定できません。 |
 | `--subagent <NAME>` | — | `lait.config.yml` の `agents:` エントリ名。繰り返し指定可能。指定したエージェント Markdown ファイルを、モデル自身が呼び出すかどうか判断できる「サブエージェント」ツールとして渡します（詳細は [サブエージェントを使う](./subagents.md)）。`--stream` とは同時に指定できません。 |
-| `<PROMPT>` | — | 送信する単一のプロンプト。 |
+| `--system <TEXT>` | — | ユーザープロンプトの前に送るシステムプロンプト。未指定時は `lait.config.yml` の `default.system` にフォールバックします。`--system-file` とは同時に指定できません。 |
+| `--system-file <FILE>` | — | システムプロンプトをファイルから読み込みます。 |
+| `--show-usage` | — | 応答後にトークン使用量（`prompt`/`completion`/`total`）を標準エラー出力へ表示します（標準出力のパイプ利用を壊しません）。`--stream` 指定時はサーバーに `stream_options: {"include_usage": true}` を要求します。`lait run`/`lait agent run` でも使え、ワークフローではステップごとの内訳と合計を表示します。 |
+| `-o, --output <PATH>` | — | 応答本文を標準出力ではなく PATH に書き込みます（`--json` 併用時は JSON を書き込み、`-o -` は標準出力の明示指定）。`--stream` 以外では成功後にのみ書き込むため、失敗時に空ファイルが残りません。 |
+| `--quiet` | — | 応答本文以外の注記（reasoning 表示・usage 表示）をすべて抑制します（`--show-reasoning`/`--show-usage` より優先）。 |
+| `--no-config` | — | カレントディレクトリの `lait.config.yml` を読み込みません。 |
+| `--no-env` | — | カレントディレクトリの `.env` を読み込みません（詳細は [設定ファイル](./config.md)）。 |
+| `<PROMPT>` | — | 送信する単一のプロンプト。省略して標準入力から渡すこともできます（下記）。 |
+
+### 標準入力からのプロンプト（パイプ対応）
+
+標準入力が TTY でない場合、lait は標準入力を読み込みます。
+
+- プロンプト引数が**ない**場合: 標準入力全体をプロンプトとして送信します。
+- プロンプト引数が**ある**場合: 標準入力をコンテキストとしてプロンプトの後ろに連結します。
+- `lait -` と書くと、標準入力をプロンプトとして明示的に読み込みます。
+
+```sh
+git diff | lait "この変更をレビューして"
+cat question.txt | lait
+```
+
+同じ規則は `lait run <FILE> [PROMPT]` と `lait agent run <FILE> [INPUT]` の入力（`{{ input }}`）にも適用されます。
+
+### そのほかのサブコマンド
+
+| コマンド | 説明 |
+| --- | --- |
+| `lait models` | `lait.config.yml` の `models:` alias を一覧表示します（`default.model` に `*` マーク）。`--remote` でサーバーの `GET /v1/models` を照会、`--json` で機械可読出力。 |
+| `lait init` | 最小の `lait.config.yml` を生成します。`lait init workflow [PATH]` / `lait init agent [PATH]` はコメント付きの雛形を生成します（既存ファイルは上書きしません）。 |
+| `lait completions <SHELL>` | bash / zsh / fish / powershell / elvish の補完スクリプトを標準出力へ生成します。 |
+| `lait man --dir <DIR>` | `lait.1`、`lait-run.1` などの man ページを生成します。 |
 
 詳細なオプションは次のコマンドで確認できます。
 

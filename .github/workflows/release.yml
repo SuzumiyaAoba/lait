@@ -1,0 +1,232 @@
+# Builds release binaries for every supported platform when a `v*` tag is
+# pushed, attaches them (with checksums) to a GitHub Release, and — when the
+# matching secrets are configured — publishes to crates.io and updates the
+# Homebrew tap formula.
+#
+# Archive naming (`lait-v<version>-<target>.tar.gz` / `.zip`) matches the
+# `[package.metadata.binstall]` templates in Cargo.toml, so
+# `cargo binstall lait` works against these releases as-is.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Cross-compiled from the arm64 runner: the macOS SDK carries both
+          # architectures, and Intel runners are on their way out.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # No rust-cache here: GitHub's action cache is ref-scoped, so a cache
+      # saved on one tag can never be restored by the next tag's run — it
+      # would be pure write-only upload time.
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # aws-lc-sys (via rustls) assembles with NASM on MSVC targets.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: choco install nasm --yes
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="lait-v${version}-${{ matrix.target }}"
+          mkdir "$archive"
+          cp "target/${{ matrix.target }}/release/lait" "$archive/"
+          cp README.md LICENSE "$archive/"
+          tar -czf "$archive.tar.gz" "$archive"
+          shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $archive = "lait-v$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $archive | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/lait.exe" "$archive/"
+          Copy-Item README.md, LICENSE "$archive/"
+          Compress-Archive -Path $archive -DestinationPath "$archive.zip"
+          $hash = (Get-FileHash "$archive.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive.zip" | Out-File -Encoding ascii "$archive.zip.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+            *.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: cat dist/*.sha256 | sort -k2 > dist/SHA256SUMS
+
+      - name: Create the release with artifacts attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS
+
+  # Publishes the crate when the CRATES_IO_TOKEN secret is configured.
+  publish-crate:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+    steps:
+      - name: Check out repository
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked
+
+  # Regenerates the formula in SuzumiyaAoba/homebrew-tap when the
+  # HOMEBREW_TAP_TOKEN secret (a token with push access to that repository)
+  # is configured.
+  homebrew:
+    name: Update Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      # Only the checksums are needed, so fetch the small SHA256SUMS the
+      # release job just attached instead of downloading every platform's
+      # full archives as artifacts.
+      - name: Fetch release checksums
+        if: env.TAP_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS
+
+      - name: Generate and push the formula
+        if: env.TAP_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          sha() {
+            local file="lait-v${version}-$1.tar.gz"
+            local hash
+            hash="$(awk -v file="$file" '$2 == file { print $1 }' SHA256SUMS)"
+            [ -n "$hash" ] || { echo "no checksum for $file in SHA256SUMS" >&2; exit 1; }
+            echo "$hash"
+          }
+          sha_mac_arm="$(sha aarch64-apple-darwin)"
+          sha_mac_x86="$(sha x86_64-apple-darwin)"
+          sha_linux="$(sha x86_64-unknown-linux-gnu)"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/SuzumiyaAoba/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/lait.rb <<EOF
+          class Lait < Formula
+            desc "Lightweight AI Tool"
+            homepage "https://github.com/SuzumiyaAoba/lait"
+            license "MIT"
+            version "${version}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${base_url}/lait-v${version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${sha_mac_arm}"
+              else
+                url "${base_url}/lait-v${version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${sha_mac_x86}"
+              end
+            end
+
+            on_linux do
+              url "${base_url}/lait-v${version}-x86_64-unknown-linux-gnu.tar.gz"
+              sha256 "${sha_linux}"
+            end
+
+            def install
+              bin.install "lait"
+              generate_completions_from_executable(bin/"lait", "completions")
+              system bin/"lait", "man", "--dir", buildpath/"man"
+              man1.install Dir[buildpath/"man/*.1"]
+            end
+
+            test do
+              assert_match "lait", shell_output("#{bin}/lait --version")
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/lait.rb
+          git commit -m "lait ${version}"
+          git push

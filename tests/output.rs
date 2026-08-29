@@ -87,6 +87,7 @@ fn emits_json_with_null_reasoning_when_reasoning_is_missing() {
         serde_json::json!({
             "content": "mock \"response\"\nsecond line",
             "reasoning": null,
+            "usage": null,
         })
     );
 }
@@ -110,6 +111,7 @@ fn emits_json_with_current_reasoning_in_preference_to_legacy_reasoning_content()
         serde_json::json!({
             "content": "mock response",
             "reasoning": "current reasoning",
+            "usage": null,
         })
     );
 }
@@ -133,6 +135,7 @@ fn emits_json_with_legacy_reasoning_content_when_current_reasoning_is_blank() {
         serde_json::json!({
             "content": "mock response",
             "reasoning": "legacy reasoning",
+            "usage": null,
         })
     );
 }
