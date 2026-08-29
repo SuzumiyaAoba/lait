@@ -263,6 +263,115 @@ steps:
 }
 
 #[test]
+fn a_prompt_node_sends_its_rendered_system_prompt_ahead_of_the_user_prompt() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  echo:
+    system_prompt: "Reply in {{{{ input }}}}."
+    prompt: "{{{{ input }}}}"
+steps:
+  - use: echo
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "French");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "Reply in French."},
+            {"role": "user", "content": "French"},
+        ])
+    );
+}
+
+#[test]
+fn a_node_overrides_the_workflow_default_system_prompt() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+  system_prompt: from default
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  echo:
+    system_prompt: from node
+    prompt: "{{{{ input }}}}"
+steps:
+  - use: echo
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["messages"][0],
+        serde_json::json!({"role": "system", "content": "from node"})
+    );
+}
+
+#[test]
+fn a_prompt_node_falls_back_to_the_workflow_default_system_prompt() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+  system_prompt: from default
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  echo:
+    prompt: "{{{{ input }}}}"
+steps:
+  - use: echo
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(
+        request_json["messages"][0],
+        serde_json::json!({"role": "system", "content": "from default"})
+    );
+}
+
+#[test]
 fn step_requests_structured_output_and_extracts_a_field_with_jq() {
     let schema = JsonSchemaFile::new(
         r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,

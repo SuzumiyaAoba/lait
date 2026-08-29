@@ -275,11 +275,12 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
     if node.agent.is_some()
         && (node.input_schema.is_some()
             || node.output_schema.is_some()
-            || node.schema_name.is_some())
+            || node.schema_name.is_some()
+            || node.system_prompt.is_some())
     {
         bail!(
-            "{description} has 'agent' set; 'input_schema'/'output_schema'/'schema_name' come \
-             from the agent file and must not be set on the node"
+            "{description} has 'agent' set; 'input_schema'/'output_schema'/'schema_name'/\
+             'system_prompt' come from the agent file and must not be set on the node"
         );
     }
     if node.workflow.is_some()
@@ -290,12 +291,13 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
             || node.max_tokens.is_some()
             || node.input_schema.is_some()
             || node.output_schema.is_some()
-            || node.schema_name.is_some())
+            || node.schema_name.is_some()
+            || node.system_prompt.is_some())
     {
         bail!(
             "{description} has 'workflow' set; 'model'/'reasoning_effort'/'temperature'/'top_p'/\
-             'max_tokens'/'input_schema'/'output_schema'/'schema_name' come from the referenced \
-             workflow file and must not be set on the node"
+             'max_tokens'/'input_schema'/'output_schema'/'schema_name'/'system_prompt' come from \
+             the referenced workflow file and must not be set on the node"
         );
     }
     if node.workflow.is_some() && (node.retry.is_some() || node.timeout.is_some()) {
@@ -329,6 +331,13 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
     }
     if !calls_model && node.output_schema.is_some() {
         bail!("{description} has 'output_schema' but no 'prompt'/'agent' to apply it to");
+    }
+    // Reached only once the 'agent'/'workflow' combinations above are ruled
+    // out, so this fires exactly for a node with 'system_prompt' but neither
+    // 'prompt' nor 'agent' (a jq-only node, or 'workflow' — already rejected
+    // above with a more specific message).
+    if node.prompt.is_none() && node.system_prompt.is_some() {
+        bail!("{description} has 'system_prompt' but no 'prompt' to apply it to");
     }
     if node.output_schema.is_none() && node.schema_name.is_some() {
         bail!("{description} has 'schema_name' but no 'output_schema'");

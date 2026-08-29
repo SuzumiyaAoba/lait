@@ -2251,9 +2251,18 @@ async fn execute_step(
         let input = template::parse_input(current_input);
         let prompt = template::render(prompt_template, &input, steps_outputs)
             .with_context(|| format!("step '{label}'"))?;
+        let system_prompt = node
+            .system_prompt
+            .as_deref()
+            .or(scope.defaults.system_prompt.as_deref())
+            .map(|system_prompt_template| {
+                template::render(system_prompt_template, &input, steps_outputs)
+            })
+            .transpose()
+            .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(env, &[], None, &prompt, response_format)
+            .complete(env, &[], system_prompt.as_deref(), &prompt, response_format)
             .await
             .with_context(|| format!("step '{label}'"))?;
 

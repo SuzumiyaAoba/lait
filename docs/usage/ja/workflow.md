@@ -352,6 +352,40 @@ steps:
 - 対応モデルは LM Studio 上のツール呼び出し対応モデル（`qwen3` 系など）を想定しています。
   ツール呼び出しに対応していないモデルでは `tool_calls` が一切返らず、ツールは呼ばれません。
 
+## システムプロンプトの指定（`system_prompt`）
+
+`prompt` を持つノードには `system_prompt:` で、ユーザーメッセージ（`prompt`）とは別に
+システムプロンプトを指定できます。指定しない場合、これまで通り `prompt` のレンダリング結果
+だけがユーザーメッセージとして送られ、システムプロンプトは付きません。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+  system_prompt: "あなたは日本語のプロの校正者です。"   # ワークフロー全体の既定
+nodes:
+  proofread:
+    system_prompt: "文体は「ですます調」に統一してください。"   # ノードで上書き
+    prompt: "{{ input }}"
+  translate:
+    prompt: "{{ input }}"
+    # system_prompt を書かなければ default.system_prompt にフォールバック
+steps:
+  - use: proofread
+  - use: translate
+```
+
+- `system_prompt` は `prompt` と同じテンプレートエンジン（handlebars）でレンダリングされ、
+  `{{ input }}` / `{{ steps.<id> }}` にアクセスできます。
+- `system_prompt` は `skills`/`mcp` と同じ、ノード → ワークフローの `default:` の順に
+  独立してフォールバックします（`lait.config.yml` 側にはフォールバックしません）。
+- `system_prompt` は `prompt` を持つノードにのみ指定できます。`agent` ノードは agent
+  Markdown ファイルの本文が既にシステムプロンプトなので、`system_prompt` と `agent` は
+  併用できません。`workflow:` ノード（サブワークフロー側の各ノードに指定してください）や
+  データ変換のみの `jq` ノードにも指定できません。
+- `skills` の追記先はこの `system_prompt`（レンダリング後）です。両方を指定した場合、
+  `system_prompt` の内容の後に `---` 区切りでスキルの内容が続きます。
+
 ## スキルの利用（`skills`）
 
 `prompt`/`agent` を持つノードに `skills:` で `lait.config.yml` の `skills:`（登録方法は
@@ -380,9 +414,11 @@ steps:
   ワークフローの `default:` → `lait.config.yml` の `default:` の順にフォールバックします。
 - `skills` は `prompt`/`agent` を持つノードだけに指定できます。データ変換のみの `jq` ノードや
   `workflow:` ノード（サブワークフロー側の各ノードに指定してください）には指定できません。
-- スキルの内容は、ノードの `prompt`（レンダリング後）や agent ファイルのシステムプロンプトの
-  後に `---` 区切りで追記されます。ノード/agent 自身の指示が優先して読まれるようにするための
-  順序です。
+- スキルの内容は、ノードの `system_prompt`（指定されていれば、レンダリング後）や agent
+  ファイルのシステムプロンプトの後に `---` 区切りで追記され、システムメッセージになります
+  （`prompt` 自体は別のユーザーメッセージのままです）。ノード/agent 自身の指示が優先して
+  読まれるようにするための順序です。`system_prompt` を指定していない `prompt` ノードでは、
+  スキルの内容だけがシステムメッセージとして送られます。
 - スキルファイルの本文は handlebars テンプレートとしてレンダリングされません（`{{ }}` を含む
   コード例などをそのまま書けます）。
 - `mcp` と異なり `--stream` との併用に制限はありません（スキルは単なる静的な追記であり、

@@ -77,6 +77,10 @@ pub(crate) struct WorkflowDefaults {
     /// Fallback `subagents` for any node that calls a model (`prompt`/
     /// `agent`) and doesn't set its own. Falls back independently, like `mcp`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Fallback `system_prompt` for any `prompt` node that doesn't set its
+    /// own. Falls back independently, like `mcp`. Meaningless for an `agent`
+    /// node, which supplies its own system prompt from its agent file.
+    pub(crate) system_prompt: Option<String>,
 }
 
 impl WorkflowDefaults {
@@ -98,6 +102,9 @@ impl WorkflowDefaults {
             max_tool_rounds: self.max_tool_rounds.or(fallback.max_tool_rounds),
             skills: self.skills.or_else(|| fallback.skills.clone()),
             subagents: self.subagents.or_else(|| fallback.subagents.clone()),
+            system_prompt: self
+                .system_prompt
+                .or_else(|| fallback.system_prompt.clone()),
         }
     }
 }
@@ -127,6 +134,13 @@ pub(crate) struct NodeDefinition {
     /// `jq` filter, making it a data-only transformation node. Mutually
     /// exclusive with `agent`.
     pub(crate) prompt: Option<String>,
+    /// A system prompt template, rendered the same way as `prompt` (see
+    /// `template::render`) and sent ahead of it as the system message. Falls
+    /// back to the workflow's `default.system_prompt` when unset, the same
+    /// way as `skills`. Only meaningful together with `prompt`: an `agent`
+    /// node already has its own system prompt (the agent file's body), so
+    /// `system_prompt` is rejected alongside `agent`.
+    pub(crate) system_prompt: Option<String>,
     /// Path to an agent Markdown file (see `agent::load_agent`) whose system
     /// prompt, model/reasoning defaults, and input/output schema drive this
     /// node instead of `prompt`/`input_schema`/`output_schema`/`schema_name`.
