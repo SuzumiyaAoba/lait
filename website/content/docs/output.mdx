@@ -1,6 +1,6 @@
 ---
 title: "出力例"
-description: "標準出力、--stream、--json-schema、--json"
+description: "標準出力、--stream、--json-schema、--json、--render"
 ---
 
 リクエストが成功すると、モデルの応答テキストが標準出力に表示されます。応答内容はロードしたモデルによって異なります。
@@ -61,3 +61,15 @@ cargo run -- --json --model "モデル ID" "Rustについて一文で説明し�
   "reasoning": null
 }
 ```
+
+## `--render`（TTY 向け Markdown レンダリング）
+
+`--render` を指定すると、応答の Markdown（見出し・リスト・強調・コードブロック・テーブルなど）を端末向けに装飾して表示します（`termimad` クレートを使用）。`lait.config.yml` の `default.render: true` で既定を変更できます。
+
+```sh
+lait --render --model "モデル ID" "Markdown で回答して"
+```
+
+- 標準出力が端末（TTY）でない場合（パイプ・リダイレクト）は自動的に生テキストにフォールバックします。
+- `--json` の出力には影響しません（機械可読な JSON はそのまま）。
+- `--stream` と併用した場合、現状は装飾されずストリーミングの生テキスト表示のままになります。

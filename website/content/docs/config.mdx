@@ -1,8 +1,7 @@
 ---
 title: "設定ファイル"
-description: "lait.config.yml、モデル定義と alias、設定値の優先順位、${VAR_NAME} による環境変数参照、MCP サーバーの登録"
+description: "lait.config.yml、モデル定義と alias、設定値の優先順位、${VAR_NAME} による環境変数参照、.env の自動読み込み、MCP サーバー・スキル・サブエージェントの登録"
 ---
-
 CLI 引数や環境変数で指定していない値は、コマンドを実行したディレクトリの
 `lait.config.yml` からデフォルトとして読み込まれます。設定できる基本項目は次のとおりです。
 
@@ -16,10 +15,13 @@ default:
   temperature: 0.7
   top_p: 0.9
   max_tokens: 512
+  system: あなたは有能なアシスタントです。
 ```
 
 `default:` には `model`/`reasoning_effort` に加えて、サンプリングパラメータ `temperature`
-（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）も指定できます。CLI の
+（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）も指定できます。
+`system` はチャットモードの既定システムプロンプトで、CLI の `--system`/`--system-file` が
+優先されます（システムプロンプトを自前で持つ agent／workflow はこの値を参照しません）。CLI の
 `--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独立してフォールバックします
 （`reasoning_effort` と同じ仕組みで、`retry` のようなブロック単位のフォールバックではありません）。
 
@@ -46,6 +48,7 @@ models:
       model_id: cloud-model
       default_reasoning_effort: high
       default_temperature: 0.7
+      default_top_p: 0.9
       default_max_tokens: 512
 
 # alias は `default.model`、CLI、環境変数から参照できます。
@@ -97,6 +100,24 @@ models:
 - この展開は設定ファイル（`lait.config.yml`、および後述するワークフローファイルの `models:`/
   トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
+
+## `.env` ファイルの自動読み込み
+
+起動時にカレントディレクトリの `.env` ファイルが自動で読み込まれ、**未設定の環境変数のみ**が
+補完されます（シェルで export 済みの変数が常に優先されます）。読み込まれた値は、CLI 引数の
+環境変数フォールバック（`OPENAI_API_KEY` など）と `${VAR_NAME}` 展開の両方から参照できます。
+
+```sh
+# .env
+OPENAI_API_KEY=sk-...
+CLOUD_API_KEY="quoted value"   # コメント
+export HOST=api.example.com    # export プレフィックスも可
+```
+
+- `.env` が存在しない場合は何もしません。壊れた行がある場合は行番号付きのエラーになります。
+- 値は `'...'`（そのまま）・`"..."`（`\n` などのエスケープ対応）・裸のいずれでも書けます。
+  複数行の値には対応していません。
+- `--no-env` フラグで読み込みを無効化できます。
 
 ## MCP サーバー
 
@@ -155,3 +176,24 @@ skills:
   慣習に合わせたもので、既存の `.claude/skills/<name>/` のようなディレクトリをそのまま指せます）。
 - パスは、`mcp_servers:` とは異なり、その場では接続を持たず、実際に使われるたびにファイルを
   読み直します。
+
+## サブエージェント
+
+`agents:` にエージェント Markdown ファイルを登録すると、`--subagent`（チャット）・agent ファイルの
+`subagents:`・ワークフローノードの `subagents:` から名前で参照して、モデル自身が実行時に呼び出す
+かどうかを判断できる「サブエージェント」ツールとして使えるようになります。詳しい使い方は
+[サブエージェントを使う](./subagents.mdx) を参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  model: local
+  subagents: [researcher]   # 全経路（チャット / agent / workflow）の最終フォールバック
+
+agents:
+  researcher: agents/researcher.md
+```
+
+- 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
+  そのまま名前を付けて登録します）。
+- パスは、`skills:` と同じく、その場では接続を持たず、実際に使われるたびにファイルを読み直します。
