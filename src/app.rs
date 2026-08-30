@@ -73,6 +73,11 @@ fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>
 #[derive(Default)]
 struct UsageTally {
     events: std::sync::Mutex<Vec<(String, response::Usage)>>,
+    /// The running sum of every event recorded so far, kept incrementally so
+    /// `total()` never has to refold `events` — `run_repl_turn` calls it
+    /// twice per REPL turn purely to compute that turn's own delta, so an
+    /// O(n) refold there would make an n-turn session cost O(n²) overall.
+    running_total: std::sync::Mutex<Option<response::Usage>>,
 }
 
 impl UsageTally {
@@ -82,6 +87,13 @@ impl UsageTally {
             .lock()
             .expect("usage tally lock should not be poisoned")
             .push((label.to_owned(), usage));
+        let mut running_total = self
+            .running_total
+            .lock()
+            .expect("usage tally lock should not be poisoned");
+        let mut total = running_total.unwrap_or_default();
+        total.add(usage);
+        *running_total = Some(total);
     }
 
     /// Records `response`'s usage under `label`; a no-op when the server
@@ -121,15 +133,10 @@ impl UsageTally {
     /// `None` when nothing has been recorded yet (never zero-vs-absent
     /// ambiguity, same convention as `response::Usage`'s own optionality).
     fn total(&self) -> Option<response::Usage> {
-        let events = self
-            .events
+        *self
+            .running_total
             .lock()
-            .expect("usage tally lock should not be poisoned");
-        events.iter().fold(None, |total, (_, usage)| {
-            let mut total = total.unwrap_or_default();
-            total.add(*usage);
-            Some(total)
-        })
+            .expect("usage tally lock should not be poisoned")
     }
 }
 
@@ -1479,6 +1486,14 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
 
     eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
 
+    // Resolved lazily on first use rather than up front, so a `--model`-less
+    // invocation still drops into the REPL instead of erroring immediately —
+    // the user can `/model <name>` before ever sending a line. Cached across
+    // turns after that (`resolve_chat_settings` does only cheap string/config
+    // work, but nothing here changes turn to turn except in response to
+    // `/model`, which invalidates it below).
+    let mut settings: Option<RequestSettings> = None;
+
     let stdin = std::io::stdin();
     loop {
         eprint!("> ");
@@ -1501,6 +1516,7 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
                 }
                 repl::MetaCommand::Model(name) if !name.is_empty() => {
                     shared.model = Some(name.to_owned());
+                    settings = None;
                     eprintln!("(model set to '{name}')");
                 }
                 repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
@@ -1514,16 +1530,21 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
             continue;
         }
 
-        let settings = match resolve_chat_settings(&shared, None, &file_config) {
-            Ok(settings) => settings,
-            Err(error) => {
-                eprintln!("lait: {error:#}");
-                continue;
-            }
-        };
+        if settings.is_none() {
+            settings = match resolve_chat_settings(&shared, None, &file_config) {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    eprintln!("lait: {error:#}");
+                    continue;
+                }
+            };
+        }
+        let settings = settings
+            .as_ref()
+            .expect("just resolved above, or the loop continued before reaching here");
 
         match run_repl_turn(
-            &settings,
+            settings,
             &env,
             &system_prompt,
             &history,

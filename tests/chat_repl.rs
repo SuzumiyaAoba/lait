@@ -154,6 +154,44 @@ fn repl_exits_cleanly_on_end_of_input_without_an_explicit_exit_command() {
 }
 
 #[test]
+fn repl_model_command_switches_the_model_for_later_turns() {
+    let server = MultiTurnStreamServer::start(&["first reply", "second reply"]);
+    let mut command = test_command();
+    command.args([
+        "chat",
+        "--model",
+        "test-model",
+        "--base-url",
+        &server.base_url,
+    ]);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().expect("failed to spawn lait chat");
+    child
+        .stdin
+        .take()
+        .expect("child stdin should be piped")
+        .write_all(b"hello\n/model other-model\nhow are you?\n/exit\n")
+        .expect("failed to write to lait chat's stdin");
+
+    let first_request = server.receive_request();
+    let second_request = server.receive_request();
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for lait chat");
+    server.finish();
+
+    assert!(output.status.success(), "lait chat failed: {output:?}");
+
+    let first_body: serde_json::Value = serde_json::from_str(&first_request.body).unwrap();
+    assert_eq!(first_body["model"], "test-model");
+
+    let second_body: serde_json::Value = serde_json::from_str(&second_request.body).unwrap();
+    assert_eq!(second_body["model"], "other-model");
+}
+
+#[test]
 fn repl_meta_commands_never_reach_the_network() {
     let mut command = test_command();
     command.args(["chat", "--model", "test-model"]);
