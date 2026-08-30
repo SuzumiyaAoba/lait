@@ -256,11 +256,11 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
     }
     validate_max_tool_rounds(node.max_tool_rounds, &description)?;
 
-    let calls_model = node.prompt.is_some() || node.agent.is_some() || node.workflow.is_some();
+    let calls_model = node.calls_model() || node.workflow.is_some();
     if !calls_model && node.jq.is_none() && node.write_file.is_none() {
         bail!(
-            "{description} must have a 'prompt', an 'agent', a 'workflow', a 'jq' filter, a \
-             'write_file' path, or a combination",
+            "{description} must have a 'prompt', a 'system_prompt', an 'agent', a 'workflow', a \
+             'jq' filter, a 'write_file' path, or a combination",
         );
     }
     if node.prompt.is_some() && node.agent.is_some() {
@@ -275,11 +275,12 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
     if node.agent.is_some()
         && (node.input_schema.is_some()
             || node.output_schema.is_some()
-            || node.schema_name.is_some())
+            || node.schema_name.is_some()
+            || node.system_prompt.is_some())
     {
         bail!(
-            "{description} has 'agent' set; 'input_schema'/'output_schema'/'schema_name' come \
-             from the agent file and must not be set on the node"
+            "{description} has 'agent' set; 'input_schema'/'output_schema'/'schema_name'/\
+             'system_prompt' come from the agent file and must not be set on the node"
         );
     }
     if node.workflow.is_some()
@@ -290,12 +291,13 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
             || node.max_tokens.is_some()
             || node.input_schema.is_some()
             || node.output_schema.is_some()
-            || node.schema_name.is_some())
+            || node.schema_name.is_some()
+            || node.system_prompt.is_some())
     {
         bail!(
             "{description} has 'workflow' set; 'model'/'reasoning_effort'/'temperature'/'top_p'/\
-             'max_tokens'/'input_schema'/'output_schema'/'schema_name' come from the referenced \
-             workflow file and must not be set on the node"
+             'max_tokens'/'input_schema'/'output_schema'/'schema_name'/'system_prompt' come from \
+             the referenced workflow file and must not be set on the node"
         );
     }
     if node.workflow.is_some() && (node.retry.is_some() || node.timeout.is_some()) {
@@ -324,11 +326,14 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
     {
         bail!(
             "{description} has 'mcp'/'max_tool_rounds'/'skills'/'subagents' set but no \
-             'prompt'/'agent' to apply it to"
+             'prompt'/'system_prompt'/'agent' to apply it to"
         );
     }
     if !calls_model && node.output_schema.is_some() {
-        bail!("{description} has 'output_schema' but no 'prompt'/'agent' to apply it to");
+        bail!(
+            "{description} has 'output_schema' but no 'prompt'/'system_prompt'/'agent' to apply \
+             it to"
+        );
     }
     if node.output_schema.is_none() && node.schema_name.is_some() {
         bail!("{description} has 'schema_name' but no 'output_schema'");

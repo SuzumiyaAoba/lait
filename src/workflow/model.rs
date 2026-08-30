@@ -77,6 +77,10 @@ pub(crate) struct WorkflowDefaults {
     /// Fallback `subagents` for any node that calls a model (`prompt`/
     /// `agent`) and doesn't set its own. Falls back independently, like `mcp`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Fallback `system_prompt` for any `prompt` node that doesn't set its
+    /// own. Falls back independently, like `mcp`. Meaningless for an `agent`
+    /// node, which supplies its own system prompt from its agent file.
+    pub(crate) system_prompt: Option<String>,
 }
 
 impl WorkflowDefaults {
@@ -98,6 +102,9 @@ impl WorkflowDefaults {
             max_tool_rounds: self.max_tool_rounds.or(fallback.max_tool_rounds),
             skills: self.skills.or_else(|| fallback.skills.clone()),
             subagents: self.subagents.or_else(|| fallback.subagents.clone()),
+            system_prompt: self
+                .system_prompt
+                .or_else(|| fallback.system_prompt.clone()),
         }
     }
 }
@@ -122,11 +129,21 @@ pub(crate) struct NodeDefinition {
     /// model call. Falls back independently to `default.max_tokens`, like
     /// `temperature`.
     pub(crate) max_tokens: Option<u32>,
-    /// The prompt template sent to the model. A node without a `prompt` and
-    /// without an `agent` does not call the model at all; it must then have a
-    /// `jq` filter, making it a data-only transformation node. Mutually
-    /// exclusive with `agent`.
+    /// The user-message prompt template sent to the model. When unset but
+    /// `system_prompt` is set, the node's current input is sent unchanged (no
+    /// template rendering) as the user message instead, the same way an
+    /// `agent` node passes its current input straight through. A node with
+    /// neither `prompt` nor `system_prompt` and without an `agent` does not
+    /// call the model at all; it must then have a `jq` filter, making it a
+    /// data-only transformation node. Mutually exclusive with `agent`.
     pub(crate) prompt: Option<String>,
+    /// A system prompt template, rendered the same way as `prompt` (see
+    /// `template::render`) and sent ahead of it as the system message. Falls
+    /// back to the workflow's `default.system_prompt` when unset, the same
+    /// way as `skills`. An `agent` node already has its own system prompt
+    /// (the agent file's body), so `system_prompt` is rejected alongside
+    /// `agent`.
+    pub(crate) system_prompt: Option<String>,
     /// Path to an agent Markdown file (see `agent::load_agent`) whose system
     /// prompt, model/reasoning defaults, and input/output schema drive this
     /// node instead of `prompt`/`input_schema`/`output_schema`/`schema_name`.
@@ -209,6 +226,27 @@ pub(crate) struct NodeDefinition {
     /// back to the agent file's own `subagents:` (for an `agent` node), then
     /// to the workflow's `default.subagents`, the same way as `mcp`.
     pub(crate) subagents: Option<Vec<String>>,
+}
+
+impl NodeDefinition {
+    /// Whether this node sends a user-message prompt to the model: it has a
+    /// `prompt` template to render, or (with `prompt` unset) sends its
+    /// current input unchanged as one — see the doc comment on `prompt`.
+    /// Shared by `execute_step`'s branch dispatch and `calls_model` below, so
+    /// the two stay in sync as fields are added.
+    pub(crate) fn sends_prompt(&self) -> bool {
+        self.prompt.is_some() || self.system_prompt.is_some()
+    }
+
+    /// Whether this node makes its own single model call — `sends_prompt`
+    /// (a `prompt`/`system_prompt` node) or `agent`. `false` for a
+    /// `workflow:` node, whose model calls happen inside the referenced
+    /// workflow's own steps instead; callers that also need to count those
+    /// (e.g. "does this node have any action at all") add
+    /// `|| self.workflow.is_some()` explicitly.
+    pub(crate) fn calls_model(&self) -> bool {
+        self.sends_prompt() || self.agent.is_some()
+    }
 }
 
 /// A control-flow reference site: one position in a `steps:` list. Carries

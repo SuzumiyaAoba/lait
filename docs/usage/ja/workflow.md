@@ -51,9 +51,10 @@ steps:
 cargo run -- run workflow.yml "要約・翻訳したい文章..."
 ```
 
-- `nodes:` はキーをノード id とするマップで、順序を持ちません。各ノードは `prompt`/`agent`/
-  `workflow`/`jq`/`model`/`reasoning_effort`/`temperature`/`top_p`/`max_tokens`/`input_schema`/
-  `output_schema`/`schema_name`/`write_file`/`retry`/`timeout` を持てます（後述）。
+- `nodes:` はキーをノード id とするマップで、順序を持ちません。各ノードは `prompt`/
+  `system_prompt`/`agent`/`workflow`/`jq`/`model`/`reasoning_effort`/`temperature`/`top_p`/
+  `max_tokens`/`input_schema`/`output_schema`/`schema_name`/`write_file`/`retry`/`timeout` を
+  持てます（後述）。
 - `steps:` は配列で、各要素（**ステップ**、または**参照サイト**）が `use: <ノードid>` で
   `nodes:` のどれを実行するかを指定します。配列の先頭から逐次実行するのが基本です。
   `when`/`switch` による分岐（後述）、`parallel` による複数のステップ列の同時実行
@@ -70,8 +71,8 @@ cargo run -- run workflow.yml "要約・翻訳したい文章..."
   `$steps` に記録されるキーでもあります。省略した場合は `use:` したノードの id が使われ、
   それも無い場合（`switch`/`parallel`/`loop`/`for_each` に `id` を付けなかった場合）は
   `step-1`、`step-2`… になります。
-- `prompt` も `agent` も `workflow` も持たないノードはモデルを呼び出さず、`jq` によるデータ変換
-  のみを行います（後述）。この場合 `model` は不要です。
+- `prompt` も `system_prompt` も `agent` も `workflow` も持たないノードはモデルを呼び出さず、
+  `jq` によるデータ変換のみを行います（後述）。この場合 `model` は不要です。
 - 最後のステップの出力のみを標準出力に出します。
 - `run` サブコマンドでも `--no-config` は利用できます（例: `lait run workflow.yml "..." --no-config`）。
 
@@ -226,14 +227,15 @@ steps:
 - `json_schemas:` を使わず、これまでどおり `output_schema: city.schema.json` のように
   直接ファイルパスを指定することもできます（`json_schemas:` に同名のキーがある場合は
   そちらが優先されます）。
-- `output_schema` を指定するには `prompt` が必須です（`prompt` のないノードには適用先がありません）。
+- `output_schema` を指定するには `prompt`/`system_prompt`/`agent` のいずれかが必須です
+  （モデルを呼び出さないノードには適用先がありません）。
 - `schema_name` は `output_schema` とセットで指定します（既定値は `structured_output`）。
 - `jq` の出力が文字列の場合は `jq -r` のように引用符なしのテキストとして展開されます。それ以外
   （オブジェクト・配列・数値など）はコンパクトな JSON テキストとして展開されます。
 - `jq` フィルターが複数の値を出力した場合は改行区切りで連結します。
-- `jq` のみを指定して `prompt` を省略すると、モデルを呼び出さずにその時点の `{{ input }}` を
-  変換するだけのノードになります（`model` の指定は不要です）。この場合、入力は有効な JSON で
-  ある必要があります。
+- `jq` のみを指定して `prompt`/`system_prompt` を両方省略すると、モデルを呼び出さずにその時点の
+  `{{ input }}` を変換するだけのノードになります（`model` の指定は不要です）。この場合、入力は
+  有効な JSON である必要があります。
 
 ## ファイルへの出力（`write_file`）
 
@@ -310,7 +312,7 @@ steps:
 
 ## MCP ツールの利用（`mcp`）
 
-`prompt`/`agent` を持つノードに `mcp:` で `lait.config.yml` の `mcp_servers:`（登録方法は
+`prompt`/`system_prompt`/`agent` を持つノードに `mcp:` で `lait.config.yml` の `mcp_servers:`（登録方法は
 [設定ファイル](./config.md#mcp-サーバー) を参照）のエントリ名を並べると、そのノードのモデル
 呼び出しに MCP ツールが渡され、モデルがツール呼び出しを返すたびに lait が実行してその結果を
 モデルに返す、というやり取りを最大 `max_tool_rounds` 回まで自動で繰り返します。
@@ -336,7 +338,7 @@ steps:
 - `mcp`/`max_tool_rounds` は `model`/`reasoning_effort` と同じ、ノード → （`agent` ノードなら）
   agent ファイルの frontmatter → ワークフローの `default:` → `lait.config.yml` の `default:` の
   順に、それぞれ独立してフォールバックします。
-- `mcp`/`max_tool_rounds` は `prompt`/`agent` を持つノードだけに指定できます。データ変換のみの
+- `mcp`/`max_tool_rounds` は `prompt`/`system_prompt`/`agent` を持つノードだけに指定できます。データ変換のみの
   `jq` ノードや `workflow:` ノード（サブワークフロー側の各ノードに指定してください）には
   指定できません。
 - `max_tool_rounds`（既定 8）に達してもモデルが最終回答を返さない場合はエラーになります。
@@ -352,9 +354,51 @@ steps:
 - 対応モデルは LM Studio 上のツール呼び出し対応モデル（`qwen3` 系など）を想定しています。
   ツール呼び出しに対応していないモデルでは `tool_calls` が一切返らず、ツールは呼ばれません。
 
+## システムプロンプトの指定（`system_prompt`）
+
+ノードには `system_prompt:` で、ユーザーメッセージ（`prompt`）とは別にシステムプロンプトを
+指定できます。指定しない場合、これまで通り `prompt` のレンダリング結果だけがユーザー
+メッセージとして送られ、システムプロンプトは付きません。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+  system_prompt: "あなたは日本語のプロの校正者です。"   # ワークフロー全体の既定
+nodes:
+  proofread:
+    system_prompt: "文体は「ですます調」に統一してください。"   # ノードで上書き
+    prompt: "{{ input }}"
+  translate:
+    prompt: "{{ input }}"
+    # system_prompt を書かなければ default.system_prompt にフォールバック
+  classify:
+    system_prompt: "次のテキストを spam/ham に分類し、ラベルだけを出力してください。"
+    # prompt を省略すると、テンプレート展開を挟まず現在の入力がそのままユーザー
+    # メッセージとして送られる（agent ノードが current_input をそのまま渡すのと同じ）
+steps:
+  - use: proofread
+  - use: translate
+  - use: classify
+```
+
+- `system_prompt` は `prompt` と同じテンプレートエンジン（handlebars）でレンダリングされ、
+  `{{ input }}` / `{{ steps.<id> }}` にアクセスできます。
+- `system_prompt` は `skills`/`mcp` と同じ、ノード → ワークフローの `default:` の順に
+  独立してフォールバックします（`lait.config.yml` 側にはフォールバックしません）。
+- `prompt` を省略して `system_prompt` だけを指定したノードでは、現在の入力（テンプレート
+  展開なしの生のテキスト）がそのままユーザーメッセージになります。入力が JSON オブジェクト/
+  配列でもエラーになりません（`prompt: "{{ input }}"` はオブジェクト/配列入力を拒否します）。
+- `system_prompt` は `agent` ノードには指定できません。agent Markdown ファイルの本文が
+  既にシステムプロンプトだからです。`workflow:` ノード（サブワークフロー側の各ノードに
+  指定してください）にも指定できません。
+- `skills` の追記先はこの `system_prompt`（レンダリング後）です。両方を指定した場合、
+  `system_prompt` の内容の後に `---` 区切りでスキルの内容が続きます。`system_prompt` を
+  指定していないノードでは、スキルの内容だけがシステムメッセージとして送られます。
+
 ## スキルの利用（`skills`）
 
-`prompt`/`agent` を持つノードに `skills:` で `lait.config.yml` の `skills:`（登録方法は
+`prompt`/`system_prompt`/`agent` を持つノードに `skills:` で `lait.config.yml` の `skills:`（登録方法は
 [設定ファイル](./config.md#スキル) を参照）のエントリ名を並べると、そのノードのシステム
 プロンプトの末尾に、それぞれのスキルファイルの内容が追記されます。詳しくは
 [スキルを使う](./skills.md) を参照してください。
@@ -378,11 +422,13 @@ steps:
 
 - `skills` は `mcp` と同じ、ノード → （`agent` ノードなら）agent ファイルの frontmatter →
   ワークフローの `default:` → `lait.config.yml` の `default:` の順にフォールバックします。
-- `skills` は `prompt`/`agent` を持つノードだけに指定できます。データ変換のみの `jq` ノードや
+- `skills` は `prompt`/`system_prompt`/`agent` を持つノードだけに指定できます。データ変換のみの `jq` ノードや
   `workflow:` ノード（サブワークフロー側の各ノードに指定してください）には指定できません。
-- スキルの内容は、ノードの `prompt`（レンダリング後）や agent ファイルのシステムプロンプトの
-  後に `---` 区切りで追記されます。ノード/agent 自身の指示が優先して読まれるようにするための
-  順序です。
+- スキルの内容は、ノードの `system_prompt`（指定されていれば、レンダリング後）や agent
+  ファイルのシステムプロンプトの後に `---` 区切りで追記され、システムメッセージになります
+  （`prompt` 自体は別のユーザーメッセージのままです）。ノード/agent 自身の指示が優先して
+  読まれるようにするための順序です。`system_prompt` を指定していない `prompt` ノードでは、
+  スキルの内容だけがシステムメッセージとして送られます。
 - スキルファイルの本文は handlebars テンプレートとしてレンダリングされません（`{{ }}` を含む
   コード例などをそのまま書けます）。
 - `mcp` と異なり `--stream` との併用に制限はありません（スキルは単なる静的な追記であり、
@@ -390,7 +436,7 @@ steps:
 
 ## サブエージェントの利用（`subagents`）
 
-`prompt`/`agent` を持つノードに `subagents:` で `lait.config.yml` の `agents:`（登録方法は
+`prompt`/`system_prompt`/`agent` を持つノードに `subagents:` で `lait.config.yml` の `agents:`（登録方法は
 [設定ファイル](./config.md#サブエージェント) を参照）のエントリ名を並べると、そのノードのモデル
 呼び出しに、対応するエージェント Markdown ファイルが「サブエージェント」ツールとして渡されます。
 `mcp` と同じ tool loop の仕組みに乗るため、モデルがツール呼び出しを返すたびに lait がそのサブ
@@ -417,7 +463,7 @@ steps:
 - `subagents` は `mcp`/`skills` と同じ、ノード → （`agent` ノードなら）agent ファイルの
   frontmatter → ワークフローの `default:` → `lait.config.yml` の `default:` の順にフォールバック
   します。
-- `subagents` は `prompt`/`agent` を持つノードだけに指定できます。データ変換のみの `jq` ノードや
+- `subagents` は `prompt`/`system_prompt`/`agent` を持つノードだけに指定できます。データ変換のみの `jq` ノードや
   `workflow:` ノード（サブワークフロー側の各ノードに指定してください）には指定できません。
 - モデルに渡すツール名は `agent__<サブエージェント名>`（例: `agent__researcher`）の形に修飾され、
   `mcp` のツール名（`<サーバー名>__<ツール名>`）と衝突しないようになっています。

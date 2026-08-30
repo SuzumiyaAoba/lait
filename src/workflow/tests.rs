@@ -476,6 +476,55 @@ fn allows_subagents_on_an_agent_node() {
 }
 
 #[test]
+fn rejects_a_workflow_node_with_system_prompt() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    workflow: sub.yml\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn allows_a_system_prompt_only_node_with_no_prompt() {
+    let workflow = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    )
+    .expect("workflow should parse");
+    assert!(workflow.nodes["n"].prompt.is_none());
+    assert_eq!(
+        workflow.nodes["n"].system_prompt.as_deref(),
+        Some("be terse")
+    );
+}
+
+#[test]
+fn allows_system_prompt_together_with_jq_as_a_model_calling_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    jq: '.'\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn rejects_system_prompt_on_an_agent_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    agent: agents/a.md\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn allows_system_prompt_on_a_prompt_node() {
+    let workflow = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    )
+    .expect("workflow should parse");
+    assert_eq!(
+        workflow.nodes["n"].system_prompt.as_deref(),
+        Some("be terse")
+    );
+}
+
+#[test]
 fn rejects_a_node_max_tool_rounds_of_zero() {
     let result = parse_workflow(
         "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    max_tool_rounds: 0\nsteps:\n  - use: n\n",

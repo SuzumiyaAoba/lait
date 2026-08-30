@@ -1997,8 +1997,9 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
 /// as a failure). "Effective" means the node's own `retry`/`timeout` if set,
 /// else `scope`'s `defaults.retry`/`defaults.timeout` (see
 /// `WorkflowScope::defaults`) — but only for a node that calls a model
-/// (`prompt`/`agent`): a `jq`-only or `workflow:` node never falls back to
-/// the workflow default (a `workflow:` node's own `retry`/`timeout` are
+/// (`prompt`/`system_prompt`/`agent`, see `NodeDefinition::calls_model`): a
+/// `jq`-only or `workflow:` node never falls back to the workflow default
+/// (a `workflow:` node's own `retry`/`timeout` are
 /// rejected by `validate::validate_node` in favor of the sub-workflow's own
 /// steps setting theirs, and applying the *caller's* default on top of that
 /// would double up whatever the sub-workflow's own steps already inherit).
@@ -2016,7 +2017,7 @@ async fn execute_step_with_retry(
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
 ) -> Result<String> {
-    let calls_model = node.prompt.is_some() || node.agent.is_some();
+    let calls_model = node.calls_model();
     let effective_retry = node.retry.as_ref().or(calls_model
         .then_some(scope.defaults.retry.as_ref())
         .flatten());
@@ -2229,7 +2230,7 @@ async fn execute_step(
         )
         .await
         .with_context(|| format!("step '{label}'"))?
-    } else if let Some(prompt_template) = &node.prompt {
+    } else if node.sends_prompt() {
         let settings = resolve_step_settings(node, scope, env.file_config, None, label)?
             .with_usage_label(label);
 
@@ -2249,11 +2250,29 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let input = template::parse_input(current_input);
-        let prompt = template::render(prompt_template, &input, steps_outputs)
+        // A `system_prompt`-only node (no `prompt`) sends the current input
+        // unchanged as the user message, the same way an `agent` node's
+        // `current_input` passes straight through `call_agent` without going
+        // through `template::render`.
+        let prompt: Cow<'_, str> = match &node.prompt {
+            Some(prompt_template) => Cow::Owned(
+                template::render(prompt_template, &input, steps_outputs)
+                    .with_context(|| format!("step '{label}'"))?,
+            ),
+            None => Cow::Borrowed(current_input),
+        };
+        let system_prompt = node
+            .system_prompt
+            .as_deref()
+            .or(scope.defaults.system_prompt.as_deref())
+            .map(|system_prompt_template| {
+                template::render(system_prompt_template, &input, steps_outputs)
+            })
+            .transpose()
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(env, &[], None, &prompt, response_format)
+            .complete(env, &[], system_prompt.as_deref(), &prompt, response_format)
             .await
             .with_context(|| format!("step '{label}'"))?;
 
