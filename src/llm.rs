@@ -132,6 +132,18 @@ pub(crate) fn user_message(
     Ok(ChatCompletionRequestMessage::from(user_message))
 }
 
+/// Builds a plain assistant-role message from `content`, the shape a resumed
+/// `--session`'s recorded replies take in `session::to_request_messages`
+/// (distinct from `assistant_tool_call_message` below, which additionally
+/// carries `tool_calls` for the in-flight tool loop — a persisted session
+/// never stores those, only the final text turn a user actually saw).
+pub(crate) fn assistant_message(content: &str) -> Result<ChatCompletionRequestMessage> {
+    let assistant_message = ChatCompletionRequestAssistantMessageArgs::default()
+        .content(content)
+        .build()?;
+    Ok(ChatCompletionRequestMessage::from(assistant_message))
+}
+
 /// Builds the assistant-role message recording a model turn's `tool_calls`
 /// (and any `content` it produced alongside them), the shape a tool loop
 /// (`app::RequestSettings::complete`) appends to its message history right

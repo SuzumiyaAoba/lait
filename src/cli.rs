@@ -47,6 +47,31 @@ pub(crate) enum Command {
     /// `lait init workflow [PATH]` / `lait init agent [PATH]` write commented
     /// workflow.yml / agent.md scaffolds.
     Init(InitArgs),
+    /// List, inspect, or delete saved `--session` conversations.
+    Sessions(SessionsCommand),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SessionsCommand {
+    #[command(subcommand)]
+    pub(crate) action: SessionsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SessionsAction {
+    /// List every saved session and how many turns it holds.
+    List,
+    /// Print every turn recorded for a session.
+    Show(SessionsNameArgs),
+    /// Delete a saved session.
+    Delete(SessionsNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SessionsNameArgs {
+    /// The session name (as passed to `--session`).
+    #[arg(value_name = "NAME")]
+    pub(crate) name: String,
 }
 
 #[derive(Debug, Args)]
@@ -280,6 +305,12 @@ pub(crate) struct ChatArgs {
     /// a base64 data URL) or an `http(s)://` URL (sent as-is). Repeatable.
     #[arg(long = "image", value_name = "PATH_OR_URL")]
     pub(crate) images: Vec<String>,
+
+    /// Resume (or start) a named conversation: this call's prompt and the
+    /// model's reply are appended to `.lait/sessions/<NAME>.jsonl`, and every
+    /// turn recorded there so far is sent ahead of this call's prompt.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) session: Option<String>,
 }
 
 impl ReasoningEffort {

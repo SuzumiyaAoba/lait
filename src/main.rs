@@ -15,6 +15,7 @@ mod mcp;
 mod models;
 mod response;
 mod schema;
+mod session;
 mod skill;
 mod subagent;
 mod template;

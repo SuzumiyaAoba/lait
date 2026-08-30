@@ -18,7 +18,7 @@ use crate::{
     cli::{AgentAction, ChatArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, ReasoningEffort},
     config::{self, ConfigFile, ModelMap},
-    jq, lint, llm, mcp, response, schema, skill, subagent, template, workflow,
+    jq, lint, llm, mcp, response, schema, session, skill, subagent, template, workflow,
 };
 
 pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -173,6 +173,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
+        Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         None => run_chat(cli.chat, cli.no_config).await,
     }
 }
@@ -185,9 +186,13 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 /// drift in this classification costs only startup time, never correctness.
 pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
     match &cli.command {
-        Some(Command::Lint(_) | Command::Completions(_) | Command::Man(_) | Command::Init(_)) => {
-            false
-        }
+        Some(
+            Command::Lint(_)
+            | Command::Completions(_)
+            | Command::Man(_)
+            | Command::Init(_)
+            | Command::Sessions(_),
+        ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
         Some(Command::Run(_) | Command::Agent(_)) | None => true,
     }
@@ -210,6 +215,7 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         }
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
+        Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Run(_) | Command::Agent(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
@@ -656,16 +662,18 @@ impl RequestSettings {
 /// are dropped when `show_reasoning` is unset, same as the non-streaming
 /// path. Fails, like `response::response_content`, if the stream ends
 /// without ever producing content.
-/// Returns the usage carried by the final chunk, when the request asked for
-/// one (see `RequestSettings::complete_stream`'s `include_usage`) and the
-/// server obliged. `output_path` redirects the content to a file (`-o`):
-/// the file then holds the body alone, so reasoning deltas — normally
-/// written ahead of the content on stdout — go to stderr instead.
+/// Returns the accumulated content text (for `--session`/`lait history` to
+/// record — see `StreamOutcome`) alongside the usage carried by the final
+/// chunk, when the request asked for one (see
+/// `RequestSettings::complete_stream`'s `include_usage`) and the server
+/// obliged. `output_path` redirects the content to a file (`-o`): the file
+/// then holds the body alone, so reasoning deltas — normally written ahead of
+/// the content on stdout — go to stderr instead.
 async fn stream_response(
     mut stream: llm::CompletionStream,
     show_reasoning: bool,
     output_path: Option<&Path>,
-) -> Result<Option<response::Usage>> {
+) -> Result<StreamOutcome> {
     use std::io::Write;
 
     // Locked/opened once for the stream's whole lifetime: every delta write
@@ -691,6 +699,7 @@ async fn stream_response(
     let mut wrote_reasoning = false;
     let mut wrote_content = false;
     let mut last_usage = None;
+    let mut content_text = String::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -725,6 +734,7 @@ async fn stream_response(
                 content_sink.flush()?;
             }
             wrote_content = true;
+            content_text.push_str(content);
         }
     }
 
@@ -736,7 +746,21 @@ async fn stream_response(
     }
     writeln!(content_sink)?;
     content_sink.flush()?;
-    Ok(last_usage)
+    Ok(StreamOutcome {
+        content: content_text,
+        usage: last_usage,
+    })
+}
+
+/// What `stream_response` produced: the full response text (concatenated
+/// from every content delta, exactly as printed) and the usage its final
+/// chunk carried, if any. The content half exists for callers that need the
+/// complete text after the stream ends even though it was already written
+/// out incrementally — recording a `--session` turn or a `lait history`
+/// entry, neither of which can work from deltas alone.
+struct StreamOutcome {
+    content: String,
+    usage: Option<response::Usage>,
 }
 
 /// Renders an agent's system prompt against `input`, calls the model with
@@ -1180,6 +1204,13 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
 
     let system_prompt = resolve_system_prompt(&chat, &file_config)?;
     let image_urls = attachment::resolve_image_urls(&chat.images)?;
+    if let Some(name) = &chat.session {
+        session::validate_name(name)?;
+    }
+    let session_history = match &chat.session {
+        Some(name) => session::to_request_messages(&session::load(name)?)?,
+        None => Vec::new(),
+    };
     let env = RunEnv::new(&file_config);
 
     // `--quiet` keeps the response body and drops every note around it.
@@ -1197,7 +1228,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
                 &env.skill_cache,
                 PromptTurn {
                     system_prompt: system_prompt.as_deref(),
-                    history: &[],
+                    history: &session_history,
                     prompt: &prompt,
                     image_urls: &image_urls,
                 },
@@ -1205,12 +1236,15 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
                 show_usage,
             )
             .await?;
-        let usage = stream_response(stream, show_reasoning, output_path).await?;
+        let outcome = stream_response(stream, show_reasoning, output_path).await?;
+        if let Some(name) = &chat.session {
+            session::append_turn(name, &prompt, &outcome.content)?;
+        }
         if show_usage {
             // Streamed usage arrives on the final chunk rather than through
             // `complete`; feed it into the same tally so both chat paths
             // share one summary format.
-            if let Some(usage) = usage {
+            if let Some(usage) = outcome.usage {
                 env.usage.record(&settings.usage_label, usage);
             }
             print_usage_summary(&env.usage);
@@ -1224,7 +1258,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
             &[],
             PromptTurn {
                 system_prompt: system_prompt.as_deref(),
-                history: &[],
+                history: &session_history,
                 prompt: &prompt,
                 image_urls: &image_urls,
             },
@@ -1248,6 +1282,12 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
             let output = response::render_response(&response, chat.json, show_reasoning)?;
             println!("{output}");
         }
+    }
+    if let Some(name) = &chat.session {
+        let content = response::first_message(&response)
+            .and_then(|message| message.content())
+            .unwrap_or_default();
+        session::append_turn(name, &prompt, content)?;
     }
     if show_usage {
         print_usage_summary(&env.usage);
