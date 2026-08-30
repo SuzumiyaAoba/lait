@@ -345,6 +345,20 @@ struct CapabilityOverrides {
     subagents: Option<Vec<String>>,
 }
 
+/// The new-turn inputs shared by `RequestSettings::complete`/
+/// `complete_stream`: the system prompt, any prior turns from a resumed
+/// `--session` (empty for every caller but chat), the new user-role prompt
+/// text, and any `--image` attachments for it (empty for every caller but
+/// chat). Bundled into one struct, like `SamplingOverrides`/
+/// `CapabilityOverrides` above, to keep `complete`'s argument count under
+/// clippy's `too_many_arguments` threshold.
+struct PromptTurn<'a> {
+    system_prompt: Option<&'a str>,
+    history: &'a [ChatCompletionRequestMessage],
+    prompt: &'a str,
+    image_urls: &'a [String],
+}
+
 /// The model/base-URL/API-key/sampling settings for a single completion
 /// request, after resolving aliases and applying every fallback layer.
 struct RequestSettings {
@@ -452,19 +466,24 @@ impl RequestSettings {
     /// step) and `call_subagent_tool` extends it for a subagent's own
     /// completion, so a subagent chain that cycles back to itself is caught
     /// the same way `workflow:` nesting is (see `MAX_SUBAGENT_DEPTH`).
+    /// `turn.history`/`turn.image_urls` are only ever non-empty for chat's
+    /// own call site (a resumed `--session`, `--image`); every other caller
+    /// passes `PromptTurn { history: &[], image_urls: &[], .. }`, which
+    /// reproduces the exact message shape this method built before either
+    /// feature existed — see `llm::initial_messages`.
     async fn complete(
         &self,
         env: &RunEnv<'_>,
         active_agent_paths: &[PathBuf],
-        system_prompt: Option<&str>,
-        prompt: &str,
+        turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
     ) -> Result<response::ChatCompletionResponse> {
-        let system_prompt = self.system_prompt_with_skills(&env.skill_cache, system_prompt)?;
+        let system_prompt = self.system_prompt_with_skills(&env.skill_cache, turn.system_prompt)?;
         let system_prompt = system_prompt.as_deref();
 
         if self.mcp.is_empty() && self.subagents.is_empty() {
-            let messages = llm::initial_messages(system_prompt, prompt)?;
+            let messages =
+                llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             return self
                 .complete_recorded(env, response_format, messages, &[])
                 .await;
@@ -490,7 +509,8 @@ impl RequestSettings {
         let mut tools = std::mem::take(&mut mcp_tool_set.tools);
         tools.extend(std::mem::take(&mut subagent_tool_set.tools));
 
-        let mut messages = llm::initial_messages(system_prompt, prompt)?;
+        let mut messages =
+            llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
 
         let mut round = 0usize;
         loop {
@@ -582,12 +602,12 @@ impl RequestSettings {
     /// restriction on streaming.
     /// `include_usage` asks the server for a final usage chunk (see
     /// `llm::CompletionRequest::stream_include_usage`); set it only when the
-    /// caller will actually display it (`--show-usage`).
+    /// caller will actually display it (`--show-usage`). `turn.history`/
+    /// `turn.image_urls` behave exactly as in `complete` — see its doc comment.
     async fn complete_stream(
         &self,
         skill_cache: &skill::SkillCache<'_>,
-        system_prompt: Option<&str>,
-        prompt: &str,
+        turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
         include_usage: bool,
     ) -> Result<llm::CompletionStream> {
@@ -602,8 +622,13 @@ impl RequestSettings {
                  of them"
             );
         }
-        let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
-        let messages = llm::initial_messages(system_prompt.as_deref(), prompt)?;
+        let system_prompt = self.system_prompt_with_skills(skill_cache, turn.system_prompt)?;
+        let messages = llm::initial_messages(
+            system_prompt.as_deref(),
+            turn.history,
+            turn.prompt,
+            turn.image_urls,
+        )?;
         let mut request = self.request(response_format, messages, &[]);
         request.stream_include_usage = include_usage;
         llm::complete_stream(request).await
@@ -745,8 +770,12 @@ async fn call_agent(
         .complete(
             env,
             active_agent_paths,
-            Some(&system_prompt),
-            prompt,
+            PromptTurn {
+                system_prompt: Some(&system_prompt),
+                history: &[],
+                prompt,
+                image_urls: &[],
+            },
             response_format,
         )
         .await?;
@@ -1150,6 +1179,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .transpose()?;
 
     let system_prompt = resolve_system_prompt(&chat, &file_config)?;
+    let image_urls = attachment::resolve_image_urls(&chat.images)?;
     let env = RunEnv::new(&file_config);
 
     // `--quiet` keeps the response body and drops every note around it.
@@ -1165,8 +1195,12 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         let stream = settings
             .complete_stream(
                 &env.skill_cache,
-                system_prompt.as_deref(),
-                &prompt,
+                PromptTurn {
+                    system_prompt: system_prompt.as_deref(),
+                    history: &[],
+                    prompt: &prompt,
+                    image_urls: &image_urls,
+                },
                 response_format,
                 show_usage,
             )
@@ -1188,8 +1222,12 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .complete(
             &env,
             &[],
-            system_prompt.as_deref(),
-            &prompt,
+            PromptTurn {
+                system_prompt: system_prompt.as_deref(),
+                history: &[],
+                prompt: &prompt,
+                image_urls: &image_urls,
+            },
             response_format,
         )
         .await?;
@@ -2277,7 +2315,17 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(env, &[], system_prompt.as_deref(), &prompt, response_format)
+            .complete(
+                env,
+                &[],
+                PromptTurn {
+                    system_prompt: system_prompt.as_deref(),
+                    history: &[],
+                    prompt: &prompt,
+                    image_urls: &[],
+                },
+                response_format,
+            )
             .await
             .with_context(|| format!("step '{label}'"))?;
 

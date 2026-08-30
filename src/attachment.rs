@@ -1,11 +1,15 @@
-//! `--file` context attachment (see `docs/usage/ja/attachments.md`): reads
-//! each path's contents and renders them as named fenced code blocks that get
-//! appended after the prompt, so a shell command substitution
-//! (`"$(cat file)"`) is never needed to give a request some file context.
+//! `--file`/`--image` context attachment (see
+//! `docs/usage/ja/attachments.md`): `--file` reads each path's contents and
+//! renders them as named fenced code blocks appended after the prompt, so a
+//! shell command substitution (`"$(cat file)"`) is never needed to give a
+//! request some file context; `--image` resolves each path/URL into an
+//! `image_url` a vision-capable model's `content` array can carry (see
+//! `llm::user_message`).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 
 /// The combined size limit across every `--file` attachment, chosen to keep a
 /// request body well within what a local server accepts while still allowing
@@ -51,6 +55,67 @@ pub(crate) fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>>
     Ok(Some(blocks.join("\n\n")))
 }
 
+/// Resolves every `--image` value into a URL a vision-capable model's
+/// `image_url` content part can carry: an `http://`/`https://` value passes
+/// through unchanged, everything else is treated as a local file path, read,
+/// sniffed for its image format (see `sniff_image_mime`), and base64-encoded
+/// into a `data:<mime>;base64,<data>` URL. Returns an empty `Vec` (not an
+/// error) for an empty `images`, so a caller can pass the result straight to
+/// `llm::initial_messages`'s `image_urls` without a separate empty check.
+pub(crate) fn resolve_image_urls(images: &[String]) -> Result<Vec<String>> {
+    images.iter().map(|image| resolve_one(image)).collect()
+}
+
+fn resolve_one(image: &str) -> Result<String> {
+    if image.starts_with("http://") || image.starts_with("https://") {
+        return Ok(image.to_owned());
+    }
+
+    let path = Path::new(image);
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read image file '{}'", path.display()))?;
+    let mime = sniff_image_mime(&bytes, path).with_context(|| {
+        format!(
+            "could not determine the image format of '{}'; supported formats are PNG/JPEG/WebP/GIF",
+            path.display()
+        )
+    })?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+/// Identifies an image's MIME type from its leading magic bytes, falling back
+/// to its file extension when the content doesn't match a known signature
+/// (e.g. a truncated/malformed-but-still-openable file). Returns `Err` when
+/// neither check recognizes the file.
+fn sniff_image_mime(bytes: &[u8], path: &Path) -> Result<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Ok("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Ok("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Ok("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Ok("image/webp");
+    }
+
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Ok("image/png"),
+        Some("jpg" | "jpeg") => Ok("image/jpeg"),
+        Some("gif") => Ok("image/gif"),
+        Some("webp") => Ok("image/webp"),
+        _ => bail!("unrecognized image format"),
+    }
+}
+
 /// Renders one attachment as a fenced code block named after its path. The
 /// fence is widened past the longest run of backticks already in `contents`
 /// (matching how Pandoc/CommonMark tooling avoids a fence prematurely closing
@@ -79,12 +144,81 @@ fn longest_backtick_run(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{fenced_block, longest_backtick_run, read_file_attachments};
+    use super::{fenced_block, longest_backtick_run, read_file_attachments, resolve_image_urls};
     use std::path::Path;
 
     #[test]
     fn returns_none_for_no_files() {
         assert!(read_file_attachments(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_image_urls_returns_empty_for_no_images() {
+        assert!(resolve_image_urls(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_image_urls_passes_http_urls_through_unchanged() {
+        let urls = resolve_image_urls(&["https://example.com/cat.png".to_owned()]).unwrap();
+        assert_eq!(urls, ["https://example.com/cat.png"]);
+    }
+
+    #[test]
+    fn resolve_image_urls_encodes_a_local_png_as_a_data_url() {
+        let mut png_bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        png_bytes.extend_from_slice(b"rest of file");
+        let file = TempFileNamed::new("lait-test-image.png", &png_bytes);
+
+        let urls = resolve_image_urls(&[file.path.display().to_string()]).unwrap();
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn resolve_image_urls_encodes_a_local_jpeg_as_a_data_url() {
+        let mut jpeg_bytes = vec![0xff, 0xd8, 0xff, 0xe0];
+        jpeg_bytes.extend_from_slice(b"rest of file");
+        let file = TempFileNamed::new("lait-test-image.jpg", &jpeg_bytes);
+
+        let urls = resolve_image_urls(&[file.path.display().to_string()]).unwrap();
+        assert!(urls[0].starts_with("data:image/jpeg;base64,"));
+    }
+
+    #[test]
+    fn resolve_image_urls_rejects_an_unrecognized_format() {
+        let file = TempFileNamed::new("lait-test-image.unknown", b"not an image");
+        let error = resolve_image_urls(&[file.path.display().to_string()]).unwrap_err();
+        assert!(error.to_string().contains("could not determine"));
+    }
+
+    #[test]
+    fn resolve_image_urls_rejects_a_missing_file() {
+        assert!(resolve_image_urls(&["/no/such/file/lait-test.png".to_owned()]).is_err());
+    }
+
+    struct TempFileNamed {
+        path: std::path::PathBuf,
+    }
+
+    impl TempFileNamed {
+        fn new(suffix: &str, contents: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "lait-test-{}-{}-{suffix}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::write(&path, contents).expect("failed to write temp image file");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempFileNamed {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     #[test]

@@ -6,9 +6,11 @@ use async_openai::{
     types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, ChatCompletionTools,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, FunctionCall,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
+        ChatCompletionStreamOptions, ChatCompletionTools, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, FunctionCall, ImageUrl,
         ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
     },
 };
@@ -68,25 +70,66 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) stream_include_usage: bool,
 }
 
-/// Builds the initial two-message history shared by every completion request
-/// (chat/agent/workflow-step): an optional system prompt, then the user's
-/// prompt. A tool loop starts from this and appends to it round by round.
+/// Builds the initial message history shared by every completion request
+/// (chat/agent/workflow-step): an optional system prompt, then `history`
+/// (prior turns of a resumed `--session`, empty for everyone else), then the
+/// new user turn built from `prompt`/`image_urls`. A tool loop starts from
+/// this and appends to it round by round.
 pub(crate) fn initial_messages(
     system_prompt: Option<&str>,
+    history: &[ChatCompletionRequestMessage],
     prompt: &str,
+    image_urls: &[String],
 ) -> Result<Vec<ChatCompletionRequestMessage>> {
-    let mut messages = Vec::with_capacity(2);
+    let mut messages = Vec::with_capacity(2 + history.len());
     if let Some(system_prompt) = system_prompt {
         let system_message = ChatCompletionRequestSystemMessageArgs::default()
             .content(system_prompt)
             .build()?;
         messages.push(ChatCompletionRequestMessage::from(system_message));
     }
-    let user_message = ChatCompletionRequestUserMessageArgs::default()
-        .content(prompt)
-        .build()?;
-    messages.push(ChatCompletionRequestMessage::from(user_message));
+    messages.extend(history.iter().cloned());
+    messages.push(user_message(prompt, image_urls)?);
     Ok(messages)
+}
+
+/// Builds a single user-role message from `prompt`, attaching `image_urls`
+/// (each already a `data:` URL or a plain `http(s)://` URL — see
+/// `attachment::resolve_image_urls`) as `image_url` content parts alongside
+/// the text when non-empty. Empty `image_urls` keeps the plain-text `content`
+/// shape every request used before `--image` existed, so a server that only
+/// understands a bare string content still works unchanged.
+pub(crate) fn user_message(
+    prompt: &str,
+    image_urls: &[String],
+) -> Result<ChatCompletionRequestMessage> {
+    if image_urls.is_empty() {
+        let user_message = ChatCompletionRequestUserMessageArgs::default()
+            .content(prompt)
+            .build()?;
+        return Ok(ChatCompletionRequestMessage::from(user_message));
+    }
+
+    let mut parts = Vec::with_capacity(1 + image_urls.len());
+    parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+        ChatCompletionRequestMessageContentPartText {
+            text: prompt.to_owned(),
+        },
+    ));
+    for url in image_urls {
+        parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
+            ChatCompletionRequestMessageContentPartImage {
+                image_url: ImageUrl {
+                    url: url.clone(),
+                    detail: None,
+                },
+            },
+        ));
+    }
+    let user_message = ChatCompletionRequestUserMessageArgs::default()
+        .content(parts)
+        .build()?;
+    Ok(ChatCompletionRequestMessage::from(user_message))
 }
 
 /// Builds the assistant-role message recording a model turn's `tool_calls`

@@ -275,6 +275,11 @@ pub(crate) struct ChatArgs {
     /// appended after the prompt). Repeatable.
     #[arg(long = "file", value_name = "PATH")]
     pub(crate) files: Vec<PathBuf>,
+
+    /// Attach an image for a vision-capable model: a local file path (sent as
+    /// a base64 data URL) or an `http(s)://` URL (sent as-is). Repeatable.
+    #[arg(long = "image", value_name = "PATH_OR_URL")]
+    pub(crate) images: Vec<String>,
 }
 
 impl ReasoningEffort {

@@ -1131,6 +1131,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-openai",
+ "base64 0.23.1",
  "clap",
  "clap_complete",
  "clap_mangen",
