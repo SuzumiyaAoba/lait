@@ -1361,7 +1361,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         Some(name) => prompt::render_named(name, &prompt, &chat.var, &file_config)?,
         None => (prompt, None),
     };
-    let prompt = match attachment::read_file_attachments(&chat.files)? {
+    let prompt = match attachment::read_file_attachments(&chat.files).await? {
         Some(file_context) => format!("{prompt}\n\n{file_context}"),
         None => prompt,
     };
@@ -1376,7 +1376,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         .transpose()?;
 
     let system_prompt = resolve_system_prompt(&chat.shared, &file_config)?;
-    let image_urls = attachment::resolve_image_urls(&chat.images)?;
+    let image_urls = attachment::resolve_image_urls(&chat.images).await?;
     let session_history = load_session_history(chat.shared.session.as_deref())?;
     let env = RunEnv::new(&file_config);
 

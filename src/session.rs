@@ -215,24 +215,12 @@ pub(crate) fn run(command: SessionsCommand) -> Result<()> {
 mod tests {
     use super::{Role, StoredMessage, append_turn, delete, list, load, show, validate_name};
 
-    /// Runs `body` with the current directory temporarily switched to a
-    /// fresh, empty directory, so `SESSIONS_DIR` ("`.lait/sessions`") resolves
-    /// under an isolated location instead of this repository's own working
-    /// tree. Serialized via a global lock: the process-wide current directory
-    /// is shared mutable state, and `cargo test`'s default threaded runner
-    /// would otherwise let two session tests race on it.
+    /// `SESSIONS_DIR` ("`.lait/sessions`") is `cwd`-relative — see
+    /// `crate::test_support::in_temp_dir`, which every cwd-swapping test in
+    /// the crate shares (not just this module's) so they can't race on the
+    /// one process-wide current directory.
     fn in_temp_dir<T>(body: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let dir = crate::test_support::unique_temp_path("lait-test-session", "");
-        std::fs::create_dir_all(&dir).unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let result = body();
-        std::env::set_current_dir(original).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        result
+        crate::test_support::in_temp_dir("lait-test-session", body)
     }
 
     #[test]

@@ -23,13 +23,17 @@ const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// string to special-case. Fails if any file cannot be read, is not valid
 /// UTF-8 text (binary attachments aren't supported), or the combined size of
 /// every attachment exceeds `MAX_TOTAL_ATTACHMENT_BYTES`.
-pub(crate) fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>> {
+///
+/// Every file's metadata is checked against the size limit up front, before
+/// any content is read, so a limit violation never pays for reading content
+/// it's about to discard; the reads themselves then run concurrently (see
+/// `read_all`) since they're otherwise independent.
+pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>> {
     if files.is_empty() {
         return Ok(None);
     }
 
     let mut total_bytes: u64 = 0;
-    let mut blocks = Vec::with_capacity(files.len());
     for path in files {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("failed to read file '{}'", path.display()))?;
@@ -40,19 +44,50 @@ pub(crate) fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>>
                 MAX_TOTAL_ATTACHMENT_BYTES
             );
         }
-
-        let contents = std::fs::read(path)
-            .with_context(|| format!("failed to read file '{}'", path.display()))?;
-        let text = String::from_utf8(contents).map_err(|_| {
-            anyhow::anyhow!(
-                "'--file {}' is not valid UTF-8 text; binary files are not supported",
-                path.display()
-            )
-        })?;
-        blocks.push(fenced_block(path, &text));
     }
 
+    let texts = read_all(files).await?;
+    let blocks: Vec<String> = files
+        .iter()
+        .zip(texts)
+        .map(|(path, text)| fenced_block(path, &text))
+        .collect();
     Ok(Some(blocks.join("\n\n")))
+}
+
+/// Reads and UTF-8-decodes every path in `files`, in order. A single file (the
+/// overwhelmingly common case for `--file`) is read inline with no task
+/// overhead; two or more run concurrently via `spawn_blocking`, since each
+/// read is independent of the others.
+async fn read_all(files: &[PathBuf]) -> Result<Vec<String>> {
+    match files {
+        [] => Ok(Vec::new()),
+        [single] => Ok(vec![read_text_file(single)?]),
+        many => {
+            // `.cloned()` isn't redundant here despite what clippy's lint
+            // thinks: `spawn_blocking`'s closure must be `'static`, so it
+            // can't borrow from `files`, which only lives for this `async
+            // fn`'s body.
+            #[allow(clippy::redundant_iter_cloned)]
+            let reads = many.iter().cloned().map(|path| async move {
+                tokio::task::spawn_blocking(move || read_text_file(&path))
+                    .await
+                    .context("file read task panicked")?
+            });
+            futures_util::future::try_join_all(reads).await
+        }
+    }
+}
+
+fn read_text_file(path: &Path) -> Result<String> {
+    let contents =
+        std::fs::read(path).with_context(|| format!("failed to read file '{}'", path.display()))?;
+    String::from_utf8(contents).map_err(|_| {
+        anyhow::anyhow!(
+            "'--file {}' is not valid UTF-8 text; binary files are not supported",
+            path.display()
+        )
+    })
 }
 
 /// Resolves every `--image` value into a URL a vision-capable model's
@@ -61,9 +96,25 @@ pub(crate) fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>>
 /// sniffed for its image format (see `sniff_image_mime`), and base64-encoded
 /// into a `data:<mime>;base64,<data>` URL. Returns an empty `Vec` (not an
 /// error) for an empty `images`, so a caller can pass the result straight to
-/// `llm::initial_messages`'s `image_urls` without a separate empty check.
-pub(crate) fn resolve_image_urls(images: &[String]) -> Result<Vec<String>> {
-    images.iter().map(|image| resolve_one(image)).collect()
+/// `llm::initial_messages`'s `image_urls` without a separate empty check. A
+/// single image is resolved inline; two or more run concurrently, the same
+/// way `read_all` above handles multiple `--file` attachments.
+pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<String>> {
+    match images {
+        [] => Ok(Vec::new()),
+        [single] => Ok(vec![resolve_one(single)?]),
+        many => {
+            // See `read_all`'s identical `#[allow]`: `spawn_blocking` needs a
+            // `'static` closure, so this can't borrow from `images`.
+            #[allow(clippy::redundant_iter_cloned)]
+            let resolutions = many.iter().cloned().map(|image| async move {
+                tokio::task::spawn_blocking(move || resolve_one(&image))
+                    .await
+                    .context("image resolution task panicked")?
+            });
+            futures_util::future::try_join_all(resolutions).await
+        }
+    }
 }
 
 fn resolve_one(image: &str) -> Result<String> {
@@ -147,59 +198,93 @@ mod tests {
     use super::{fenced_block, longest_backtick_run, read_file_attachments, resolve_image_urls};
     use std::path::Path;
 
-    #[test]
-    fn returns_none_for_no_files() {
-        assert!(read_file_attachments(&[]).unwrap().is_none());
+    #[tokio::test]
+    async fn returns_none_for_no_files() {
+        assert!(read_file_attachments(&[]).await.unwrap().is_none());
     }
 
-    #[test]
-    fn resolve_image_urls_returns_empty_for_no_images() {
-        assert!(resolve_image_urls(&[]).unwrap().is_empty());
+    #[tokio::test]
+    async fn resolve_image_urls_returns_empty_for_no_images() {
+        assert!(resolve_image_urls(&[]).await.unwrap().is_empty());
     }
 
-    #[test]
-    fn resolve_image_urls_passes_http_urls_through_unchanged() {
-        let urls = resolve_image_urls(&["https://example.com/cat.png".to_owned()]).unwrap();
+    #[tokio::test]
+    async fn resolve_image_urls_passes_http_urls_through_unchanged() {
+        let urls = resolve_image_urls(&["https://example.com/cat.png".to_owned()])
+            .await
+            .unwrap();
         assert_eq!(urls, ["https://example.com/cat.png"]);
     }
 
-    #[test]
-    fn resolve_image_urls_encodes_a_local_png_as_a_data_url() {
+    #[tokio::test]
+    async fn resolve_image_urls_encodes_a_local_png_as_a_data_url() {
         let mut png_bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         png_bytes.extend_from_slice(b"rest of file");
         let file = TempFile::with_suffix("lait-test-image.png", &png_bytes);
 
-        let urls = resolve_image_urls(&[file.path.display().to_string()]).unwrap();
+        let urls = resolve_image_urls(&[file.path.display().to_string()])
+            .await
+            .unwrap();
         assert_eq!(urls.len(), 1);
         assert!(urls[0].starts_with("data:image/png;base64,"));
     }
 
-    #[test]
-    fn resolve_image_urls_encodes_a_local_jpeg_as_a_data_url() {
+    #[tokio::test]
+    async fn resolve_image_urls_encodes_a_local_jpeg_as_a_data_url() {
         let mut jpeg_bytes = vec![0xff, 0xd8, 0xff, 0xe0];
         jpeg_bytes.extend_from_slice(b"rest of file");
         let file = TempFile::with_suffix("lait-test-image.jpg", &jpeg_bytes);
 
-        let urls = resolve_image_urls(&[file.path.display().to_string()]).unwrap();
+        let urls = resolve_image_urls(&[file.path.display().to_string()])
+            .await
+            .unwrap();
         assert!(urls[0].starts_with("data:image/jpeg;base64,"));
     }
 
-    #[test]
-    fn resolve_image_urls_rejects_an_unrecognized_format() {
+    #[tokio::test]
+    async fn resolve_image_urls_rejects_an_unrecognized_format() {
         let file = TempFile::with_suffix("lait-test-image.unknown", b"not an image");
-        let error = resolve_image_urls(&[file.path.display().to_string()]).unwrap_err();
+        let error = resolve_image_urls(&[file.path.display().to_string()])
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("could not determine"));
     }
 
-    #[test]
-    fn resolve_image_urls_rejects_a_missing_file() {
-        assert!(resolve_image_urls(&["/no/such/file/lait-test.png".to_owned()]).is_err());
+    #[tokio::test]
+    async fn resolve_image_urls_rejects_a_missing_file() {
+        assert!(
+            resolve_image_urls(&["/no/such/file/lait-test.png".to_owned()])
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn reads_a_single_file_into_a_fenced_block() {
+    #[tokio::test]
+    async fn resolves_multiple_images_concurrently_and_preserves_order() {
+        let mut png_bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        png_bytes.extend_from_slice(b"rest of file");
+        let png = TempFile::with_suffix("lait-test-image.png", &png_bytes);
+        let mut jpeg_bytes = vec![0xff, 0xd8, 0xff, 0xe0];
+        jpeg_bytes.extend_from_slice(b"rest of file");
+        let jpeg = TempFile::with_suffix("lait-test-image.jpg", &jpeg_bytes);
+
+        let urls = resolve_image_urls(&[
+            png.path.display().to_string(),
+            "https://example.com/cat.png".to_owned(),
+            jpeg.path.display().to_string(),
+        ])
+        .await
+        .unwrap();
+        assert!(urls[0].starts_with("data:image/png;base64,"));
+        assert_eq!(urls[1], "https://example.com/cat.png");
+        assert!(urls[2].starts_with("data:image/jpeg;base64,"));
+    }
+
+    #[tokio::test]
+    async fn reads_a_single_file_into_a_fenced_block() {
         let file = TempFile::new("hello world\n");
         let result = read_file_attachments(std::slice::from_ref(&file.path))
+            .await
             .unwrap()
             .unwrap();
         assert!(result.starts_with("```"));
@@ -207,11 +292,12 @@ mod tests {
         assert!(result.contains("hello world"));
     }
 
-    #[test]
-    fn joins_multiple_files_with_a_blank_line() {
+    #[tokio::test]
+    async fn joins_multiple_files_with_a_blank_line() {
         let a = TempFile::new("aaa\n");
         let b = TempFile::new("bbb\n");
         let result = read_file_attachments(&[a.path.clone(), b.path.clone()])
+            .await
             .unwrap()
             .unwrap();
         assert!(result.contains("aaa"));
@@ -219,15 +305,21 @@ mod tests {
         assert!(result.contains("\n\n```"));
     }
 
-    #[test]
-    fn rejects_a_missing_file() {
-        assert!(read_file_attachments(&["/no/such/file/lait-test".into()]).is_err());
+    #[tokio::test]
+    async fn rejects_a_missing_file() {
+        assert!(
+            read_file_attachments(&["/no/such/file/lait-test".into()])
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn rejects_binary_content() {
+    #[tokio::test]
+    async fn rejects_binary_content() {
         let file = TempFile::new_bytes(&[0xff, 0xfe, 0x00, 0xff]);
-        let error = read_file_attachments(std::slice::from_ref(&file.path)).unwrap_err();
+        let error = read_file_attachments(std::slice::from_ref(&file.path))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("not valid UTF-8"));
     }
 
