@@ -310,6 +310,11 @@ fn lint_node(
     if let Some(prompt) = &node.prompt {
         check_prompt_template(&node_context, "'prompt' template", prompt, issues);
     }
+    if let Some(argv) = &node.command {
+        for arg in argv {
+            check_prompt_template(&node_context, "'command' argument template", arg, issues);
+        }
+    }
     if let Some(name_or_path) = &node.input_schema
         && let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path)
     {
@@ -699,6 +704,19 @@ mod tests {
         assert!(
             issues.iter().any(|issue| issue.severity == Severity::Error
                 && issue.message.contains("'prompt' template")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn flags_an_invalid_command_argument_template() {
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    command: [\"echo\", \"{{ input\"]\nsteps:\n  - use: a\n",
+        );
+        let issues = lint_fixture(&wf, Some(&empty_config()));
+        assert!(
+            issues.iter().any(|issue| issue.severity == Severity::Error
+                && issue.message.contains("'command' argument template")),
             "{issues:?}"
         );
     }

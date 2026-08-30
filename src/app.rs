@@ -892,23 +892,45 @@ struct StreamOutcome {
     usage: Option<response::Usage>,
 }
 
-/// Renders an agent's system prompt against `input`, calls the model with
-/// `prompt` as the user message, and renders the response. Shared by
-/// `run_agent`, `execute_step`'s agent branch, and `call_subagent_tool`.
+/// The per-call inputs to `call_agent` beyond settings/env: the JSON-parsed
+/// input (for rendering the agent's system prompt template), the raw text
+/// sent as the user message, and any `--image`-style attachments for it.
+/// Bundled, like `PromptTurn` above, to keep `call_agent`'s argument count
+/// under clippy's `too_many_arguments` threshold.
+struct AgentTurn<'a> {
+    input: &'a serde_json::Value,
+    prompt: &'a str,
+    image_urls: &'a [String],
+}
+
+impl<'a> AgentTurn<'a> {
+    /// A turn with no image attachments — every caller but `execute_step`'s
+    /// agent branch, which has a node's own `images:` to resolve.
+    fn simple(input: &'a serde_json::Value, prompt: &'a str) -> Self {
+        Self {
+            input,
+            prompt,
+            image_urls: &[],
+        }
+    }
+}
+
+/// Renders an agent's system prompt against `turn.input`, calls the model
+/// with `turn.prompt` as the user message, and renders the response. Shared
+/// by `run_agent`, `execute_step`'s agent branch, and `call_subagent_tool`.
 /// `active_agent_paths` is threaded straight through to `settings.complete`
 /// — see its doc comment; every caller but `call_subagent_tool` passes `&[]`.
 async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
     env: &RunEnv<'_>,
-    input: &serde_json::Value,
-    prompt: &str,
+    turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
 ) -> Result<String> {
     let system_prompt = template::render(
         &agent_file.system_prompt_template,
-        input,
+        turn.input,
         steps_outputs,
         &serde_json::Map::new(),
     )?;
@@ -928,7 +950,12 @@ async fn call_agent(
         .complete(
             env,
             active_agent_paths,
-            PromptTurn::simple(Some(&system_prompt), prompt),
+            PromptTurn {
+                system_prompt: Some(&system_prompt),
+                history: &[],
+                prompt: turn.prompt,
+                image_urls: turn.image_urls,
+            },
             response_format,
         )
         .await?;
@@ -1054,8 +1081,7 @@ fn call_subagent_tool<'a>(
             &loaded.file,
             &settings,
             env,
-            &input,
-            &prompt,
+            AgentTurn::simple(&input, &prompt),
             &workflow::StepOutputs::new(),
             &next_active_paths,
         )
@@ -1735,8 +1761,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         &agent_file,
         &settings,
         &env,
-        &input,
-        &raw_input,
+        AgentTurn::simple(&input, &raw_input),
         &workflow::StepOutputs::new(),
         &[],
     )
@@ -2722,12 +2747,26 @@ async fn execute_step(
             resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?
                 .with_usage_label(label);
 
+        let file_context = attachment::read_file_attachments(node.files.as_deref().unwrap_or(&[]))
+            .await
+            .with_context(|| format!("step '{label}'"))?;
+        let prompt: Cow<'_, str> = match &file_context {
+            Some(context) => Cow::Owned(format!("{current_input}\n\n{context}")),
+            None => Cow::Borrowed(current_input),
+        };
+        let image_urls = attachment::resolve_image_urls(node.images.as_deref().unwrap_or(&[]))
+            .await
+            .with_context(|| format!("step '{label}'"))?;
+
         call_agent(
             agent_file,
             &settings,
             env,
-            &input,
-            current_input,
+            AgentTurn {
+                input: &input,
+                prompt: &prompt,
+                image_urls: &image_urls,
+            },
             steps_outputs,
             &[],
         )
@@ -2769,6 +2808,16 @@ async fn execute_step(
             ),
             None => Cow::Borrowed(current_input),
         };
+        let file_context = attachment::read_file_attachments(node.files.as_deref().unwrap_or(&[]))
+            .await
+            .with_context(|| format!("step '{label}'"))?;
+        let prompt: Cow<'_, str> = match &file_context {
+            Some(context) => Cow::Owned(format!("{prompt}\n\n{context}")),
+            None => prompt,
+        };
+        let image_urls = attachment::resolve_image_urls(node.images.as_deref().unwrap_or(&[]))
+            .await
+            .with_context(|| format!("step '{label}'"))?;
         let system_prompt = node
             .system_prompt
             .as_deref()
@@ -2788,7 +2837,12 @@ async fn execute_step(
             .complete(
                 env,
                 &[],
-                PromptTurn::simple(system_prompt.as_deref(), &prompt),
+                PromptTurn {
+                    system_prompt: system_prompt.as_deref(),
+                    history: &[],
+                    prompt: &prompt,
+                    image_urls: &image_urls,
+                },
                 response_format,
             )
             .await
@@ -2825,6 +2879,16 @@ async fn execute_step(
         .await
         .with_context(|| format!("step '{label}'"))?;
         result
+    } else if let Some(argv) = &node.command {
+        let input = template::parse_input(current_input);
+        let rendered_argv: Vec<String> = argv
+            .iter()
+            .map(|arg| template::render(arg, &input, steps_outputs, &serde_json::Map::new()))
+            .collect::<Result<_>>()
+            .with_context(|| format!("step '{label}'"))?;
+        run_command(&rendered_argv, current_input)
+            .await
+            .with_context(|| format!("step '{label}'"))?
     } else {
         current_input.to_string()
     };
@@ -2844,4 +2908,58 @@ async fn execute_step(
     }
 
     Ok(step_output)
+}
+
+/// Runs `argv[0]` as a child process with `argv[1..]` as its arguments,
+/// piping `stdin_input` to its stdin and capturing stdout as this node's
+/// output (see `NodeDefinition::command`'s doc comment for the full
+/// contract). `stdin` is written from a separate task running concurrently
+/// with `wait_with_output` so a command that writes a lot of stdout before
+/// reading all of stdin (or never reads stdin at all) can't deadlock against
+/// this side's write filling the pipe buffer.
+async fn run_command(argv: &[String], stdin_input: &str) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+
+    let (program, args) = argv
+        .split_first()
+        .expect("validate::validate_node rejects an empty 'command' list");
+
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run command '{program}'"))?;
+
+    let mut stdin = child.stdin.take().expect("stdin was requested as piped");
+    let stdin_input = stdin_input.to_owned();
+    let write_stdin = tokio::spawn(async move {
+        stdin.write_all(stdin_input.as_bytes()).await?;
+        stdin.shutdown().await
+    });
+
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("failed to run command '{program}'"))?;
+    // Only checked after the process has been reaped: a command that closes
+    // stdin without reading all of it (or ignores it entirely) makes this
+    // write fail with a broken pipe, which isn't a real error as long as the
+    // process itself still exited the way it exited.
+    let _ = write_stdin.await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "command '{program}' exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        anyhow!("command '{program}' produced non-UTF-8 output on stdout; binary output is not supported")
+    })?;
+    Ok(stdout.trim_end_matches(['\n', '\r']).to_string())
 }

@@ -144,6 +144,20 @@ pub(crate) struct NodeDefinition {
     /// (the agent file's body), so `system_prompt` is rejected alongside
     /// `agent`.
     pub(crate) system_prompt: Option<String>,
+    /// Paths whose contents are attached as context, like the CLI's
+    /// `--file`: each is read as UTF-8 text and appended (as named fenced
+    /// code blocks, see `attachment::read_file_attachments`) after the
+    /// rendered `prompt` (or, for a `system_prompt`-only node, after the
+    /// current input passed through unchanged). Only meaningful for a node
+    /// that calls a model (`prompt`/`system_prompt`/`agent`); rejected
+    /// alongside `workflow`/`command`, neither of which sends a message of
+    /// its own for this to attach to.
+    pub(crate) files: Option<Vec<PathBuf>>,
+    /// Images attached for a vision-capable model, like the CLI's `--image`:
+    /// each entry is a local file path (sent as a base64 data URL) or an
+    /// `http(s)://` URL (sent as-is); see `attachment::resolve_image_urls`.
+    /// Same restriction as `files` above.
+    pub(crate) images: Option<Vec<String>>,
     /// Path to an agent Markdown file (see `agent::load_agent`) whose system
     /// prompt, model/reasoning defaults, and input/output schema drive this
     /// node instead of `prompt`/`input_schema`/`output_schema`/`schema_name`.
@@ -156,7 +170,7 @@ pub(crate) struct NodeDefinition {
     /// sub-workflow's final output becomes this node's output. Its own
     /// `default:`/`models:`/`json_schemas:` take precedence, falling back to
     /// this workflow's when it doesn't define an entry. Mutually exclusive
-    /// with `prompt`, `agent`, `model`, `reasoning_effort`,
+    /// with `prompt`, `agent`, `command`, `model`, `reasoning_effort`,
     /// `temperature`/`top_p`/`max_tokens`,
     /// `input_schema`/`output_schema`/`schema_name` (which the sub-workflow's
     /// own steps supply), and `retry`/`timeout` (set those on the
@@ -164,6 +178,22 @@ pub(crate) struct NodeDefinition {
     /// lives on the calling `FlowStep`, not this node, and is free to catch
     /// this sub-workflow failing as a whole.
     pub(crate) workflow: Option<PathBuf>,
+    /// Runs `command[0]` as a child process with `command[1..]` as its
+    /// arguments, each rendered via `template::render` like `prompt` (this
+    /// never goes through a shell, so a rendered value can't inject an extra
+    /// argument or command the way string concatenation into a shell command
+    /// line could — see `docs/usage/ja/attachments.md`'s note on why
+    /// `--file` exists for the same reason). This node's current input is
+    /// piped to the process's stdin; its captured stdout (a single trailing
+    /// newline stripped, like a shell `$(...)` substitution) becomes this
+    /// node's output, then goes through `jq`/`write_file` like any other
+    /// node's output. A non-UTF-8 stdout is rejected, matching `--file`'s
+    /// text-only restriction. A non-zero exit status fails this node's
+    /// action (stderr included in the error), the same as any other
+    /// failure — subject to the calling `FlowStep`'s `on_error` and this
+    /// node's own `retry`. Mutually exclusive with `prompt`, `system_prompt`,
+    /// `agent`, `workflow`, `files`, and `images`.
+    pub(crate) command: Option<Vec<String>>,
     /// Validates this node's input before it runs (before rendering `prompt`,
     /// or before `jq` for a transform-only node). Resolved against the
     /// workflow's top-level `json_schemas:` first; if no such key exists,

@@ -3,13 +3,20 @@
 //! under `tests/` — those compile as a separate crate and can't reach this
 //! one (or vice versa).
 
-/// A path under the OS temp directory, unique to this process and instant:
-/// `{prefix}-{pid}-{nanos}{suffix}`. `suffix` is appended verbatim so a
-/// caller that needs a real extension at the end (e.g. `".png"`, for
-/// MIME-sniffing fallback tests) can still get one.
+/// A path under the OS temp directory, unique to this process and call:
+/// `{prefix}-{pid}-{nanos}-{counter}{suffix}`. `suffix` is appended verbatim
+/// so a caller that needs a real extension at the end (e.g. `".png"`, for
+/// MIME-sniffing fallback tests) can still get one. The trailing `counter`
+/// (shared process-wide, like `tests/support::next_temp_path`'s) is what
+/// actually guarantees uniqueness: `SystemTime::now()` alone is not — on a
+/// clock whose reported resolution is coarser than a nanosecond (common on
+/// macOS), two calls from different test threads can land on the same
+/// instant and collide on the same path.
 pub(crate) fn unique_temp_path(prefix: &str, suffix: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}{suffix}",
+        "{prefix}-{}-{}-{counter}{suffix}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
