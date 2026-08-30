@@ -270,6 +270,11 @@ pub(crate) struct ChatArgs {
     /// the prompt from stdin explicitly.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+
+    /// Attach a file's contents as context (as a named fenced code block
+    /// appended after the prompt). Repeatable.
+    #[arg(long = "file", value_name = "PATH")]
+    pub(crate) files: Vec<PathBuf>,
 }
 
 impl ReasoningEffort {

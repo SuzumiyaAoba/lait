@@ -14,6 +14,7 @@ use futures_util::{StreamExt, TryStreamExt};
 
 use crate::{
     agent::{self, AgentFile},
+    attachment,
     cli::{AgentAction, ChatArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, ReasoningEffort},
     config::{self, ConfigFile, ModelMap},
@@ -1102,6 +1103,10 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
             "a PROMPT is required; provide one, pipe input via stdin, or use `lait run <FILE> <PROMPT>`"
         )
     })?;
+    let prompt = match attachment::read_file_attachments(&chat.files)? {
+        Some(file_context) => format!("{prompt}\n\n{file_context}"),
+        None => prompt,
+    };
 
     let file_config = config::load_config(no_config)?;
     let model_name = chat

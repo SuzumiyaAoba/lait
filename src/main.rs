@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod agent;
 mod app;
+mod attachment;
 mod cli;
 mod config;
 mod dotenv;
