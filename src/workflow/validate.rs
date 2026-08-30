@@ -263,14 +263,25 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
              'command', a 'jq' filter, a 'write_file' path, or a combination",
         );
     }
-    if node.prompt.is_some() && node.agent.is_some() {
-        bail!("{description} cannot have both 'prompt' and 'agent'");
-    }
-    if node.workflow.is_some() && node.prompt.is_some() {
-        bail!("{description} cannot have both 'prompt' and 'workflow'");
-    }
-    if node.workflow.is_some() && node.agent.is_some() {
-        bail!("{description} cannot have both 'agent' and 'workflow'");
+    // A node's `prompt`/`agent`/`workflow`/`command` are its four alternative
+    // "primary actions" — at most one may be set (unlike `system_prompt`,
+    // which is an adjunct to `prompt`/`agent` rather than an action of its
+    // own, and is instead excluded per-action below alongside that action's
+    // other invalid companion fields). Counted the same way
+    // `validate_steps`' `router_count` counts `switch`/`parallel`/`loop`/
+    // `for_each`, so a future fifth action kind is one more array entry, not
+    // another O(n) set of pairwise bails.
+    let action_count = [
+        node.prompt.is_some(),
+        node.agent.is_some(),
+        node.workflow.is_some(),
+        node.command.is_some(),
+    ]
+    .into_iter()
+    .filter(|set| *set)
+    .count();
+    if action_count > 1 {
+        bail!("{description} can have at most one of 'prompt', 'agent', 'workflow', or 'command'");
     }
     if let Some(argv) = &node.command {
         if argv.is_empty() {
@@ -279,22 +290,10 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
                  to run"
             );
         }
-        if node.prompt.is_some() {
-            bail!("{description} cannot have both 'prompt' and 'command'");
-        }
-        if node.system_prompt.is_some() {
-            bail!("{description} cannot have both 'system_prompt' and 'command'");
-        }
-        if node.agent.is_some() {
-            bail!("{description} cannot have both 'agent' and 'command'");
-        }
-        if node.workflow.is_some() {
-            bail!("{description} cannot have both 'workflow' and 'command'");
-        }
-        if node.files.is_some() || node.images.is_some() {
+        if node.system_prompt.is_some() || node.files.is_some() || node.images.is_some() {
             bail!(
-                "{description} has 'command' set; 'files'/'images' only apply to a \
-                 'prompt'/'system_prompt'/'agent' message and must not be set alongside it"
+                "{description} has 'command' set; 'system_prompt'/'files'/'images' only apply \
+                 to a 'prompt'/'system_prompt'/'agent' message and must not be set alongside it"
             );
         }
     }
