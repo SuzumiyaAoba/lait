@@ -80,11 +80,11 @@ pub(crate) fn record(
         response: response.to_owned(),
         usage,
     };
-    jsonl::append(&history_path()?, [entry], "history")
+    jsonl::append(&history_path()?, [entry])
 }
 
 fn load_all() -> Result<Vec<HistoryEntry>> {
-    jsonl::load(&history_path()?, "history")
+    jsonl::load(&history_path()?)
 }
 
 /// Every recorded entry, most-recent first, numbered so `1` is the most

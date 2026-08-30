@@ -64,7 +64,7 @@ fn session_path(name: &str) -> Result<PathBuf> {
 /// been used before — starting a brand-new named session is the common case
 /// for a first `--session <NAME>` call.
 pub(crate) fn load(name: &str) -> Result<Vec<StoredMessage>> {
-    jsonl::load(&session_path(name)?, "session")
+    jsonl::load(&session_path(name)?)
 }
 
 /// Converts a loaded session's turns into the message shape
@@ -100,7 +100,6 @@ pub(crate) fn append_turn(name: &str, user_content: &str, assistant_content: &st
                 content: assistant_content.to_owned(),
             },
         ],
-        "session",
     )
 }
 
@@ -108,19 +107,7 @@ pub(crate) fn append_turn(name: &str, user_content: &str, assistant_content: &st
 /// session file at `path`, counted from raw lines rather than deserializing
 /// every stored message — `lait sessions list` only needs the count.
 fn count_turns(path: &Path) -> Result<usize> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read session file '{}'", path.display()));
-        }
-    };
-    Ok(contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-        / 2)
+    Ok(jsonl::count_lines(path)? / 2)
 }
 
 /// One row of `lait sessions list`: a session's name and how many turns

@@ -121,13 +121,15 @@ impl UsageTally {
     /// `None` when nothing has been recorded yet (never zero-vs-absent
     /// ambiguity, same convention as `response::Usage`'s own optionality).
     fn total(&self) -> Option<response::Usage> {
-        self.summarize()
-            .into_iter()
-            .fold(None, |total, (_, usage, _)| {
-                let mut total = total.unwrap_or_default();
-                total.add(usage);
-                Some(total)
-            })
+        let events = self
+            .events
+            .lock()
+            .expect("usage tally lock should not be poisoned");
+        events.iter().fold(None, |total, (_, usage)| {
+            let mut total = total.unwrap_or_default();
+            total.add(*usage);
+            Some(total)
+        })
     }
 }
 
@@ -464,7 +466,6 @@ struct CapabilityOverrides {
 /// chat). Bundled into one struct, like `SamplingOverrides`/
 /// `CapabilityOverrides` above, to keep `complete`'s argument count under
 /// clippy's `too_many_arguments` threshold.
-#[derive(Clone, Copy)]
 struct PromptTurn<'a> {
     system_prompt: Option<&'a str>,
     history: &'a [ChatCompletionRequestMessage],
