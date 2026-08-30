@@ -15,10 +15,10 @@ use futures_util::{StreamExt, TryStreamExt};
 use crate::{
     agent::{self, AgentFile},
     attachment,
-    cli::{AgentAction, ChatArgs, Cli, Command, LintArgs, RunArgs},
-    cli::{AgentRunArgs, ReasoningEffort},
+    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
+    cli::{AgentRunArgs, ReasoningEffort, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
-    jq, lint, llm, mcp, response, schema, session, skill, subagent, template, workflow,
+    jq, lint, llm, mcp, repl, response, schema, session, skill, subagent, template, workflow,
 };
 
 pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -174,7 +174,38 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
-        None => run_chat(cli.chat, cli.no_config).await,
+        Some(Command::Chat(chat_repl_args)) => run_chat_repl(chat_repl_args, cli.no_config).await,
+        None => run_chat_or_repl(cli.chat, cli.no_config).await,
+    }
+}
+
+/// The bare-invocation entry point (`lait [OPTIONS] [PROMPT]`, no
+/// subcommand): sends a single-shot chat request when a prompt is available
+/// (an argument or piped stdin — see `resolve_input_with_stdin`), or, when
+/// none is and stdin is an interactive terminal, starts the same REPL
+/// `lait chat` does instead of erroring. Piped-but-empty stdin (a script's
+/// `< /dev/null`, or a forgotten argument in a pipeline) still errors exactly
+/// as before — only an actual interactive terminal with nothing typed counts
+/// as "the user wants the REPL", so a script's exit-code contract never
+/// silently changes into "launched an interactive prompt that then exits
+/// immediately."
+async fn run_chat_or_repl(chat: ChatArgs, no_config: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    match resolve_input_with_stdin(chat.prompt.clone())? {
+        Some(prompt) => run_chat(chat, prompt, no_config).await,
+        None if std::io::stdin().is_terminal() => {
+            run_chat_repl(
+                ChatReplArgs {
+                    shared: chat.shared,
+                },
+                no_config,
+            )
+            .await
+        }
+        None => Err(anyhow!(
+            "a PROMPT is required; provide one, pipe input via stdin, or use `lait run <FILE> <PROMPT>`"
+        )),
     }
 }
 
@@ -194,7 +225,7 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::Sessions(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
-        Some(Command::Run(_) | Command::Agent(_)) | None => true,
+        Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => true,
     }
 }
 
@@ -216,7 +247,7 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
-        Some(Command::Run(_) | Command::Agent(_)) | None => {
+        Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
     }
@@ -1138,11 +1169,14 @@ fn agent_file_settings(
 /// contents, else `default.system` from lait.config.yml (`--system` and
 /// `--system-file` conflict at the clap level, so their order here never
 /// actually decides anything).
-fn resolve_system_prompt(chat: &ChatArgs, file_config: &ConfigFile) -> Result<Option<String>> {
-    if let Some(text) = &chat.system {
+fn resolve_system_prompt(
+    shared: &SharedChatArgs,
+    file_config: &ConfigFile,
+) -> Result<Option<String>> {
+    if let Some(text) = &shared.system {
         return Ok(Some(text.clone()));
     }
-    if let Some(path) = &chat.system_file {
+    if let Some(path) = &shared.system_file {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read system prompt file '{}'", path.display()))?;
         return Ok(Some(text.trim_end().to_owned()));
@@ -1150,19 +1184,19 @@ fn resolve_system_prompt(chat: &ChatArgs, file_config: &ConfigFile) -> Result<Op
     Ok(file_config.default.system.clone())
 }
 
-async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
-    let prompt = resolve_input_with_stdin(chat.prompt.clone())?.ok_or_else(|| {
-        anyhow!(
-            "a PROMPT is required; provide one, pipe input via stdin, or use `lait run <FILE> <PROMPT>`"
-        )
-    })?;
-    let prompt = match attachment::read_file_attachments(&chat.files)? {
-        Some(file_context) => format!("{prompt}\n\n{file_context}"),
-        None => prompt,
-    };
-
-    let file_config = config::load_config(no_config)?;
-    let model_name = chat
+/// Resolves a chat turn's `RequestSettings` from `shared` (the options common
+/// to single-shot chat and `lait chat`'s REPL — see `SharedChatArgs`) and
+/// `file_config`. Shared by `run_chat` and `repl::run`, which both need
+/// exactly this: chat's own model-resolution rule (`--model`/`LLM_MODEL` >
+/// `default.model`) plus the sampling/capability overrides every chat turn
+/// carries. The REPL calls this again after `/model`, so a model switch
+/// re-resolves the full settings (base URL, sampling defaults, ...) rather
+/// than only swapping the model id.
+fn resolve_chat_settings(
+    shared: &SharedChatArgs,
+    file_config: &ConfigFile,
+) -> Result<RequestSettings> {
+    let model_name = shared
         .model
         .clone()
         .or_else(|| file_config.default.model.clone())
@@ -1176,25 +1210,50 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let settings = resolve_request_settings(
         model_name,
         SamplingOverrides {
-            reasoning_effort: chat.reasoning_effort,
-            temperature: chat.temperature,
-            top_p: chat.top_p,
-            max_tokens: chat.max_tokens,
+            reasoning_effort: shared.reasoning_effort,
+            temperature: shared.temperature,
+            top_p: shared.top_p,
+            max_tokens: shared.max_tokens,
         },
-        chat.base_url.clone(),
-        chat.api_key.clone(),
+        shared.base_url.clone(),
+        shared.api_key.clone(),
         CapabilityOverrides {
-            mcp: (!chat.mcp.is_empty()).then(|| chat.mcp.clone()),
+            mcp: (!shared.mcp.is_empty()).then(|| shared.mcp.clone()),
             max_tool_rounds: None,
             // No `--skill` CLI flag: chat only ever gets skills from
             // `default.skills` in `lait.config.yml` (see `resolve_request_settings`).
             skills: None,
-            subagents: (!chat.subagent.is_empty()).then(|| chat.subagent.clone()),
+            subagents: (!shared.subagent.is_empty()).then(|| shared.subagent.clone()),
         },
         &ModelMap::default(),
-        &file_config,
-    )?
-    .with_usage_label("chat");
+        file_config,
+    )?;
+    Ok(settings.with_usage_label("chat"))
+}
+
+/// Resolves `shared.session`'s prior turns (empty when `--session` is unset)
+/// into the shape `PromptTurn::history` needs. Shared by `run_chat` and
+/// `repl::run`'s startup (the REPL loads history once and grows its own
+/// in-memory copy turn by turn from there, rather than reloading from disk
+/// every turn).
+fn load_session_history(session_name: Option<&str>) -> Result<Vec<ChatCompletionRequestMessage>> {
+    match session_name {
+        Some(name) => session::to_request_messages(&session::load(name)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Runs a single-shot chat request with an already-resolved `prompt` — see
+/// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
+/// CLI argument and/or piped stdin).
+async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()> {
+    let prompt = match attachment::read_file_attachments(&chat.files)? {
+        Some(file_context) => format!("{prompt}\n\n{file_context}"),
+        None => prompt,
+    };
+
+    let file_config = config::load_config(no_config)?;
+    let settings = resolve_chat_settings(&chat.shared, &file_config)?;
 
     let response_format = chat
         .json_schema
@@ -1202,20 +1261,17 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
-    let system_prompt = resolve_system_prompt(&chat, &file_config)?;
+    let system_prompt = resolve_system_prompt(&chat.shared, &file_config)?;
     let image_urls = attachment::resolve_image_urls(&chat.images)?;
-    if let Some(name) = &chat.session {
+    if let Some(name) = &chat.shared.session {
         session::validate_name(name)?;
     }
-    let session_history = match &chat.session {
-        Some(name) => session::to_request_messages(&session::load(name)?)?,
-        None => Vec::new(),
-    };
+    let session_history = load_session_history(chat.shared.session.as_deref())?;
     let env = RunEnv::new(&file_config);
 
     // `--quiet` keeps the response body and drops every note around it.
-    let show_reasoning = chat.show_reasoning && !chat.quiet;
-    let show_usage = chat.show_usage && !chat.quiet;
+    let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
+    let show_usage = chat.shared.show_usage && !chat.quiet;
     // `-o -` is an explicit "stdout", the same as no `-o` at all.
     let output_path = chat
         .output
@@ -1237,7 +1293,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
             )
             .await?;
         let outcome = stream_response(stream, show_reasoning, output_path).await?;
-        if let Some(name) = &chat.session {
+        if let Some(name) = &chat.shared.session {
             session::append_turn(name, &prompt, &outcome.content)?;
         }
         if show_usage {
@@ -1283,7 +1339,7 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
             println!("{output}");
         }
     }
-    if let Some(name) = &chat.session {
+    if let Some(name) = &chat.shared.session {
         let content = response::first_message(&response)
             .and_then(|message| message.content())
             .unwrap_or_default();
@@ -1293,6 +1349,146 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         print_usage_summary(&env.usage);
     }
     Ok(())
+}
+
+/// Runs `lait chat`'s interactive REPL: reads one line at a time from stdin,
+/// sends it (plus every earlier turn this process has seen) to the model,
+/// and prints the reply, until `/exit` or end-of-input (Ctrl-D closes stdin,
+/// which a piped-stdin test also relies on to end the loop without an
+/// explicit `/exit`). See `repl::parse_meta_command` for the `/exit`/
+/// `/clear`/`/model`/`/system` syntax handled below. Also reached from a
+/// prompt-less, stdin-is-a-terminal bare `lait` invocation — see
+/// `run_chat_or_repl`.
+async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let mut shared = args.shared;
+    let file_config = config::load_config(no_config)?;
+    if let Some(name) = &shared.session {
+        session::validate_name(name)?;
+    }
+    let mut history = load_session_history(shared.session.as_deref())?;
+    let mut system_prompt = resolve_system_prompt(&shared, &file_config)?;
+    let env = RunEnv::new(&file_config);
+
+    eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
+
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("> ");
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break; // end-of-input (Ctrl-D)
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(command) = repl::parse_meta_command(line) {
+            match command {
+                repl::MetaCommand::Exit => break,
+                repl::MetaCommand::Clear => {
+                    history.clear();
+                    eprintln!("(history cleared — a --session log, if any, is unaffected)");
+                }
+                repl::MetaCommand::Model(name) if !name.is_empty() => {
+                    shared.model = Some(name.to_owned());
+                    eprintln!("(model set to '{name}')");
+                }
+                repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
+                repl::MetaCommand::System(text) if !text.is_empty() => {
+                    system_prompt = Some(text.to_owned());
+                    eprintln!("(system prompt updated)");
+                }
+                repl::MetaCommand::System(_) => eprintln!("usage: /system <text>"),
+                repl::MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+            }
+            continue;
+        }
+
+        let settings = match resolve_chat_settings(&shared, &file_config) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("lait: {error:#}");
+                continue;
+            }
+        };
+
+        match run_repl_turn(
+            &settings,
+            &env,
+            &system_prompt,
+            &history,
+            line,
+            shared.show_reasoning,
+            shared.show_usage,
+        )
+        .await
+        {
+            Ok(assistant_text) => {
+                history.push(llm::user_message(line, &[])?);
+                history.push(llm::assistant_message(&assistant_text)?);
+                if let Some(name) = &shared.session {
+                    session::append_turn(name, line, &assistant_text)?;
+                }
+            }
+            // One bad turn (a request error, a bad `/model` name that only
+            // fails once actually resolved) shouldn't end the whole session
+            // — report it and let the user try again or `/exit`.
+            Err(error) => eprintln!("lait: {error:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Runs one `lait chat` turn: streams the response to stdout (the REPL's
+/// default), or — when `settings.mcp`/`settings.subagents` names at least
+/// one tool source — falls back to a single non-streamed request printed
+/// once it completes, since `RequestSettings::complete_stream` cannot yet
+/// drive a tool loop (see its own doc comment). Returns the assistant's raw
+/// reply text (never the `Reasoning:`-prefixed display form), the shape
+/// `history`/a `--session` log need.
+async fn run_repl_turn(
+    settings: &RequestSettings,
+    env: &RunEnv<'_>,
+    system_prompt: &Option<String>,
+    history: &[ChatCompletionRequestMessage],
+    prompt: &str,
+    show_reasoning: bool,
+    show_usage: bool,
+) -> Result<String> {
+    let turn = PromptTurn {
+        system_prompt: system_prompt.as_deref(),
+        history,
+        prompt,
+        image_urls: &[],
+    };
+    if settings.mcp.is_empty() && settings.subagents.is_empty() {
+        let stream = settings
+            .complete_stream(&env.skill_cache, turn, None, show_usage)
+            .await?;
+        let outcome = stream_response(stream, show_reasoning, None).await?;
+        if show_usage && let Some(usage) = outcome.usage {
+            env.usage.record(&settings.usage_label, usage);
+        }
+        if show_usage {
+            print_usage_summary(&env.usage);
+        }
+        Ok(outcome.content)
+    } else {
+        let response = settings.complete(env, &[], turn, None).await?;
+        let rendered = response::render_response(&response, false, show_reasoning)?;
+        println!("{rendered}");
+        if show_usage {
+            print_usage_summary(&env.usage);
+        }
+        Ok(response::first_message(&response)
+            .and_then(|message| message.content())
+            .unwrap_or_default()
+            .to_owned())
+    }
 }
 
 /// Prints the `<prefix> name: description` announcement line shared by
