@@ -209,6 +209,14 @@ fn lint_workflow_contents(
         ctx,
         issues,
     );
+    if let Some(system_prompt) = &wf.default.system_prompt {
+        check_prompt_template(
+            "the workflow's 'default'",
+            "'system_prompt' template",
+            system_prompt,
+            issues,
+        );
+    }
 
     for (node_id, node) in &wf.nodes {
         lint_node(
@@ -310,7 +318,23 @@ fn lint_node(
     if let Some(prompt) = &node.prompt {
         check_prompt_template(&node_context, "'prompt' template", prompt, issues);
     }
+    if let Some(system_prompt) = &node.system_prompt {
+        check_prompt_template(
+            &node_context,
+            "'system_prompt' template",
+            system_prompt,
+            issues,
+        );
+    }
     if let Some(argv) = &node.command {
+        if argv
+            .first()
+            .is_some_and(|program| program.trim().is_empty())
+        {
+            issues.push(LintIssue::error(format!(
+                "{node_context} has an empty 'command[0]' program; it must name an executable"
+            )));
+        }
         for arg in argv {
             check_prompt_template(&node_context, "'command' argument template", arg, issues);
         }

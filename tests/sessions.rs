@@ -151,3 +151,179 @@ fn an_invalid_session_name_is_rejected() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid session name"));
 }
+
+#[cfg(unix)]
+#[test]
+fn session_directory_symlinks_are_rejected_without_touching_the_target() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    for link_kind in ["lait", "sessions"] {
+        let dir = ConfigDirectory::empty();
+        let target = ConfigDirectory::empty();
+        let target_sessions = target.path().join("sessions");
+        fs::create_dir_all(&target_sessions).expect("failed to create target sessions directory");
+        let target_file = target_sessions.join("demo.jsonl");
+        let target_contents = "{\"role\":\"user\",\"content\":\"outside\"}\n{\"role\":\"assistant\",\"content\":\"secret\"}\n";
+        fs::write(&target_file, target_contents).expect("failed to write target session");
+
+        let link_path = if link_kind == "lait" {
+            dir.path().join(".lait")
+        } else {
+            let lait_dir = dir.path().join(".lait");
+            fs::create_dir(&lait_dir).expect("failed to create .lait directory");
+            lait_dir.join("sessions")
+        };
+        let link_target = if link_kind == "lait" {
+            target.path().to_path_buf()
+        } else {
+            target_sessions.clone()
+        };
+        symlink(&link_target, &link_path).expect("failed to create session directory symlink");
+
+        let assert_refused = |label: &str, output: std::process::Output| {
+            assert!(
+                !output.status.success(),
+                "{label} unexpectedly succeeded: {output:?}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("symbolic link"),
+                "{label} should report the symlink: {stderr}"
+            );
+        };
+
+        assert_refused(
+            "sessions list",
+            test_command()
+                .current_dir(dir.path())
+                .args(["sessions", "list"])
+                .output()
+                .expect("failed to execute lait sessions list"),
+        );
+        assert_refused(
+            "sessions show",
+            test_command()
+                .current_dir(dir.path())
+                .args(["sessions", "show", "demo"])
+                .output()
+                .expect("failed to execute lait sessions show"),
+        );
+        assert_refused(
+            "sessions delete",
+            test_command()
+                .current_dir(dir.path())
+                .args(["sessions", "delete", "demo"])
+                .output()
+                .expect("failed to execute lait sessions delete"),
+        );
+        assert_refused(
+            "session append",
+            test_command()
+                .current_dir(dir.path())
+                .args([
+                    "--model",
+                    "test-model",
+                    "--base-url",
+                    "http://127.0.0.1:1",
+                    "--session",
+                    "demo",
+                    "hello",
+                ])
+                .output()
+                .expect("failed to execute lait session append"),
+        );
+
+        assert_eq!(
+            fs::read_to_string(&target_file).expect("target session should remain readable"),
+            target_contents
+        );
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .expect("session directory link should remain")
+                .file_type()
+                .is_symlink()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn individual_session_file_symlinks_are_rejected_without_touching_the_target() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let dir = ConfigDirectory::empty();
+    let target = ConfigDirectory::empty();
+    let sessions_dir = dir.path().join(".lait/sessions");
+    fs::create_dir_all(&sessions_dir).expect("failed to create sessions directory");
+    let target_file = target.path().join("outside.jsonl");
+    let target_contents = "{\"role\":\"user\",\"content\":\"outside\"}\n{\"role\":\"assistant\",\"content\":\"secret\"}\n";
+    fs::write(&target_file, target_contents).expect("failed to write target session");
+    let link_path = sessions_dir.join("demo.jsonl");
+    symlink(&target_file, &link_path).expect("failed to create session file symlink");
+
+    let assert_refused = |label: &str, output: std::process::Output| {
+        assert!(
+            !output.status.success(),
+            "{label} unexpectedly succeeded: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("symbolic link"),
+            "{label} should report the symlink: {stderr}"
+        );
+    };
+
+    assert_refused(
+        "sessions list",
+        test_command()
+            .current_dir(dir.path())
+            .args(["sessions", "list"])
+            .output()
+            .expect("failed to execute lait sessions list"),
+    );
+    assert_refused(
+        "sessions show",
+        test_command()
+            .current_dir(dir.path())
+            .args(["sessions", "show", "demo"])
+            .output()
+            .expect("failed to execute lait sessions show"),
+    );
+    assert_refused(
+        "sessions delete",
+        test_command()
+            .current_dir(dir.path())
+            .args(["sessions", "delete", "demo"])
+            .output()
+            .expect("failed to execute lait sessions delete"),
+    );
+    assert_refused(
+        "session append",
+        test_command()
+            .current_dir(dir.path())
+            .args([
+                "--model",
+                "test-model",
+                "--base-url",
+                "http://127.0.0.1:1",
+                "--session",
+                "demo",
+                "hello",
+            ])
+            .output()
+            .expect("failed to execute lait session append"),
+    );
+
+    assert_eq!(
+        fs::read_to_string(&target_file).expect("target session should remain readable"),
+        target_contents
+    );
+    assert!(
+        fs::symlink_metadata(&link_path)
+            .expect("session file link should remain")
+            .file_type()
+            .is_symlink()
+    );
+}

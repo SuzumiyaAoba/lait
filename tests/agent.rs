@@ -114,3 +114,40 @@ fn agent_run_rejects_input_missing_a_field_required_by_the_input_schema() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("city"), "stderr: {stderr}");
 }
+
+#[test]
+fn top_level_agent_rejects_a_self_referential_subagent_before_recursing() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_self","type":"function","function":{"name":"agent__self","arguments":"{\"input\":\"again\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    );
+    let agent = AgentMarkdownFile::new(
+        "---\nname: self\nmodel: test-model\nsubagents: [self]\n---\nDelegate only when needed.\n",
+    );
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\nagents:\n  self: \"{}\"\n",
+        server.base_url,
+        agent.path.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "agent",
+            "run",
+            agent.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait agent run");
+    server.receive_request();
+    server.finish();
+
+    assert!(
+        !output.status.success(),
+        "expected the self-reference to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cycle"), "stderr: {stderr}");
+}

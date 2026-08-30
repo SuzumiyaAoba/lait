@@ -6,10 +6,7 @@
 //! call (`--system`/`--system-file`/`default.system`), same as without a
 //! session.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use async_openai::types::chat::ChatCompletionRequestMessage;
@@ -122,26 +119,19 @@ pub(crate) struct SessionSummary {
 /// created in this project).
 pub(crate) fn list() -> Result<Vec<SessionSummary>> {
     let dir = Path::new(SESSIONS_DIR);
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read session directory '{}'", dir.display()));
-        }
-    };
+    if !jsonl::directory_exists(dir)? {
+        return Ok(Vec::new());
+    }
+    let entries = jsonl::read_dir(dir)?;
 
     let mut summaries = Vec::new();
     for entry in entries {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to read an entry of session directory '{}'",
-                dir.display()
-            )
-        })?;
-        let path = entry.path();
+        let path = dir.join(&entry.name);
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
+        }
+        if entry.is_symlink {
+            bail!("refusing to follow symbolic link '{}'", path.display());
         }
         let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
@@ -161,7 +151,7 @@ pub(crate) fn list() -> Result<Vec<SessionSummary>> {
 /// reporting, unlike resuming one via `--session` for the first time.
 pub(crate) fn show(name: &str) -> Result<Vec<StoredMessage>> {
     let path = session_path(name)?;
-    if !path.exists() {
+    if !jsonl::path_exists(&path)? {
         bail!("no such session '{name}'");
     }
     load(name)
@@ -171,10 +161,11 @@ pub(crate) fn show(name: &str) -> Result<Vec<StoredMessage>> {
 /// exist.
 pub(crate) fn delete(name: &str) -> Result<()> {
     let path = session_path(name)?;
-    fs::remove_file(&path).with_context(|| match path.exists() {
-        true => format!("failed to delete session file '{}'", path.display()),
-        false => format!("no such session '{name}'"),
-    })
+    if !jsonl::path_exists(&path)? {
+        bail!("no such session '{name}'");
+    }
+    jsonl::remove(&path)
+        .with_context(|| format!("failed to delete session file '{}'", path.display()))
 }
 
 /// Runs `lait sessions <action>`: `list`/`show <name>`/`delete <name>`, all
