@@ -2,6 +2,7 @@
 title: "会話セッションと対話モード（lait chat）"
 description: "lait chat REPL、--session/lait sessions による会話の保存と再開"
 ---
+
 ## `lait chat`（インタラクティブなマルチターン会話）
 
 `lait chat` は会話履歴を保持したままターンを重ねられる REPL（対話モード）を起動します。応答は既定でストリーミング表示されます。
@@ -46,3 +47,4 @@ lait sessions list              # 保存されている全セッションとタ�
 lait sessions show demo         # demo セッションの全ターンを表示
 lait sessions delete demo       # demo セッションを削除
 ```
+

@@ -2,6 +2,7 @@
 title: "はじめに"
 description: "必要な環境、LM Studio の準備、CLI 引数と環境変数、標準入力からのプロンプト（パイプ対応）、--system/--show-usage/-o/--quiet、lait models/lait init/lait completions/lait man、ビルドと実行、認証あり／なし"
 ---
+
 `lait` は `async-openai` を使って OpenAI Compatible API に接続し、単体のプロンプトをチャット補完として送信する CLI です。LM Studio のローカルサーバーを利用した動作確認や、LLM API 接続のサンプルとして使えます。
 
 ## 必要な環境
@@ -44,7 +45,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--base-url <URL>` | `OPENAI_BASE_URL` | OpenAI Compatible API のベース URL。既定値は `http://localhost:1234/v1`。 |
 | `--model <MODEL_ID_OR_ALIAS>` | `LLM_MODEL` | モデル ID または設定ファイルの alias。CLI 引数、環境変数、または設定ファイルで指定できます。 |
 | `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
-| `--show-reasoning` | — | 対応サーバーが返す `reasoning`(旧形式の `reasoning_content` にも対応)を回答前に表示します。既定では非表示です。 |
+| `--show-reasoning` | — | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` にも対応）を回答前に表示します。既定では非表示です。 |
 | `--stream` | — | 応答が生成され次第、標準出力へ逐次書き出します。API へは `stream: true` を送信します。完全な応答をまとめて JSON 化する `--json` とは同時に指定できません。 |
 | `--json` | — | CLI の応答を JSON 形式で出力します。API の Structured Outputs を指定する `--json-schema` とは別の機能です。`--stream` とは同時に指定できません。 |
 | `--json-schema <FILE>` | — | API の Structured Outputs に使用する JSON Schema ファイル。指定時は `response_format` の `type` を `json_schema`、`strict` を `true` として送信します。 |
@@ -53,15 +54,15 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--temperature <FLOAT>` | `LLM_TEMPERATURE` | サンプリング温度（`0.0`〜`2.0`）。低いほど決定的、高いほどランダムな応答になります。未指定時は API リクエストにフィールドを追加しません。 |
 | `--top-p <FLOAT>` | `LLM_TOP_P` | nucleus sampling の確率質量（`0.0`〜`1.0`）。`--temperature` の代替として使います。未指定時は API リクエストにフィールドを追加しません。 |
 | `--max-tokens <INT>` | `LLM_MAX_TOKENS` | 応答として生成するトークン数の上限（`1`以上）。API へは（非推奨の `max_tokens` ではなく）`max_completion_tokens` として送信されます。未指定時は API リクエストにフィールドを追加しません。 |
-| `--mcp <NAME>` | — | `lait.config.yml` の `mcp_servers:` エントリ名。繰り返し指定可能。指定した MCP サーバーのツールをモデルに渡します（詳細は [MCP サーバーのツールを使う](./mcp.mdx)）。`--stream` とは同時に指定できません。 |
-| `--subagent <NAME>` | — | `lait.config.yml` の `agents:` エントリ名。繰り返し指定可能。指定したエージェント Markdown ファイルを、モデル自身が呼び出すかどうか判断できる「サブエージェント」ツールとして渡します（詳細は [サブエージェントを使う](./subagents.mdx)）。`--stream` とは同時に指定できません。 |
+| `--mcp <NAME>` | — | `lait.config.yml` の `mcp_servers:` エントリ名。繰り返し指定可能。指定した MCP サーバーのツールをモデルに渡します（詳細は [MCP サーバーのツールを使う](/lait/docs/mcp/)）。`--stream` とは同時に指定できません。 |
+| `--subagent <NAME>` | — | `lait.config.yml` の `agents:` エントリ名。繰り返し指定可能。指定したエージェント Markdown ファイルを、モデル自身が呼び出すかどうか判断できる「サブエージェント」ツールとして渡します（詳細は [サブエージェントを使う](/lait/docs/subagents/)）。`--stream` とは同時に指定できません。 |
 | `--system <TEXT>` | — | ユーザープロンプトの前に送るシステムプロンプト。未指定時は `lait.config.yml` の `default.system` にフォールバックします。`--system-file` とは同時に指定できません。 |
 | `--system-file <FILE>` | — | システムプロンプトをファイルから読み込みます。 |
 | `--show-usage` | — | 応答後にトークン使用量（`prompt`/`completion`/`total`）を標準エラー出力へ表示します（標準出力のパイプ利用を壊しません）。`--stream` 指定時はサーバーに `stream_options: {"include_usage": true}` を要求します。`lait run`/`lait agent run` でも使え、ワークフローではステップごとの内訳と合計を表示します。 |
 | `-o, --output <PATH>` | — | 応答本文を標準出力ではなく PATH に書き込みます（`--json` 併用時は JSON を書き込み、`-o -` は標準出力の明示指定）。`--stream` 以外では成功後にのみ書き込むため、失敗時に空ファイルが残りません。 |
 | `--quiet` | — | 応答本文以外の注記（reasoning 表示・usage 表示）をすべて抑制します（`--show-reasoning`/`--show-usage` より優先）。 |
 | `--no-config` | — | カレントディレクトリの `lait.config.yml` を読み込みません。 |
-| `--no-env` | — | カレントディレクトリの `.env` を読み込みません（詳細は [設定ファイル](./config.mdx)）。 |
+| `--no-env` | — | カレントディレクトリの `.env` を読み込みません（詳細は [設定ファイル](/lait/docs/config/)）。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。省略して標準入力から渡すこともできます（下記）。 |
 
 ### 標準入力からのプロンプト（パイプ対応）
@@ -190,3 +191,4 @@ cargo run -- --api-key "your-api-key" --model "モデル ID" "こんにちは。
 ```sh
 makers run -- --api-key "your-api-key" --model "モデル ID" "こんにちは。"
 ```
+

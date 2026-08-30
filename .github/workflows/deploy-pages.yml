@@ -1,6 +1,5 @@
-# Builds the Fumadocs/Next.js site under `website/` as a static export and
-# publishes it to GitHub Pages. The site is a project page, so it is served
-# under a `/lait/` path prefix — `NEXT_BASE_PATH` bakes that into the build.
+# Builds the Astro/Starlight site under `website/` and publishes it to GitHub
+# Pages. The site is a project page served under the `/lait/` path prefix.
 name: Deploy website
 
 on:
@@ -49,8 +48,6 @@ jobs:
 
       - name: Build static site
         working-directory: website
-        env:
-          NEXT_BASE_PATH: /lait
         run: pnpm build
 
       - name: Configure Pages
@@ -59,7 +56,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: website/out
+          path: website/dist
 
   deploy:
     name: Deploy

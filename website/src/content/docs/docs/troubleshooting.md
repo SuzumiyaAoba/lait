@@ -15,3 +15,4 @@ CLI のヘルプとバージョンは以下で確認できます。
 cargo run -- --help
 cargo run -- --version
 ```
+

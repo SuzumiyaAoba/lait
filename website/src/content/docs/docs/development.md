@@ -17,3 +17,4 @@ cargo build --release --locked
 には、`makers` の cargo ラッパーが Apple Clang と Xcode SDK を設定して対応します。
 
 GitHub Actions でも同じチェックを実行します。
+

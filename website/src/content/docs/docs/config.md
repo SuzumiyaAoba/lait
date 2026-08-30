@@ -2,6 +2,7 @@
 title: "設定ファイル"
 description: "lait.config.yml、モデル定義と alias、設定値の優先順位、${VAR_NAME} による環境変数参照、.env の自動読み込み、MCP サーバー・スキル・サブエージェントの登録"
 ---
+
 CLI 引数や環境変数で指定していない値は、コマンドを実行したディレクトリの
 `lait.config.yml` からデフォルトとして読み込まれます。設定できる基本項目は次のとおりです。
 
@@ -123,7 +124,7 @@ export HOST=api.example.com    # export プレフィックスも可
 
 `mcp_servers:` に MCP (Model Context Protocol) サーバーを登録すると、`--mcp`（チャット）・
 agent ファイルの `mcp:`・ワークフローノードの `mcp:` から名前で参照してツールを使えるように
-なります。詳しい使い方は [MCP サーバーのツールを使う](./mcp.mdx) を参照してください。
+なります。詳しい使い方は [MCP サーバーのツールを使う](/lait/docs/mcp/) を参照してください。
 
 ```yaml
 # lait.config.yml
@@ -159,7 +160,7 @@ mcp_servers:
 
 `skills:` にスキル Markdown ファイルを登録すると、`default.skills`（チャット）・agent ファイルの
 `skills:`・ワークフローノードの `skills:` から名前で参照して、その内容をシステムプロンプトに
-追記できるようになります。詳しい使い方は [スキルを使う](./skills.mdx) を参照してください。
+追記できるようになります。詳しい使い方は [スキルを使う](/lait/docs/skills/) を参照してください。
 
 ```yaml
 # lait.config.yml
@@ -182,7 +183,7 @@ skills:
 `agents:` にエージェント Markdown ファイルを登録すると、`--subagent`（チャット）・agent ファイルの
 `subagents:`・ワークフローノードの `subagents:` から名前で参照して、モデル自身が実行時に呼び出す
 かどうかを判断できる「サブエージェント」ツールとして使えるようになります。詳しい使い方は
-[サブエージェントを使う](./subagents.mdx) を参照してください。
+[サブエージェントを使う](/lait/docs/subagents/) を参照してください。
 
 ```yaml
 # lait.config.yml
@@ -197,3 +198,4 @@ agents:
 - 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
   そのまま名前を付けて登録します）。
 - パスは、`skills:` と同じく、その場では接続を持たず、実際に使われるたびにファイルを読み直します。
+

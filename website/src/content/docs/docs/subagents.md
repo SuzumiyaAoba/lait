@@ -2,12 +2,13 @@
 title: "サブエージェントを使う"
 description: "agents: の登録、チャット／agent／workflow での subagents: 指定、ツール名とツール引数の扱い、サブエージェントの入れ子、agent:/workflow: ノードとの違い"
 ---
-`lait` は、エージェント Markdown ファイル（[エージェント Markdown ファイル（agent.md）](./agent.mdx)）
+
+`lait` は、エージェント Markdown ファイル（[エージェント Markdown ファイル（agent.md）](/lait/docs/agent/)）
 を「サブエージェント」——モデル自身が実行時に呼び出すかどうかを判断できるツール——として、
 チャット・`lait agent run`・`lait run`（workflow）のどの経路からもモデルに渡せます。モデルが
 サブエージェントのツール呼び出しを返すと lait がそのエージェントファイルを実行して結果を受け取り、
 モデルに返す、というやり取りを最終回答が出るまで自動で繰り返します（[MCP サーバーのツールを使う]
-(./mcp.mdx) と同じ tool loop の仕組みです）。
+(./mcp.md) と同じ tool loop の仕組みです）。
 
 `agent:`/`workflow:` ワークフローノードが「このステップでは必ずこのエージェント（サブワーク
 フロー）を呼ぶ」という静的な配線であるのに対し、サブエージェントは「モデルが必要だと判断した
@@ -50,7 +51,7 @@ cargo run -- run workflow.yml "量子コンピュータの最新動向"
 ## サブエージェントの登録（`lait.config.yml`）
 
 `agents:` に、エージェント Markdown ファイルへのパスを登録します。詳しい書式は
-[設定ファイル](./config.mdx#サブエージェント) を参照してください。
+[設定ファイル](/lait/docs/config/#サブエージェント) を参照してください。
 
 ```yaml
 agents:
@@ -93,8 +94,8 @@ nodes:
     subagents: [researcher, fact-checker]
 ```
 
-それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.mdx#サブエージェントの利用) と
-[ワークフロー（workflow.yml）](./workflow.mdx#サブエージェントの利用-subagents) にもあります。
+それぞれの詳細は [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/#サブエージェントの利用) と
+[ワークフロー（workflow.yml）](/lait/docs/workflow/#サブエージェントの利用-subagents) にもあります。
 
 ## ツール名とツール引数の扱い
 
@@ -160,6 +161,7 @@ CLI フラグ（`--base-url`/`--api-key` など）や `--model` は、サブエ�
 - 同じ名前が `mcp`（MCP サーバーのツール）と `subagents`（サブエージェント）の両方で修飾後に
   衝突した場合はエラーになります（通常は起こりません。「ツール名の扱い」を参照）。
 
-関連: [エージェント Markdown ファイル（agent.md）](./agent.mdx)、
-[ワークフロー（workflow.yml）](./workflow.mdx)、[MCP サーバーのツールを使う](./mcp.mdx)、
-[設定ファイル](./config.mdx#サブエージェント)
+関連: [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/)、
+[ワークフロー（workflow.yml）](/lait/docs/workflow/)、[MCP サーバーのツールを使う](/lait/docs/mcp/)、
+[設定ファイル](/lait/docs/config/#サブエージェント)
+

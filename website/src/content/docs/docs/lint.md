@@ -2,10 +2,11 @@
 title: "ワークフロー／エージェントファイルの静的チェック（lint）"
 description: "lait lint、未使用ノードや jq/テンプレート構文エラー、mcp/skills/agent/workflow 参照や schema_name の事前検出"
 ---
+
 `lait lint <FILE>...` サブコマンドで、`workflow.yml`（`.yml`/`.yaml`）とエージェント Markdown
 ファイル（`.md`）をモデルに実際にリクエストを送らずに静的チェックできます。CI やコミット前の
 確認に使うことを想定しています（Rust ソース自体の `cargo clippy` とは別物です。そちらは
-[開発](./development.mdx) を参照してください）。
+[開発](/lait/docs/development/) を参照してください）。
 
 ```sh
 cargo run -- lint workflow.yml agents/city-fact.md
@@ -27,6 +28,7 @@ cargo run -- lint workflow.yml agents/city-fact.md
   `parallel`・`for_each` の `join` に書いた jq フィルタの構文エラー
 - `prompt:`（ノード）およびエージェントファイルのシステムプロンプトテンプレートの handlebars
   構文エラー
+- `command:` の各要素（引数）の handlebars 構文エラー
 - `input_schema`/`output_schema` に指定した名前・パスが解決できるか（`json_schemas:` のキー、
   または実在するファイルパスであるか）
 - `schema_name`（省略時は `structured_output`）が Structured Outputs のスキーマ名として妥当か
@@ -39,7 +41,7 @@ cargo run -- lint workflow.yml agents/city-fact.md
   `lait.config.yml` の `agents:` に定義されているか
 - `agent:` に指定したエージェントファイルが存在し、読み込めるか（`agent:` は `lait run` と同じく
   カレントディレクトリからの相対パスとして解決されます。詳細は
-  [エージェント Markdown ファイル（agent.md）](./agent.mdx) を参照）
+  [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/) を参照）
 - `workflow:` に指定したサブワークフローファイルが存在し、読み込めるか（`workflow.yml` 自身の
   ディレクトリからの相対パスとして解決されます）。サブワークフローも再帰的にチェックされ、
   循環参照（`workflow:` が巡り巡って自分自身を呼ぶ）も検出します
@@ -65,7 +67,8 @@ lait: 1 of 2 file(s) had errors
   （終了コードには影響しません）。
 - 問題が見つからなかったファイルは `<FILE>: OK` とだけ表示されます。
 
-関連: [ワークフロー（workflow.yml）](./workflow.mdx)、
-[エージェント Markdown ファイル（agent.md）](./agent.mdx)、
-[MCP サーバーのツールを使う](./mcp.mdx)、[スキルを使う](./skills.mdx)、
-[サブエージェントを使う](./subagents.mdx)
+関連: [ワークフロー（workflow.yml）](/lait/docs/workflow/)、
+[エージェント Markdown ファイル（agent.md）](/lait/docs/agent/)、
+[MCP サーバーのツールを使う](/lait/docs/mcp/)、[スキルを使う](/lait/docs/skills/)、
+[サブエージェントを使う](/lait/docs/subagents/)
+

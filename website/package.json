@@ -2,28 +2,19 @@
   "name": "lait-docs",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "types:check": "next typegen && tsc --noEmit"
+    "dev": "astro dev",
+    "build": "astro check && astro build",
+    "preview": "astro preview",
+    "types:check": "astro check"
   },
   "dependencies": {
-    "fumadocs-core": "^16.15.2",
-    "fumadocs-mdx": "^15.3.1",
-    "fumadocs-ui": "^16.15.2",
-    "next": "^16.3.3",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "@astrojs/starlight": "^0.41.10",
+    "astro": "^7.2.9"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.3.3",
-    "@types/mdx": "^2.0.14",
-    "@types/node": "^26.3.0",
-    "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.5",
-    "postcss": "^8.5.26",
-    "tailwindcss": "^4.3.3",
-    "typescript": "^5.9.3"
+    "@astrojs/check": "^0.9.10",
+    "typescript": "^6.0.3"
   }
 }
