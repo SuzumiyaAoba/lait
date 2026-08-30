@@ -1929,6 +1929,163 @@ steps:
 }
 
 #[test]
+fn parses_a_node_with_a_command() {
+    let workflow = parse_workflow(
+        r#"
+nodes:
+  n:
+    command: ["wc", "-l"]
+steps:
+  - use: n
+"#,
+    )
+    .expect("workflow with a command node should parse");
+
+    assert_eq!(
+        workflow.nodes["n"].command.as_deref(),
+        Some(["wc".to_owned(), "-l".to_owned()].as_slice())
+    );
+}
+
+#[test]
+fn rejects_a_node_with_an_empty_command_list() {
+    let result = parse_workflow("nodes:\n  n:\n    command: []\nsteps:\n  - use: n\n");
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_node_with_both_command_and_prompt() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    command: [\"wc\"]\n    prompt: \"{{ input }}\"\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_node_with_both_command_and_system_prompt() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    command: [\"wc\"]\n    system_prompt: hi\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_node_with_both_command_and_agent() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    command: [\"wc\"]\n    agent: agents/extract.md\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_node_with_both_command_and_workflow() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    command: [\"wc\"]\n    workflow: sub.yml\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_command_node_with_files() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    command: [\"wc\"]\n    files: [notes.txt]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_command_node_with_images() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    command: [\"wc\"]\n    images: [photo.png]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn a_command_node_can_have_a_jq_filter_and_write_file() {
+    let result = parse_workflow(
+        r#"
+nodes:
+  n:
+    command: ["wc", "-l"]
+    jq: "tonumber"
+    write_file: out.txt
+steps:
+  - use: n
+"#,
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn parses_a_node_with_files_and_images() {
+    let workflow = parse_workflow(
+        r#"
+nodes:
+  n:
+    prompt: "{{ input }}"
+    files: [notes.txt, more.txt]
+    images: [photo.png, "https://example.com/cat.png"]
+steps:
+  - use: n
+"#,
+    )
+    .expect("workflow with files/images should parse");
+
+    assert_eq!(
+        workflow.nodes["n"].files.as_deref(),
+        Some(
+            [
+                std::path::PathBuf::from("notes.txt"),
+                std::path::PathBuf::from("more.txt")
+            ]
+            .as_slice()
+        )
+    );
+    assert_eq!(
+        workflow.nodes["n"].images.as_deref(),
+        Some(
+            [
+                "photo.png".to_owned(),
+                "https://example.com/cat.png".to_owned()
+            ]
+            .as_slice()
+        )
+    );
+}
+
+#[test]
+fn rejects_files_on_a_jq_only_node() {
+    let result =
+        parse_workflow("nodes:\n  n:\n    jq: \".\"\n    files: [notes.txt]\nsteps:\n  - use: n\n");
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_images_on_a_jq_only_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    jq: \".\"\n    images: [photo.png]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_node_with_files() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    workflow: sub.yml\n    files: [notes.txt]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_node_with_images() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    workflow: sub.yml\n    images: [photo.png]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn parses_a_workflow_default_retry_and_timeout() {
     let workflow = parse_workflow(
         r#"

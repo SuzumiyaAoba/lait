@@ -1,20 +1,14 @@
 mod support;
 
-use support::{ConfigDirectory, MockServer, test_command};
+use support::{ConfigDirectory, MINIMAL_PNG_BYTES, MockServer, test_command};
 
 const RESPONSE: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
-
-/// A minimal, valid 1x1 PNG (the PNG signature plus arbitrary trailing bytes
-/// — lait only sniffs the leading magic bytes, it never decodes the image).
-const PNG_BYTES: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02,
-];
 
 #[test]
 fn image_flag_sends_a_base64_data_url_alongside_the_text() {
     let dir = ConfigDirectory::empty();
     let image_path = dir.path().join("photo.png");
-    std::fs::write(&image_path, PNG_BYTES).unwrap();
+    std::fs::write(&image_path, MINIMAL_PNG_BYTES).unwrap();
 
     let server = MockServer::start("200 OK", RESPONSE);
     let output = test_command()

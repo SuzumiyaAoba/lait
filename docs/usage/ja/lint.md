@@ -27,6 +27,7 @@ cargo run -- lint workflow.yml agents/city-fact.md
   `parallel`・`for_each` の `join` に書いた jq フィルタの構文エラー
 - `prompt:`（ノード）およびエージェントファイルのシステムプロンプトテンプレートの handlebars
   構文エラー
+- `command:` の各要素（引数）の handlebars 構文エラー
 - `input_schema`/`output_schema` に指定した名前・パスが解決できるか（`json_schemas:` のキー、
   または実在するファイルパスであるか）
 - `schema_name`（省略時は `structured_output`）が Structured Outputs のスキーマ名として妥当か

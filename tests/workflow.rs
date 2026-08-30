@@ -3,8 +3,8 @@ mod support;
 use std::time::Duration;
 
 use support::{
-    AgentMarkdownFile, ConfigDirectory, JsonSchemaFile, MockServer, WorkflowFile,
-    run_lait_workflow, test_command, without_json_whitespace,
+    AgentMarkdownFile, ConfigDirectory, JsonSchemaFile, MINIMAL_PNG_BYTES, MockServer,
+    WorkflowFile, run_lait_workflow, test_command, without_json_whitespace,
 };
 
 const SERVER_ERROR_BODY: &str = r#"{"error":{"message":"mock failure","type":"server_error"}}"#;
@@ -2261,4 +2261,281 @@ steps:
         stderr.contains("LAIT_TEST_ENV_DEFINITELY_UNSET"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn a_command_node_pipes_the_current_input_to_stdin_and_its_stdout_becomes_the_next_input() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  upper:
+    command: ["tr", "a-z", "A-Z"]
+steps:
+  - use: upper
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "hello world");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "HELLO WORLD"
+    );
+}
+
+#[test]
+fn a_command_nodes_arguments_are_rendered_as_templates() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  greet:
+    command: ["echo", "hello, {{ input }}"]
+steps:
+  - use: greet
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "world");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "hello, world"
+    );
+}
+
+#[test]
+fn a_command_nodes_output_flows_into_a_jq_filter_and_the_next_step() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  count:
+    command: ["wc", "-l"]
+    jq: 'tonumber | {{lines: .}}'
+  echo:
+    prompt: "{{{{ json input }}}}"
+steps:
+  - id: count
+    use: count
+  - use: echo
+"#,
+        server.base_url
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "a\nb\nc\n");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    assert_eq!(request_json["messages"][0]["content"], r#"{"lines":3}"#);
+}
+
+#[test]
+fn a_commands_nonzero_exit_fails_the_step_with_stderr_in_the_error() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  fail:
+    command: ["sh", "-c", "echo boom >&2; exit 3"]
+steps:
+  - use: fail
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(!output.status.success(), "expected the step to fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_nonzero_command_exit_can_be_caught_by_on_error() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  fail:
+    command: ["sh", "-c", "exit 1"]
+  recover:
+    jq: '"recovered"'
+steps:
+  - use: fail
+    on_error:
+      steps:
+        - use: recover
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(
+        output.status.success(),
+        "on_error should have recovered the failing command: {output:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "recovered");
+}
+
+#[test]
+fn an_empty_command_list_is_a_clear_lint_error() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  n:
+    command: []
+steps:
+  - use: n
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("empty 'command'"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_prompt_node_attaches_files_as_a_fenced_block_after_the_rendered_prompt() {
+    let dir = ConfigDirectory::empty();
+    let file_path = dir.path().join("notes.txt");
+    std::fs::write(&file_path, "line one\nline two\n").unwrap();
+
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  echo:
+    prompt: "summarize: {{{{ input }}}}"
+    files: ["{}"]
+steps:
+  - use: echo
+"#,
+        server.base_url,
+        file_path.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert!(request.body.contains("summarize: hello"));
+    assert!(request.body.contains(&file_path.display().to_string()));
+    assert!(request.body.contains("line one"));
+    assert!(request.body.contains("line two"));
+}
+
+#[test]
+fn a_prompt_node_attaches_images_as_image_url_content_parts() {
+    let dir = ConfigDirectory::empty();
+    let image_path = dir.path().join("photo.png");
+    std::fs::write(&image_path, MINIMAL_PNG_BYTES).unwrap();
+
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  describe:
+    prompt: "what is this? {{{{ input }}}}"
+    images: ["{}"]
+steps:
+  - use: describe
+"#,
+        server.base_url,
+        image_path.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    let content = request_json["messages"][0]["content"]
+        .as_array()
+        .expect("content should be an array when an image is attached");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    let url = content[1]["image_url"]["url"].as_str().unwrap();
+    assert!(url.starts_with("data:image/png;base64,"));
+}
+
+#[test]
+fn an_agent_node_attaches_files_and_images_alongside_its_current_input() {
+    let dir = ConfigDirectory::empty();
+    let file_path = dir.path().join("notes.txt");
+    std::fs::write(&file_path, "note content").unwrap();
+    let image_path = dir.path().join("photo.png");
+    std::fs::write(&image_path, MINIMAL_PNG_BYTES).unwrap();
+
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let agent = AgentMarkdownFile::new("---\n---\nDescribe: {{ input }}\n");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  describe:
+    agent: "{}"
+    files: ["{}"]
+    images: ["{}"]
+steps:
+  - use: describe
+"#,
+        server.base_url,
+        agent.path.display(),
+        file_path.display(),
+        image_path.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "a photo");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let request_json: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid JSON");
+    let content = request_json["messages"][1]["content"]
+        .as_array()
+        .expect("content should be an array when an image is attached");
+    assert_eq!(content[0]["type"], "text");
+    assert!(content[0]["text"].as_str().unwrap().contains("a photo"));
+    assert!(
+        content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("note content")
+    );
+    assert_eq!(content[1]["type"], "image_url");
 }

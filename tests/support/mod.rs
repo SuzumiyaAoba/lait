@@ -13,6 +13,12 @@ use std::time::Duration;
 const MAX_TEMP_PATH_ATTEMPTS: usize = 100;
 static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// A minimal, valid 1x1 PNG (the PNG signature plus arbitrary trailing bytes
+/// — lait only sniffs the leading magic bytes, it never decodes the image).
+pub(crate) const MINIMAL_PNG_BYTES: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02,
+];
+
 #[derive(Debug)]
 pub(crate) struct HttpRequest {
     pub(crate) method: String,
