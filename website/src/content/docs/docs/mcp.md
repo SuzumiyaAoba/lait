@@ -37,7 +37,7 @@ cargo run -- run workflow.yml "調べたいこと"
 
 `mcp_servers:` に、`command:`（子プロセスとして起動する stdio サーバー）または `url:`
 （streamable HTTP でリモート接続するサーバー）のどちらか一方を指定します。詳しい書式は
-[設定ファイル](./config.mdx#mcp-サーバー) を参照してください。
+[設定ファイル](/lait/docs/config/#mcp-サーバー) を参照してください。
 
 ```yaml
 mcp_servers:
@@ -90,8 +90,8 @@ nodes:
     mcp: [filesystem, remote-search]
 ```
 
-それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.mdx#mcp-ツールの利用) と
-[ワークフロー（workflow.yml）](./workflow.mdx#mcp-ツールの利用-mcp) にもあります。
+それぞれの詳細は [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/#mcp-ツールの利用) と
+[ワークフロー（workflow.yml）](/lait/docs/workflow/#mcp-ツールの利用-mcp) にもあります。
 
 ## ツール名の扱い
 
@@ -130,3 +130,4 @@ lait は LM Studio のローカルモデルを主な想定用途としていま�
 （tool calling）への対応度が様々です。ツール呼び出しに対応していないモデルでは `tool_calls` が
 一切返らず、`mcp:` を指定していてもツールは呼ばれません。ツール対応モデル（`qwen3` 系など）を
 使って手元で確認してください。
+

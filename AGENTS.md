@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-This repository is primarily a Rust 2024 CLI (Rust 1.88, stable). `src/main.rs` is the module root; feature modules live in `src/`, with workflow parsing and validation under `src/workflow/`. Rust integration tests are in `tests/`, and `tests/support/` provides temporary-file fixtures and mock OpenAI-compatible servers. Japanese user documentation is in `docs/usage/ja/`. The `website/` directory is a Next.js/Fumadocs TypeScript site; follow its existing `website/AGENTS.md` instructions for any work there. Configuration and development metadata are in `Cargo.toml`, `Makefile.toml`, `rust-toolchain.toml`, `lait.config.yml`, and `scripts/`.
+This repository is primarily a Rust 2024 CLI (Rust 1.88, stable). `src/main.rs` is the module root; feature modules live in `src/`, with workflow parsing and validation under `src/workflow/`. Rust integration tests are in `tests/`, and `tests/support/` provides temporary-file fixtures and mock OpenAI-compatible servers. Japanese user documentation is in `docs/usage/ja/`. The `website/` directory is an Astro/Starlight TypeScript site; follow its existing `website/AGENTS.md` instructions for any work there. Configuration and development metadata are in `Cargo.toml`, `Makefile.toml`, `rust-toolchain.toml`, `lait.config.yml`, and `scripts/`.
 
 ## Build, Test, and Development Commands
 
@@ -17,7 +17,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --all-features --locked
 ```
 
-`makers run|check|test|fmt-check|clippy|build` provides the corresponding cargo-make tasks; its wrapper configures Apple Clang and the macOS SDK when needed. For the documentation site, use `cd website && pnpm dev`, `pnpm build`, or `pnpm types:check`.
+`makers run|check|test|fmt-check|clippy|build` provides the corresponding cargo-make tasks; its wrapper configures Apple Clang and the macOS SDK when needed. For the documentation site, use `cd website && pnpm dev`, `pnpm build`, `pnpm preview`, or `pnpm types:check`.
 
 ## Coding Style and Naming
 

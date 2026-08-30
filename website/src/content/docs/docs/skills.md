@@ -39,7 +39,7 @@ cargo run -- run workflow.yml "レビューしてほしい差分"
 ## スキルファイルの形式
 
 スキルファイルは、エージェント Markdown ファイル（[エージェント Markdown ファイル
-（agent.md）](./agent.mdx)）と同じく、1行目が必ず `---` で始まり、次に現れる `---` 行までが
+（agent.md）](/lait/docs/agent/)）と同じく、1行目が必ず `---` で始まり、次に現れる `---` 行までが
 frontmatter（YAML）、それ以降が本文（Markdown）になります。
 
 ```markdown
@@ -99,8 +99,8 @@ nodes:
     skills: [code-review, style-guide]
 ```
 
-それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.mdx#スキルの利用) と
-[ワークフロー（workflow.yml）](./workflow.mdx#スキルの利用-skills) にもあります。
+それぞれの詳細は [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/#スキルの利用) と
+[ワークフロー（workflow.yml）](/lait/docs/workflow/#スキルの利用-skills) にもあります。
 
 ## システムプロンプトへの追記のされ方
 
@@ -130,9 +130,10 @@ nodes:
 ## `mcp`/`--stream`/`structured_output` との違い
 
 スキルは、MCP ツールのようにモデルへ「呼び出し可能な機能」として渡されるのではなく、リクエスト
-前にシステムプロンプトへ静的に追記されるだけです（[MCP サーバーのツールを使う](./mcp.mdx)
+前にシステムプロンプトへ静的に追記されるだけです（[MCP サーバーのツールを使う](/lait/docs/mcp/)
 とは別の仕組みです）。そのため:
 
 - `--stream` との併用に制限はありません。
 - `structured_output`（`output_schema`）との併用にも追加のラウンドトリップは発生しません。
 - `max_tool_rounds` の消費対象にはなりません。
+

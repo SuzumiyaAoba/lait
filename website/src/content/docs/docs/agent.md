@@ -2,6 +2,7 @@
 title: "エージェント Markdown ファイル（agent.md）"
 description: "frontmatter によるエージェント定義、ワークフローからの利用、MCP ツールの利用、スキルの利用、サブエージェントの利用"
 ---
+
 `lait agent run <FILE> <INPUT>` サブコマンドで、Markdown ファイル1つでエージェントを定義・
 実行できます。ファイルは YAML の frontmatter（`---` で区切られたブロック）とそれに続く
 Markdown 本文で構成され、本文がシステムプロンプトのテンプレートになります。
@@ -77,7 +78,7 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 
 ## MCP ツールの利用
 
-frontmatter に `mcp:`(`lait.config.yml` の `mcp_servers:` エントリ名のリスト)と、任意で
+frontmatter に `mcp:`（`lait.config.yml` の `mcp_servers:` エントリ名のリスト）と、任意で
 `max_tool_rounds:`（既定 8）を指定すると、その agent の呼び出しに MCP ツールが渡されます。
 
 ```markdown
@@ -90,7 +91,7 @@ max_tool_rounds: 8
 ```
 
 `mcp:` を省略した場合は `lait.config.yml` の `default.mcp` にフォールバックします。詳しい仕組みは
-[MCP サーバーのツールを使う](./mcp.mdx) を参照してください。
+[MCP サーバーのツールを使う](/lait/docs/mcp/) を参照してください。
 
 ## スキルの利用
 
@@ -108,7 +109,7 @@ skills: [code-review]
 ```
 
 `skills:` を省略した場合は `lait.config.yml` の `default.skills` にフォールバックします。詳しい
-仕組みは [スキルを使う](./skills.mdx) を参照してください。
+仕組みは [スキルを使う](/lait/docs/skills/) を参照してください。
 
 ## サブエージェントの利用
 
@@ -127,7 +128,7 @@ subagents: [researcher]
 ```
 
 `subagents:` を省略した場合は `lait.config.yml` の `default.subagents` にフォールバックします。
-詳しい仕組みは [サブエージェントを使う](./subagents.mdx) を参照してください。
+詳しい仕組みは [サブエージェントを使う](/lait/docs/subagents/) を参照してください。
 
 ## ワークフローからエージェントファイルを使う
 
@@ -158,6 +159,7 @@ frontmatter → ワークフローの `default:` の順に、それぞれ独立�
 を含む）でレンダリングされるため、フィールドアクセスはエージェントファイルの本文に限りません。
 さらに、ワークフロー内で `id` を持つ他のステップの出力は、エージェントのシステムプロンプトから
 も `{{ steps.<id> }}` として参照できます（詳細は
-[ワークフロー（workflow.yml）](./workflow.mdx#ステップ間の値の受け渡し-stepsid---steps) を参照）。
+[ワークフロー（workflow.yml）](/lait/docs/workflow/#ステップ間の値の受け渡し-stepsid---steps) を参照）。
 
-関連: [ワークフロー（workflow.yml）](./workflow.mdx)、[サブエージェントを使う](./subagents.mdx)
+関連: [ワークフロー（workflow.yml）](/lait/docs/workflow/)、[サブエージェントを使う](/lait/docs/subagents/)
+

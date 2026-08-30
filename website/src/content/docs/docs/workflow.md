@@ -2,6 +2,7 @@
 title: "ワークフロー（workflow.yml）"
 description: "nodes/steps の分離とノードの再利用、モデル定義、JSON 出力と jq による加工、write_file、MCP ツールの利用、system_prompt、スキルの利用、サブエージェントの利用、steps 参照、retry/timeout/on_error、when/switch、parallel、loop、for_each、stop/break、サブワークフロー呼び出し"
 ---
+
 `lait run <FILE> <PROMPT>` サブコマンドで、複数の LLM 呼び出しを YAML で逐次実行できます。
 ワークフローファイルは **`nodes:`**（何をするか。プロンプトやモデル呼び出し、jq によるデータ
 変換などの定義）と **`steps:`**（どう繋ぐか。実行順序と分岐・ループなどの制御）の2つに分かれます。
@@ -52,9 +53,9 @@ cargo run -- run workflow.yml "要約・翻訳したい文章..."
 ```
 
 - `nodes:` はキーをノード id とするマップで、順序を持ちません。各ノードは `prompt`/
-  `system_prompt`/`agent`/`workflow`/`jq`/`model`/`reasoning_effort`/`temperature`/`top_p`/
-  `max_tokens`/`input_schema`/`output_schema`/`schema_name`/`write_file`/`retry`/`timeout` を
-  持てます（後述）。
+  `system_prompt`/`agent`/`workflow`/`command`/`files`/`images`/`jq`/`model`/`reasoning_effort`/
+  `temperature`/`top_p`/`max_tokens`/`input_schema`/`output_schema`/`schema_name`/`write_file`/
+  `retry`/`timeout` を持てます（後述）。
 - `steps:` は配列で、各要素（**ステップ**、または**参照サイト**）が `use: <ノードid>` で
   `nodes:` のどれを実行するかを指定します。配列の先頭から逐次実行するのが基本です。
   `when`/`switch` による分岐（後述）、`parallel` による複数のステップ列の同時実行
@@ -71,8 +72,9 @@ cargo run -- run workflow.yml "要約・翻訳したい文章..."
   `$steps` に記録されるキーでもあります。省略した場合は `use:` したノードの id が使われ、
   それも無い場合（`switch`/`parallel`/`loop`/`for_each` に `id` を付けなかった場合）は
   `step-1`、`step-2`… になります。
-- `prompt` も `system_prompt` も `agent` も `workflow` も持たないノードはモデルを呼び出さず、
-  `jq` によるデータ変換のみを行います（後述）。この場合 `model` は不要です。
+- `prompt` も `system_prompt` も `agent` も `workflow` も `command` も持たないノードはモデルを
+  呼び出さず、`jq` によるデータ変換のみを行います（後述）。この場合 `model` は不要です。
+  `command`（後述）を持つノードもモデルを呼び出さず、代わりに任意のコマンドを実行します。
 - 最後のステップの出力のみを標準出力に出します。
 - `run` サブコマンドでも `--no-config` は利用できます（例: `lait run workflow.yml "..." --no-config`）。
 
@@ -170,7 +172,7 @@ steps:
 の `models` から解決されます。
 
 `provider.api_key`/`provider.base_url` には `${VAR_NAME}` で環境変数を埋め込めます（[設定ファイル
-の該当節](./config.mdx#var_name-による環境変数参照)を参照）。API キーをワークフローファイルに平文で
+の該当節](/lait/docs/config/#var_name-による環境変数参照)を参照）。API キーをワークフローファイルに平文で
 書かずに済みます。
 
 ## JSON 出力の指定と jq による加工
@@ -313,7 +315,7 @@ steps:
 ## MCP ツールの利用（`mcp`）
 
 `prompt`/`system_prompt`/`agent` を持つノードに `mcp:` で `lait.config.yml` の `mcp_servers:`（登録方法は
-[設定ファイル](./config.mdx#mcp-サーバー) を参照）のエントリ名を並べると、そのノードのモデル
+[設定ファイル](/lait/docs/config/#mcp-サーバー) を参照）のエントリ名を並べると、そのノードのモデル
 呼び出しに MCP ツールが渡され、モデルがツール呼び出しを返すたびに lait が実行してその結果を
 モデルに返す、というやり取りを最大 `max_tool_rounds` 回まで自動で繰り返します。
 
@@ -396,12 +398,45 @@ steps:
   `system_prompt` の内容の後に `---` 区切りでスキルの内容が続きます。`system_prompt` を
   指定していないノードでは、スキルの内容だけがシステムメッセージとして送られます。
 
+## ファイル・画像の添付（`files` / `images`）
+
+`prompt`/`system_prompt`/`agent` を持つノードには、CLI の `--file`/`--image`
+（[ファイル・画像の添付](/lait/docs/attachments/)を参照）と同じ添付を `files:`/`images:` で指定
+できます。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+nodes:
+  review:
+    prompt: "次の差分をレビューしてください。\n{{ input }}"
+    files: [diff.patch, CONTRIBUTING.md]
+  describe:
+    prompt: "この画像に写っているものを説明してください。"
+    images: [photo.png, "https://example.com/cat.png"]
+steps:
+  - use: review
+  - use: describe
+```
+
+- `files:` に列挙した各パスはテキストとして読み込まれ、（レンダリング後の）`prompt`
+  （`prompt` を省略したノードでは現在の入力）の後ろに、ファイル名付きのフェンスコードブロック
+  として追記されます。バイナリファイル（UTF-8 として読めない内容）はエラーになります。
+- `images:` に列挙した各値は、ローカルファイルパスなら base64 データ URL に、
+  `http://`/`https://` から始まる値ならそのまま `image_url` として、ユーザーメッセージに
+  添付されます。vision 対応モデルでのみ意味を持ちます。
+- どちらもパスは、`agent:`/`write_file:` と同じく**コマンドを実行したカレントディレクトリ**
+  からの相対パスとして解決されます。テンプレート展開はされません（固定のパス/URL のみ）。
+- `files`/`images` は `prompt`/`system_prompt`/`agent` を持つノードにしか指定できません。
+  データ変換のみの `jq` ノードや、`workflow:`/`command` を持つノードには指定できません。
+
 ## スキルの利用（`skills`）
 
 `prompt`/`system_prompt`/`agent` を持つノードに `skills:` で `lait.config.yml` の `skills:`（登録方法は
-[設定ファイル](./config.mdx#スキル) を参照）のエントリ名を並べると、そのノードのシステム
+[設定ファイル](/lait/docs/config/#スキル) を参照）のエントリ名を並べると、そのノードのシステム
 プロンプトの末尾に、それぞれのスキルファイルの内容が追記されます。詳しくは
-[スキルを使う](./skills.mdx) を参照してください。
+[スキルを使う](/lait/docs/skills/) を参照してください。
 
 ```yaml
 # workflow.yml
@@ -437,7 +472,7 @@ steps:
 ## サブエージェントの利用（`subagents`）
 
 `prompt`/`system_prompt`/`agent` を持つノードに `subagents:` で `lait.config.yml` の `agents:`（登録方法は
-[設定ファイル](./config.mdx#サブエージェント) を参照）のエントリ名を並べると、そのノードのモデル
+[設定ファイル](/lait/docs/config/#サブエージェント) を参照）のエントリ名を並べると、そのノードのモデル
 呼び出しに、対応するエージェント Markdown ファイルが「サブエージェント」ツールとして渡されます。
 `mcp` と同じ tool loop の仕組みに乗るため、モデルがツール呼び出しを返すたびに lait がそのサブ
 エージェントを実行して結果を受け取り、モデルに返す、というやり取りを最終回答が出るまで自動で
@@ -478,8 +513,8 @@ steps:
 - `--stream` との併用は `mcp` と同じ理由（ストリームの `tool_calls` を再組み立てする実装が
   まだない）で未対応です。
 
-それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.mdx#サブエージェントの利用)
-にもあります。詳しい仕組みは [サブエージェントを使う](./subagents.mdx) を参照してください。
+それぞれの詳細は [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/#サブエージェントの利用)
+にもあります。詳しい仕組みは [サブエージェントを使う](/lait/docs/subagents/) を参照してください。
 
 ## ステップ間の値の受け渡し（`{{ steps.<id> }}` / `$steps`）
 
@@ -1025,3 +1060,45 @@ steps:
   `when`/`jq`/`stop`/`break` も通常どおり併用できます。
 - 循環参照（A が B を呼び、B が A を呼ぶ、など）はエラーになります。ネストの深さにも上限が
   あります。
+
+## 任意コマンドの実行（`command`）
+
+ノードに `command:` を指定すると、そのノードは `prompt`/`agent` の代わりに**外部コマンド**を
+実行します。コマンドの標準入力にはその時点の `{{ input }}` がそのままパイプされ、標準出力
+（末尾の改行は1つだけ取り除かれます。シェルの `$(...)` と同じ扱いです）がこのノードの出力
+になります。既存のシェルツール（`jq`/`rg`/`sort`/自作スクリプトなど）をワークフローの
+パイプラインに直接組み込めます。
+
+```yaml
+# workflow.yml
+nodes:
+  count-lines:
+    command: ["wc", "-l"]
+    jq: 'tonumber'
+  format:
+    prompt: "行数: {{ input }}"
+steps:
+  - use: count-lines
+  - use: format
+```
+
+```sh
+printf 'a\nb\nc\n' | cargo run -- run workflow.yml -
+```
+
+- `command:` は配列で、先頭要素が実行するプログラム、残りがその引数です。
+  **シェルを経由せず直接 exec します**（`sh -c` や文字列連結は行いません）。そのためプロンプト
+  と同様、各要素は `{{ input }}`/`{{ steps.<id> }}` を含む handlebars テンプレートとして
+  レンダリングできますが、レンダリング結果が余分な引数や別のコマンドとして解釈されることは
+  ありません。
+- 終了コードが 0 以外の場合、そのノードの実行は失敗として扱われます（標準エラー出力の内容が
+  エラーメッセージに含まれます）。他のノードの失敗と同じく、ステップの `retry`/`on_error` で
+  拾えます。
+- 標準出力が UTF-8 として読めない場合はエラーになります（バイナリ出力は非対応です）。
+- コマンドの出力は、他のノードの出力と同じく、この後に指定した `jq`/`write_file` を通ります。
+- `retry`/`timeout` は指定すれば適用されますが、`jq` 専用ノードと同じく、ワークフロー全体の
+  `default.retry`/`default.timeout` へは自動的にフォールバックしません（LLM 呼び出し向けの
+  既定値を、無関係なコマンド実行にまで及ぼさないためです）。
+- `command` は `prompt`/`system_prompt`/`agent`/`workflow`/`files`/`images` と併用できません。
+  実行するのは1つのアクションだけだからです。
+
