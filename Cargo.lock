@@ -1290,6 +1290,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "base64 0.23.1",
+ "chrono",
  "clap",
  "clap_complete",
  "clap_mangen",

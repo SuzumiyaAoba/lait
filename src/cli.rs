@@ -54,6 +54,41 @@ pub(crate) enum Command {
     /// Run a named prompt template from `prompts:` in lait.config.yml, or
     /// `lait prompt list` to show every configured prompt.
     Prompt(PromptArgs),
+    /// List, show, or search recorded chat/agent/workflow/prompt runs (see
+    /// docs/usage/ja/history.md).
+    History(HistoryArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HistoryArgs {
+    #[command(subcommand)]
+    pub(crate) action: Option<HistoryAction>,
+
+    /// Maximum number of entries to show when listing (most recent first).
+    #[arg(long, short = 'l', default_value_t = 20)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum HistoryAction {
+    /// Print the full prompt/response of history entry N (`1` = most recent,
+    /// matching the numbering `lait history`/`lait history search` show).
+    Show(HistoryShowArgs),
+    /// List every entry whose prompt or response contains QUERY
+    /// (case-insensitive).
+    Search(HistorySearchArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HistoryShowArgs {
+    #[arg(value_name = "N")]
+    pub(crate) index: usize,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HistorySearchArgs {
+    #[arg(value_name = "QUERY")]
+    pub(crate) query: String,
 }
 
 #[derive(Debug, Args)]
@@ -76,6 +111,10 @@ pub(crate) struct PromptArgs {
     /// Print a token usage summary to stderr when the prompt finishes.
     #[arg(long)]
     pub(crate) show_usage: bool,
+
+    /// Do not record this run in `lait history`.
+    #[arg(long)]
+    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]
@@ -171,6 +210,10 @@ pub(crate) struct RunArgs {
     /// workflow finishes (for servers that report usage).
     #[arg(long)]
     pub(crate) show_usage: bool,
+
+    /// Do not record this run in `lait history`.
+    #[arg(long)]
+    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +246,10 @@ pub(crate) struct AgentRunArgs {
     /// servers that report usage).
     #[arg(long)]
     pub(crate) show_usage: bool,
+
+    /// Do not record this run in `lait history`.
+    #[arg(long)]
+    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]
@@ -297,6 +344,11 @@ pub(crate) struct SharedChatArgs {
     /// turn recorded there so far is sent ahead of this call's prompt.
     #[arg(long, value_name = "NAME")]
     pub(crate) session: Option<String>,
+
+    /// Do not record this run in `lait history` (see `--no-config`'s
+    /// counterpart `default.history: false`).
+    #[arg(long)]
+    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]

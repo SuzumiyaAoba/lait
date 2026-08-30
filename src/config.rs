@@ -71,6 +71,10 @@ pub(crate) struct DefaultSettings {
     /// Whether to render chat's response as Markdown for terminal display by
     /// default, when `--render` isn't passed. See `crate::render`.
     pub(crate) render: Option<bool>,
+    /// Whether to record runs in `lait history` by default (`true` unless
+    /// set to `false` here), when `--no-history` isn't passed. See
+    /// `crate::history`.
+    pub(crate) history: Option<bool>,
 }
 
 /// A map of `mcp_servers:` name to its connection settings, as used by

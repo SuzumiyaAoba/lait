@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod dotenv;
 mod frontmatter;
+mod history;
 mod init;
 mod jq;
 mod lint;
