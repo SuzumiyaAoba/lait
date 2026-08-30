@@ -47,6 +47,97 @@ pub(crate) enum Command {
     /// `lait init workflow [PATH]` / `lait init agent [PATH]` write commented
     /// workflow.yml / agent.md scaffolds.
     Init(InitArgs),
+    /// List, inspect, or delete saved `--session` conversations.
+    Sessions(SessionsCommand),
+    /// Start an interactive, multi-turn chat REPL (see docs/usage/ja/chat.md).
+    Chat(ChatReplArgs),
+    /// Run a named prompt template from `prompts:` in lait.config.yml, or
+    /// `lait prompt list` to show every configured prompt.
+    Prompt(PromptArgs),
+    /// List, show, or search recorded chat/agent/workflow/prompt runs (see
+    /// docs/usage/ja/history.md).
+    History(HistoryArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HistoryArgs {
+    #[command(subcommand)]
+    pub(crate) action: Option<HistoryAction>,
+
+    /// Maximum number of entries to show when listing (most recent first).
+    #[arg(long, short = 'l', default_value_t = 20)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum HistoryAction {
+    /// Print the full prompt/response of history entry N (`1` = most recent,
+    /// matching the numbering `lait history`/`lait history search` show).
+    Show(HistoryShowArgs),
+    /// List every entry whose prompt or response contains QUERY
+    /// (case-insensitive).
+    Search(HistorySearchArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HistoryShowArgs {
+    #[arg(value_name = "N")]
+    pub(crate) index: usize,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HistorySearchArgs {
+    #[arg(value_name = "QUERY")]
+    pub(crate) query: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PromptArgs {
+    /// Name of a `prompts:` entry in lait.config.yml, or the literal `list`
+    /// to print every configured prompt instead of running one.
+    #[arg(value_name = "NAME")]
+    pub(crate) name: String,
+
+    /// The input passed to the prompt template (exposed as `{{ input }}`).
+    /// May be omitted when input is piped via stdin.
+    #[arg(value_name = "INPUT")]
+    pub(crate) input: Option<String>,
+
+    /// Override a `vars:` default declared on the prompt: `--var
+    /// KEY=VALUE`. Repeatable; a later `--var` for the same key wins.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    pub(crate) var: Vec<String>,
+
+    /// Print a token usage summary to stderr when the prompt finishes.
+    #[arg(long)]
+    pub(crate) show_usage: bool,
+
+    /// Do not record this run in `lait history`.
+    #[arg(long)]
+    pub(crate) no_history: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SessionsCommand {
+    #[command(subcommand)]
+    pub(crate) action: SessionsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SessionsAction {
+    /// List every saved session and how many turns it holds.
+    List,
+    /// Print every turn recorded for a session.
+    Show(SessionsNameArgs),
+    /// Delete a saved session.
+    Delete(SessionsNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SessionsNameArgs {
+    /// The session name (as passed to `--session`).
+    #[arg(value_name = "NAME")]
+    pub(crate) name: String,
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +210,10 @@ pub(crate) struct RunArgs {
     /// workflow finishes (for servers that report usage).
     #[arg(long)]
     pub(crate) show_usage: bool,
+
+    /// Do not record this run in `lait history`.
+    #[arg(long)]
+    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]
@@ -151,6 +246,10 @@ pub(crate) struct AgentRunArgs {
     /// servers that report usage).
     #[arg(long)]
     pub(crate) show_usage: bool,
+
+    /// Do not record this run in `lait history`.
+    #[arg(long)]
+    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]
@@ -162,8 +261,14 @@ pub(crate) struct LintArgs {
     pub(crate) files: Vec<PathBuf>,
 }
 
-#[derive(Debug, Args)]
-pub(crate) struct ChatArgs {
+/// The chat options shared by single-shot chat (`ChatArgs`, flattened at the
+/// top level) and the interactive REPL (`ChatReplArgs`, under `lait chat`):
+/// everything about which model/endpoint/system-prompt/session a turn uses,
+/// as opposed to `ChatArgs`' own fields, which only make sense for a single
+/// request-and-exit invocation (`--json`, `--stream`, `-o`, `--json-schema`,
+/// `--file`/`--image`, `-p`/`--var`).
+#[derive(Debug, Clone, Args)]
+pub(crate) struct SharedChatArgs {
     /// A configured model name or model identifier accepted by the server.
     #[arg(long, env = "LLM_MODEL")]
     pub(crate) model: Option<String>,
@@ -195,6 +300,61 @@ pub(crate) struct ChatArgs {
     /// `stream_options: {"include_usage": true}`.
     #[arg(long)]
     pub(crate) show_usage: bool,
+
+    /// The reasoning effort to request from the model.
+    #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+
+    /// Sampling temperature (0.0-2.0). Lower is more deterministic, higher is
+    /// more random. Omitted from the request when unset.
+    #[arg(long, env = "LLM_TEMPERATURE")]
+    pub(crate) temperature: Option<f64>,
+
+    /// Nucleus sampling probability mass (0.0-1.0), an alternative to
+    /// `--temperature`. Omitted from the request when unset.
+    #[arg(long, env = "LLM_TOP_P")]
+    pub(crate) top_p: Option<f64>,
+
+    /// An upper bound on the number of tokens generated for the completion.
+    /// Omitted from the request when unset.
+    #[arg(long, env = "LLM_MAX_TOKENS")]
+    pub(crate) max_tokens: Option<u32>,
+
+    /// Name of an `mcp_servers:` entry (from lait.config.yml) whose tools
+    /// this request may call. Repeatable. Falls back to `default.mcp` in
+    /// lait.config.yml when unset. Single-shot chat rejects combining this
+    /// with `--stream` at request-resolve time rather than at parse time (a
+    /// streamed `tool_calls` field arrives as fragments lait does not yet
+    /// reassemble; see `RequestSettings::complete_stream`) — unlike
+    /// `ChatArgs`' own flags, this field is also reachable from `lait chat`,
+    /// which has no single `--stream` flag to declare a clap-level conflict
+    /// against (see `docs/usage/ja/chat.md`).
+    #[arg(long = "mcp", value_name = "NAME")]
+    pub(crate) mcp: Vec<String>,
+
+    /// Name of an `agents:` entry (from lait.config.yml) made available as a
+    /// callable subagent tool this request may call. Repeatable. Falls back
+    /// to `default.subagents` in lait.config.yml when unset. Same
+    /// `--stream` caveat as `--mcp` above.
+    #[arg(long = "subagent", value_name = "NAME")]
+    pub(crate) subagent: Vec<String>,
+
+    /// Resume (or start) a named conversation: this call's prompt and the
+    /// model's reply are appended to `.lait/sessions/<NAME>.jsonl`, and every
+    /// turn recorded there so far is sent ahead of this call's prompt.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) session: Option<String>,
+
+    /// Do not record this run in `lait history` (see `--no-config`'s
+    /// counterpart `default.history: false`).
+    #[arg(long)]
+    pub(crate) no_history: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ChatArgs {
+    #[command(flatten)]
+    pub(crate) shared: SharedChatArgs,
 
     /// Write the response body to PATH instead of stdout (`-o -` writes to
     /// stdout explicitly). With `--json`, the JSON object goes to the file;
@@ -228,48 +388,53 @@ pub(crate) struct ChatArgs {
     #[arg(long, default_value = "structured_output", requires = "json_schema")]
     pub(crate) schema_name: String,
 
-    /// The reasoning effort to request from the model.
-    #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
-    pub(crate) reasoning_effort: Option<ReasoningEffort>,
-
-    /// Sampling temperature (0.0-2.0). Lower is more deterministic, higher is
-    /// more random. Omitted from the request when unset.
-    #[arg(long, env = "LLM_TEMPERATURE")]
-    pub(crate) temperature: Option<f64>,
-
-    /// Nucleus sampling probability mass (0.0-1.0), an alternative to
-    /// `--temperature`. Omitted from the request when unset.
-    #[arg(long, env = "LLM_TOP_P")]
-    pub(crate) top_p: Option<f64>,
-
-    /// An upper bound on the number of tokens generated for the completion.
-    /// Omitted from the request when unset.
-    #[arg(long, env = "LLM_MAX_TOKENS")]
-    pub(crate) max_tokens: Option<u32>,
-
-    /// Name of an `mcp_servers:` entry (from lait.config.yml) whose tools
-    /// this request may call. Repeatable. Falls back to `default.mcp` in
-    /// lait.config.yml when unset. Incompatible with `--stream` (a streamed
-    /// `tool_calls` field arrives as fragments lait does not yet reassemble;
-    /// see `RequestSettings::complete_stream`). `default.mcp` alone, with no
-    /// `--mcp` flag, is caught later at request-resolve time instead — clap
-    /// can only see flags actually passed on this invocation's command line.
-    #[arg(long = "mcp", value_name = "NAME", conflicts_with = "stream")]
-    pub(crate) mcp: Vec<String>,
-
-    /// Name of an `agents:` entry (from lait.config.yml) made available as a
-    /// callable subagent tool this request may call. Repeatable. Falls back
-    /// to `default.subagents` in lait.config.yml when unset. Incompatible
-    /// with `--stream`, for the same reason as `--mcp`.
-    #[arg(long = "subagent", value_name = "NAME", conflicts_with = "stream")]
-    pub(crate) subagent: Vec<String>,
-
     /// A single prompt to send as a user message. May be omitted when input
     /// is piped via stdin (which is then sent as the prompt; when both are
     /// given, the piped text is appended to PROMPT as context). `-` reads
     /// the prompt from stdin explicitly.
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+
+    /// Attach a file's contents as context (as a named fenced code block
+    /// appended after the prompt). Repeatable.
+    #[arg(long = "file", value_name = "PATH")]
+    pub(crate) files: Vec<PathBuf>,
+
+    /// Attach an image for a vision-capable model: a local file path (sent as
+    /// a base64 data URL) or an `http(s)://` URL (sent as-is). Repeatable.
+    #[arg(long = "image", value_name = "PATH_OR_URL")]
+    pub(crate) images: Vec<String>,
+
+    /// Run a named prompt template (a `prompts.<NAME>` entry in
+    /// lait.config.yml) instead of sending PROMPT/stdin directly as the
+    /// request text: PROMPT/stdin becomes the template's `{{ input }}`. See
+    /// `lait prompt <NAME>`/`lait prompt list` for the equivalent subcommand.
+    #[arg(short = 'p', long = "prompt-name", value_name = "NAME")]
+    pub(crate) prompt_name: Option<String>,
+
+    /// Override a named prompt's `vars:` default: `--var KEY=VALUE`. Only
+    /// meaningful together with `-p`/`--prompt-name`. Repeatable; a later
+    /// `--var` for the same key wins.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    pub(crate) var: Vec<String>,
+
+    /// Render the response as Markdown for terminal display (headings,
+    /// lists, emphasis, code blocks, tables, ...) instead of printing it as
+    /// raw text. Falls back to raw text automatically when stdout isn't a
+    /// terminal, or when combined with `--stream`. Falls back to
+    /// `default.render` in lait.config.yml when unset here.
+    #[arg(long)]
+    pub(crate) render: bool,
+}
+
+/// `lait chat`'s own arguments: just the options a REPL turn can use — see
+/// `SharedChatArgs`. There is no `--stream` flag here because the REPL
+/// streams every turn by default (falling back to a non-streamed request
+/// only when `--mcp`/`--subagent` is set — see `repl::run`).
+#[derive(Debug, Args)]
+pub(crate) struct ChatReplArgs {
+    #[command(flatten)]
+    pub(crate) shared: SharedChatArgs,
 }
 
 impl ReasoningEffort {
@@ -334,14 +499,17 @@ mod tests {
         .expect("valid CLI arguments should parse");
 
         assert!(cli.command.is_none());
-        assert_eq!(cli.chat.model.as_deref(), Some("local-model"));
+        assert_eq!(cli.chat.shared.model.as_deref(), Some("local-model"));
         assert_eq!(
-            cli.chat.base_url.as_deref(),
+            cli.chat.shared.base_url.as_deref(),
             Some("http://localhost:1234/v1")
         );
-        assert_eq!(cli.chat.api_key.as_deref(), Some("test-key"));
-        assert!(cli.chat.show_reasoning);
-        assert_eq!(cli.chat.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(cli.chat.shared.api_key.as_deref(), Some("test-key"));
+        assert!(cli.chat.shared.show_reasoning);
+        assert_eq!(
+            cli.chat.shared.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
         assert_eq!(cli.chat.prompt.as_deref(), Some("hello"));
         assert!(cli.chat.json_schema.is_none());
         assert_eq!(cli.chat.schema_name, "structured_output");
@@ -374,8 +542,8 @@ mod tests {
         let cli = Cli::try_parse_from(["lait", "--model", "local-model", "hello"])
             .expect("valid CLI arguments should parse");
 
-        assert!(!cli.chat.show_reasoning);
-        assert_eq!(cli.chat.reasoning_effort, None);
+        assert!(!cli.chat.shared.show_reasoning);
+        assert_eq!(cli.chat.shared.reasoning_effort, None);
     }
 
     #[test]
@@ -408,7 +576,7 @@ mod tests {
             .expect("reasoning effort should be accepted");
 
             assert_eq!(
-                cli.chat.reasoning_effort,
+                cli.chat.shared.reasoning_effort,
                 Some(match effort {
                     "none" => ReasoningEffort::None,
                     "minimal" => ReasoningEffort::Minimal,
@@ -438,9 +606,9 @@ mod tests {
         ])
         .expect("valid sampling options should parse");
 
-        assert_eq!(cli.chat.temperature, Some(0.7));
-        assert_eq!(cli.chat.top_p, Some(0.9));
-        assert_eq!(cli.chat.max_tokens, Some(256));
+        assert_eq!(cli.chat.shared.temperature, Some(0.7));
+        assert_eq!(cli.chat.shared.top_p, Some(0.9));
+        assert_eq!(cli.chat.shared.max_tokens, Some(256));
     }
 
     #[test]
@@ -448,9 +616,9 @@ mod tests {
         let cli = Cli::try_parse_from(["lait", "--model", "local-model", "hello"])
             .expect("valid CLI arguments should parse");
 
-        assert!(cli.chat.temperature.is_none());
-        assert!(cli.chat.top_p.is_none());
-        assert!(cli.chat.max_tokens.is_none());
+        assert!(cli.chat.shared.temperature.is_none());
+        assert!(cli.chat.shared.top_p.is_none());
+        assert!(cli.chat.shared.max_tokens.is_none());
     }
 
     #[test]

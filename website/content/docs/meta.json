@@ -6,9 +6,15 @@
     "config",
     "workflow",
     "agent",
+    "lint",
     "mcp",
     "skills",
+    "subagents",
     "output",
+    "attachments",
+    "chat",
+    "prompts",
+    "history",
     "troubleshooting",
     "development"
   ]

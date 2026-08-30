@@ -28,6 +28,10 @@ pub(crate) struct ConfigFile {
     /// agent file/workflow node/`default:` block. See `crate::subagent`.
     #[serde(default)]
     pub(crate) agents: AgentMap,
+    /// Named prompt templates, run via `-p`/`--prompt-name <NAME>` or
+    /// `lait prompt <NAME>`. See `crate::prompt`.
+    #[serde(default)]
+    pub(crate) prompts: PromptMap,
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
@@ -64,6 +68,13 @@ pub(crate) struct DefaultSettings {
     /// by default, when an agent file/workflow node doesn't set its own
     /// `subagents:`. Falls back independently, like `temperature`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Whether to render chat's response as Markdown for terminal display by
+    /// default, when `--render` isn't passed. See `crate::render`.
+    pub(crate) render: Option<bool>,
+    /// Whether to record runs in `lait history` by default (`true` unless
+    /// set to `false` here), when `--no-history` isn't passed. See
+    /// `crate::history`.
+    pub(crate) history: Option<bool>,
 }
 
 /// A map of `mcp_servers:` name to its connection settings, as used by
@@ -173,6 +184,27 @@ pub(crate) type AgentMap = HashMap<String, PathBuf>;
 /// A map of model alias to its candidate definitions, as used by both
 /// `lait.config.yml`'s top-level `models:` and a workflow file's `models:`.
 pub(crate) type ModelMap = HashMap<String, Vec<ModelDefinition>>;
+
+/// A map of `prompts:` name to its template definition, as used by
+/// `lait.config.yml`'s top-level `prompts:`. See `crate::prompt`.
+pub(crate) type PromptMap = HashMap<String, PromptDefinition>;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromptDefinition {
+    /// The handlebars template rendered against `{{ input }}` (the CLI
+    /// PROMPT/INPUT argument or piped stdin) and `{{ vars.<key> }}` (this
+    /// entry's `vars:` defaults, overridable per call with `--var
+    /// KEY=VALUE`) — see `crate::template::render`.
+    pub(crate) template: String,
+    /// The model this prompt runs on when `--model`/`LLM_MODEL` doesn't
+    /// override it. Falls back to `default.model` when unset here too.
+    pub(crate) model: Option<String>,
+    /// Default values for `{{ vars.<key> }}` placeholders in `template`,
+    /// overridable per call with `--var key=value`.
+    #[serde(default)]
+    pub(crate) vars: HashMap<String, String>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

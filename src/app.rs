@@ -14,10 +14,12 @@ use futures_util::{StreamExt, TryStreamExt};
 
 use crate::{
     agent::{self, AgentFile},
-    cli::{AgentAction, ChatArgs, Cli, Command, LintArgs, RunArgs},
-    cli::{AgentRunArgs, ReasoningEffort},
+    attachment,
+    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
+    cli::{AgentRunArgs, PromptArgs, ReasoningEffort, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
-    jq, lint, llm, mcp, response, schema, skill, subagent, template, workflow,
+    history, jq, lint, llm, mcp, prompt, render, repl, response, schema, session, skill, subagent,
+    template, workflow,
 };
 
 pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -71,6 +73,11 @@ fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>
 #[derive(Default)]
 struct UsageTally {
     events: std::sync::Mutex<Vec<(String, response::Usage)>>,
+    /// The running sum of every event recorded so far, kept incrementally so
+    /// `total()` never has to refold `events` — `run_repl_turn` calls it
+    /// twice per REPL turn purely to compute that turn's own delta, so an
+    /// O(n) refold there would make an n-turn session cost O(n²) overall.
+    running_total: std::sync::Mutex<Option<response::Usage>>,
 }
 
 impl UsageTally {
@@ -80,6 +87,13 @@ impl UsageTally {
             .lock()
             .expect("usage tally lock should not be poisoned")
             .push((label.to_owned(), usage));
+        let mut running_total = self
+            .running_total
+            .lock()
+            .expect("usage tally lock should not be poisoned");
+        let mut total = running_total.unwrap_or_default();
+        total.add(usage);
+        *running_total = Some(total);
     }
 
     /// Records `response`'s usage under `label`; a no-op when the server
@@ -112,6 +126,17 @@ impl UsageTally {
             }
         }
         per_label
+    }
+
+    /// The sum of every event recorded so far, across every label —
+    /// `lait history`'s per-run `usage` field (see `record_history`).
+    /// `None` when nothing has been recorded yet (never zero-vs-absent
+    /// ambiguity, same convention as `response::Usage`'s own optionality).
+    fn total(&self) -> Option<response::Usage> {
+        *self
+            .running_total
+            .lock()
+            .expect("usage tally lock should not be poisoned")
     }
 }
 
@@ -151,6 +176,55 @@ fn requests_suffix(count: usize) -> String {
     }
 }
 
+/// Records a completed chat/agent/workflow/prompt run in `lait history`,
+/// unless `no_history` (the caller's own `--no-history`) or
+/// `default.history: false` opts out — the one gate every `run_*` entry
+/// point goes through before ever calling `history::record`, so recording
+/// can never happen from a place that forgot to check the opt-out. Called
+/// only after a run has actually succeeded (every call site is on the
+/// success path), matching `history::record`'s own contract.
+fn record_history(
+    no_history: bool,
+    file_config: &ConfigFile,
+    kind: &str,
+    model: Option<&str>,
+    prompt: &str,
+    response: &str,
+    usage: Option<response::Usage>,
+) -> Result<()> {
+    if no_history || !file_config.default.history.unwrap_or(true) {
+        return Ok(());
+    }
+    history::record(kind, model, prompt, response, usage)
+}
+
+/// Records one finished chat turn: appends it to `--session`'s log (when
+/// set) and to `lait history` (unless suppressed) — the shared tail of
+/// `run_chat`'s streamed and non-streamed paths and `run_chat_repl`'s
+/// per-turn loop.
+fn finish_chat_turn(
+    session_name: Option<&str>,
+    no_history: bool,
+    file_config: &ConfigFile,
+    model_id: &str,
+    prompt: &str,
+    response: &str,
+    usage: Option<response::Usage>,
+) -> Result<()> {
+    if let Some(name) = session_name {
+        session::append_turn(name, prompt, response)?;
+    }
+    record_history(
+        no_history,
+        file_config,
+        "chat",
+        Some(model_id),
+        prompt,
+        response,
+        usage,
+    )
+}
+
 /// The maximum number of tool-call round trips a single completion request
 /// may take (see `RequestSettings::complete`) before lait gives up and
 /// errors instead of looping forever on a model that keeps calling tools.
@@ -172,7 +246,41 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
-        None => run_chat(cli.chat, cli.no_config).await,
+        Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
+        Some(Command::Chat(chat_repl_args)) => run_chat_repl(chat_repl_args, cli.no_config).await,
+        Some(Command::Prompt(prompt_args)) => run_prompt(prompt_args, cli.no_config).await,
+        Some(Command::History(history_args)) => history::run(history_args),
+        None => run_chat_or_repl(cli.chat, cli.no_config).await,
+    }
+}
+
+/// The bare-invocation entry point (`lait [OPTIONS] [PROMPT]`, no
+/// subcommand): sends a single-shot chat request when a prompt is available
+/// (an argument or piped stdin — see `resolve_input_with_stdin`), or, when
+/// none is and stdin is an interactive terminal, starts the same REPL
+/// `lait chat` does instead of erroring. Piped-but-empty stdin (a script's
+/// `< /dev/null`, or a forgotten argument in a pipeline) still errors exactly
+/// as before — only an actual interactive terminal with nothing typed counts
+/// as "the user wants the REPL", so a script's exit-code contract never
+/// silently changes into "launched an interactive prompt that then exits
+/// immediately."
+async fn run_chat_or_repl(chat: ChatArgs, no_config: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    match resolve_input_with_stdin(chat.prompt.clone())? {
+        Some(prompt) => run_chat(chat, prompt, no_config).await,
+        None if std::io::stdin().is_terminal() => {
+            run_chat_repl(
+                ChatReplArgs {
+                    shared: chat.shared,
+                },
+                no_config,
+            )
+            .await
+        }
+        None => Err(anyhow!(
+            "a PROMPT is required; provide one, pipe input via stdin, or use `lait run <FILE> <PROMPT>`"
+        )),
     }
 }
 
@@ -184,11 +292,17 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 /// drift in this classification costs only startup time, never correctness.
 pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
     match &cli.command {
-        Some(Command::Lint(_) | Command::Completions(_) | Command::Man(_) | Command::Init(_)) => {
-            false
-        }
+        Some(
+            Command::Lint(_)
+            | Command::Completions(_)
+            | Command::Man(_)
+            | Command::Init(_)
+            | Command::Sessions(_)
+            | Command::History(_),
+        ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
-        Some(Command::Run(_) | Command::Agent(_)) | None => true,
+        Some(Command::Prompt(prompt_args)) => prompt_args.name != "list",
+        Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => true,
     }
 }
 
@@ -209,7 +323,15 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         }
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
-        Some(Command::Run(_) | Command::Agent(_)) | None => {
+        Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
+        Some(Command::Prompt(prompt_args)) => {
+            if prompt_args.name != "list" {
+                bail!("internal error: `prompt <NAME>` must run on the async path");
+            }
+            crate::prompt::list(&config::load_config(cli.no_config)?)
+        }
+        Some(Command::History(history_args)) => crate::history::run(history_args),
+        Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
     }
@@ -344,6 +466,34 @@ struct CapabilityOverrides {
     subagents: Option<Vec<String>>,
 }
 
+/// The new-turn inputs shared by `RequestSettings::complete`/
+/// `complete_stream`: the system prompt, any prior turns from a resumed
+/// `--session` (empty for every caller but chat), the new user-role prompt
+/// text, and any `--image` attachments for it (empty for every caller but
+/// chat). Bundled into one struct, like `SamplingOverrides`/
+/// `CapabilityOverrides` above, to keep `complete`'s argument count under
+/// clippy's `too_many_arguments` threshold.
+struct PromptTurn<'a> {
+    system_prompt: Option<&'a str>,
+    history: &'a [ChatCompletionRequestMessage],
+    prompt: &'a str,
+    image_urls: &'a [String],
+}
+
+impl<'a> PromptTurn<'a> {
+    /// A turn with no prior history and no image attachments — every caller
+    /// but chat's own (`run_chat`/`run_repl_turn`, which have a real
+    /// `--session`/`--image` history to carry).
+    fn simple(system_prompt: Option<&'a str>, prompt: &'a str) -> Self {
+        Self {
+            system_prompt,
+            history: &[],
+            prompt,
+            image_urls: &[],
+        }
+    }
+}
+
 /// The model/base-URL/API-key/sampling settings for a single completion
 /// request, after resolving aliases and applying every fallback layer.
 struct RequestSettings {
@@ -451,19 +601,24 @@ impl RequestSettings {
     /// step) and `call_subagent_tool` extends it for a subagent's own
     /// completion, so a subagent chain that cycles back to itself is caught
     /// the same way `workflow:` nesting is (see `MAX_SUBAGENT_DEPTH`).
+    /// `turn.history`/`turn.image_urls` are only ever non-empty for chat's
+    /// own call site (a resumed `--session`, `--image`); every other caller
+    /// passes `PromptTurn { history: &[], image_urls: &[], .. }`, which
+    /// reproduces the exact message shape this method built before either
+    /// feature existed — see `llm::initial_messages`.
     async fn complete(
         &self,
         env: &RunEnv<'_>,
         active_agent_paths: &[PathBuf],
-        system_prompt: Option<&str>,
-        prompt: &str,
+        turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
     ) -> Result<response::ChatCompletionResponse> {
-        let system_prompt = self.system_prompt_with_skills(&env.skill_cache, system_prompt)?;
+        let system_prompt = self.system_prompt_with_skills(&env.skill_cache, turn.system_prompt)?;
         let system_prompt = system_prompt.as_deref();
 
         if self.mcp.is_empty() && self.subagents.is_empty() {
-            let messages = llm::initial_messages(system_prompt, prompt)?;
+            let messages =
+                llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             return self
                 .complete_recorded(env, response_format, messages, &[])
                 .await;
@@ -489,7 +644,8 @@ impl RequestSettings {
         let mut tools = std::mem::take(&mut mcp_tool_set.tools);
         tools.extend(std::mem::take(&mut subagent_tool_set.tools));
 
-        let mut messages = llm::initial_messages(system_prompt, prompt)?;
+        let mut messages =
+            llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
 
         let mut round = 0usize;
         loop {
@@ -581,12 +737,12 @@ impl RequestSettings {
     /// restriction on streaming.
     /// `include_usage` asks the server for a final usage chunk (see
     /// `llm::CompletionRequest::stream_include_usage`); set it only when the
-    /// caller will actually display it (`--show-usage`).
+    /// caller will actually display it (`--show-usage`). `turn.history`/
+    /// `turn.image_urls` behave exactly as in `complete` — see its doc comment.
     async fn complete_stream(
         &self,
         skill_cache: &skill::SkillCache<'_>,
-        system_prompt: Option<&str>,
-        prompt: &str,
+        turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
         include_usage: bool,
     ) -> Result<llm::CompletionStream> {
@@ -601,8 +757,13 @@ impl RequestSettings {
                  of them"
             );
         }
-        let system_prompt = self.system_prompt_with_skills(skill_cache, system_prompt)?;
-        let messages = llm::initial_messages(system_prompt.as_deref(), prompt)?;
+        let system_prompt = self.system_prompt_with_skills(skill_cache, turn.system_prompt)?;
+        let messages = llm::initial_messages(
+            system_prompt.as_deref(),
+            turn.history,
+            turn.prompt,
+            turn.image_urls,
+        )?;
         let mut request = self.request(response_format, messages, &[]);
         request.stream_include_usage = include_usage;
         llm::complete_stream(request).await
@@ -630,16 +791,18 @@ impl RequestSettings {
 /// are dropped when `show_reasoning` is unset, same as the non-streaming
 /// path. Fails, like `response::response_content`, if the stream ends
 /// without ever producing content.
-/// Returns the usage carried by the final chunk, when the request asked for
-/// one (see `RequestSettings::complete_stream`'s `include_usage`) and the
-/// server obliged. `output_path` redirects the content to a file (`-o`):
-/// the file then holds the body alone, so reasoning deltas — normally
-/// written ahead of the content on stdout — go to stderr instead.
+/// Returns the accumulated content text (for `--session`/`lait history` to
+/// record — see `StreamOutcome`) alongside the usage carried by the final
+/// chunk, when the request asked for one (see
+/// `RequestSettings::complete_stream`'s `include_usage`) and the server
+/// obliged. `output_path` redirects the content to a file (`-o`): the file
+/// then holds the body alone, so reasoning deltas — normally written ahead of
+/// the content on stdout — go to stderr instead.
 async fn stream_response(
     mut stream: llm::CompletionStream,
     show_reasoning: bool,
     output_path: Option<&Path>,
-) -> Result<Option<response::Usage>> {
+) -> Result<StreamOutcome> {
     use std::io::Write;
 
     // Locked/opened once for the stream's whole lifetime: every delta write
@@ -665,6 +828,7 @@ async fn stream_response(
     let mut wrote_reasoning = false;
     let mut wrote_content = false;
     let mut last_usage = None;
+    let mut content_text = String::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -699,6 +863,7 @@ async fn stream_response(
                 content_sink.flush()?;
             }
             wrote_content = true;
+            content_text.push_str(content);
         }
     }
 
@@ -710,7 +875,21 @@ async fn stream_response(
     }
     writeln!(content_sink)?;
     content_sink.flush()?;
-    Ok(last_usage)
+    Ok(StreamOutcome {
+        content: content_text,
+        usage: last_usage,
+    })
+}
+
+/// What `stream_response` produced: the full response text (concatenated
+/// from every content delta, exactly as printed) and the usage its final
+/// chunk carried, if any. The content half exists for callers that need the
+/// complete text after the stream ends even though it was already written
+/// out incrementally — recording a `--session` turn or a `lait history`
+/// entry, neither of which can work from deltas alone.
+struct StreamOutcome {
+    content: String,
+    usage: Option<response::Usage>,
 }
 
 /// Renders an agent's system prompt against `input`, calls the model with
@@ -727,7 +906,12 @@ async fn call_agent(
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
 ) -> Result<String> {
-    let system_prompt = template::render(&agent_file.system_prompt_template, input, steps_outputs)?;
+    let system_prompt = template::render(
+        &agent_file.system_prompt_template,
+        input,
+        steps_outputs,
+        &serde_json::Map::new(),
+    )?;
     let response_format = agent_file
         .structured_output
         .then(|| {
@@ -744,8 +928,7 @@ async fn call_agent(
         .complete(
             env,
             active_agent_paths,
-            Some(&system_prompt),
-            prompt,
+            PromptTurn::simple(Some(&system_prompt), prompt),
             response_format,
         )
         .await?;
@@ -1084,11 +1267,14 @@ fn agent_file_settings(
 /// contents, else `default.system` from lait.config.yml (`--system` and
 /// `--system-file` conflict at the clap level, so their order here never
 /// actually decides anything).
-fn resolve_system_prompt(chat: &ChatArgs, file_config: &ConfigFile) -> Result<Option<String>> {
-    if let Some(text) = &chat.system {
+fn resolve_system_prompt(
+    shared: &SharedChatArgs,
+    file_config: &ConfigFile,
+) -> Result<Option<String>> {
+    if let Some(text) = &shared.system {
         return Ok(Some(text.clone()));
     }
-    if let Some(path) = &chat.system_file {
+    if let Some(path) = &shared.system_file {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read system prompt file '{}'", path.display()))?;
         return Ok(Some(text.trim_end().to_owned()));
@@ -1096,17 +1282,26 @@ fn resolve_system_prompt(chat: &ChatArgs, file_config: &ConfigFile) -> Result<Op
     Ok(file_config.default.system.clone())
 }
 
-async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
-    let prompt = resolve_input_with_stdin(chat.prompt.clone())?.ok_or_else(|| {
-        anyhow!(
-            "a PROMPT is required; provide one, pipe input via stdin, or use `lait run <FILE> <PROMPT>`"
-        )
-    })?;
-
-    let file_config = config::load_config(no_config)?;
-    let model_name = chat
+/// Resolves a chat turn's `RequestSettings` from `shared` (the options common
+/// to single-shot chat and `lait chat`'s REPL — see `SharedChatArgs`) and
+/// `file_config`. Shared by `run_chat` and `repl::run`, which both need
+/// exactly this: chat's own model-resolution rule (`--model`/`LLM_MODEL` >
+/// `prompt_model_fallback` > `default.model`) plus the sampling/capability
+/// overrides every chat turn carries. The REPL calls this again after
+/// `/model`, so a model switch re-resolves the full settings (base URL,
+/// sampling defaults, ...) rather than only swapping the model id.
+/// `prompt_model_fallback` is `-p`/`--prompt-name`'s own `model:`, when set
+/// and `-p` was used (`None` from every other caller, including the REPL,
+/// which has no `-p` equivalent).
+fn resolve_chat_settings(
+    shared: &SharedChatArgs,
+    prompt_model_fallback: Option<&str>,
+    file_config: &ConfigFile,
+) -> Result<RequestSettings> {
+    let model_name = shared
         .model
         .clone()
+        .or_else(|| prompt_model_fallback.map(str::to_owned))
         .or_else(|| file_config.default.model.clone())
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| {
@@ -1118,25 +1313,61 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
     let settings = resolve_request_settings(
         model_name,
         SamplingOverrides {
-            reasoning_effort: chat.reasoning_effort,
-            temperature: chat.temperature,
-            top_p: chat.top_p,
-            max_tokens: chat.max_tokens,
+            reasoning_effort: shared.reasoning_effort,
+            temperature: shared.temperature,
+            top_p: shared.top_p,
+            max_tokens: shared.max_tokens,
         },
-        chat.base_url.clone(),
-        chat.api_key.clone(),
+        shared.base_url.clone(),
+        shared.api_key.clone(),
         CapabilityOverrides {
-            mcp: (!chat.mcp.is_empty()).then(|| chat.mcp.clone()),
+            mcp: (!shared.mcp.is_empty()).then(|| shared.mcp.clone()),
             max_tool_rounds: None,
             // No `--skill` CLI flag: chat only ever gets skills from
             // `default.skills` in `lait.config.yml` (see `resolve_request_settings`).
             skills: None,
-            subagents: (!chat.subagent.is_empty()).then(|| chat.subagent.clone()),
+            subagents: (!shared.subagent.is_empty()).then(|| shared.subagent.clone()),
         },
         &ModelMap::default(),
-        &file_config,
-    )?
-    .with_usage_label("chat");
+        file_config,
+    )?;
+    Ok(settings.with_usage_label("chat"))
+}
+
+/// Resolves `shared.session`'s prior turns (empty when `--session` is unset)
+/// into the shape `PromptTurn::history` needs. Shared by `run_chat` and
+/// `repl::run`'s startup (the REPL loads history once and grows its own
+/// in-memory copy turn by turn from there, rather than reloading from disk
+/// every turn).
+fn load_session_history(session_name: Option<&str>) -> Result<Vec<ChatCompletionRequestMessage>> {
+    match session_name {
+        Some(name) => session::to_request_messages(&session::load(name)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Runs a single-shot chat request with an already-resolved `prompt` — see
+/// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
+/// CLI argument and/or piped stdin).
+async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()> {
+    let file_config = config::load_config(no_config)?;
+
+    // `-p`/`--prompt-name` renders a named `prompts:` template against
+    // `prompt` (which, for this path, is really the template's `{{ input }}`
+    // rather than literal text to send) before anything else touches it —
+    // `--file` attachments below still append to the *rendered* text, the
+    // same way they'd append to a plain prompt.
+    let (prompt, prompt_model_fallback) = match &chat.prompt_name {
+        Some(name) => prompt::render_named(name, &prompt, &chat.var, &file_config)?,
+        None => (prompt, None),
+    };
+    let prompt = match attachment::read_file_attachments(&chat.files).await? {
+        Some(file_context) => format!("{prompt}\n\n{file_context}"),
+        None => prompt,
+    };
+
+    let settings =
+        resolve_chat_settings(&chat.shared, prompt_model_fallback.as_deref(), &file_config)?;
 
     let response_format = chat
         .json_schema
@@ -1144,50 +1375,55 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
-    let system_prompt = resolve_system_prompt(&chat, &file_config)?;
+    let system_prompt = resolve_system_prompt(&chat.shared, &file_config)?;
+    let image_urls = attachment::resolve_image_urls(&chat.images).await?;
+    let session_history = load_session_history(chat.shared.session.as_deref())?;
     let env = RunEnv::new(&file_config);
 
     // `--quiet` keeps the response body and drops every note around it.
-    let show_reasoning = chat.show_reasoning && !chat.quiet;
-    let show_usage = chat.show_usage && !chat.quiet;
+    let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
+    let show_usage = chat.shared.show_usage && !chat.quiet;
+    let render_enabled = chat.render || file_config.default.render.unwrap_or(false);
     // `-o -` is an explicit "stdout", the same as no `-o` at all.
     let output_path = chat
         .output
         .as_deref()
         .filter(|path| path.as_os_str() != "-");
 
+    let turn = PromptTurn {
+        system_prompt: system_prompt.as_deref(),
+        history: &session_history,
+        prompt: &prompt,
+        image_urls: &image_urls,
+    };
+
     if chat.stream {
         let stream = settings
-            .complete_stream(
-                &env.skill_cache,
-                system_prompt.as_deref(),
-                &prompt,
-                response_format,
-                show_usage,
-            )
+            .complete_stream(&env.skill_cache, turn, response_format, show_usage)
             .await?;
-        let usage = stream_response(stream, show_reasoning, output_path).await?;
+        let outcome = stream_response(stream, show_reasoning, output_path).await?;
+        // Streamed usage arrives on the final chunk rather than through
+        // `complete`; feed it into the same tally so both chat paths share
+        // one summary format and so `env.usage.total()` below reflects it.
+        if let Some(usage) = outcome.usage {
+            env.usage.record(&settings.usage_label, usage);
+        }
+        finish_chat_turn(
+            chat.shared.session.as_deref(),
+            chat.shared.no_history,
+            &file_config,
+            &settings.resolved_model.model_id,
+            &prompt,
+            &outcome.content,
+            env.usage.total(),
+        )?;
         if show_usage {
-            // Streamed usage arrives on the final chunk rather than through
-            // `complete`; feed it into the same tally so both chat paths
-            // share one summary format.
-            if let Some(usage) = usage {
-                env.usage.record(&settings.usage_label, usage);
-            }
             print_usage_summary(&env.usage);
         }
         return Ok(());
     }
 
-    let response = settings
-        .complete(
-            &env,
-            &[],
-            system_prompt.as_deref(),
-            &prompt,
-            response_format,
-        )
-        .await?;
+    let response = settings.complete(&env, &[], turn, response_format).await?;
 
     match output_path {
         Some(path) => {
@@ -1203,10 +1439,256 @@ async fn run_chat(chat: ChatArgs, no_config: bool) -> Result<()> {
         }
         None => {
             let output = response::render_response(&response, chat.json, show_reasoning)?;
+            // `--json`'s output is machine-readable and never rendered as
+            // Markdown; `chat.stream`'s branch above already returned before
+            // reaching here, so `--render` never has to reckon with a
+            // partial streamed response either — see `render::maybe_render`.
+            let output = if chat.json {
+                output
+            } else {
+                render::maybe_render(&output, render_enabled)
+            };
             println!("{output}");
         }
     }
+    let content = response::content_text(&response);
+    finish_chat_turn(
+        chat.shared.session.as_deref(),
+        chat.shared.no_history,
+        &file_config,
+        &settings.resolved_model.model_id,
+        &prompt,
+        content,
+        env.usage.total(),
+    )?;
     if show_usage {
+        print_usage_summary(&env.usage);
+    }
+    Ok(())
+}
+
+/// Runs `lait chat`'s interactive REPL: reads one line at a time from stdin,
+/// sends it (plus every earlier turn this process has seen) to the model,
+/// and prints the reply, until `/exit` or end-of-input (Ctrl-D closes stdin,
+/// which a piped-stdin test also relies on to end the loop without an
+/// explicit `/exit`). See `repl::parse_meta_command` for the `/exit`/
+/// `/clear`/`/model`/`/system` syntax handled below. Also reached from a
+/// prompt-less, stdin-is-a-terminal bare `lait` invocation — see
+/// `run_chat_or_repl`.
+async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let mut shared = args.shared;
+    let file_config = config::load_config(no_config)?;
+    let mut history = load_session_history(shared.session.as_deref())?;
+    let mut system_prompt = resolve_system_prompt(&shared, &file_config)?;
+    let env = RunEnv::new(&file_config);
+
+    eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
+
+    // Resolved lazily on first use rather than up front, so a `--model`-less
+    // invocation still drops into the REPL instead of erroring immediately —
+    // the user can `/model <name>` before ever sending a line. Cached across
+    // turns after that (`resolve_chat_settings` does only cheap string/config
+    // work, but nothing here changes turn to turn except in response to
+    // `/model`, which invalidates it below).
+    let mut settings: Option<RequestSettings> = None;
+
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("> ");
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break; // end-of-input (Ctrl-D)
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(command) = repl::parse_meta_command(line) {
+            match command {
+                repl::MetaCommand::Exit => break,
+                repl::MetaCommand::Clear => {
+                    history.clear();
+                    eprintln!("(history cleared — a --session log, if any, is unaffected)");
+                }
+                repl::MetaCommand::Model(name) if !name.is_empty() => {
+                    shared.model = Some(name.to_owned());
+                    settings = None;
+                    eprintln!("(model set to '{name}')");
+                }
+                repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
+                repl::MetaCommand::System(text) if !text.is_empty() => {
+                    system_prompt = Some(text.to_owned());
+                    eprintln!("(system prompt updated)");
+                }
+                repl::MetaCommand::System(_) => eprintln!("usage: /system <text>"),
+                repl::MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+            }
+            continue;
+        }
+
+        if settings.is_none() {
+            settings = match resolve_chat_settings(&shared, None, &file_config) {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    eprintln!("lait: {error:#}");
+                    continue;
+                }
+            };
+        }
+        let settings = settings
+            .as_ref()
+            .expect("just resolved above, or the loop continued before reaching here");
+
+        match run_repl_turn(
+            settings,
+            &env,
+            &system_prompt,
+            &history,
+            line,
+            shared.show_reasoning,
+            shared.show_usage,
+        )
+        .await
+        {
+            Ok((assistant_text, turn_usage)) => {
+                history.push(llm::user_message(line, &[])?);
+                history.push(llm::assistant_message(&assistant_text)?);
+                finish_chat_turn(
+                    shared.session.as_deref(),
+                    shared.no_history,
+                    &file_config,
+                    &settings.resolved_model.model_id,
+                    line,
+                    &assistant_text,
+                    turn_usage,
+                )?;
+            }
+            // One bad turn (a request error, a bad `/model` name that only
+            // fails once actually resolved) shouldn't end the whole session
+            // — report it and let the user try again or `/exit`.
+            Err(error) => eprintln!("lait: {error:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Runs one `lait chat` turn: streams the response to stdout (the REPL's
+/// default), or — when `settings.mcp`/`settings.subagents` names at least
+/// one tool source — falls back to a single non-streamed request printed
+/// once it completes, since `RequestSettings::complete_stream` cannot yet
+/// drive a tool loop (see its own doc comment). Returns the assistant's raw
+/// reply text (never the `Reasoning:`-prefixed display form, the shape
+/// `history`/a `--session` log need) alongside this turn's own token usage
+/// (not `env.usage`'s running session total — see the `before`/`after`
+/// delta below — since `env` persists across every REPL turn and `lait
+/// history` wants each entry's own usage, not the cumulative session total).
+async fn run_repl_turn(
+    settings: &RequestSettings,
+    env: &RunEnv<'_>,
+    system_prompt: &Option<String>,
+    history: &[ChatCompletionRequestMessage],
+    prompt: &str,
+    show_reasoning: bool,
+    show_usage: bool,
+) -> Result<(String, Option<response::Usage>)> {
+    let before = env.usage.total().unwrap_or_default();
+    let turn = PromptTurn {
+        system_prompt: system_prompt.as_deref(),
+        history,
+        prompt,
+        image_urls: &[],
+    };
+    let content = if settings.mcp.is_empty() && settings.subagents.is_empty() {
+        let stream = settings
+            .complete_stream(&env.skill_cache, turn, None, show_usage)
+            .await?;
+        let outcome = stream_response(stream, show_reasoning, None).await?;
+        if show_usage && let Some(usage) = outcome.usage {
+            env.usage.record(&settings.usage_label, usage);
+        }
+        if show_usage {
+            print_usage_summary(&env.usage);
+        }
+        outcome.content
+    } else {
+        let response = settings.complete(env, &[], turn, None).await?;
+        let rendered = response::render_response(&response, false, show_reasoning)?;
+        println!("{rendered}");
+        if show_usage {
+            print_usage_summary(&env.usage);
+        }
+        response::content_text(&response).to_owned()
+    };
+    let turn_usage = env.usage.total().map(|after| response::Usage {
+        prompt_tokens: after.prompt_tokens.saturating_sub(before.prompt_tokens),
+        completion_tokens: after
+            .completion_tokens
+            .saturating_sub(before.completion_tokens),
+        total_tokens: after.total_tokens.saturating_sub(before.total_tokens),
+    });
+    Ok((content, turn_usage))
+}
+
+/// Runs `lait prompt <NAME> [INPUT]` (`args.name == "list"` is handled
+/// separately, synchronously, by `prompt::list` — see `needs_async_runtime`/
+/// `run_blocking`): renders the named prompt (see `prompt::render_named`)
+/// and sends the result as a plain, tool-free, non-streamed request. This
+/// subcommand form is intentionally narrower than `-p`/`--prompt-name` on
+/// the main chat invocation (no `--model`/`--stream`/`-o`/... overrides —
+/// see `docs/usage/ja/prompts.md`); reach for `-p` when those are needed.
+async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
+    let file_config = config::load_config(no_config)?;
+    if args.name == "list" {
+        return prompt::list(&file_config);
+    }
+
+    let raw_input = resolve_input_with_stdin(args.input.clone())?
+        .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
+    let (prompt_text, prompt_model) =
+        prompt::render_named(&args.name, &raw_input, &args.var, &file_config)?;
+
+    let model_name = prompt_model
+        .or_else(|| file_config.default.model.clone())
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "model is required for prompt '{}'; set 'prompts.{}.model' or default.model in {}",
+                args.name,
+                args.name,
+                config::CONFIG_FILE_NAME
+            )
+        })?;
+    let settings = resolve_request_settings(
+        model_name,
+        SamplingOverrides::default(),
+        None,
+        None,
+        CapabilityOverrides::default(),
+        &ModelMap::default(),
+        &file_config,
+    )?
+    .with_usage_label(format!("prompt '{}'", args.name));
+
+    let env = RunEnv::new(&file_config);
+    let response = settings
+        .complete(&env, &[], PromptTurn::simple(None, &prompt_text), None)
+        .await?;
+    let output = response::render_response(&response, false, false)?;
+    println!("{output}");
+    record_history(
+        args.no_history,
+        &file_config,
+        "prompt",
+        Some(&settings.resolved_model.model_id),
+        &prompt_text,
+        &output,
+        env.usage.total(),
+    )?;
+    if args.show_usage {
         print_usage_summary(&env.usage);
     }
     Ok(())
@@ -1261,6 +1743,15 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     .await
     .with_context(|| format!("agent '{}'", args.file.display()))?;
     println!("{output}");
+    record_history(
+        args.no_history,
+        &file_config,
+        "agent",
+        Some(&settings.resolved_model.model_id),
+        &raw_input,
+        &output,
+        env.usage.total(),
+    )?;
     if args.show_usage {
         print_usage_summary(&env.usage);
     }
@@ -1277,6 +1768,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let env = RunEnv::new(&file_config);
+    let initial_prompt = prompt.clone();
     let (current_input, _, _, _) = run_steps(
         &wf.steps,
         prompt,
@@ -1288,6 +1780,17 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     )
     .await?;
     println!("{current_input}");
+    // A workflow can touch several models across its steps, so no single
+    // `model` is recorded here — see `history::HistoryEntry::model`.
+    record_history(
+        run_args.no_history,
+        &file_config,
+        "workflow",
+        None,
+        &initial_prompt,
+        &current_input,
+        env.usage.total(),
+    )?;
     if run_args.show_usage {
         print_usage_summary(&env.usage);
     }
@@ -2256,8 +2759,13 @@ async fn execute_step(
         // through `template::render`.
         let prompt: Cow<'_, str> = match &node.prompt {
             Some(prompt_template) => Cow::Owned(
-                template::render(prompt_template, &input, steps_outputs)
-                    .with_context(|| format!("step '{label}'"))?,
+                template::render(
+                    prompt_template,
+                    &input,
+                    steps_outputs,
+                    &serde_json::Map::new(),
+                )
+                .with_context(|| format!("step '{label}'"))?,
             ),
             None => Cow::Borrowed(current_input),
         };
@@ -2266,13 +2774,23 @@ async fn execute_step(
             .as_deref()
             .or(scope.defaults.system_prompt.as_deref())
             .map(|system_prompt_template| {
-                template::render(system_prompt_template, &input, steps_outputs)
+                template::render(
+                    system_prompt_template,
+                    &input,
+                    steps_outputs,
+                    &serde_json::Map::new(),
+                )
             })
             .transpose()
             .with_context(|| format!("step '{label}'"))?;
 
         let response = settings
-            .complete(env, &[], system_prompt.as_deref(), &prompt, response_format)
+            .complete(
+                env,
+                &[],
+                PromptTurn::simple(system_prompt.as_deref(), &prompt),
+                response_format,
+            )
             .await
             .with_context(|| format!("step '{label}'"))?;
 

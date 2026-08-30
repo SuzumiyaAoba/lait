@@ -2,21 +2,30 @@ use clap::Parser;
 
 mod agent;
 mod app;
+mod attachment;
 mod cli;
 mod config;
 mod dotenv;
 mod frontmatter;
+mod history;
 mod init;
 mod jq;
+mod jsonl;
 mod lint;
 mod llm;
 mod mcp;
 mod models;
+mod prompt;
+mod render;
+mod repl;
 mod response;
 mod schema;
+mod session;
 mod skill;
 mod subagent;
 mod template;
+#[cfg(test)]
+mod test_support;
 mod workflow;
 
 fn main() {

@@ -176,6 +176,16 @@ pub(crate) fn first_message(
     response.choices.first().map(|choice| &choice.message)
 }
 
+/// The first choice's raw content text, or `""` when there is none — the
+/// shape a `--session`/`lait history` turn record needs (unlike
+/// `response_content`, never an error; unlike `render_response`, never
+/// `Reasoning:`-prefixed).
+pub(crate) fn content_text(response: &ChatCompletionResponse) -> &str {
+    first_message(response)
+        .and_then(|message| message.content())
+        .unwrap_or_default()
+}
+
 impl ChatCompletionResponseMessage {
     pub(crate) fn content(&self) -> Option<&str> {
         self.content

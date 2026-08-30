@@ -12,22 +12,27 @@ pub(crate) fn parse_input(raw: &str) -> serde_json::Value {
 }
 
 /// Renders `template` against `input`, exposed to the template as `{{ input }}`
-/// (and, when `input` is an object, `{{ input.field }}` for nested access), and
+/// (and, when `input` is an object, `{{ input.field }}` for nested access),
 /// `steps`, a map of step `id` to that step's recorded output (see
 /// `workflow::StepOutputs`), exposed as `{{ steps.<id> }}` /
-/// `{{ steps.<id>.field }}`. Referencing an undefined variable is an error
-/// rather than an empty string. `{{ json input }}` (or `{{ json steps.<id> }}`)
-/// renders a value as compact JSON text; handlebars' default bare rendering of
-/// an object or array is the literal placeholder `[object]`/`[array]`, which is
-/// rarely what's wanted, so a bare `{{ input }}` against an object/array input
-/// is rejected up front rather than silently sending that placeholder text to
-/// the model. The same guard does not apply to `steps`, since referencing a
-/// specific step's output either names a field (`{{ steps.foo.bar }}`) or is
+/// `{{ steps.<id>.field }}`, and `vars`, a named prompt's `vars:` defaults
+/// merged with its call's `--var key=value` overrides (see
+/// `prompt::build_vars`; empty for every caller but a named prompt),
+/// exposed as `{{ vars.<key> }}`. Referencing an undefined variable is an
+/// error rather than an empty string. `{{ json input }}` (or
+/// `{{ json steps.<id> }}`) renders a value as compact JSON text; handlebars'
+/// default bare rendering of an object or array is the literal placeholder
+/// `[object]`/`[array]`, which is rarely what's wanted, so a bare
+/// `{{ input }}` against an object/array input is rejected up front rather
+/// than silently sending that placeholder text to the model. The same guard
+/// does not apply to `steps`/`vars`, since referencing one of their fields
+/// either names a field (`{{ steps.foo.bar }}`/`{{ vars.lang }}`) or is
 /// expected to be used with `{{ json steps.foo }}`.
 pub(crate) fn render(
     template: &str,
     input: &serde_json::Value,
     steps: &serde_json::Map<String, serde_json::Value>,
+    vars: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
     if matches!(
         input,
@@ -42,7 +47,7 @@ pub(crate) fn render(
     }
 
     HANDLEBARS
-        .render_template(template, &TemplateData { input, steps })
+        .render_template(template, &TemplateData { input, steps, vars })
         .with_context(|| format!("failed to render template: {template:?}"))
 }
 
@@ -57,14 +62,16 @@ static HANDLEBARS: LazyLock<Handlebars<'static>> = LazyLock::new(|| {
     handlebars
 });
 
-/// The `{ input, steps }` root object a template renders against, borrowing
-/// both values: handlebars only needs something `Serialize`, so this avoids
-/// deep-cloning the input and every recorded step output into a fresh
-/// `serde_json::Value` on every render (which a `json!` literal would do).
+/// The `{ input, steps, vars }` root object a template renders against,
+/// borrowing every value: handlebars only needs something `Serialize`, so
+/// this avoids deep-cloning the input and every recorded step output/prompt
+/// var into a fresh `serde_json::Value` on every render (which a `json!`
+/// literal would do).
 #[derive(Serialize)]
 struct TemplateData<'a> {
     input: &'a serde_json::Value,
     steps: &'a serde_json::Map<String, serde_json::Value>,
+    vars: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 /// Checks `template`'s handlebars syntax without rendering it (used by the
@@ -124,10 +131,20 @@ mod tests {
         serde_json::Map::new()
     }
 
+    fn no_vars() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
     #[test]
     fn renders_a_bare_input_placeholder_from_a_string() {
         assert_eq!(
-            render("summarize: {{ input }}", &parse_input("hello"), &no_steps()).unwrap(),
+            render(
+                "summarize: {{ input }}",
+                &parse_input("hello"),
+                &no_steps(),
+                &no_vars()
+            )
+            .unwrap(),
             "summarize: hello"
         );
     }
@@ -136,7 +153,7 @@ mod tests {
     fn renders_a_field_from_an_object_input() {
         let input = parse_input(r#"{"city":"Tokyo","population":37400000}"#);
         assert_eq!(
-            render("city: {{ input.city }}", &input, &no_steps()).unwrap(),
+            render("city: {{ input.city }}", &input, &no_steps(), &no_vars()).unwrap(),
             "city: Tokyo"
         );
     }
@@ -144,27 +161,41 @@ mod tests {
     #[test]
     fn renders_no_placeholder_text_unchanged() {
         assert_eq!(
-            render("no placeholder here", &parse_input("x"), &no_steps()).unwrap(),
+            render(
+                "no placeholder here",
+                &parse_input("x"),
+                &no_steps(),
+                &no_vars()
+            )
+            .unwrap(),
             "no placeholder here"
         );
     }
 
     #[test]
     fn rejects_an_undefined_variable() {
-        assert!(render("{{ input.nope }}", &parse_input(r#"{"a":1}"#), &no_steps()).is_err());
-        assert!(render("{{ nope }}", &parse_input("x"), &no_steps()).is_err());
+        assert!(
+            render(
+                "{{ input.nope }}",
+                &parse_input(r#"{"a":1}"#),
+                &no_steps(),
+                &no_vars()
+            )
+            .is_err()
+        );
+        assert!(render("{{ nope }}", &parse_input("x"), &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn rejects_an_unterminated_placeholder() {
-        assert!(render("{{ input", &parse_input("x"), &no_steps()).is_err());
+        assert!(render("{{ input", &parse_input("x"), &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn renders_a_whole_object_input_as_compact_json_via_the_json_helper() {
         let input = json!({"b": 2, "a": 1});
         assert_eq!(
-            render("{{ json input }}", &input, &no_steps()).unwrap(),
+            render("{{ json input }}", &input, &no_steps(), &no_vars()).unwrap(),
             r#"{"b":2,"a":1}"#
         );
     }
@@ -173,7 +204,7 @@ mod tests {
     fn renders_a_nested_field_via_the_json_helper_when_it_is_itself_an_object() {
         let input = json!({"address": {"city": "Tokyo", "zip": "100-0001"}});
         assert_eq!(
-            render("{{ json input.address }}", &input, &no_steps()).unwrap(),
+            render("{{ json input.address }}", &input, &no_steps(), &no_vars()).unwrap(),
             r#"{"city":"Tokyo","zip":"100-0001"}"#
         );
     }
@@ -181,21 +212,21 @@ mod tests {
     #[test]
     fn rejects_a_bare_input_placeholder_against_an_object_input() {
         let input = json!({"city": "Tokyo"});
-        let error = render("{{ input }}", &input, &no_steps()).unwrap_err();
+        let error = render("{{ input }}", &input, &no_steps(), &no_vars()).unwrap_err();
         assert!(error.to_string().contains("json input"));
     }
 
     #[test]
     fn rejects_a_bare_input_placeholder_against_an_array_input() {
         let input = json!(["Tokyo", "Osaka"]);
-        assert!(render("{{ input }}", &input, &no_steps()).is_err());
+        assert!(render("{{ input }}", &input, &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn allows_field_access_and_the_json_helper_against_an_object_input() {
         let input = json!({"city": "Tokyo"});
-        assert!(render("{{ input.city }}", &input, &no_steps()).is_ok());
-        assert!(render("{{ json input }}", &input, &no_steps()).is_ok());
+        assert!(render("{{ input.city }}", &input, &no_steps(), &no_vars()).is_ok());
+        assert!(render("{{ json input }}", &input, &no_steps(), &no_vars()).is_ok());
     }
 
     #[test]
@@ -203,7 +234,13 @@ mod tests {
         let mut steps = no_steps();
         steps.insert("extract".to_owned(), json!({"city": "Tokyo"}));
         assert_eq!(
-            render("city: {{ steps.extract.city }}", &parse_input("x"), &steps).unwrap(),
+            render(
+                "city: {{ steps.extract.city }}",
+                &parse_input("x"),
+                &steps,
+                &no_vars()
+            )
+            .unwrap(),
             "city: Tokyo"
         );
     }
@@ -213,14 +250,51 @@ mod tests {
         let mut steps = no_steps();
         steps.insert("extract".to_owned(), json!({"city": "Tokyo"}));
         assert_eq!(
-            render("{{ json steps.extract }}", &parse_input("x"), &steps).unwrap(),
+            render(
+                "{{ json steps.extract }}",
+                &parse_input("x"),
+                &steps,
+                &no_vars()
+            )
+            .unwrap(),
             r#"{"city":"Tokyo"}"#
         );
     }
 
     #[test]
+    fn renders_a_var_placeholder() {
+        let mut vars = no_vars();
+        vars.insert("lang".to_owned(), json!("英語"));
+        assert_eq!(
+            render("{{ vars.lang }}", &parse_input("x"), &no_steps(), &vars).unwrap(),
+            "英語"
+        );
+    }
+
+    #[test]
+    fn rejects_a_reference_to_an_unset_var() {
+        assert!(
+            render(
+                "{{ vars.missing }}",
+                &parse_input("x"),
+                &no_steps(),
+                &no_vars()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn rejects_a_reference_to_an_unrecorded_step_id() {
-        assert!(render("{{ steps.missing }}", &parse_input("x"), &no_steps()).is_err());
+        assert!(
+            render(
+                "{{ steps.missing }}",
+                &parse_input("x"),
+                &no_steps(),
+                &no_vars()
+            )
+            .is_err()
+        );
     }
 
     #[test]
