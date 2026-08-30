@@ -2,7 +2,10 @@ mod support;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use support::{ConfigDirectory, JsonSchemaFile, run_lait_with_json_schema, test_command};
+use support::{
+    ConfigDirectory, JsonSchemaFile, WorkflowFile, run_lait_with_json_schema, run_lait_workflow,
+    test_command,
+};
 
 #[test]
 fn reports_invalid_json_schema_file_with_path_context() {
@@ -205,4 +208,18 @@ fn requires_model_option() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("model"));
+}
+
+#[test]
+fn rejects_an_empty_or_whitespace_command_program_before_execution() {
+    for program in ["", "  "] {
+        let workflow = WorkflowFile::new(&format!(
+            "nodes:\n  n:\n    command: [\"{program}\"]\nsteps:\n  - use: n\n"
+        ));
+        let output = run_lait_workflow(&workflow.path, "input");
+
+        assert!(!output.status.success(), "workflow unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("command[0]"), "stderr: {stderr}");
+    }
 }

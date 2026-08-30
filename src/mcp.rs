@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
@@ -13,6 +17,18 @@ use rmcp::{
 };
 
 use crate::config;
+
+/// Finite safety net for MCP handshakes, pagination requests, and tool calls.
+/// Workflow nodes may still impose a shorter existing `timeout:`; this keeps
+/// chat/agent calls and malformed or unresponsive MCP peers from waiting
+/// forever when no workflow timeout exists.
+const MCP_IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A healthy server should expose its tools in a small number of pages. This
+/// bound also makes an untrusted/misbehaving remote server unable to grow the
+/// client-side tool list without limit by returning an endless sequence of
+/// distinct cursors.
+const MAX_TOOL_LIST_PAGES: usize = 128;
 
 /// A running MCP connection: lait only ever calls tools, so it never needs
 /// the more elaborate `ClientHandler`/`RoleClient` type parameters a server
@@ -132,12 +148,23 @@ impl<'a> McpRegistry<'a> {
             .entry(name.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
             .clone();
+        let tool_list_cell = Arc::clone(&cell);
 
         cell.get_or_try_init(|| async {
             let connection = self.connection(name).await?;
-            let server_tools = list_all_tools(&connection)
-                .await
-                .with_context(|| format!("failed to list tools for MCP server '{name}'"))?;
+            let server_tools = match list_all_tools(&connection).await {
+                Ok(server_tools) => server_tools,
+                Err(error) => {
+                    // A failed list request may have left an in-flight
+                    // request in the transport (especially for stdio). Do
+                    // not retain that service in either cache: cancel it and
+                    // let the next attempt establish a fresh connection.
+                    self.invalidate_connection_and_tool_list(name, &connection, &tool_list_cell)
+                        .await;
+                    return Err(error)
+                        .with_context(|| format!("failed to list tools for MCP server '{name}'"));
+                }
+            };
             Ok::<_, anyhow::Error>(Arc::new(server_tools))
         })
         .await
@@ -180,9 +207,23 @@ impl<'a> McpRegistry<'a> {
             Some(arguments) => params.with_arguments(arguments),
             None => params,
         };
-        let result = connection.call_tool(params).await.with_context(|| {
-            format!("MCP server '{server_name}' failed to run tool '{tool_name}'")
-        })?;
+        let result = match tokio::time::timeout(MCP_IO_TIMEOUT, connection.call_tool(params)).await
+        {
+            Ok(result) => result.with_context(|| {
+                format!("MCP server '{server_name}' failed to run tool '{tool_name}'")
+            })?,
+            Err(_) => {
+                // Dropping only the call future does not stop a stdio
+                // server's in-flight work. Cancel and evict the exact
+                // connection so a later call cannot reuse that service and
+                // accidentally duplicate a side effect.
+                self.invalidate_connection(server_name, &connection).await;
+                return Err(anyhow!(
+                    "MCP server '{server_name}' timed out after {}s while running tool '{tool_name}'",
+                    MCP_IO_TIMEOUT.as_secs()
+                ));
+            }
+        };
 
         Ok(render_tool_result(result))
     }
@@ -240,8 +281,14 @@ async fn connect(name: &str, transport: config::McpTransport) -> Result<McpConne
             let child = TokioChildProcess::new(process_command).with_context(|| {
                 format!("failed to spawn MCP server '{name}' (command '{command}')")
             })?;
-            ().serve(child)
+            tokio::time::timeout(MCP_IO_TIMEOUT, ().serve(child))
                 .await
+                .map_err(|_| {
+                    anyhow!(
+                        "timed out after {}s while initializing MCP server '{name}'",
+                        MCP_IO_TIMEOUT.as_secs()
+                    )
+                })?
                 .map_err(|error| anyhow!("failed to initialize MCP server '{name}': {error}"))
         }
         config::McpTransport::Http { url, headers } => {
@@ -258,10 +305,70 @@ async fn connect(name: &str, transport: config::McpTransport) -> Result<McpConne
             }
             let transport_config =
                 StreamableHttpClientTransportConfig::with_uri(url).custom_headers(header_map);
-            let transport = StreamableHttpClientTransport::from_config(transport_config);
-            ().serve(transport)
+            let http_client = reqwest::Client::builder()
+                .timeout(MCP_IO_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .with_context(|| format!("failed to configure MCP server '{name}' HTTP client"))?;
+            let transport =
+                StreamableHttpClientTransport::with_client(http_client, transport_config);
+            tokio::time::timeout(MCP_IO_TIMEOUT, ().serve(transport))
                 .await
+                .map_err(|_| {
+                    anyhow!(
+                        "timed out after {}s while initializing MCP server '{name}'",
+                        MCP_IO_TIMEOUT.as_secs()
+                    )
+                })?
                 .map_err(|error| anyhow!("failed to initialize MCP server '{name}': {error}"))
+        }
+    }
+}
+
+impl<'a> McpRegistry<'a> {
+    /// Cancels `connection` and removes it from the cache only when the map
+    /// still points at that exact `RunningService`. Pointer identity matters:
+    /// another task may already have evicted the old service and installed a
+    /// fresh one while this timeout handler was being scheduled.
+    async fn invalidate_connection(&self, name: &str, connection: &Arc<McpConnection>) {
+        connection.cancellation_token().cancel();
+        let mut connections = self.connections.lock().await;
+        let should_remove = connections
+            .get(name)
+            .and_then(|cell| cell.get())
+            .is_some_and(|current| Arc::ptr_eq(current, connection));
+        if should_remove {
+            connections.remove(name);
+        }
+    }
+
+    /// Like [`Self::invalidate_connection`], also evicts the exact
+    /// `tools/list` cell that failed. A cached list can be retained after a
+    /// `tools/call` timeout (its definitions remain valid for a new
+    /// connection), but a list initializer that failed must not be reused.
+    async fn invalidate_connection_and_tool_list(
+        &self,
+        name: &str,
+        connection: &Arc<McpConnection>,
+        tool_list_cell: &ToolListCell,
+    ) {
+        connection.cancellation_token().cancel();
+        let mut connections = self.connections.lock().await;
+        let should_remove_connection = connections
+            .get(name)
+            .and_then(|cell| cell.get())
+            .is_some_and(|current| Arc::ptr_eq(current, connection));
+        if should_remove_connection {
+            connections.remove(name);
+        }
+        drop(connections);
+
+        let mut tool_lists = self.tool_lists.lock().await;
+        let should_remove_tool_list = tool_lists
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, tool_list_cell));
+        if should_remove_tool_list {
+            tool_lists.remove(name);
         }
     }
 }
@@ -271,17 +378,33 @@ async fn connect(name: &str, transport: config::McpTransport) -> Result<McpConne
 async fn list_all_tools(connection: &McpConnection) -> Result<Vec<Tool>> {
     let mut tools = Vec::new();
     let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
+    let mut pages = 0usize;
     loop {
+        if pages >= MAX_TOOL_LIST_PAGES {
+            bail!("MCP server returned more than {MAX_TOOL_LIST_PAGES} pages from 'tools/list'");
+        }
+        pages += 1;
         let params = cursor
             .take()
             .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-        let result = connection
-            .list_tools(params)
+        let result = tokio::time::timeout(MCP_IO_TIMEOUT, connection.list_tools(params))
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "MCP server timed out after {}s while listing tools (page {pages})",
+                    MCP_IO_TIMEOUT.as_secs()
+                )
+            })?
             .map_err(|error| anyhow!("{error}"))?;
         tools.extend(result.tools);
         match result.next_cursor {
-            Some(next) => cursor = Some(next),
+            Some(next) => {
+                if !seen_cursors.insert(next.clone()) {
+                    bail!("MCP server repeated a 'tools/list' pagination cursor '{next}'");
+                }
+                cursor = Some(next);
+            }
             None => break,
         }
     }
@@ -320,30 +443,40 @@ pub(crate) fn qualify_tool_name(kind: &str, prefix: &str, name: &str) -> Result<
 
 /// Renders a `tools/call` result as plain text for a `tool`-role message:
 /// text content blocks joined as-is, any other block type (image/audio/
-/// resource) JSON-serialized so nothing is silently dropped. `is_error` is
-/// not treated specially — the model sees the error content and decides how
-/// to react, the same way a real assistant sees a failed shell command.
+/// resource) JSON-serialized so nothing is silently dropped. Structured
+/// content is included in a separate labeled section, and `is_error: true`
+/// is likewise labeled so the model can distinguish a failed tool from a
+/// successful result while still seeing every returned value.
 /// Takes `result` by value (the caller never reuses it) so a text block's
 /// content can be moved into the output instead of cloned — tool output can
 /// be large (file contents, search results, ...).
 fn render_tool_result(result: rmcp::model::CallToolResult) -> String {
-    if result.content.is_empty() {
-        return String::new();
-    }
-    result
+    let is_error = result.is_error == Some(true);
+    let mut parts = result
         .content
         .into_iter()
         .map(|block| match block {
             rmcp::model::ContentBlock::Text(text) => text.text,
-            other => serde_json::to_string(&other).unwrap_or_default(),
+            other => serde_json::to_string(&other)
+                .expect("MCP content blocks should always be JSON-serializable"),
         })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+        .collect::<Vec<_>>();
+    if let Some(structured_content) = result.structured_content {
+        let structured_content = serde_json::to_string(&structured_content)
+            .expect("MCP structured content should always be JSON-serializable");
+        parts.push(format!("structuredContent:\n{structured_content}"));
+    }
+    if is_error {
+        parts.insert(0, "isError: true".to_owned());
+    }
+    parts.join("\n\n")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::qualify_tool_name;
+    use super::{qualify_tool_name, render_tool_result};
+    use rmcp::model::CallToolResult;
+    use serde_json::json;
 
     #[test]
     fn qualifies_a_tool_name_with_its_server() {
@@ -365,5 +498,48 @@ mod tests {
     fn rejects_a_name_over_64_characters() {
         let long_tool = "a".repeat(60);
         assert!(qualify_tool_name("MCP tool", "server", &long_tool).is_err());
+    }
+
+    #[test]
+    fn preserves_structured_content_without_text_content() {
+        let result: CallToolResult = serde_json::from_value(json!({
+            "structuredContent": {"answer": 42},
+            "isError": false,
+        }))
+        .expect("structured MCP result should deserialize");
+
+        assert_eq!(
+            render_tool_result(result),
+            "structuredContent:\n{\"answer\":42}"
+        );
+    }
+
+    #[test]
+    fn preserves_structured_content_alongside_text_content() {
+        let result: CallToolResult = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "plain result"}],
+            "structuredContent": {"answer": 42},
+        }))
+        .expect("structured MCP result should deserialize");
+
+        assert_eq!(
+            render_tool_result(result),
+            "plain result\n\nstructuredContent:\n{\"answer\":42}"
+        );
+    }
+
+    #[test]
+    fn preserves_the_error_flag_alongside_structured_content() {
+        let result: CallToolResult = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "details"}],
+            "structuredContent": {"code": "invalid"},
+            "isError": true,
+        }))
+        .expect("error MCP result should deserialize");
+
+        assert_eq!(
+            render_tool_result(result),
+            "isError: true\n\ndetails\n\nstructuredContent:\n{\"code\":\"invalid\"}"
+        );
     }
 }

@@ -1,6 +1,6 @@
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{
     AgentMarkdownFile, ConfigDirectory, JsonSchemaFile, MINIMAL_PNG_BYTES, MockServer,
@@ -91,6 +91,44 @@ steps:
     assert!(
         body.contains(r#""model":"workflow-model""#),
         "expected the workflow's own alias to win over the config file's, request body: {body}"
+    );
+}
+
+#[test]
+fn step_falls_back_to_the_config_file_default_model_when_workflow_omits_one() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\ndefault:\n  model: config-model\n",
+        server.base_url
+    ));
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  echo:
+    prompt: "{{ input }}"
+steps:
+  - use: echo
+"#,
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"config-model""#),
+        "request body: {body}"
     );
 }
 
@@ -777,6 +815,52 @@ steps:
         String::from_utf8_lossy(&output.stdout).trim(),
         r#"{"city":"Tokyo"}"#
     );
+}
+
+#[test]
+fn workflow_agent_nodes_reject_a_self_referential_subagent_before_recursing() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_self","type":"function","function":{"name":"agent__self","arguments":"{\"input\":\"again\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    );
+    let agent = AgentMarkdownFile::new(
+        "---\nname: self\nmodel: test-model\nsubagents: [self]\n---\nDelegate only when needed.\n",
+    );
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\nagents:\n  self: \"{}\"\n",
+        server.base_url,
+        agent.path.display()
+    ));
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  invoke:
+    agent: "{}"
+steps:
+  - use: invoke
+"#,
+        agent.path.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+    server.receive_request();
+    server.finish();
+
+    assert!(
+        !output.status.success(),
+        "expected the self-reference to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cycle"), "stderr: {stderr}");
 }
 
 #[test]
@@ -2306,6 +2390,24 @@ steps:
 }
 
 #[test]
+fn a_command_node_removes_only_one_trailing_crlf_from_stdout() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  endings:
+    command: ["printf", "a\r\n\r\n"]
+steps:
+  - use: endings
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a\r\n\n");
+}
+
+#[test]
 fn a_command_nodes_output_flows_into_a_jq_filter_and_the_next_step() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let workflow = WorkflowFile::new(&format!(
@@ -2358,6 +2460,158 @@ steps:
     assert!(!output.status.success(), "expected the step to fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("boom"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_timed_out_command_is_killed_before_the_workflow_returns() {
+    let config = ConfigDirectory::empty();
+    let pid_path = config.path().join("timed-out-command.pid");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  stuck:
+    command: ["sh", "-c", "echo $$ > '{}'; sleep 5"]
+    timeout: 1
+steps:
+  - use: stuck
+"#,
+        pid_path.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(!output.status.success(), "expected the command to time out");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "stderr: {stderr}");
+    let pid = std::fs::read_to_string(&pid_path)
+        .expect("the command should have written its pid")
+        .trim()
+        .to_owned();
+    let probe = std::process::Command::new("kill")
+        .args(["-0", &pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to probe the timed-out command");
+    assert!(!probe.success(), "timed-out command {pid} is still running");
+}
+
+#[cfg(unix)]
+#[test]
+fn command_timeout_covers_a_blocking_write_file_action() {
+    use std::process::Stdio;
+
+    let config = ConfigDirectory::empty();
+    let fifo_path = config.path().join("blocked-output.fifo");
+    let fifo_status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("failed to create a FIFO for the timeout test");
+    assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  emit:
+    command: ["printf", "done"]
+    write_file: "{}"
+    timeout: 1
+steps:
+  - use: emit
+"#,
+        fifo_path.display()
+    ));
+
+    let started = Instant::now();
+    let output = test_command()
+        .current_dir(config.path())
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "blocking write_file ignored the node timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(!output.status.success(), "expected write_file to time out");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "stderr: {stderr}");
+}
+
+#[test]
+fn command_does_not_wait_for_a_stdin_writer_after_the_child_exits() {
+    use std::{io::Write, process::Stdio};
+
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  exits:
+    command: ["sh", "-c", "sleep 5 >/dev/null 2>/dev/null & exit 0"]
+steps:
+  - use: exits
+"#,
+    );
+    let mut command = test_command();
+    command
+        .args(["run", workflow.path.to_str().unwrap(), "-", "--no-history"])
+        .stdin(Stdio::piped());
+    let mut child = command.spawn().expect("failed to spawn lait");
+    let started = Instant::now();
+    child
+        .stdin
+        .take()
+        .expect("lait stdin should be piped")
+        .write_all(&vec![b'x'; 1024 * 1024])
+        .expect("failed to write test input");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for lait to finish");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "lait waited for a descendant-held stdin pipe: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn command_timeout_interrupts_reader_tasks_after_the_child_exits() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  exits:
+    command: ["sh", "-c", "sleep 5 & exit 0"]
+    timeout: 1
+steps:
+  - use: exits
+"#,
+    );
+    let started = Instant::now();
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "reader tasks ignored the node timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(!output.status.success(), "expected the command to time out");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "stderr: {stderr}");
 }
 
 #[test]

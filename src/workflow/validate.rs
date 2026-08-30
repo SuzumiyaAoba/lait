@@ -58,6 +58,24 @@ fn reject_router_incompatible_fields(
     Ok(())
 }
 
+/// Rejects a step-site id that would collide with a different node id in the
+/// same workflow file. A site that explicitly uses the node of the same id is
+/// the one intentional exception: its output already belongs to that shared
+/// name. This check applies equally to routers and bare `stop`/`break` sites,
+/// whose outputs are also recorded in the `$steps` namespace.
+fn reject_step_id_node_collision(step: &FlowStep, nodes: &NodeMap, label: &str) -> Result<()> {
+    let Some(site_id) = step.id.as_deref() else {
+        return Ok(());
+    };
+    if nodes.contains_key(site_id) && step.r#use.as_deref() != Some(site_id) {
+        bail!(
+            "step '{label}' has 'id: {site_id}', which collides with a different node of the same id in \
+             'nodes'; '{{{{ steps.{site_id} }}}}'/'$steps.{site_id}' would become ambiguous"
+        );
+    }
+    Ok(())
+}
+
 /// Tracks the lexical nesting `validate_steps` is currently inside, used to
 /// validate `break`/`stop`/`write_file` placement. `in_loop` requires an
 /// enclosing `loop`/`for_each` body reachable without crossing a `parallel`
@@ -138,6 +156,12 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
             );
         }
 
+        // Router and bare-control sites have no node lookup below, but their
+        // explicit ids are still recorded in the same `$steps` namespace.
+        if step.r#use.is_none() {
+            reject_step_id_node_collision(step, nodes, &label)?;
+        }
+
         // `router_count` above guarantees at most one of these is set, so
         // `step.router()` (which just checks them in a fixed order) can't
         // silently prefer one over another here.
@@ -187,19 +211,7 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
                     node_id
                 );
             };
-            if let Some(site_id) = &step.id
-                && site_id != node_id
-                && nodes.contains_key(site_id)
-            {
-                bail!(
-                    "step '{}' has 'id: {}', which collides with a different node of the same id in \
-                     'nodes'; '{{{{ steps.{} }}}}'/'$steps.{}' would become ambiguous",
-                    label,
-                    site_id,
-                    site_id,
-                    site_id
-                );
-            }
+            reject_step_id_node_collision(step, nodes, &label)?;
             if node.write_file.is_some() && ctx.in_concurrent_for_each {
                 bail!(
                     "step '{}' uses node '{}', which has 'write_file' set, inside a 'for_each' body \
@@ -289,6 +301,9 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
                 "{description} has an empty 'command' list; it must name at least the program \
                  to run"
             );
+        }
+        if argv[0].trim().is_empty() {
+            bail!("{description} has an empty 'command[0]' program; it must name an executable");
         }
         if node.system_prompt.is_some() || node.files.is_some() || node.images.is_some() {
             bail!(

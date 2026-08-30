@@ -28,6 +28,7 @@ clap_mangen = "0.3.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 handlebars = "6.4.4"
 http = "1"
+libc = "0.2"
 jaq-core = "3.1.0"
 jaq-json = "2.0.2"
 jaq-std = "3.0.2"

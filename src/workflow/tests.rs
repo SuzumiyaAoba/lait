@@ -2266,6 +2266,55 @@ steps:
 }
 
 #[test]
+fn rejects_a_router_site_id_colliding_with_a_different_node_id() {
+    let result = parse_workflow(
+        r#"
+nodes:
+  n:
+    jq: '.'
+steps:
+  - id: n
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - use: n
+"#,
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("collides"), "error was: {error}");
+}
+
+#[test]
+fn rejects_a_nested_control_site_id_colliding_with_a_different_node_id() {
+    let result = parse_workflow(
+        r#"
+nodes:
+  n:
+    jq: '.'
+steps:
+  - switch:
+      cases:
+        - when: 'true'
+          steps:
+            - id: n
+              stop: true
+"#,
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("collides"), "error was: {error}");
+}
+
+#[test]
+fn rejects_a_command_with_an_empty_or_whitespace_program() {
+    for program in ["", "  "] {
+        let yaml = format!("nodes:\n  n:\n    command: [\"{program}\"]\nsteps:\n  - use: n\n");
+        let error = parse_workflow(&yaml).unwrap_err().to_string();
+        assert!(error.contains("command[0]"), "error was: {error}");
+    }
+}
+
+#[test]
 fn eval_when_coerces_plain_text_input_to_a_json_string() {
     assert!(eval_when(". == \"hello\"", "hello", &StepOutputs::new()).unwrap());
     assert!(!eval_when(". == \"hello\"", "world", &StepOutputs::new()).unwrap());

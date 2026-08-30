@@ -16,6 +16,8 @@ use async_openai::{
 };
 use futures_util::Stream;
 
+use std::time::Duration;
+
 use crate::{
     cli::ReasoningEffort,
     response::{ChatCompletionResponse, ChatCompletionStreamChunk, ToolCall},
@@ -287,8 +289,19 @@ fn build_chat_request(
 /// connections instead of paying a fresh TCP (and, for HTTPS, TLS) handshake
 /// per request — `Client::with_config` alone would build a new pool each
 /// call.
-static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(reqwest::Client::new);
+/// Upper bound for one LLM HTTP request, including a streamed response. A
+/// server that accepts a connection but never completes it must not be able
+/// to keep a chat/agent invocation alive forever. Workflow nodes can still
+/// choose a shorter timeout through their existing `timeout:` setting; this
+/// is only the finite safety net shared by every endpoint.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(DEFAULT_HTTP_TIMEOUT)
+        .build()
+        .expect("the fixed LLM HTTP timeout should produce a valid reqwest client")
+});
 
 /// The shared HTTP client, for API calls outside the chat completions path
 /// (`lait models --remote`'s `GET /v1/models`), so they reuse the same

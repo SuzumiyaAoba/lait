@@ -1736,6 +1736,12 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     let raw_input = resolve_input_with_stdin(args.input.clone())?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let agent_file = agent::load_agent(&args.file)?;
+    let canonical_agent_path = std::fs::canonicalize(&args.file).with_context(|| {
+        format!(
+            "failed to resolve agent file path '{}'",
+            args.file.display()
+        )
+    })?;
     let file_config = config::load_config(no_config)?;
 
     announce_named_file(
@@ -1763,7 +1769,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         &env,
         AgentTurn::simple(&input, &raw_input),
         &workflow::StepOutputs::new(),
-        &[],
+        std::slice::from_ref(&canonical_agent_path),
     )
     .await
     .with_context(|| format!("agent '{}'", args.file.display()))?;
@@ -2570,17 +2576,52 @@ async fn execute_step_with_retry(
     loop {
         attempt += 1;
         let outcome = match effective_timeout {
+            // Keep the timeout around the whole node action (including its
+            // later jq/write_file work), but give a command attempt a
+            // cancellation channel so a timeout can ask `run_command` to
+            // kill and reap its child before a retry starts. The future stays
+            // borrowed until that cleanup finishes, avoiding a second timer
+            // racing the child-owning future.
+            Some(seconds) if node.command.is_some() => {
+                let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+                let execution = execute_step(
+                    node,
+                    current_input,
+                    StepExecutionContext {
+                        scope,
+                        env,
+                        label,
+                        progress_prefix,
+                        steps_outputs,
+                        step_cancel: Some(cancel_receiver),
+                    },
+                );
+                tokio::pin!(execution);
+                match tokio::time::timeout(Duration::from_secs(seconds), &mut execution).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let _ = cancel_sender.send(true);
+                        let _ = execution.await;
+                        Err(anyhow!(
+                            "step '{label}' timed out after {seconds}s (attempt {attempt}/{max_attempts})"
+                        ))
+                    }
+                }
+            }
             Some(seconds) => {
                 match tokio::time::timeout(
                     Duration::from_secs(seconds),
                     execute_step(
                         node,
                         current_input,
-                        scope,
-                        env,
-                        label,
-                        progress_prefix,
-                        steps_outputs,
+                        StepExecutionContext {
+                            scope,
+                            env,
+                            label,
+                            progress_prefix,
+                            steps_outputs,
+                            step_cancel: None,
+                        },
                     ),
                 )
                 .await
@@ -2595,11 +2636,14 @@ async fn execute_step_with_retry(
                 execute_step(
                     node,
                     current_input,
-                    scope,
-                    env,
-                    label,
-                    progress_prefix,
-                    steps_outputs,
+                    StepExecutionContext {
+                        scope,
+                        env,
+                        label,
+                        progress_prefix,
+                        steps_outputs,
+                        step_cancel: None,
+                    },
                 )
                 .await
             }
@@ -2628,6 +2672,15 @@ async fn execute_step_with_retry(
     }
 }
 
+struct StepExecutionContext<'a, 'env> {
+    scope: &'a WorkflowScope,
+    env: &'a RunEnv<'env>,
+    label: &'a str,
+    progress_prefix: &'a str,
+    steps_outputs: &'a workflow::StepOutputs,
+    step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
 /// Resolves the model/reasoning-effort settings for a node's model call,
 /// applying the node > agent file (when this node has one) > workflow
 /// default precedence chain shared by `execute_step`'s `agent` and `prompt`
@@ -2646,6 +2699,7 @@ fn resolve_step_settings(
         .clone()
         .or_else(|| agent_file.and_then(|agent_file| agent_file.model.clone()))
         .or_else(|| scope.defaults.model.clone())
+        .or_else(|| file_config.default.model.clone())
         .ok_or_else(|| {
             anyhow!(
                 "model is required for step '{label}'; set it on the node,{} the workflow's default.model, or in {}",
@@ -2739,12 +2793,16 @@ async fn resolve_attachments<'a>(
 async fn execute_step(
     node: &workflow::NodeDefinition,
     current_input: &str,
-    scope: &WorkflowScope,
-    env: &RunEnv<'_>,
-    label: &str,
-    progress_prefix: &str,
-    steps_outputs: &workflow::StepOutputs,
+    context: StepExecutionContext<'_, '_>,
 ) -> Result<String> {
+    let StepExecutionContext {
+        scope,
+        env,
+        label,
+        progress_prefix,
+        steps_outputs,
+        mut step_cancel,
+    } = context;
     if let Some(name_or_path) = &node.input_schema {
         let schema = schema::resolve_named_schema_value(&scope.json_schemas, name_or_path)
             .with_context(|| format!("step '{label}'"))?;
@@ -2785,7 +2843,7 @@ async fn execute_step(
                 image_urls: &image_urls,
             },
             steps_outputs,
-            &[],
+            std::slice::from_ref(&loaded.canonical_path),
         )
         .await
         .with_context(|| format!("step '{label}'"))?
@@ -2894,7 +2952,7 @@ async fn execute_step(
             .map(|arg| template::render(arg, &input, steps_outputs, &serde_json::Map::new()))
             .collect::<Result<_>>()
             .with_context(|| format!("step '{label}'"))?;
-        run_command(&rendered_argv, current_input)
+        run_command(&rendered_argv, current_input, step_cancel.clone())
             .await
             .with_context(|| format!("step '{label}'"))?
     } else {
@@ -2902,31 +2960,112 @@ async fn execute_step(
     };
 
     if let Some(filter) = &node.jq {
-        step_output = jq::apply(filter, &step_output, steps_outputs)
+        step_output = apply_jq(filter, &step_output, steps_outputs, step_cancel.as_mut())
+            .await
             .with_context(|| format!("step '{label}'"))?;
     }
 
     if let Some(path) = &node.write_file {
-        std::fs::write(path, &step_output).with_context(|| {
-            format!(
-                "step '{label}': failed to write output to '{}'",
-                path.display()
-            )
-        })?;
+        write_output_file(path, &step_output, step_cancel)
+            .await
+            .with_context(|| format!("step '{label}'"))?;
     }
 
     Ok(step_output)
 }
 
+/// Applies a node's jq transform off the Tokio workers. jq evaluation is
+/// synchronous and can be expensive for a large input; running it on a
+/// dedicated OS thread means the enclosing node timeout remains effective.
+/// When the caller supplies a cancellation receiver (the command-node path),
+/// cancellation is observed without waiting for the jq thread to finish.
+async fn apply_jq(
+    filter: &str,
+    input: &str,
+    steps_outputs: &workflow::StepOutputs,
+    step_cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<String> {
+    let filter = filter.to_owned();
+    let input = input.to_owned();
+    let steps_outputs = steps_outputs.clone();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::pin!(receiver);
+    std::thread::spawn(move || {
+        let result = jq::apply(&filter, &input, &steps_outputs);
+        let _ = sender.send(result);
+    });
+
+    if let Some(step_cancel) = step_cancel {
+        let result = tokio::select! {
+            result = &mut receiver => result.context("jq evaluation task was cancelled")?,
+            changed = step_cancel.changed() => {
+                if changed.is_err() || *step_cancel.borrow() {
+                    bail!("jq evaluation was cancelled")
+                }
+                Ok(receiver.await.context("jq evaluation task was cancelled")??)
+            }
+        };
+        result
+    } else {
+        Ok(receiver
+            .await
+            .context("jq evaluation task was cancelled")??)
+    }
+}
+
+/// Writes a node's output from a dedicated OS thread. `fs::write` can block
+/// indefinitely for special files such as a FIFO; keeping that blocking call
+/// off the Tokio workers lets the enclosing node timeout still fire. The
+/// thread is intentionally detached if the caller times out — unlike a
+/// `spawn_blocking` task, Tokio runtime shutdown will not wait forever for a
+/// blocked filesystem call to finish.
+async fn write_output_file(
+    path: &Path,
+    output: &str,
+    mut step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    let path = path.to_owned();
+    let output = output.to_owned();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::pin!(receiver);
+    std::thread::spawn(move || {
+        let result = std::fs::write(&path, output)
+            .with_context(|| format!("failed to write output to '{}'", path.display()));
+        let _ = sender.send(result);
+    });
+
+    if let Some(step_cancel) = &mut step_cancel {
+        let result = tokio::select! {
+            result = &mut receiver => result.context("output file write task was cancelled")?,
+            changed = step_cancel.changed() => {
+                if changed.is_err() || *step_cancel.borrow() {
+                    bail!("output file write was cancelled")
+                }
+                Ok(receiver.await.context("output file write task was cancelled")??)
+            }
+        };
+        result?;
+    } else {
+        receiver
+            .await
+            .context("output file write task was cancelled")??;
+    }
+    Ok(())
+}
+
 /// Runs `argv[0]` as a child process with `argv[1..]` as its arguments,
 /// piping `stdin_input` to its stdin and capturing stdout as this node's
 /// output (see `NodeDefinition::command`'s doc comment for the full
-/// contract). `stdin` is written from a separate task running concurrently
-/// with `wait_with_output` so a command that writes a lot of stdout before
-/// reading all of stdin (or never reads stdin at all) can't deadlock against
-/// this side's write filling the pipe buffer.
-async fn run_command(argv: &[String], stdin_input: &str) -> Result<String> {
-    use tokio::io::AsyncWriteExt;
+/// contract). `stdin`/stdout/stderr are handled by separate tasks while the
+/// child is awaited so a command that writes a lot of output before reading
+/// all of stdin (or never reads stdin at all) can't deadlock against this
+/// side's pipes filling up.
+async fn run_command(
+    argv: &[String],
+    stdin_input: &str,
+    mut step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (program, args) = argv
         .split_first()
@@ -2937,6 +3076,10 @@ async fn run_command(argv: &[String], stdin_input: &str) -> Result<String> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // The enclosing node timeout sends a cancellation signal that
+        // performs kill + wait, while this also protects the child if this
+        // future is cancelled by a caller.
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to run command '{program}'"))?;
 
@@ -2947,27 +3090,142 @@ async fn run_command(argv: &[String], stdin_input: &str) -> Result<String> {
         stdin.shutdown().await
     });
 
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("failed to run command '{program}'"))?;
-    // Only checked after the process has been reaped: a command that closes
-    // stdin without reading all of it (or ignores it entirely) makes this
-    // write fail with a broken pipe, which isn't a real error as long as the
-    // process itself still exited the way it exited.
-    let _ = write_stdin.await;
+    let mut stdout = child.stdout.take().expect("stdout was requested as piped");
+    let mut read_stdout = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut stderr = child.stderr.take().expect("stderr was requested as piped");
+    let mut read_stderr = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = if let Some(step_cancel) = &mut step_cancel {
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    break status.with_context(|| format!("failed to run command '{program}'"))?;
+                }
+                changed = step_cancel.changed() => {
+                    if changed.is_ok() && !*step_cancel.borrow() {
+                        continue;
+                    }
+
+                    // Closing the parent's stdin first prevents a writer
+                    // blocked behind a descendant-inherited pipe from
+                    // delaying child cleanup. `Child::kill` then waits for
+                    // the direct child, so the retry cannot overlap it.
+                    write_stdin.abort();
+                    let _ = write_stdin.await;
+                    let kill_result = child.kill().await;
+
+                    // A descendant may retain stdout/stderr after the direct
+                    // child exits. Those readers are no longer needed once
+                    // the command is cancelled, so abort them rather than
+                    // waiting for an unrelated descendant to close its copy.
+                    read_stdout.abort();
+                    read_stderr.abort();
+                    let _ = read_stdout.await;
+                    let _ = read_stderr.await;
+
+                    if let Err(error) = kill_result {
+                        let reap_result = child.wait().await;
+                        if let Err(reap_error) = reap_result {
+                            bail!(
+                                "command '{program}' was cancelled; failed to kill it: {error}; failed to reap it: {reap_error}"
+                            );
+                        }
+                        bail!("command '{program}' was cancelled; failed to kill it: {error}");
+                    }
+                    bail!("command '{program}' was cancelled");
+                }
+            }
+        }
+    } else {
+        child
+            .wait()
+            .await
+            .with_context(|| format!("failed to run command '{program}'"))?
+    };
+
+    // Once the direct child has exited, no more input can affect this
+    // command. Abort the writer instead of awaiting it: a descendant that
+    // inherited the child's stdin can otherwise keep the pipe open forever.
+    write_stdin.abort();
+    let _ = write_stdin.await;
+    let (stdout, stderr) = if let Some(step_cancel) = &mut step_cancel {
+        let mut stdout_bytes = None;
+        let mut stderr_bytes = None;
+        loop {
+            tokio::select! {
+                result = &mut read_stdout, if stdout_bytes.is_none() => {
+                    stdout_bytes = Some(
+                        result
+                            .context("command stdout read task panicked")?
+                            .with_context(|| format!("failed to read stdout from command '{program}'"))?,
+                    );
+                }
+                result = &mut read_stderr, if stderr_bytes.is_none() => {
+                    stderr_bytes = Some(
+                        result
+                            .context("command stderr read task panicked")?
+                            .with_context(|| format!("failed to read stderr from command '{program}'"))?,
+                    );
+                }
+                changed = step_cancel.changed() => {
+                    if changed.is_ok() && !*step_cancel.borrow() {
+                        continue;
+                    }
+                    read_stdout.abort();
+                    read_stderr.abort();
+                    let _ = read_stdout.await;
+                    let _ = read_stderr.await;
+                    bail!("command '{program}' was cancelled");
+                }
+            }
+            if let Some(stdout) = stdout_bytes.take() {
+                if let Some(stderr) = stderr_bytes.take() {
+                    break (stdout, stderr);
+                }
+                stdout_bytes = Some(stdout);
+            }
+        }
+    } else {
+        let stdout = read_stdout
+            .await
+            .context("command stdout read task panicked")?
+            .with_context(|| format!("failed to read stdout from command '{program}'"))?;
+        let stderr = read_stderr
+            .await
+            .context("command stderr read task panicked")?
+            .with_context(|| format!("failed to read stderr from command '{program}'"))?;
+        (stdout, stderr)
+    };
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         bail!(
             "command '{program}' exited with {}: {}",
-            output.status,
+            status,
             stderr.trim()
         );
     }
 
-    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+    let stdout = String::from_utf8(stdout).map_err(|_| {
         anyhow!("command '{program}' produced non-UTF-8 output on stdout; binary output is not supported")
     })?;
-    Ok(stdout.trim_end_matches(['\n', '\r']).to_string())
+    Ok(strip_one_trailing_line_ending(stdout))
+}
+
+/// Removes one line ending from command output. A CRLF pair counts as one
+/// line ending, while additional trailing line endings remain part of the
+/// command's output.
+fn strip_one_trailing_line_ending(mut output: String) -> String {
+    if output.ends_with("\r\n") {
+        output.truncate(output.len() - 2);
+    } else if output.ends_with(['\n', '\r']) {
+        output.truncate(output.len() - 1);
+    }
+    output
 }

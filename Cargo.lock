@@ -1300,6 +1300,7 @@ dependencies = [
  "jaq-core",
  "jaq-json",
  "jaq-std",
+ "libc",
  "reqwest",
  "rmcp",
  "serde",

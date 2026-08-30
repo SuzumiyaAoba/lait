@@ -270,3 +270,46 @@ fn lint_flags_an_invalid_jq_filter_in_a_when_condition() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("'when'"), "stdout: {stdout}");
 }
+
+#[test]
+fn lint_flags_an_invalid_node_system_prompt_template() {
+    let workflow = WorkflowFile::new(
+        "nodes:\n  a:\n    prompt: hi\n    system_prompt: \"{{ input\"\nsteps:\n  - use: a\n",
+    );
+
+    let output = run_lait_lint(&[&workflow.path]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("'system_prompt' template"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn lint_flags_an_invalid_workflow_default_system_prompt_template() {
+    let workflow = WorkflowFile::new(
+        "default:\n  system_prompt: \"{{ input\"\nnodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n",
+    );
+
+    let output = run_lait_lint(&[&workflow.path]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("'system_prompt' template"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn lint_flags_an_empty_command_program() {
+    let workflow = WorkflowFile::new("nodes:\n  a:\n    command: [\"  \"]\nsteps:\n  - use: a\n");
+
+    let output = run_lait_lint(&[&workflow.path]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("command[0]"), "stdout: {stdout}");
+}
