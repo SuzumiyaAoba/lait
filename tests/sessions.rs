@@ -8,6 +8,22 @@ fn response_with(content: &str) -> String {
     )
 }
 
+/// Seeds `dir`'s `demo` session with one turn ("hello" → "hi there") via a
+/// real `lait --session demo hello` call against a mock server — the common
+/// setup for tests that only care about a session already having history.
+fn seed_session(dir: &ConfigDirectory) {
+    let server = MockServer::start("200 OK", &response_with("hi there"));
+    test_command()
+        .current_dir(dir.path())
+        .args(["--model", "test-model", "--base-url", &server.base_url])
+        .args(["--session", "demo"])
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    server.receive_request();
+    server.finish();
+}
+
 #[test]
 fn a_second_call_with_the_same_session_sends_the_first_turn_as_history() {
     let dir = ConfigDirectory::empty();
@@ -55,17 +71,7 @@ fn a_second_call_with_the_same_session_sends_the_first_turn_as_history() {
 #[test]
 fn sessions_show_prints_every_recorded_turn() {
     let dir = ConfigDirectory::empty();
-
-    let server = MockServer::start("200 OK", &response_with("hi there"));
-    test_command()
-        .current_dir(dir.path())
-        .args(["--model", "test-model", "--base-url", &server.base_url])
-        .args(["--session", "demo"])
-        .arg("hello")
-        .output()
-        .expect("failed to execute lait");
-    server.receive_request();
-    server.finish();
+    seed_session(&dir);
 
     let output = test_command()
         .current_dir(dir.path())
@@ -81,17 +87,7 @@ fn sessions_show_prints_every_recorded_turn() {
 #[test]
 fn sessions_list_reports_the_session_and_its_turn_count() {
     let dir = ConfigDirectory::empty();
-
-    let server = MockServer::start("200 OK", &response_with("hi there"));
-    test_command()
-        .current_dir(dir.path())
-        .args(["--model", "test-model", "--base-url", &server.base_url])
-        .args(["--session", "demo"])
-        .arg("hello")
-        .output()
-        .expect("failed to execute lait");
-    server.receive_request();
-    server.finish();
+    seed_session(&dir);
 
     let output = test_command()
         .current_dir(dir.path())
@@ -119,17 +115,7 @@ fn sessions_list_reports_none_saved_yet_when_empty() {
 #[test]
 fn sessions_delete_removes_a_session() {
     let dir = ConfigDirectory::empty();
-
-    let server = MockServer::start("200 OK", &response_with("hi there"));
-    test_command()
-        .current_dir(dir.path())
-        .args(["--model", "test-model", "--base-url", &server.base_url])
-        .args(["--session", "demo"])
-        .arg("hello")
-        .output()
-        .expect("failed to execute lait");
-    server.receive_request();
-    server.finish();
+    seed_session(&dir);
 
     let output = test_command()
         .current_dir(dir.path())

@@ -121,15 +121,13 @@ impl UsageTally {
     /// `None` when nothing has been recorded yet (never zero-vs-absent
     /// ambiguity, same convention as `response::Usage`'s own optionality).
     fn total(&self) -> Option<response::Usage> {
-        let events = self
-            .events
-            .lock()
-            .expect("usage tally lock should not be poisoned");
-        events.iter().fold(None, |total, (_, usage)| {
-            let mut total = total.unwrap_or_default();
-            total.add(*usage);
-            Some(total)
-        })
+        self.summarize()
+            .into_iter()
+            .fold(None, |total, (_, usage, _)| {
+                let mut total = total.unwrap_or_default();
+                total.add(usage);
+                Some(total)
+            })
     }
 }
 
@@ -189,6 +187,33 @@ fn record_history(
         return Ok(());
     }
     history::record(kind, model, prompt, response, usage)
+}
+
+/// Records one finished chat turn: appends it to `--session`'s log (when
+/// set) and to `lait history` (unless suppressed) — the shared tail of
+/// `run_chat`'s streamed and non-streamed paths and `run_chat_repl`'s
+/// per-turn loop.
+fn finish_chat_turn(
+    session_name: Option<&str>,
+    no_history: bool,
+    file_config: &ConfigFile,
+    model_id: &str,
+    prompt: &str,
+    response: &str,
+    usage: Option<response::Usage>,
+) -> Result<()> {
+    if let Some(name) = session_name {
+        session::append_turn(name, prompt, response)?;
+    }
+    record_history(
+        no_history,
+        file_config,
+        "chat",
+        Some(model_id),
+        prompt,
+        response,
+        usage,
+    )
 }
 
 /// The maximum number of tool-call round trips a single completion request
@@ -439,6 +464,7 @@ struct CapabilityOverrides {
 /// chat). Bundled into one struct, like `SamplingOverrides`/
 /// `CapabilityOverrides` above, to keep `complete`'s argument count under
 /// clippy's `too_many_arguments` threshold.
+#[derive(Clone, Copy)]
 struct PromptTurn<'a> {
     system_prompt: Option<&'a str>,
     history: &'a [ChatCompletionRequestMessage],
@@ -1350,35 +1376,29 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         .as_deref()
         .filter(|path| path.as_os_str() != "-");
 
+    let turn = PromptTurn {
+        system_prompt: system_prompt.as_deref(),
+        history: &session_history,
+        prompt: &prompt,
+        image_urls: &image_urls,
+    };
+
     if chat.stream {
         let stream = settings
-            .complete_stream(
-                &env.skill_cache,
-                PromptTurn {
-                    system_prompt: system_prompt.as_deref(),
-                    history: &session_history,
-                    prompt: &prompt,
-                    image_urls: &image_urls,
-                },
-                response_format,
-                show_usage,
-            )
+            .complete_stream(&env.skill_cache, turn, response_format, show_usage)
             .await?;
         let outcome = stream_response(stream, show_reasoning, output_path).await?;
-        if let Some(name) = &chat.shared.session {
-            session::append_turn(name, &prompt, &outcome.content)?;
-        }
         // Streamed usage arrives on the final chunk rather than through
         // `complete`; feed it into the same tally so both chat paths share
         // one summary format and so `env.usage.total()` below reflects it.
         if let Some(usage) = outcome.usage {
             env.usage.record(&settings.usage_label, usage);
         }
-        record_history(
+        finish_chat_turn(
+            chat.shared.session.as_deref(),
             chat.shared.no_history,
             &file_config,
-            "chat",
-            Some(&settings.resolved_model.model_id),
+            &settings.resolved_model.model_id,
             &prompt,
             &outcome.content,
             env.usage.total(),
@@ -1389,19 +1409,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         return Ok(());
     }
 
-    let response = settings
-        .complete(
-            &env,
-            &[],
-            PromptTurn {
-                system_prompt: system_prompt.as_deref(),
-                history: &session_history,
-                prompt: &prompt,
-                image_urls: &image_urls,
-            },
-            response_format,
-        )
-        .await?;
+    let response = settings.complete(&env, &[], turn, response_format).await?;
 
     match output_path {
         Some(path) => {
@@ -1432,14 +1440,11 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     let content = response::first_message(&response)
         .and_then(|message| message.content())
         .unwrap_or_default();
-    if let Some(name) = &chat.shared.session {
-        session::append_turn(name, &prompt, content)?;
-    }
-    record_history(
+    finish_chat_turn(
+        chat.shared.session.as_deref(),
         chat.shared.no_history,
         &file_config,
-        "chat",
-        Some(&settings.resolved_model.model_id),
+        &settings.resolved_model.model_id,
         &prompt,
         content,
         env.usage.total(),
@@ -1529,14 +1534,11 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
             Ok((assistant_text, turn_usage)) => {
                 history.push(llm::user_message(line, &[])?);
                 history.push(llm::assistant_message(&assistant_text)?);
-                if let Some(name) = &shared.session {
-                    session::append_turn(name, line, &assistant_text)?;
-                }
-                record_history(
+                finish_chat_turn(
+                    shared.session.as_deref(),
                     shared.no_history,
                     &file_config,
-                    "chat",
-                    Some(&settings.resolved_model.model_id),
+                    &settings.resolved_model.model_id,
                     line,
                     &assistant_text,
                     turn_usage,

@@ -6,13 +6,14 @@
 //! `default.history: false` — see `app::record_history`, the one place that
 //! decides whether to call `record` at all.
 
-use std::{fs, io::Write, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{HistoryAction, HistoryArgs},
+    jsonl,
     response::Usage,
 };
 
@@ -71,12 +72,6 @@ pub(crate) fn record(
     response: &str,
     usage: Option<Usage>,
 ) -> Result<()> {
-    let path = history_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create history directory '{}'", parent.display())
-        })?;
-    }
     let entry = HistoryEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         kind: kind.to_owned(),
@@ -85,38 +80,11 @@ pub(crate) fn record(
         response: response.to_owned(),
         usage,
     };
-    let line = serde_json::to_string(&entry).context("failed to serialize a history entry")?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open history file '{}'", path.display()))?;
-    writeln!(file, "{line}")
-        .with_context(|| format!("failed to write to history file '{}'", path.display()))
+    jsonl::append(&history_path()?, [entry], "history")
 }
 
 fn load_all() -> Result<Vec<HistoryEntry>> {
-    let path = history_path()?;
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read history file '{}'", path.display()));
-        }
-    };
-    contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line).with_context(|| {
-                format!(
-                    "failed to parse a line of history file '{}'",
-                    path.display()
-                )
-            })
-        })
-        .collect()
+    jsonl::load(&history_path()?, "history")
 }
 
 /// Every recorded entry, most-recent first, numbered so `1` is the most

@@ -167,7 +167,7 @@ mod tests {
     fn resolve_image_urls_encodes_a_local_png_as_a_data_url() {
         let mut png_bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         png_bytes.extend_from_slice(b"rest of file");
-        let file = TempFileNamed::new("lait-test-image.png", &png_bytes);
+        let file = TempFile::with_suffix("lait-test-image.png", &png_bytes);
 
         let urls = resolve_image_urls(&[file.path.display().to_string()]).unwrap();
         assert_eq!(urls.len(), 1);
@@ -178,7 +178,7 @@ mod tests {
     fn resolve_image_urls_encodes_a_local_jpeg_as_a_data_url() {
         let mut jpeg_bytes = vec![0xff, 0xd8, 0xff, 0xe0];
         jpeg_bytes.extend_from_slice(b"rest of file");
-        let file = TempFileNamed::new("lait-test-image.jpg", &jpeg_bytes);
+        let file = TempFile::with_suffix("lait-test-image.jpg", &jpeg_bytes);
 
         let urls = resolve_image_urls(&[file.path.display().to_string()]).unwrap();
         assert!(urls[0].starts_with("data:image/jpeg;base64,"));
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn resolve_image_urls_rejects_an_unrecognized_format() {
-        let file = TempFileNamed::new("lait-test-image.unknown", b"not an image");
+        let file = TempFile::with_suffix("lait-test-image.unknown", b"not an image");
         let error = resolve_image_urls(&[file.path.display().to_string()]).unwrap_err();
         assert!(error.to_string().contains("could not determine"));
     }
@@ -194,31 +194,6 @@ mod tests {
     #[test]
     fn resolve_image_urls_rejects_a_missing_file() {
         assert!(resolve_image_urls(&["/no/such/file/lait-test.png".to_owned()]).is_err());
-    }
-
-    struct TempFileNamed {
-        path: std::path::PathBuf,
-    }
-
-    impl TempFileNamed {
-        fn new(suffix: &str, contents: &[u8]) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "lait-test-{}-{}-{suffix}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::write(&path, contents).expect("failed to write temp image file");
-            Self { path }
-        }
-    }
-
-    impl Drop for TempFileNamed {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
     }
 
     #[test]
@@ -281,15 +256,22 @@ mod tests {
         }
 
         pub(super) fn new_bytes(contents: &[u8]) -> Self {
+            Self::with_suffix("attachment", contents)
+        }
+
+        /// Like [`Self::new_bytes`], but `suffix` is appended to the file
+        /// name verbatim so an extension (e.g. `"lait-test-image.png"`) is
+        /// preserved for MIME-sniffing fallback tests.
+        fn with_suffix(suffix: &str, contents: &[u8]) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "lait-test-attachment-{}-{}",
+                "lait-test-{}-{}-{suffix}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
             ));
-            std::fs::write(&path, contents).expect("failed to write temp attachment file");
+            std::fs::write(&path, contents).expect("failed to write temp file");
             Self { path }
         }
     }

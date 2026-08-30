@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{SessionsAction, SessionsCommand},
-    llm,
+    jsonl, llm,
 };
 
 /// The directory every session's JSONL file lives under, relative to the
@@ -64,31 +64,7 @@ fn session_path(name: &str) -> Result<PathBuf> {
 /// been used before — starting a brand-new named session is the common case
 /// for a first `--session <NAME>` call.
 pub(crate) fn load(name: &str) -> Result<Vec<StoredMessage>> {
-    let path = session_path(name)?;
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read session file '{}'", path.display()));
-        }
-    };
-    parse_lines(&contents, &path)
-}
-
-fn parse_lines(contents: &str, path: &Path) -> Result<Vec<StoredMessage>> {
-    contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line).with_context(|| {
-                format!(
-                    "failed to parse a line of session file '{}'",
-                    path.display()
-                )
-            })
-        })
-        .collect()
+    jsonl::load(&session_path(name)?, "session")
 }
 
 /// Converts a loaded session's turns into the message shape
@@ -112,33 +88,39 @@ pub(crate) fn to_request_messages(
 /// model without its answer.
 pub(crate) fn append_turn(name: &str, user_content: &str, assistant_content: &str) -> Result<()> {
     let path = session_path(name)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create session directory '{}'", parent.display())
-        })?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open session file '{}'", path.display()))?;
-    use std::io::Write;
-    for message in [
-        StoredMessage {
-            role: Role::User,
-            content: user_content.to_owned(),
-        },
-        StoredMessage {
-            role: Role::Assistant,
-            content: assistant_content.to_owned(),
-        },
-    ] {
-        let line =
-            serde_json::to_string(&message).context("failed to serialize a session message")?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to write to session file '{}'", path.display()))?;
-    }
-    Ok(())
+    jsonl::append(
+        &path,
+        [
+            StoredMessage {
+                role: Role::User,
+                content: user_content.to_owned(),
+            },
+            StoredMessage {
+                role: Role::Assistant,
+                content: assistant_content.to_owned(),
+            },
+        ],
+        "session",
+    )
+}
+
+/// The number of turns (user+assistant message pairs) recorded in the
+/// session file at `path`, counted from raw lines rather than deserializing
+/// every stored message — `lait sessions list` only needs the count.
+fn count_turns(path: &Path) -> Result<usize> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read session file '{}'", path.display()));
+        }
+    };
+    Ok(contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        / 2)
 }
 
 /// One row of `lait sessions list`: a session's name and how many turns
@@ -177,10 +159,9 @@ pub(crate) fn list() -> Result<Vec<SessionSummary>> {
         let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let messages = load(name)?;
         summaries.push(SessionSummary {
             name: name.to_owned(),
-            turn_count: messages.len() / 2,
+            turn_count: count_turns(&path)?,
         });
     }
     summaries.sort_by(|a, b| a.name.cmp(&b.name));
