@@ -14,6 +14,7 @@ mod llm;
 mod mcp;
 mod models;
 mod prompt;
+mod render;
 mod repl;
 mod response;
 mod schema;

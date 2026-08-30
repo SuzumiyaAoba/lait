@@ -68,6 +68,9 @@ pub(crate) struct DefaultSettings {
     /// by default, when an agent file/workflow node doesn't set its own
     /// `subagents:`. Falls back independently, like `temperature`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Whether to render chat's response as Markdown for terminal display by
+    /// default, when `--render` isn't passed. See `crate::render`.
+    pub(crate) render: Option<bool>,
 }
 
 /// A map of `mcp_servers:` name to its connection settings, as used by

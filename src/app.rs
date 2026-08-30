@@ -18,7 +18,7 @@ use crate::{
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, PromptArgs, ReasoningEffort, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
-    jq, lint, llm, mcp, prompt, repl, response, schema, session, skill, subagent, template,
+    jq, lint, llm, mcp, prompt, render, repl, response, schema, session, skill, subagent, template,
     workflow,
 };
 
@@ -1302,6 +1302,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
     let show_usage = chat.shared.show_usage && !chat.quiet;
+    let render_enabled = chat.render || file_config.default.render.unwrap_or(false);
     // `-o -` is an explicit "stdout", the same as no `-o` at all.
     let output_path = chat
         .output
@@ -1366,6 +1367,15 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         }
         None => {
             let output = response::render_response(&response, chat.json, show_reasoning)?;
+            // `--json`'s output is machine-readable and never rendered as
+            // Markdown; `chat.stream`'s branch above already returned before
+            // reaching here, so `--render` never has to reckon with a
+            // partial streamed response either — see `render::maybe_render`.
+            let output = if chat.json {
+                output
+            } else {
+                render::maybe_render(&output, render_enabled)
+            };
             println!("{output}");
         }
     }

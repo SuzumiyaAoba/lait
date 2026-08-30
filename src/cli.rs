@@ -365,6 +365,14 @@ pub(crate) struct ChatArgs {
     /// `--var` for the same key wins.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub(crate) var: Vec<String>,
+
+    /// Render the response as Markdown for terminal display (headings,
+    /// lists, emphasis, code blocks, tables, ...) instead of printing it as
+    /// raw text. Falls back to raw text automatically when stdout isn't a
+    /// terminal, or when combined with `--stream`. Falls back to
+    /// `default.render` in lait.config.yml when unset here.
+    #[arg(long)]
+    pub(crate) render: bool,
 }
 
 /// `lait chat`'s own arguments: just the options a REPL turn can use — see

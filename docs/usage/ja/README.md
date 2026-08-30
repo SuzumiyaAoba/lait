@@ -10,7 +10,7 @@
 - [MCP サーバーのツールを使う](./mcp.md) — `mcp_servers:` の登録、チャット／agent／workflow での `mcp:` 指定、ツール名の修飾、`structured_output`/`--stream` との関係、`max_tool_rounds`
 - [スキルを使う](./skills.md) — `skills:` の登録、agent／workflow での `skills:` 指定、システムプロンプトへの追記のされ方、`mcp`/`--stream`/`structured_output` との違い
 - [サブエージェントを使う](./subagents.md) — `agents:` の登録、チャット／agent／workflow での `subagents:` 指定、ツール名とツール引数の扱い、サブエージェントの入れ子、`agent:`/`workflow:` ノードとの違い
-- [出力例](./output.md) — 標準出力、`--stream`、`--json-schema`、`--json`
+- [出力例](./output.md) — 標準出力、`--stream`、`--json-schema`、`--json`、`--render`
 - [ファイル・画像の添付](./attachments.md) — `--file` によるファイル内容の添付、`--image` による vision モデル向け画像入力
 - [会話セッションと対話モード（lait chat）](./chat.md) — `lait chat` REPL、`--session`/`lait sessions` による会話の保存と再開
 - [名前付きプロンプトテンプレート（prompts）](./prompts.md) — `prompts:` の登録、`-p`/`lait prompt`、`--var`
