@@ -3,8 +3,8 @@ mod support;
 use std::time::Duration;
 
 use support::{
-    AgentMarkdownFile, ConfigDirectory, JsonSchemaFile, MockServer, WorkflowFile,
-    run_lait_workflow, test_command, without_json_whitespace,
+    AgentMarkdownFile, ConfigDirectory, JsonSchemaFile, MINIMAL_PNG_BYTES, MockServer,
+    WorkflowFile, run_lait_workflow, test_command, without_json_whitespace,
 };
 
 const SERVER_ERROR_BODY: &str = r#"{"error":{"message":"mock failure","type":"server_error"}}"#;
@@ -2445,12 +2445,9 @@ steps:
 
 #[test]
 fn a_prompt_node_attaches_images_as_image_url_content_parts() {
-    const PNG_BYTES: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02,
-    ];
     let dir = ConfigDirectory::empty();
     let image_path = dir.path().join("photo.png");
-    std::fs::write(&image_path, PNG_BYTES).unwrap();
+    std::fs::write(&image_path, MINIMAL_PNG_BYTES).unwrap();
 
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let workflow = WorkflowFile::new(&format!(
@@ -2491,14 +2488,11 @@ steps:
 
 #[test]
 fn an_agent_node_attaches_files_and_images_alongside_its_current_input() {
-    const PNG_BYTES: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02,
-    ];
     let dir = ConfigDirectory::empty();
     let file_path = dir.path().join("notes.txt");
     std::fs::write(&file_path, "note content").unwrap();
     let image_path = dir.path().join("photo.png");
-    std::fs::write(&image_path, PNG_BYTES).unwrap();
+    std::fs::write(&image_path, MINIMAL_PNG_BYTES).unwrap();
 
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let agent = AgentMarkdownFile::new("---\n---\nDescribe: {{ input }}\n");

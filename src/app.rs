@@ -2707,6 +2707,32 @@ fn resolve_step_settings(
     .with_context(|| format!("step '{label}'"))
 }
 
+/// Resolves a node's `files:`/`images:` attachments against `base_prompt`:
+/// file contents become a named fenced code block appended after it
+/// (`base_prompt` unchanged when `files` is unset), and image paths/URLs
+/// resolve into `image_url` content parts for the caller's eventual
+/// `AgentTurn`/`PromptTurn`. The two kinds are read/resolved concurrently
+/// since they're otherwise-independent I/O. Shared by `execute_step`'s
+/// `agent` and `sends_prompt` branches, which each attach to a different
+/// "base" user message (the current input passed through unchanged, vs. the
+/// rendered `prompt` template).
+async fn resolve_attachments<'a>(
+    node: &workflow::NodeDefinition,
+    base_prompt: &'a str,
+    label: &str,
+) -> Result<(Cow<'a, str>, Vec<String>)> {
+    let (file_context, image_urls) = tokio::try_join!(
+        attachment::read_file_attachments(node.files.as_deref().unwrap_or(&[])),
+        attachment::resolve_image_urls(node.images.as_deref().unwrap_or(&[])),
+    )
+    .with_context(|| format!("step '{label}'"))?;
+    let prompt = match file_context {
+        Some(context) => Cow::Owned(format!("{base_prompt}\n\n{context}")),
+        None => Cow::Borrowed(base_prompt),
+    };
+    Ok((prompt, image_urls))
+}
+
 /// Runs a single node (agent call, prompt call, or `jq`-only data transform)
 /// and returns its output, with `jq` applied afterward if set. `label` is the
 /// calling `use:` site's label, used only for progress output/error messages.
@@ -2747,16 +2773,7 @@ async fn execute_step(
             resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?
                 .with_usage_label(label);
 
-        let file_context = attachment::read_file_attachments(node.files.as_deref().unwrap_or(&[]))
-            .await
-            .with_context(|| format!("step '{label}'"))?;
-        let prompt: Cow<'_, str> = match &file_context {
-            Some(context) => Cow::Owned(format!("{current_input}\n\n{context}")),
-            None => Cow::Borrowed(current_input),
-        };
-        let image_urls = attachment::resolve_image_urls(node.images.as_deref().unwrap_or(&[]))
-            .await
-            .with_context(|| format!("step '{label}'"))?;
+        let (prompt, image_urls) = resolve_attachments(node, current_input, label).await?;
 
         call_agent(
             agent_file,
@@ -2808,16 +2825,7 @@ async fn execute_step(
             ),
             None => Cow::Borrowed(current_input),
         };
-        let file_context = attachment::read_file_attachments(node.files.as_deref().unwrap_or(&[]))
-            .await
-            .with_context(|| format!("step '{label}'"))?;
-        let prompt: Cow<'_, str> = match &file_context {
-            Some(context) => Cow::Owned(format!("{prompt}\n\n{context}")),
-            None => prompt,
-        };
-        let image_urls = attachment::resolve_image_urls(node.images.as_deref().unwrap_or(&[]))
-            .await
-            .with_context(|| format!("step '{label}'"))?;
+        let (prompt, image_urls) = resolve_attachments(node, &prompt, label).await?;
         let system_prompt = node
             .system_prompt
             .as_deref()
