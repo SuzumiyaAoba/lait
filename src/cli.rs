@@ -51,6 +51,31 @@ pub(crate) enum Command {
     Sessions(SessionsCommand),
     /// Start an interactive, multi-turn chat REPL (see docs/usage/ja/chat.md).
     Chat(ChatReplArgs),
+    /// Run a named prompt template from `prompts:` in lait.config.yml, or
+    /// `lait prompt list` to show every configured prompt.
+    Prompt(PromptArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PromptArgs {
+    /// Name of a `prompts:` entry in lait.config.yml, or the literal `list`
+    /// to print every configured prompt instead of running one.
+    #[arg(value_name = "NAME")]
+    pub(crate) name: String,
+
+    /// The input passed to the prompt template (exposed as `{{ input }}`).
+    /// May be omitted when input is piped via stdin.
+    #[arg(value_name = "INPUT")]
+    pub(crate) input: Option<String>,
+
+    /// Override a `vars:` default declared on the prompt: `--var
+    /// KEY=VALUE`. Repeatable; a later `--var` for the same key wins.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    pub(crate) var: Vec<String>,
+
+    /// Print a token usage summary to stderr when the prompt finishes.
+    #[arg(long)]
+    pub(crate) show_usage: bool,
 }
 
 #[derive(Debug, Args)]
@@ -327,6 +352,19 @@ pub(crate) struct ChatArgs {
     /// a base64 data URL) or an `http(s)://` URL (sent as-is). Repeatable.
     #[arg(long = "image", value_name = "PATH_OR_URL")]
     pub(crate) images: Vec<String>,
+
+    /// Run a named prompt template (a `prompts.<NAME>` entry in
+    /// lait.config.yml) instead of sending PROMPT/stdin directly as the
+    /// request text: PROMPT/stdin becomes the template's `{{ input }}`. See
+    /// `lait prompt <NAME>`/`lait prompt list` for the equivalent subcommand.
+    #[arg(short = 'p', long = "prompt-name", value_name = "NAME")]
+    pub(crate) prompt_name: Option<String>,
+
+    /// Override a named prompt's `vars:` default: `--var KEY=VALUE`. Only
+    /// meaningful together with `-p`/`--prompt-name`. Repeatable; a later
+    /// `--var` for the same key wins.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    pub(crate) var: Vec<String>,
 }
 
 /// `lait chat`'s own arguments: just the options a REPL turn can use — see

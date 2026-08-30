@@ -13,6 +13,7 @@ mod lint;
 mod llm;
 mod mcp;
 mod models;
+mod prompt;
 mod repl;
 mod response;
 mod schema;

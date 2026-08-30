@@ -13,5 +13,6 @@
 - [出力例](./output.md) — 標準出力、`--stream`、`--json-schema`、`--json`
 - [ファイル・画像の添付](./attachments.md) — `--file` によるファイル内容の添付、`--image` による vision モデル向け画像入力
 - [会話セッションと対話モード（lait chat）](./chat.md) — `lait chat` REPL、`--session`/`lait sessions` による会話の保存と再開
+- [名前付きプロンプトテンプレート（prompts）](./prompts.md) — `prompts:` の登録、`-p`/`lait prompt`、`--var`
 - [トラブルシュート](./troubleshooting.md) — よくあるエラーと対処法
 - [開発](./development.md) — テスト、フォーマット、Lint、ビルド

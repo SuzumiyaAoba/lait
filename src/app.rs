@@ -16,9 +16,10 @@ use crate::{
     agent::{self, AgentFile},
     attachment,
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
-    cli::{AgentRunArgs, ReasoningEffort, SharedChatArgs},
+    cli::{AgentRunArgs, PromptArgs, ReasoningEffort, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
-    jq, lint, llm, mcp, repl, response, schema, session, skill, subagent, template, workflow,
+    jq, lint, llm, mcp, prompt, repl, response, schema, session, skill, subagent, template,
+    workflow,
 };
 
 pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -175,6 +176,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Chat(chat_repl_args)) => run_chat_repl(chat_repl_args, cli.no_config).await,
+        Some(Command::Prompt(prompt_args)) => run_prompt(prompt_args, cli.no_config).await,
         None => run_chat_or_repl(cli.chat, cli.no_config).await,
     }
 }
@@ -225,6 +227,7 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::Sessions(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
+        Some(Command::Prompt(prompt_args)) => prompt_args.name != "list",
         Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => true,
     }
 }
@@ -247,6 +250,12 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Man(man_args)) => generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
+        Some(Command::Prompt(prompt_args)) => {
+            if prompt_args.name != "list" {
+                bail!("internal error: `prompt <NAME>` must run on the async path");
+            }
+            crate::prompt::list(&config::load_config(cli.no_config)?)
+        }
         Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
@@ -808,7 +817,12 @@ async fn call_agent(
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
 ) -> Result<String> {
-    let system_prompt = template::render(&agent_file.system_prompt_template, input, steps_outputs)?;
+    let system_prompt = template::render(
+        &agent_file.system_prompt_template,
+        input,
+        steps_outputs,
+        &serde_json::Map::new(),
+    )?;
     let response_format = agent_file
         .structured_output
         .then(|| {
@@ -1188,17 +1202,22 @@ fn resolve_system_prompt(
 /// to single-shot chat and `lait chat`'s REPL — see `SharedChatArgs`) and
 /// `file_config`. Shared by `run_chat` and `repl::run`, which both need
 /// exactly this: chat's own model-resolution rule (`--model`/`LLM_MODEL` >
-/// `default.model`) plus the sampling/capability overrides every chat turn
-/// carries. The REPL calls this again after `/model`, so a model switch
-/// re-resolves the full settings (base URL, sampling defaults, ...) rather
-/// than only swapping the model id.
+/// `prompt_model_fallback` > `default.model`) plus the sampling/capability
+/// overrides every chat turn carries. The REPL calls this again after
+/// `/model`, so a model switch re-resolves the full settings (base URL,
+/// sampling defaults, ...) rather than only swapping the model id.
+/// `prompt_model_fallback` is `-p`/`--prompt-name`'s own `model:`, when set
+/// and `-p` was used (`None` from every other caller, including the REPL,
+/// which has no `-p` equivalent).
 fn resolve_chat_settings(
     shared: &SharedChatArgs,
+    prompt_model_fallback: Option<&str>,
     file_config: &ConfigFile,
 ) -> Result<RequestSettings> {
     let model_name = shared
         .model
         .clone()
+        .or_else(|| prompt_model_fallback.map(str::to_owned))
         .or_else(|| file_config.default.model.clone())
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| {
@@ -1247,13 +1266,24 @@ fn load_session_history(session_name: Option<&str>) -> Result<Vec<ChatCompletion
 /// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
 /// CLI argument and/or piped stdin).
 async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()> {
+    let file_config = config::load_config(no_config)?;
+
+    // `-p`/`--prompt-name` renders a named `prompts:` template against
+    // `prompt` (which, for this path, is really the template's `{{ input }}`
+    // rather than literal text to send) before anything else touches it —
+    // `--file` attachments below still append to the *rendered* text, the
+    // same way they'd append to a plain prompt.
+    let (prompt, prompt_model_fallback) = match &chat.prompt_name {
+        Some(name) => prompt::render_named(name, &prompt, &chat.var, &file_config)?,
+        None => (prompt, None),
+    };
     let prompt = match attachment::read_file_attachments(&chat.files)? {
         Some(file_context) => format!("{prompt}\n\n{file_context}"),
         None => prompt,
     };
 
-    let file_config = config::load_config(no_config)?;
-    let settings = resolve_chat_settings(&chat.shared, &file_config)?;
+    let settings =
+        resolve_chat_settings(&chat.shared, prompt_model_fallback.as_deref(), &file_config)?;
 
     let response_format = chat
         .json_schema
@@ -1408,7 +1438,7 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
             continue;
         }
 
-        let settings = match resolve_chat_settings(&shared, &file_config) {
+        let settings = match resolve_chat_settings(&shared, None, &file_config) {
             Ok(settings) => settings,
             Err(error) => {
                 eprintln!("lait: {error:#}");
@@ -1489,6 +1519,67 @@ async fn run_repl_turn(
             .unwrap_or_default()
             .to_owned())
     }
+}
+
+/// Runs `lait prompt <NAME> [INPUT]` (`args.name == "list"` is handled
+/// separately, synchronously, by `prompt::list` — see `needs_async_runtime`/
+/// `run_blocking`): renders the named prompt (see `prompt::render_named`)
+/// and sends the result as a plain, tool-free, non-streamed request. This
+/// subcommand form is intentionally narrower than `-p`/`--prompt-name` on
+/// the main chat invocation (no `--model`/`--stream`/`-o`/... overrides —
+/// see `docs/usage/ja/prompts.md`); reach for `-p` when those are needed.
+async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
+    let file_config = config::load_config(no_config)?;
+    if args.name == "list" {
+        return prompt::list(&file_config);
+    }
+
+    let raw_input = resolve_input_with_stdin(args.input.clone())?
+        .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
+    let (prompt_text, prompt_model) =
+        prompt::render_named(&args.name, &raw_input, &args.var, &file_config)?;
+
+    let model_name = prompt_model
+        .or_else(|| file_config.default.model.clone())
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "model is required for prompt '{}'; set 'prompts.{}.model' or default.model in {}",
+                args.name,
+                args.name,
+                config::CONFIG_FILE_NAME
+            )
+        })?;
+    let settings = resolve_request_settings(
+        model_name,
+        SamplingOverrides::default(),
+        None,
+        None,
+        CapabilityOverrides::default(),
+        &ModelMap::default(),
+        &file_config,
+    )?
+    .with_usage_label(format!("prompt '{}'", args.name));
+
+    let env = RunEnv::new(&file_config);
+    let response = settings
+        .complete(
+            &env,
+            &[],
+            PromptTurn {
+                system_prompt: None,
+                history: &[],
+                prompt: &prompt_text,
+                image_urls: &[],
+            },
+            None,
+        )
+        .await?;
+    println!("{}", response::render_response(&response, false, false)?);
+    if args.show_usage {
+        print_usage_summary(&env.usage);
+    }
+    Ok(())
 }
 
 /// Prints the `<prefix> name: description` announcement line shared by
@@ -2535,8 +2626,13 @@ async fn execute_step(
         // through `template::render`.
         let prompt: Cow<'_, str> = match &node.prompt {
             Some(prompt_template) => Cow::Owned(
-                template::render(prompt_template, &input, steps_outputs)
-                    .with_context(|| format!("step '{label}'"))?,
+                template::render(
+                    prompt_template,
+                    &input,
+                    steps_outputs,
+                    &serde_json::Map::new(),
+                )
+                .with_context(|| format!("step '{label}'"))?,
             ),
             None => Cow::Borrowed(current_input),
         };
@@ -2545,7 +2641,12 @@ async fn execute_step(
             .as_deref()
             .or(scope.defaults.system_prompt.as_deref())
             .map(|system_prompt_template| {
-                template::render(system_prompt_template, &input, steps_outputs)
+                template::render(
+                    system_prompt_template,
+                    &input,
+                    steps_outputs,
+                    &serde_json::Map::new(),
+                )
             })
             .transpose()
             .with_context(|| format!("step '{label}'"))?;
