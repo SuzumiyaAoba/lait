@@ -214,14 +214,7 @@ mod tests {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let dir = std::env::temp_dir().join(format!(
-            "lait-test-history-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::test_support::unique_temp_path("lait-test-history", "");
         std::fs::create_dir_all(&dir).unwrap();
         let original_home = std::env::var("HOME").ok();
         let original_xdg = std::env::var("XDG_DATA_HOME").ok();

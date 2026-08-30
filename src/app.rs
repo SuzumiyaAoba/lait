@@ -473,6 +473,20 @@ struct PromptTurn<'a> {
     image_urls: &'a [String],
 }
 
+impl<'a> PromptTurn<'a> {
+    /// A turn with no prior history and no image attachments — every caller
+    /// but chat's own (`run_chat`/`run_repl_turn`, which have a real
+    /// `--session`/`--image` history to carry).
+    fn simple(system_prompt: Option<&'a str>, prompt: &'a str) -> Self {
+        Self {
+            system_prompt,
+            history: &[],
+            prompt,
+            image_urls: &[],
+        }
+    }
+}
+
 /// The model/base-URL/API-key/sampling settings for a single completion
 /// request, after resolving aliases and applying every fallback layer.
 struct RequestSettings {
@@ -907,12 +921,7 @@ async fn call_agent(
         .complete(
             env,
             active_agent_paths,
-            PromptTurn {
-                system_prompt: Some(&system_prompt),
-                history: &[],
-                prompt,
-                image_urls: &[],
-            },
+            PromptTurn::simple(Some(&system_prompt), prompt),
             response_format,
         )
         .await?;
@@ -1361,9 +1370,6 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
 
     let system_prompt = resolve_system_prompt(&chat.shared, &file_config)?;
     let image_urls = attachment::resolve_image_urls(&chat.images)?;
-    if let Some(name) = &chat.shared.session {
-        session::validate_name(name)?;
-    }
     let session_history = load_session_history(chat.shared.session.as_deref())?;
     let env = RunEnv::new(&file_config);
 
@@ -1438,9 +1444,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
             println!("{output}");
         }
     }
-    let content = response::first_message(&response)
-        .and_then(|message| message.content())
-        .unwrap_or_default();
+    let content = response::content_text(&response);
     finish_chat_turn(
         chat.shared.session.as_deref(),
         chat.shared.no_history,
@@ -1469,9 +1473,6 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
 
     let mut shared = args.shared;
     let file_config = config::load_config(no_config)?;
-    if let Some(name) = &shared.session {
-        session::validate_name(name)?;
-    }
     let mut history = load_session_history(shared.session.as_deref())?;
     let mut system_prompt = resolve_system_prompt(&shared, &file_config)?;
     let env = RunEnv::new(&file_config);
@@ -1599,10 +1600,7 @@ async fn run_repl_turn(
         if show_usage {
             print_usage_summary(&env.usage);
         }
-        response::first_message(&response)
-            .and_then(|message| message.content())
-            .unwrap_or_default()
-            .to_owned()
+        response::content_text(&response).to_owned()
     };
     let turn_usage = env.usage.total().map(|after| response::Usage {
         prompt_tokens: after.prompt_tokens.saturating_sub(before.prompt_tokens),
@@ -1656,17 +1654,7 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
 
     let env = RunEnv::new(&file_config);
     let response = settings
-        .complete(
-            &env,
-            &[],
-            PromptTurn {
-                system_prompt: None,
-                history: &[],
-                prompt: &prompt_text,
-                image_urls: &[],
-            },
-            None,
-        )
+        .complete(&env, &[], PromptTurn::simple(None, &prompt_text), None)
         .await?;
     let output = response::render_response(&response, false, false)?;
     println!("{output}");
@@ -2779,12 +2767,7 @@ async fn execute_step(
             .complete(
                 env,
                 &[],
-                PromptTurn {
-                    system_prompt: system_prompt.as_deref(),
-                    history: &[],
-                    prompt: &prompt,
-                    image_urls: &[],
-                },
+                PromptTurn::simple(system_prompt.as_deref(), &prompt),
                 response_format,
             )
             .await

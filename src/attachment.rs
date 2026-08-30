@@ -263,14 +263,7 @@ mod tests {
         /// name verbatim so an extension (e.g. `"lait-test-image.png"`) is
         /// preserved for MIME-sniffing fallback tests.
         fn with_suffix(suffix: &str, contents: &[u8]) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "lait-test-{}-{}-{suffix}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let path = crate::test_support::unique_temp_path("lait-test", &format!("-{suffix}"));
             std::fs::write(&path, contents).expect("failed to write temp file");
             Self { path }
         }
