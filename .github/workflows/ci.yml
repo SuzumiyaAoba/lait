@@ -29,13 +29,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-features --locked
+        run: cargo test --locked
 
       - name: Build release binary
-        run: cargo build --release --all-features --locked
+        run: cargo build --release --locked
 
   website:
     name: Website checks

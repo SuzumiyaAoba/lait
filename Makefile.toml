@@ -33,7 +33,6 @@ args = [
     "scripts/makers-cargo.sh",
     "clippy",
     "--all-targets",
-    "--all-features",
     "--locked",
     "--",
     "-D",

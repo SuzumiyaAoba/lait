@@ -25,6 +25,16 @@ default:
 `--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独立してフォールバックします
 （`reasoning_effort` と同じ仕組みで、`retry` のようなブロック単位のフォールバックではありません）。
 
+`default:` にはこの他、`mcp:`/`skills:`/`subagents:`（後述の各節を参照）、`max_tool_rounds:`
+（既定 8）、および次の 2 項目も指定できます。
+
+- `render: true` — `--render` を渡さなくてもチャットの応答を Markdown として端末表示します
+  （[出力例](./output.md) を参照）。
+- `history: false` — `--no-history` を渡さなくても `lait history` への記録を止めます
+  （[実行履歴](./history.md) を参照）。
+
+いずれも CLI フラグ（`--render`/`--no-history`）が指定されればそちらが優先されます。
+
 ## モデル定義と alias
 
 複数の呼び出しモデルを設定ファイルに定義し、alias で使い回せます。`models` は alias をキー、
@@ -63,14 +73,26 @@ default:
 
 ## 設定値の優先順位
 
-設定値は項目ごとに、次の優先順位で解決されます。CLI 引数と環境変数の間では CLI 引数が優先されます。
+`base_url`/`api_key` は、次の優先順位で解決されます。CLI 引数と環境変数の間では CLI 引数が優先されます。
 
-`CLI 引数 > 環境変数 > モデル定義 > 既存トップレベル設定 > 組み込み既定値`
+`CLI 引数 > 環境変数 > モデル定義（provider.*） > トップレベル設定（base_url/api_key） > 組み込み既定値`
 
 たとえば alias のモデル定義が `provider.base_url` を持つ場合、その値はトップレベルの `base_url`
 より優先されます。CLI の `--base-url` や `OPENAI_BASE_URL` を指定した場合は、それらがモデル定義を
 上書きします。`provider.api_key` と `default_reasoning_effort` を省略した場合は、対応する
 トップレベルの `api_key`、`default.reasoning_effort` がフォールバックとして使用されます。
+
+`model`/`reasoning_effort`/サンプリングパラメータ/`mcp`/`skills`/`subagents`/`max_tool_rounds` の
+解決順は、**呼び出し経路によって異なる 2 系統**があります（`base_url`/`api_key` とは別のチェーン
+です）。
+
+- **チャット／`lait prompt`／`-p`**: `CLI 引数（環境変数フォールバック込み） > 名前付きプロンプト
+  の値（`prompts.<name>.model` など） > default: の値 > 組み込み既定値`
+- **`lait agent run`／ワークフローノード**: `ノード自身（またはエージェント Markdown の
+  frontmatter）の値 > エージェント Markdown の値（ノードが `agent:` を指す場合） >
+  ワークフローファイルの `default:` > lait.config.yml の `default:` > 組み込み既定値`
+
+どちらの経路でも、`lait.config.yml` の `default:` が最終手前のフォールバック層になります。
 
 `base_url`、`api_key` はトップレベルの項目として、フォールバック用の `model`、`reasoning_effort`、
 `temperature`、`top_p`、`max_tokens` は `default:` の配下にまとめて指定します。設定ファイルの自動読込を
@@ -100,6 +122,10 @@ models:
 - この展開は設定ファイル（`lait.config.yml`、および後述するワークフローファイルの `models:`/
   トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
+- 後述の [MCP サーバー](#mcp-サーバー) の `command`/`args`/`env`/`cwd`/`url`/`headers` も同じ
+  規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
+  パス、`default.system`、ワークフローの `prompt:`/`system_prompt:` には**この展開は適用されません**
+  （こちらは `--var`/handlebars のテンプレート変数で渡してください）。
 
 ## `.env` ファイルの自動読み込み
 
@@ -154,6 +180,27 @@ mcp_servers:
   です（前節と同じ規則）。
 - 実際に使われるサーバーだけがその場で接続されます（`mcp:` で名前を挙げていないサーバーは
   起動しません）。
+
+## 名前付きプロンプト
+
+`prompts:` に名前付きプロンプトを登録すると、`-p/--prompt-name <NAME>`（チャット）または
+`lait prompt <NAME>` から実行できます。詳しい使い方は
+[名前付きプロンプトを使う](./prompts.md) を参照してください。
+
+```yaml
+# lait.config.yml
+prompts:
+  summarize:
+    template: "次の文章を3行で要約してください。\n\n{{ input }}"
+    model: local            # 省略時は default.model にフォールバック
+    vars:
+      style: casual         # --var style=formal で上書き可能
+```
+
+- `template` は handlebars テンプレートで、`{{ input }}`（位置引数／stdin）と
+  `{{ vars.<key> }}`（`vars:` の既定値、`--var key=value` で上書き可能）を参照できます。
+- `model` を省略した場合は `default.model` にフォールバックします。
+- `lait prompt list` で登録済みのプロンプト名を一覧できます。
 
 ## スキル
 
