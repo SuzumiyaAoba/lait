@@ -1,6 +1,6 @@
 //! `--show-usage` accounting: a per-run tally of every completion request's
 //! token usage, and the summary printed from it. Extracted out of
-//! `app.rs`'s `RunEnv`, which holds one [`UsageTally`] per run and is the
+//! `app.rs`'s `AppContext`, which holds one [`UsageTally`] per run and is the
 //! only thing that constructs or reads it.
 
 use crate::response;
@@ -8,7 +8,7 @@ use crate::response;
 /// Accumulates every completion request's usage over one `lait` run, by the
 /// label of whatever drove it (a workflow step, an agent, "chat"), so
 /// `--show-usage` can print a per-label and total summary once a run
-/// finishes. Lives in `app::RunEnv`, so recording must tolerate concurrent
+/// finishes. Lives in `app::AppContext`, so recording must tolerate concurrent
 /// callers (`parallel`/concurrent `for_each` steps record from concurrently
 /// running tasks).
 #[derive(Default)]

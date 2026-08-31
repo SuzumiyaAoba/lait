@@ -452,7 +452,7 @@ impl RequestSettings {
     /// feature existed — see `llm::initial_messages`.
     async fn complete(
         &self,
-        env: &RunEnv<'_>,
+        env: &AppContext<'_>,
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
@@ -571,7 +571,7 @@ impl RequestSettings {
     /// and skew `--show-usage`.
     async fn complete_recorded(
         &self,
-        env: &RunEnv<'_>,
+        env: &AppContext<'_>,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
@@ -782,7 +782,7 @@ impl<'a> AgentTurn<'a> {
 async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
-    env: &RunEnv<'_>,
+    env: &AppContext<'_>,
     turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
@@ -905,7 +905,7 @@ fn subagent_tool_input(
 fn call_subagent_tool<'a>(
     name: &'a str,
     arguments_json: &'a str,
-    env: &'a RunEnv<'a>,
+    env: &'a AppContext<'a>,
     active_paths: &'a [PathBuf],
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
@@ -1273,7 +1273,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     let system_prompt = resolve_system_prompt(&chat.shared, &file_config)?;
     let image_urls = attachment::resolve_image_urls(&chat.images).await?;
     let session_history = load_session_history(chat.shared.session.as_deref())?;
-    let env = RunEnv::new(&file_config);
+    let env = AppContext::new(&file_config);
 
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
@@ -1323,7 +1323,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     }
 
     let response = env
-        .finish(settings.complete(&env, &[], turn, response_format, None))
+        .finish(settings.complete(&env, &[], turn, response_format, env.cancel.clone()))
         .await?;
 
     match output_path {
@@ -1383,7 +1383,7 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
     let file_config = config::load_config(no_config)?;
     let mut history = load_session_history(shared.session.as_deref())?;
     let mut system_prompt = resolve_system_prompt(&shared, &file_config)?;
-    let env = RunEnv::new(&file_config);
+    let env = AppContext::new(&file_config);
 
     eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
 
@@ -1492,7 +1492,7 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
 /// history` wants each entry's own usage, not the cumulative session total).
 async fn run_repl_turn(
     settings: &RequestSettings,
-    env: &RunEnv<'_>,
+    env: &AppContext<'_>,
     system_prompt: &Option<String>,
     history: &[ChatCompletionRequestMessage],
     prompt: &str,
@@ -1519,7 +1519,9 @@ async fn run_repl_turn(
         }
         outcome.content
     } else {
-        let response = settings.complete(env, &[], turn, None, None).await?;
+        let response = settings
+            .complete(env, &[], turn, None, env.cancel.clone())
+            .await?;
         let rendered = response::render_response(&response, false, show_reasoning)?;
         println!("{rendered}");
         if show_usage {
@@ -1577,14 +1579,14 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
     )?
     .with_usage_label(format!("prompt '{}'", args.name));
 
-    let env = RunEnv::new(&file_config);
+    let env = AppContext::new(&file_config);
     let response = env
         .finish(settings.complete(
             &env,
             &[],
             PromptTurn::simple(None, &prompt_text),
             None,
-            None,
+            env.cancel.clone(),
         ))
         .await?;
     let output = response::render_response(&response, false, false)?;
@@ -1646,7 +1648,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     let settings =
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
-    let env = RunEnv::new(&file_config);
+    let env = AppContext::new(&file_config);
     let output = env
         .finish(call_agent(
             &agent_file,
@@ -1655,7 +1657,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
             AgentTurn::simple(&input, &raw_input),
             &workflow::StepOutputs::new(),
             std::slice::from_ref(&canonical_agent_path),
-            None,
+            env.cancel.clone(),
         ))
         .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;
@@ -1684,7 +1686,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
-    let env = RunEnv::new(&file_config);
+    let env = AppContext::new(&file_config);
     let initial_prompt = prompt.clone();
     let (current_input, _, _, _) = env
         .finish(run_steps(
@@ -1695,7 +1697,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
             0,
             "",
             workflow::StepOutputs::new(),
-            None,
+            env.cancel.clone(),
         ))
         .await?;
     println!("{current_input}");
@@ -1765,16 +1767,17 @@ pub(crate) fn check_workflow_nesting(
     check_nesting_depth(active, canonical, MAX_WORKFLOW_DEPTH)
 }
 
-/// The loaded config file, the MCP registry, the skill cache, and the
-/// subagent registry for the whole `lait`/`lait agent run`/`lait run`
-/// invocation — unlike `WorkflowScope`, none of these change at a
-/// `workflow:` nesting boundary, so the same `&RunEnv` flows unchanged
-/// through every `run_steps`/`execute_step_with_retry`/`execute_step` call
-/// (and, for `call_agent`/`RequestSettings::complete`, through a subagent
-/// call's own recursive completion too — see `call_subagent_tool`). Bundled
-/// into one struct (rather than four parameters) purely to keep those
-/// functions' argument counts under clippy's `too_many_arguments` threshold.
-struct RunEnv<'a> {
+/// The loaded config file, the MCP registry, the skill cache, the subagent
+/// registry, and the run's top-level cancellation source for the whole
+/// `lait`/`lait agent run`/`lait run` invocation — unlike `WorkflowScope`,
+/// none of these change at a `workflow:` nesting boundary, so the same
+/// `&AppContext` flows unchanged through every
+/// `run_steps`/`execute_step_with_retry`/`execute_step` call (and, for
+/// `call_agent`/`RequestSettings::complete`, through a subagent call's own
+/// recursive completion too — see `call_subagent_tool`). Bundled into one
+/// struct (rather than five parameters) purely to keep those functions'
+/// argument counts under clippy's `too_many_arguments` threshold.
+struct AppContext<'a> {
     file_config: &'a ConfigFile,
     registry: mcp::McpRegistry<'a>,
     skill_cache: skill::SkillCache<'a>,
@@ -1783,9 +1786,18 @@ struct RunEnv<'a> {
     /// `RequestSettings::complete` and summarized when `--show-usage` asks
     /// for it.
     usage: usage::UsageTally,
+    /// This invocation's own cancellation source, if any — the value every
+    /// top-level `run_steps`/`complete` call seeds its own cancellation
+    /// chain from (a node's own `timeout`/nested `workflow:` call then
+    /// derives further child tokens off of that seed, see
+    /// `execute_step_with_retry`). Currently always `None`: no caller wires
+    /// up a real source (e.g. Ctrl-C) yet, but giving it one field here
+    /// means a future one only has to change `new`'s caller, not every
+    /// `run_steps`/`complete` call site.
+    cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
-impl<'a> RunEnv<'a> {
+impl<'a> AppContext<'a> {
     /// Builds the registries/cache over `file_config`'s named entries. Cheap:
     /// each one only borrows its config map — MCP connections, skill files,
     /// and agent files are all loaded lazily on first use.
@@ -1796,6 +1808,7 @@ impl<'a> RunEnv<'a> {
             skill_cache: skill::SkillCache::new(&file_config.skills),
             agent_registry: subagent::AgentRegistry::new(&file_config.agents),
             usage: usage::UsageTally::default(),
+            cancel: None,
         }
     }
 
@@ -2010,7 +2023,7 @@ fn run_steps<'a>(
     steps: &'a [workflow::FlowStep],
     current_input: String,
     scope: &'a WorkflowScope,
-    env: &'a RunEnv<'a>,
+    env: &'a AppContext<'a>,
     start_counter: usize,
     progress_prefix: &'a str,
     steps_outputs: workflow::StepOutputs,
@@ -2526,7 +2539,7 @@ async fn execute_step_with_retry(
     node: &workflow::NodeDefinition,
     current_input: &str,
     scope: &WorkflowScope,
-    env: &RunEnv<'_>,
+    env: &AppContext<'_>,
     label: &str,
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
@@ -2666,7 +2679,7 @@ async fn wait_retry_delay(
 
 struct StepExecutionContext<'a, 'env> {
     scope: &'a WorkflowScope,
-    env: &'a RunEnv<'env>,
+    env: &'a AppContext<'env>,
     label: &'a str,
     progress_prefix: &'a str,
     steps_outputs: &'a workflow::StepOutputs,
@@ -3186,7 +3199,7 @@ fn write_nonblocking_special_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{RunEnv, WorkflowScope, apply_jq, run_steps, write_output_file};
+    use super::{AppContext, WorkflowScope, apply_jq, run_steps, write_output_file};
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
@@ -3251,7 +3264,7 @@ steps:
         let mut workflow = crate::workflow::load_workflow(&path).unwrap();
         let scope = WorkflowScope::top_level(&mut workflow, &path).unwrap();
         let config = crate::config::ConfigFile::default();
-        let env = RunEnv::new(&config);
+        let env = AppContext::new(&config);
         let token = CancellationToken::new();
         let started = std::time::Instant::now();
         let execution = run_steps(
