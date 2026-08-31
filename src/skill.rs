@@ -43,7 +43,7 @@ fn resolve_skill_file_path(configured_path: &Path) -> PathBuf {
 async fn load_skill(
     name: &str,
     configured_path: &Path,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<SkillFile> {
     let configured_path = configured_path.to_owned();
     let name = name.to_owned();
@@ -153,14 +153,14 @@ impl<'a> SkillCache<'a> {
     pub(crate) async fn render(
         &self,
         names: &[String],
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Option<String>> {
         if names.is_empty() {
             return Ok(None);
         }
         if cancellation
             .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
             anyhow::bail!("skill rendering was cancelled");
         }
@@ -181,11 +181,11 @@ impl<'a> SkillCache<'a> {
     async fn section(
         &self,
         name: &str,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Rc<String>> {
         if cancellation
             .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
             anyhow::bail!("skill rendering was cancelled");
         }
@@ -203,7 +203,7 @@ impl<'a> SkillCache<'a> {
         let skill = load_skill(name, configured_path, cancellation).await?;
         if read_cancellation
             .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
             anyhow::bail!("skill rendering was cancelled");
         }
@@ -297,13 +297,13 @@ mod tests {
         skills_map.insert("blocked".to_owned(), path.clone());
         let cache = SkillCache::new(&skills_map);
         let names = ["blocked".to_owned()];
-        let (sender, receiver) = tokio::sync::watch::channel(false);
-        let mut render = Box::pin(cache.render(&names, Some(receiver)));
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut render = Box::pin(cache.render(&names, Some(token.clone())));
 
         tokio::select! {
             result = &mut render => panic!("FIFO skill unexpectedly returned: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                sender.send(true).unwrap();
+                token.cancel();
             }
         }
         let result = tokio::time::timeout(Duration::from_secs(1), render)

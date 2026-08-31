@@ -73,10 +73,10 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) stream_include_usage: bool,
     /// Cancellation signal for a workflow/agent attempt.  This is optional
     /// because top-level chat requests have no enclosing step timeout.  Keep
-    /// the receiver on the request so cancellation is observed by the HTTP
+    /// the token on the request so cancellation is observed by the HTTP
     /// future itself rather than only by a caller that may drop that future
     /// before a nested MCP/subagent operation has cleaned up.
-    pub(crate) cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Builds the initial message history shared by every completion request
@@ -351,37 +351,19 @@ pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<Co
 /// future is not enough for callers that are also driving MCP/subagent work:
 /// the outer timeout can win a `select!` and drop this future before those
 /// operations observe cancellation.  The request itself therefore watches
-/// the same receiver and exits as soon as the attempt is cancelled.
+/// the same token and exits as soon as the attempt is cancelled. Thin
+/// wrapper around `async_io::await_cancellation` (shared with `mcp::call`),
+/// mapping its `CancellationResult` onto this module's plain `Result`.
 async fn await_cancellation<F, T>(
     future: F,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<T>
 where
     F: Future<Output = Result<T, OpenAIError>>,
 {
-    let Some(mut cancellation) = cancellation else {
-        return Ok(future.await?);
-    };
-
-    let mut future = Box::pin(future);
-    loop {
-        if *cancellation.borrow() {
-            bail!("LLM completion was cancelled");
-        }
-        tokio::select! {
-            biased;
-            result = &mut future => {
-                if *cancellation.borrow() {
-                    bail!("LLM completion was cancelled");
-                }
-                return Ok(result?);
-            },
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    bail!("LLM completion was cancelled");
-                }
-            }
-        }
+    match crate::async_io::await_cancellation(future, cancellation).await {
+        crate::async_io::CancellationResult::Completed(result) => Ok(result?),
+        crate::async_io::CancellationResult::Cancelled => bail!("LLM completion was cancelled"),
     }
 }
 

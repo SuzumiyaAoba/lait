@@ -110,7 +110,7 @@ impl<'a> AgentRegistry<'a> {
     pub(crate) async fn load_cancellable(
         &self,
         name: &str,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Rc<LoadedAgent>> {
         let path = self.agents_map.get(name).ok_or_else(|| {
             anyhow!(
@@ -136,7 +136,7 @@ impl<'a> AgentRegistry<'a> {
     pub(crate) async fn load_path_cancellable(
         &self,
         path: &Path,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Rc<LoadedAgent>> {
         if let Some(cached) = self.loaded.borrow().get(path) {
             return Ok(Rc::clone(cached));
@@ -183,7 +183,7 @@ impl<'a> AgentRegistry<'a> {
     pub(crate) async fn tools_cancellable(
         &self,
         names: &[String],
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<ToolSet> {
         let loaded_agents = futures_util::future::try_join_all(
             names

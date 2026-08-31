@@ -93,7 +93,7 @@ pub(crate) fn load_agent(path: &Path) -> Result<AgentFile> {
 /// commands (lint/init/top-level `agent run`) that do not have a step timeout.
 pub(crate) async fn load_agent_cancellable(
     path: &Path,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<AgentFile> {
     let contents =
         async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)

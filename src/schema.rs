@@ -46,7 +46,7 @@ pub(crate) fn load_schema_value(entry: &JsonSchemaEntry) -> Result<serde_json::V
 /// opened non-blocking by [`async_io::read_file`].
 pub(crate) async fn load_schema_value_cancellable(
     entry: &JsonSchemaEntry,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<serde_json::Value> {
     match entry {
         JsonSchemaEntry::Inline { schema } => Ok(schema.clone()),
@@ -72,7 +72,7 @@ pub(crate) async fn load_schema_value_cancellable(
 pub(crate) async fn build_response_format_from_entry_cancellable(
     entry: &JsonSchemaEntry,
     name: &str,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ResponseFormat> {
     build_json_schema(
         load_schema_value_cancellable(entry, cancellation).await?,
@@ -104,7 +104,7 @@ pub(crate) fn resolve_named_schema_value(
 pub(crate) async fn resolve_named_schema_value_cancellable(
     json_schemas: &JsonSchemaMap,
     name_or_path: &str,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<serde_json::Value> {
     match json_schemas.get(name_or_path) {
         Some(entry) => load_schema_value_cancellable(entry, cancellation).await,
@@ -266,7 +266,7 @@ pub(crate) fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat
 pub(crate) async fn load_json_schema_cancellable(
     path: &Path,
     name: &str,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ResponseFormat> {
     let contents =
         async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)

@@ -402,7 +402,7 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &'a [ChatCompletionTools],
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> llm::CompletionRequest<'a> {
         llm::CompletionRequest {
             base_url: &self.base_url,
@@ -456,7 +456,7 @@ impl RequestSettings {
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
         let system_prompt = self
             .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, cancellation.clone())
@@ -575,7 +575,7 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
         let response =
             llm::complete(self.request(response_format, messages, tools, cancellation)).await?;
@@ -634,7 +634,7 @@ impl RequestSettings {
         &self,
         skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&'a str>,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Option<Cow<'a, str>>> {
         let skills_text = skill_cache.render(&self.skills, cancellation).await?;
         Ok(with_skills(system_prompt, skills_text.as_deref()))
@@ -786,7 +786,7 @@ async fn call_agent(
     turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     let system_prompt = template::render(
         &agent_file.system_prompt_template,
@@ -907,7 +907,7 @@ fn call_subagent_tool<'a>(
     arguments_json: &'a str,
     env: &'a RunEnv<'a>,
     active_paths: &'a [PathBuf],
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
     Box::pin(async move {
         // `Copy` (it only captures `name: &str`), so it can back every
@@ -1973,9 +1973,9 @@ type StepsOutcome = Result<(String, usize, Flow, workflow::StepOutputs)>;
 /// cancellation cannot be lost merely because a router has no model node of
 /// its own.
 fn check_workflow_cancellation(
-    cancellation: Option<&tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
-    if cancellation.is_some_and(|receiver| *receiver.borrow()) {
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         bail!("workflow execution was cancelled");
     }
     Ok(())
@@ -2014,7 +2014,7 @@ fn run_steps<'a>(
     start_counter: usize,
     progress_prefix: &'a str,
     steps_outputs: workflow::StepOutputs,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Pin<Box<dyn Future<Output = StepsOutcome> + 'a>> {
     Box::pin(async move {
         let mut current_input = current_input;
@@ -2530,7 +2530,7 @@ async fn execute_step_with_retry(
     label: &str,
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
-    mut workflow_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    workflow_cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     let calls_model = node.calls_model();
     let effective_retry = node.retry.as_ref().or(calls_model
@@ -2566,9 +2566,15 @@ async fn execute_step_with_retry(
             // until cancellation cleanup finishes, avoiding a second attempt
             // racing the child-owning or file-writing future.
             Some(seconds) => {
-                let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
-                let _forwarder =
-                    CancellationForwarder::new(workflow_cancel.clone(), cancel_sender.clone());
+                // A child token is cancelled both by this node's own timeout
+                // (below) and by `workflow_cancel` being cancelled (a
+                // `CancellationToken` property, not something forwarded by
+                // hand) — `execute_step` only ever needs to watch this one
+                // token either way.
+                let node_cancel = match &workflow_cancel {
+                    Some(parent) => parent.child_token(),
+                    None => tokio_util::sync::CancellationToken::new(),
+                };
                 let execution = execute_step(
                     node,
                     current_input,
@@ -2578,14 +2584,14 @@ async fn execute_step_with_retry(
                         label,
                         progress_prefix,
                         steps_outputs,
-                        step_cancel: Some(cancel_receiver),
+                        step_cancel: Some(node_cancel.clone()),
                     },
                 );
                 tokio::pin!(execution);
                 match tokio::time::timeout(Duration::from_secs(seconds), &mut execution).await {
                     Ok(result) => result,
                     Err(_) => {
-                        let _ = cancel_sender.send(true);
+                        node_cancel.cancel();
                         let _ = execution.await;
                         Err(anyhow!(
                             "step '{label}' timed out after {seconds}s (attempt {attempt}/{max_attempts})"
@@ -2618,7 +2624,7 @@ async fn execute_step_with_retry(
                     "{progress_prefix}    -> attempt {attempt}/{max_attempts} failed: {error}; retrying in {:.1}s",
                     delay.as_secs_f64()
                 );
-                wait_retry_delay(delay, workflow_cancel.as_mut()).await?;
+                wait_retry_delay(delay, workflow_cancel.as_ref()).await?;
                 // `try_from_secs_f64` + the `MAX_RETRY_DELAY` clamp keep an
                 // exponentially growing (or pathological) delay from
                 // overflowing `Duration` — `Duration::from_secs_f64` would
@@ -2632,52 +2638,12 @@ async fn execute_step_with_retry(
     }
 }
 
-/// For a timed node there are two independent cancellation sources: the
-/// node's own timeout and the cancellation inherited from an enclosing
-/// workflow/step. The low-level operations accept one watch receiver, so a
-/// short-lived forwarding task combines the two sources into one channel.
-/// Dropping the guard aborts that task after the node has completed, avoiding
-/// one permanently-live task per workflow step.
-struct CancellationForwarder {
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl CancellationForwarder {
-    fn new(
-        source: Option<tokio::sync::watch::Receiver<bool>>,
-        sender: tokio::sync::watch::Sender<bool>,
-    ) -> Self {
-        let task = source.map(|mut source| {
-            tokio::spawn(async move {
-                loop {
-                    if *source.borrow() {
-                        let _ = sender.send(true);
-                        break;
-                    }
-                    if source.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-        });
-        Self { task }
-    }
-}
-
-impl Drop for CancellationForwarder {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
 /// Sleeps between retries while still honoring cancellation inherited from a
 /// surrounding workflow. A plain `sleep` would allow a cancelled nested
 /// workflow to wait for an arbitrarily large backoff before returning.
 async fn wait_retry_delay(
     delay: Duration,
-    cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     let Some(cancellation) = cancellation else {
         if !delay.is_zero() {
@@ -2685,27 +2651,16 @@ async fn wait_retry_delay(
         }
         return Ok(());
     };
-    if *cancellation.borrow() {
-        bail!("workflow execution was cancelled");
-    }
     if delay.is_zero() {
+        if cancellation.is_cancelled() {
+            bail!("workflow execution was cancelled");
+        }
         return Ok(());
     }
-    let sleep = tokio::time::sleep(delay);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
+    tokio::select! {
         biased;
-        changed = cancellation.changed() => {
-            if changed.is_err() || *cancellation.borrow() {
-                bail!("workflow execution was cancelled");
-            }
-                // A non-cancelling update does not shorten the backoff; keep
-                // waiting on the same deadline.
-                continue;
-        }
-            _ = &mut sleep => return Ok(()),
-        }
+        () = cancellation.cancelled() => bail!("workflow execution was cancelled"),
+        () = tokio::time::sleep(delay) => Ok(()),
     }
 }
 
@@ -2715,7 +2670,7 @@ struct StepExecutionContext<'a, 'env> {
     label: &'a str,
     progress_prefix: &'a str,
     steps_outputs: &'a workflow::StepOutputs,
-    step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    step_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Resolves the model/reasoning-effort settings for a node's model call,
@@ -2811,7 +2766,7 @@ async fn resolve_attachments<'a>(
     node: &workflow::NodeDefinition,
     base_prompt: &'a str,
     label: &str,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<(Cow<'a, str>, Vec<String>)> {
     let (file_context, image_urls) = tokio::try_join!(
         attachment::read_file_attachments_cancellable(
@@ -2845,7 +2800,7 @@ async fn execute_step(
         label,
         progress_prefix,
         steps_outputs,
-        mut step_cancel,
+        step_cancel,
     } = context;
     if let Some(name_or_path) = &node.input_schema {
         let schema = schema::resolve_named_schema_value_cancellable(
@@ -3026,7 +2981,7 @@ async fn execute_step(
     };
 
     if let Some(filter) = &node.jq {
-        step_output = apply_jq(filter, &step_output, steps_outputs, step_cancel.as_mut())
+        step_output = apply_jq(filter, &step_output, steps_outputs, step_cancel.as_ref())
             .await
             .with_context(|| format!("step '{label}'"))?;
     }
@@ -3050,9 +3005,9 @@ async fn apply_jq(
     filter: &str,
     input: &str,
     steps_outputs: &workflow::StepOutputs,
-    step_cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    step_cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
-    let cancellation = step_cancel.as_ref().map(|receiver| (**receiver).clone());
+    let cancellation = step_cancel.cloned();
     // Input normalization is deliberately performed inside the bounded jq
     // worker. A large plain-text model/command result must not be parsed and
     // re-serialized on a Tokio executor thread before cancellation can win.
@@ -3070,7 +3025,7 @@ async fn apply_jq(
 async fn write_output_file(
     path: &Path,
     output: &str,
-    step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    step_cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     let path = path.to_owned();
     let output = output.to_owned();
@@ -3232,6 +3187,7 @@ fn write_nonblocking_special_file(
 #[cfg(test)]
 mod tests {
     use super::{RunEnv, WorkflowScope, apply_jq, run_steps, write_output_file};
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn a_cancelled_regular_write_does_not_truncate_an_existing_file() {
@@ -3244,12 +3200,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&path, "original").expect("failed to create output fixture");
-        let (sender, receiver) = tokio::sync::watch::channel(false);
-        sender
-            .send(true)
-            .expect("the cancellation receiver should still be connected");
+        let token = CancellationToken::new();
+        token.cancel();
 
-        let result = write_output_file(&path, "replacement", Some(receiver)).await;
+        let result = write_output_file(&path, "replacement", Some(token)).await;
         let contents = std::fs::read_to_string(&path).expect("output fixture should remain");
         std::fs::remove_file(&path).expect("failed to remove output fixture");
 
@@ -3259,14 +3213,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_already_cancelled_jq_stops_before_returning_a_value() {
-        let (_sender, mut receiver) = tokio::sync::watch::channel(true);
+        let token = CancellationToken::new();
+        token.cancel();
         let steps = crate::workflow::StepOutputs::new();
         let started = std::time::Instant::now();
 
         // The filter is intentionally expensive if it is allowed to run. A
         // pre-set step cancellation must be observed immediately, before a
         // caller can mistake a value from the worker for a successful step.
-        let result = apply_jq("range(0; 1000000000)", "null", &steps, Some(&mut receiver)).await;
+        let result = apply_jq("range(0; 1000000000)", "null", &steps, Some(&token)).await;
 
         assert!(result.is_err());
         assert!(
@@ -3297,7 +3252,7 @@ steps:
         let scope = WorkflowScope::top_level(&mut workflow, &path).unwrap();
         let config = crate::config::ConfigFile::default();
         let env = RunEnv::new(&config);
-        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let token = CancellationToken::new();
         let started = std::time::Instant::now();
         let execution = run_steps(
             &workflow.steps,
@@ -3307,13 +3262,13 @@ steps:
             0,
             "",
             crate::workflow::StepOutputs::new(),
-            Some(receiver),
+            Some(token.clone()),
         );
         tokio::pin!(execution);
         let result = tokio::select! {
             result = &mut execution => result,
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                sender.send(true).expect("router should still observe cancellation");
+                token.cancel();
                 tokio::time::timeout(std::time::Duration::from_secs(2), &mut execution)
                     .await
                     .expect("cancelled router should stop promptly")
@@ -3356,17 +3311,16 @@ steps:
             .expect("FIFO reader should open without a writer");
         let first_output = "x".repeat(512 * 1024);
         let retry_output = "y".repeat(512 * 1024);
-        let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let cancel_token = CancellationToken::new();
         let first_path = path.clone();
         let first_output_for_task = first_output.clone();
+        let first_token = cancel_token.clone();
         let first = tokio::spawn(async move {
-            write_output_file(&first_path, &first_output_for_task, Some(cancel_receiver)).await
+            write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        cancel_sender
-            .send(true)
-            .expect("the first writer should still be observing cancellation");
+        cancel_token.cancel();
         let first_result = tokio::time::timeout(Duration::from_secs(1), first)
             .await
             .expect("cancelling the first FIFO writer should finish promptly")

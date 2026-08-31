@@ -351,7 +351,7 @@ async fn terminate_command_process_tree(
 pub(crate) async fn run_command(
     argv: &[String],
     stdin_input: &str,
-    mut step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    step_cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -403,37 +403,31 @@ pub(crate) async fn run_command(
         stderr.read_to_end(&mut bytes).await.map(|_| bytes)
     });
 
-    let status = if let Some(step_cancel) = &mut step_cancel {
-        loop {
-            tokio::select! {
-                status = child.wait() => {
-                    break status.with_context(|| format!("failed to run command '{program}'"))?;
-                }
-                changed = step_cancel.changed() => {
-                    if changed.is_ok() && !*step_cancel.borrow() {
-                        continue;
-                    }
+    let status = if let Some(step_cancel) = &step_cancel {
+        tokio::select! {
+            status = child.wait() => {
+                status.with_context(|| format!("failed to run command '{program}'"))?
+            }
+            () = step_cancel.cancelled() => {
+                // Closing the parent's stdin first prevents a writer
+                // blocked behind a descendant-inherited pipe from
+                // delaying command cleanup. Terminate the process group /
+                // Job Object so the retry cannot overlap any descendant.
+                write_stdin.abort();
+                let _ = write_stdin.await;
+                let cleanup_result =
+                    terminate_command_process_tree(&process_tree, &mut child).await;
 
-                    // Closing the parent's stdin first prevents a writer
-                    // blocked behind a descendant-inherited pipe from
-                    // delaying command cleanup. Terminate the process group /
-                    // Job Object so the retry cannot overlap any descendant.
-                    write_stdin.abort();
-                    let _ = write_stdin.await;
-                    let cleanup_result =
-                        terminate_command_process_tree(&process_tree, &mut child).await;
-
-                    // A descendant may retain stdout/stderr after the direct
-                    // child exits. Those readers are no longer needed once
-                    // the command is cancelled, so abort them rather than
-                    // waiting for an unrelated descendant to close its copy.
-                    read_stdout.abort();
-                    read_stderr.abort();
-                    let _ = read_stdout.await;
-                    let _ = read_stderr.await;
-                    cleanup_result.with_context(|| format!("command '{program}' was cancelled"))?;
-                    bail!("command '{program}' was cancelled");
-                }
+                // A descendant may retain stdout/stderr after the direct
+                // child exits. Those readers are no longer needed once
+                // the command is cancelled, so abort them rather than
+                // waiting for an unrelated descendant to close its copy.
+                read_stdout.abort();
+                read_stderr.abort();
+                let _ = read_stdout.await;
+                let _ = read_stderr.await;
+                cleanup_result.with_context(|| format!("command '{program}' was cancelled"))?;
+                bail!("command '{program}' was cancelled");
             }
         }
     } else {
@@ -448,7 +442,7 @@ pub(crate) async fn run_command(
     // inherited the child's stdin can otherwise keep the pipe open forever.
     write_stdin.abort();
     let _ = write_stdin.await;
-    let (stdout, stderr) = if let Some(step_cancel) = &mut step_cancel {
+    let (stdout, stderr) = if let Some(step_cancel) = &step_cancel {
         let mut stdout_bytes = None;
         let mut stderr_bytes = None;
         loop {
@@ -467,10 +461,7 @@ pub(crate) async fn run_command(
                             .with_context(|| format!("failed to read stderr from command '{program}'"))?,
                     );
                 }
-                changed = step_cancel.changed() => {
-                    if changed.is_ok() && !*step_cancel.borrow() {
-                        continue;
-                    }
+                () = step_cancel.cancelled() => {
                     let tree_kill_result = process_tree.kill();
                     read_stdout.abort();
                     read_stderr.abort();

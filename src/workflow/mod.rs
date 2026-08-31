@@ -56,7 +56,7 @@ pub(crate) async fn eval_when_async(
     filter: &str,
     current_input: &str,
     steps: &StepOutputs,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<bool> {
     jq::apply_bool_cancellable_async(filter, current_input, steps, cancellation)
         .await

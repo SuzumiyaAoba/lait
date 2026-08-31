@@ -46,7 +46,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::config;
+use crate::{
+    async_io::{CancellationResult, await_cancellation},
+    config,
+};
 
 /// Finite safety net for MCP handshakes, pagination requests, and tool calls.
 /// Workflow nodes may still impose a shorter existing `timeout:`; this keeps
@@ -80,56 +83,13 @@ const MAX_TOOL_METADATA_BYTES: usize = 16 * 1024 * 1024;
 /// distinct cursors.
 const MAX_TOOL_LIST_PAGES: usize = 128;
 
-type CancellationReceiver = tokio::sync::watch::Receiver<bool>;
-
-/// The outer workflow timeout may race an MCP future.  Keep cancellation as
-/// an explicit outcome so the caller can evict the exact cached connection
-/// before returning; simply dropping `RunningService::call_tool` leaves the
-/// server-side request in flight and makes a retry capable of duplicating a
-/// side effect.
-enum CancellationResult<T> {
-    Completed(T),
-    Cancelled,
-}
-
-async fn await_cancellation<F, T>(
-    future: F,
-    cancellation: Option<CancellationReceiver>,
-) -> CancellationResult<T>
-where
-    F: Future<Output = T>,
-{
-    let Some(mut cancellation) = cancellation else {
-        return CancellationResult::Completed(future.await);
-    };
-
-    let mut future = Box::pin(future);
-    loop {
-        if *cancellation.borrow() {
-            return CancellationResult::Cancelled;
-        }
-        tokio::select! {
-            biased;
-            result = &mut future => {
-                // Prefer cancellation even when the operation and the
-                // sender become ready in the same turn.  A timeout handler
-                // may already have started a cleanup/retry sequence by the
-                // time this branch is polled; returning the result would
-                // retain a connection whose request was part of that timed
-                // out attempt.
-                if *cancellation.borrow() {
-                    return CancellationResult::Cancelled;
-                }
-                return CancellationResult::Completed(result);
-            },
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    return CancellationResult::Cancelled;
-                }
-            }
-        }
-    }
-}
+/// The app-level "this run was cancelled" signal threaded down from
+/// `app.rs`, distinct from this module's own [`CancellationToken`] uses
+/// below (each of those represents one MCP I/O operation's own timeout, not
+/// the run as a whole). Kept as its own alias — rather than writing
+/// `CancellationToken` at each of these call sites — precisely so that
+/// distinction stays visible at a glance.
+type CancellationReceiver = CancellationToken;
 
 /// Completion state for a cleanup operation that is performed by another
 /// task.  `Notify` is paired with the atomic flag so a waiter cannot miss a
@@ -639,7 +599,7 @@ impl<'a> McpRegistry<'a> {
         if result.is_err()
             && cancellation
                 .as_ref()
-                .is_some_and(|receiver| *receiver.borrow())
+                .is_some_and(CancellationToken::is_cancelled)
         {
             self.remove_tool_list_cell(name, &tool_list_cell).await;
         }
@@ -745,7 +705,7 @@ impl<'a> McpRegistry<'a> {
     ) -> Result<Arc<McpConnection>> {
         if cancellation
             .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+            .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(anyhow!("MCP operation was cancelled"));
         }
@@ -764,19 +724,11 @@ impl<'a> McpRegistry<'a> {
             // turns a caller's cancellation into cancellation of that shared
             // attempt; the initializer then remains alive long enough for
             // `connect` to close/reap its transport before this future ends.
-            let monitor = cancellation.clone().map(|mut receiver| {
+            let monitor = cancellation.clone().map(|cancellation| {
                 let initializer_cancellation = initializer_cancellation.clone();
                 tokio::spawn(async move {
-                    if *receiver.borrow() {
-                        initializer_cancellation.cancel();
-                        return;
-                    }
-                    while receiver.changed().await.is_ok() {
-                        if *receiver.borrow() {
-                            initializer_cancellation.cancel();
-                            return;
-                        }
-                    }
+                    cancellation.cancelled().await;
+                    initializer_cancellation.cancel();
                 })
             });
             let result = cell
@@ -804,7 +756,7 @@ impl<'a> McpRegistry<'a> {
                     let cancelled = initializer_cancellation.is_cancelled()
                         || cancellation
                             .as_ref()
-                            .is_some_and(|receiver| *receiver.borrow());
+                            .is_some_and(CancellationToken::is_cancelled);
                     if cancelled {
                         connection.shutdown().await;
                         self.remove_connection_cell(name, &cell).await;
