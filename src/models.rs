@@ -202,7 +202,7 @@ async fn list_remote(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> 
     // config), except model aliases play no part: `--remote` asks one
     // concrete server, and no API key means no Authorization header rather
     // than the completion path's dummy key.
-    let (base_url, api_key) = crate::app::resolve_endpoint(
+    let (base_url, api_key) = crate::config::resolve_endpoint(
         args.base_url.clone(),
         args.api_key.clone(),
         None,

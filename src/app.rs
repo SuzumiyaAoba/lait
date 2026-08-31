@@ -20,11 +20,9 @@ use crate::{
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, PromptArgs, ReasoningEffort, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
-    docgen, history, jq, lint, llm, mcp, prompt, render, repl, response, schema, session, skill,
-    subagent, template, usage, workflow,
+    docgen, history, jq, lint, llm, mcp, nesting, prompt, render, repl, response, schema, session,
+    skill, subagent, template, usage, workflow,
 };
-
-pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// Reads all of stdin into a string, trimming trailing newlines (piped text
 /// almost always ends in one, and a prompt should not).
@@ -920,14 +918,14 @@ fn call_subagent_tool<'a>(
             .await?;
 
         if let Err(error) =
-            check_nesting_depth(active_paths, &loaded.canonical_path, MAX_SUBAGENT_DEPTH)
+            nesting::check_nesting_depth(active_paths, &loaded.canonical_path, MAX_SUBAGENT_DEPTH)
         {
             match error {
-                NestingDepthError::Cycle => bail!(
+                nesting::NestingDepthError::Cycle => bail!(
                     "calling subagent '{name}' would create a cycle ('{}' is already running)",
                     loaded.canonical_path.display()
                 ),
-                NestingDepthError::TooDeep => bail!(
+                nesting::NestingDepthError::TooDeep => bail!(
                     "calling subagent '{name}' exceeded the maximum subagent nesting depth of \
                      {MAX_SUBAGENT_DEPTH}"
                 ),
@@ -984,7 +982,7 @@ fn resolve_request_settings(
         Some(resolved) => resolved,
         None => config::resolve_model(model_name, file_config)?,
     };
-    let (base_url, api_key) = resolve_endpoint(
+    let (base_url, api_key) = config::resolve_endpoint(
         base_url_override,
         api_key_override,
         resolved_model.base_url.as_deref(),
@@ -1060,50 +1058,6 @@ fn resolve_request_settings(
         subagents,
         usage_label: String::new(),
     })
-}
-
-/// Resolves the endpoint a request goes to from the three layers every
-/// caller shares — explicit override > model-definition value > config
-/// top-level — falling back to `DEFAULT_BASE_URL`, normalizing the trailing
-/// slash, and rejecting an empty base URL. `${VAR}` placeholders are only
-/// expanded in the config-sourced layers (see
-/// `config::expand_env_placeholders`), never in an override, which the
-/// shell already expands on its own. The API key comes back as `None` when
-/// no layer sets one — `resolve_request_settings` substitutes its dummy
-/// key, `lait models --remote` sends no Authorization header at all.
-pub(crate) fn resolve_endpoint(
-    base_url_override: Option<String>,
-    api_key_override: Option<String>,
-    model_base_url: Option<&str>,
-    model_api_key: Option<&str>,
-    file_config: &ConfigFile,
-) -> Result<(String, Option<String>)> {
-    let model_base_url = model_base_url
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let config_base_url = file_config
-        .base_url
-        .as_deref()
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let base_url = base_url_override
-        .or(model_base_url)
-        .or(config_base_url)
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
-    let base_url = base_url.trim_end_matches('/').to_owned();
-    if base_url.is_empty() {
-        return Err(anyhow!("base URL must not be empty"));
-    }
-    let model_api_key = model_api_key
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let config_api_key = file_config
-        .api_key
-        .as_deref()
-        .map(config::expand_env_placeholders)
-        .transpose()?;
-    let api_key = api_key_override.or(model_api_key).or(config_api_key);
-    Ok((base_url, api_key))
 }
 
 /// Resolves an agent file's own `RequestSettings` — its `model` (required,
@@ -1723,55 +1677,6 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     Ok(())
 }
 
-/// The maximum `workflow:` nesting depth (a workflow step calling another
-/// workflow file, whose own steps may call another, ...), rejected as a
-/// runtime error rather than left to overflow the stack or hang.
-pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
-
-/// Why entering a self-referential file (a `workflow:` node or a subagent)
-/// failed `check_nesting_depth` below.
-pub(crate) enum NestingDepthError {
-    /// The file is already on the call stack.
-    Cycle,
-    /// Entering it would exceed the caller's `max_depth`.
-    TooDeep,
-}
-
-/// Whether entering `canonical` from `active` (every file of the same kind
-/// currently on the call stack, canonicalized) would create a cycle or
-/// exceed `max_depth`. The generic core behind `check_workflow_nesting`
-/// (`workflow:` nodes, `max_depth` = `MAX_WORKFLOW_DEPTH`) and
-/// `call_subagent_tool` (`subagents:` calls, `max_depth` =
-/// `MAX_SUBAGENT_DEPTH`), so both kinds of self-referential file nesting
-/// share one cycle/depth-limit check instead of two copies of the same two
-/// comparisons.
-fn check_nesting_depth(
-    active: &[PathBuf],
-    canonical: &Path,
-    max_depth: usize,
-) -> Result<(), NestingDepthError> {
-    if active.iter().any(|path| path == canonical) {
-        return Err(NestingDepthError::Cycle);
-    }
-    if active.len() >= max_depth {
-        return Err(NestingDepthError::TooDeep);
-    }
-    Ok(())
-}
-
-/// Whether entering `canonical` from `active` (every `workflow:` file
-/// currently on the call stack, canonicalized) would create a cycle or
-/// exceed `MAX_WORKFLOW_DEPTH`. Shared by `WorkflowScope::nested` (fails the
-/// whole run) and `lint::lint_sub_workflow` (reports it as one more issue and
-/// keeps linting the rest of the file), so the two can't drift on what counts
-/// as too deep or cyclic.
-pub(crate) fn check_workflow_nesting(
-    active: &[PathBuf],
-    canonical: &Path,
-) -> Result<(), NestingDepthError> {
-    check_nesting_depth(active, canonical, MAX_WORKFLOW_DEPTH)
-}
-
 /// The loaded config file, the MCP registry, the skill cache, the subagent
 /// registry, and the run's top-level cancellation source for the whole
 /// `lait`/`lait agent run`/`lait run` invocation — unlike `WorkflowScope`,
@@ -1908,15 +1813,16 @@ impl WorkflowScope {
                 resolved_path.display()
             )
         })?;
-        if let Err(error) = check_workflow_nesting(&self.active_paths, &canonical) {
+        if let Err(error) = nesting::check_workflow_nesting(&self.active_paths, &canonical) {
             match error {
-                NestingDepthError::Cycle => bail!(
+                nesting::NestingDepthError::Cycle => bail!(
                     "step '{label}': 'workflow: {}' would create a cycle ('{}' is already running)",
                     relative_path.display(),
                     canonical.display()
                 ),
-                NestingDepthError::TooDeep => bail!(
-                    "step '{label}': 'workflow:' nesting exceeded the maximum depth of {MAX_WORKFLOW_DEPTH}"
+                nesting::NestingDepthError::TooDeep => bail!(
+                    "step '{label}': 'workflow:' nesting exceeded the maximum depth of {}",
+                    nesting::MAX_WORKFLOW_DEPTH
                 ),
             }
         }

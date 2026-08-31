@@ -298,6 +298,48 @@ pub(crate) fn expand_env_placeholders(value: &str) -> Result<String> {
     expand_with(value, |name| std::env::var(name).ok())
 }
 
+pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+
+/// Resolves the endpoint a request goes to from the three layers every
+/// caller shares — explicit override > model-definition value > config
+/// top-level — falling back to `DEFAULT_BASE_URL`, normalizing the trailing
+/// slash, and rejecting an empty base URL. `${VAR}` placeholders are only
+/// expanded in the config-sourced layers (see `expand_env_placeholders`),
+/// never in an override, which the shell already expands on its own. The API
+/// key comes back as `None` when no layer sets one — `resolve_request_settings`
+/// substitutes its dummy key, `lait models --remote` sends no Authorization
+/// header at all.
+pub(crate) fn resolve_endpoint(
+    base_url_override: Option<String>,
+    api_key_override: Option<String>,
+    model_base_url: Option<&str>,
+    model_api_key: Option<&str>,
+    file_config: &ConfigFile,
+) -> Result<(String, Option<String>)> {
+    let model_base_url = model_base_url.map(expand_env_placeholders).transpose()?;
+    let config_base_url = file_config
+        .base_url
+        .as_deref()
+        .map(expand_env_placeholders)
+        .transpose()?;
+    let base_url = base_url_override
+        .or(model_base_url)
+        .or(config_base_url)
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let base_url = base_url.trim_end_matches('/').to_owned();
+    if base_url.is_empty() {
+        return Err(anyhow!("base URL must not be empty"));
+    }
+    let model_api_key = model_api_key.map(expand_env_placeholders).transpose()?;
+    let config_api_key = file_config
+        .api_key
+        .as_deref()
+        .map(expand_env_placeholders)
+        .transpose()?;
+    let api_key = api_key_override.or(model_api_key).or(config_api_key);
+    Ok((base_url, api_key))
+}
+
 /// The parsing logic behind `expand_env_placeholders`, taking a `lookup`
 /// function instead of reading `std::env` directly so it can be unit tested
 /// without touching real process environment variables (mutating those from

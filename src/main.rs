@@ -17,6 +17,7 @@ mod lint;
 mod llm;
 mod mcp;
 mod models;
+mod nesting;
 mod process;
 mod prompt;
 mod render;

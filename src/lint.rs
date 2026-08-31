@@ -8,9 +8,10 @@ use anyhow::{Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
-    app::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
     config::{self, ConfigFile},
-    jq, schema, template, workflow,
+    jq,
+    nesting::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
+    schema, template, workflow,
 };
 
 /// How serious a `LintIssue` is. An `Error` names something that would fail
