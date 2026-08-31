@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod docgen;
 mod dotenv;
+mod engine;
 mod frontmatter;
 mod history;
 mod init;
