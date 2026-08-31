@@ -1688,16 +1688,21 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let env = AppContext::new(&file_config);
     let initial_prompt = prompt.clone();
-    let (current_input, _, _, _) = env
+    let StepsOutcome {
+        output: current_input,
+        ..
+    } = env
         .finish(run_steps(
             &wf.steps,
             prompt,
-            &scope,
-            &env,
-            0,
-            "",
             workflow::StepOutputs::new(),
-            env.cancel.clone(),
+            RunStepsFrame {
+                scope: &scope,
+                env: &env,
+                start_counter: 0,
+                progress_prefix: "",
+                cancellation: env.cancel.clone(),
+            },
         ))
         .await?;
     println!("{current_input}");
@@ -1978,7 +1983,12 @@ enum Flow {
 /// The final input, the running progress counter, the `Flow` signal the run
 /// ended with, and the named step outputs recorded along the way, returned by
 /// `run_steps`.
-type StepsOutcome = Result<(String, usize, Flow, workflow::StepOutputs)>;
+struct StepsOutcome {
+    output: String,
+    counter: usize,
+    flow: Flow,
+    steps_outputs: workflow::StepOutputs,
+}
 
 /// Returns an error as soon as the cancellation inherited from an enclosing
 /// timed step/workflow is observed. Router frames use this check between
@@ -1994,15 +2004,33 @@ fn check_workflow_cancellation(
     Ok(())
 }
 
+/// Where in the overall run a call to `run_steps` sits, as opposed to
+/// `steps`/`current_input`/`steps_outputs` (passed to `run_steps` directly),
+/// which are what to run and the data flowing through it. Unchanged across
+/// most recursive calls — `switch`/`loop`/a sequential `for_each` item/
+/// `on_error` all reuse the caller's own frame fields — while a `parallel`
+/// branch or a concurrent `for_each` item builds itself a fresh one with
+/// `start_counter: 0` and a branch-local `progress_prefix`, and a nested
+/// `workflow:` node's own call (from `execute_step`) builds one with a new
+/// `scope` (see `WorkflowScope::nested`) and `cancellation` set to the
+/// node's own `step_cancel`.
+struct RunStepsFrame<'a> {
+    scope: &'a WorkflowScope,
+    env: &'a AppContext<'a>,
+    start_counter: usize,
+    progress_prefix: &'a str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+}
+
 /// Runs a sequence of steps (the workflow's top-level `steps`, the nested
 /// `steps` of a `switch` case/`else`, or a `parallel` branch), returning the
 /// final input and the running progress counter so nested calls keep
 /// numbering `[n]` labels continuously across the whole executed path
-/// (skipped steps still consume a number). `progress_prefix` is prepended to
-/// every progress line, so a `parallel` branch's interleaved output stays
-/// attributable to its branch; it is threaded through unchanged by `switch`
-/// (only one case ever runs, so its numbering stays continuous with the
-/// parent) but reset to a fresh branch-local prefix and counter by
+/// (skipped steps still consume a number). `frame.progress_prefix` is
+/// prepended to every progress line, so a `parallel` branch's interleaved
+/// output stays attributable to its branch; it is threaded through unchanged
+/// by `switch` (only one case ever runs, so its numbering stays continuous
+/// with the parent) but reset to a fresh branch-local prefix and counter by
 /// `parallel` (every branch runs concurrently, so a single shared counter
 /// would not reflect real execution order). `steps_outputs` is threaded the
 /// same way as `current_input`/`counter` for a `switch` case, `loop`
@@ -2012,23 +2040,22 @@ fn check_workflow_cancellation(
 /// recording into a shared namespace would race, and there is no well-defined
 /// "the" value for an id set differently by two branches. Boxed because a
 /// `switch`/`parallel` step recurses into this function from within an
-/// `async` body, which Rust cannot size otherwise. `cancellation` is cloned
-/// into every nested frame and router jq operation, preserving the timeout of
-/// the enclosing step/workflow across control-flow boundaries.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "recursive workflow state is intentionally explicit at each call site"
-)]
+/// `async` body, which Rust cannot size otherwise. `frame.cancellation` is
+/// cloned into every nested frame and router jq operation, preserving the
+/// timeout of the enclosing step/workflow across control-flow boundaries.
 fn run_steps<'a>(
     steps: &'a [workflow::FlowStep],
     current_input: String,
-    scope: &'a WorkflowScope,
-    env: &'a AppContext<'a>,
-    start_counter: usize,
-    progress_prefix: &'a str,
     steps_outputs: workflow::StepOutputs,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
-) -> Pin<Box<dyn Future<Output = StepsOutcome> + 'a>> {
+    frame: RunStepsFrame<'a>,
+) -> Pin<Box<dyn Future<Output = Result<StepsOutcome>> + 'a>> {
+    let RunStepsFrame {
+        scope,
+        env,
+        start_counter,
+        progress_prefix,
+        cancellation,
+    } = frame;
     Box::pin(async move {
         let mut current_input = current_input;
         let mut counter = start_counter;
@@ -2067,19 +2094,26 @@ fn run_steps<'a>(
                                 run_steps(
                                     &case.steps,
                                     current_input.clone(),
-                                    scope,
-                                    env,
-                                    counter,
-                                    progress_prefix,
                                     steps_outputs.clone(),
-                                    cancellation.clone(),
+                                    RunStepsFrame {
+                                        scope,
+                                        env,
+                                        start_counter: counter,
+                                        progress_prefix,
+                                        cancellation: cancellation.clone(),
+                                    },
                                 )
                                 .await?,
                             );
                             break;
                         }
                     }
-                    let (result, new_counter, flow, new_steps_outputs) = match matched {
+                    let StepsOutcome {
+                        output: result,
+                        counter: new_counter,
+                        flow,
+                        steps_outputs: new_steps_outputs,
+                    } = match matched {
                         Some(result) => result,
                         None => match &switch.else_steps {
                             Some(else_steps) => {
@@ -2089,12 +2123,14 @@ fn run_steps<'a>(
                                 run_steps(
                                     else_steps,
                                     current_input.clone(),
-                                    scope,
-                                    env,
-                                    counter,
-                                    progress_prefix,
                                     steps_outputs.clone(),
-                                    cancellation.clone(),
+                                    RunStepsFrame {
+                                        scope,
+                                        env,
+                                        start_counter: counter,
+                                        progress_prefix,
+                                        cancellation: cancellation.clone(),
+                                    },
                                 )
                                 .await?
                             }
@@ -2110,7 +2146,12 @@ fn run_steps<'a>(
                     steps_outputs = new_steps_outputs;
                     record_step_output(&mut steps_outputs, step, &current_input);
                     if flow != Flow::Continue {
-                        return Ok((current_input, counter, flow, steps_outputs));
+                        return Ok(StepsOutcome {
+                            output: current_input,
+                            counter,
+                            flow,
+                            steps_outputs,
+                        });
                     }
                     continue;
                 }
@@ -2137,12 +2178,14 @@ fn run_steps<'a>(
                             run_steps(
                                 &branch.steps,
                                 current_input.clone(),
-                                scope,
-                                env,
-                                0,
-                                branch_prefix,
                                 steps_outputs.clone(),
-                                cancellation.clone(),
+                                RunStepsFrame {
+                                    scope,
+                                    env,
+                                    start_counter: 0,
+                                    progress_prefix: branch_prefix,
+                                    cancellation: cancellation.clone(),
+                                },
                             )
                         },
                     );
@@ -2154,10 +2197,10 @@ fn run_steps<'a>(
                     // got its own clone of `steps_outputs` (see this function's
                     // doc comment), so whatever it recorded stays branch-local.
                     let mut joined = serde_json::Map::new();
-                    for (branch_label, (branch_output, _, _, _)) in
+                    for (branch_label, branch_result) in
                         branch_labels.into_iter().zip(branch_results)
                     {
-                        joined.insert(branch_label, template::parse_input(&branch_output));
+                        joined.insert(branch_label, template::parse_input(&branch_result.output));
                     }
                     let joined_json = serde_json::to_string(&serde_json::Value::Object(joined))
                         .context("failed to serialize joined 'parallel' branch outputs")?;
@@ -2221,15 +2264,22 @@ fn run_steps<'a>(
                         eprintln!(
                             "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
                         );
-                        let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                        let StepsOutcome {
+                            output: result,
+                            counter: new_counter,
+                            flow,
+                            steps_outputs: new_steps_outputs,
+                        } = run_steps(
                             &loop_def.steps,
                             iteration_input.clone(),
-                            scope,
-                            env,
-                            loop_counter,
-                            progress_prefix,
                             steps_outputs.clone(),
-                            cancellation.clone(),
+                            RunStepsFrame {
+                                scope,
+                                env,
+                                start_counter: loop_counter,
+                                progress_prefix,
+                                cancellation: cancellation.clone(),
+                            },
                         )
                         .await?;
                         iteration_input = result;
@@ -2239,12 +2289,12 @@ fn run_steps<'a>(
                             Flow::Continue => {}
                             Flow::Break => break true,
                             Flow::Stop => {
-                                return Ok((
-                                    iteration_input,
-                                    loop_counter,
-                                    Flow::Stop,
+                                return Ok(StepsOutcome {
+                                    output: iteration_input,
+                                    counter: loop_counter,
+                                    flow: Flow::Stop,
                                     steps_outputs,
-                                ));
+                                });
                             }
                         }
                         if let Some(until_cond) = &loop_def.until
@@ -2322,15 +2372,22 @@ fn run_steps<'a>(
                             // in the pipeline does.
                             let item_input =
                                 value_to_input_text(item, "failed to serialize a 'for_each' item")?;
-                            let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                            let StepsOutcome {
+                                output: result,
+                                counter: new_counter,
+                                flow,
+                                steps_outputs: new_steps_outputs,
+                            } = run_steps(
                                 &for_each.steps,
                                 item_input,
-                                scope,
-                                env,
-                                for_each_counter,
-                                progress_prefix,
                                 steps_outputs.clone(),
-                                cancellation.clone(),
+                                RunStepsFrame {
+                                    scope,
+                                    env,
+                                    start_counter: for_each_counter,
+                                    progress_prefix,
+                                    cancellation: cancellation.clone(),
+                                },
                             )
                             .await?;
                             for_each_counter = new_counter;
@@ -2346,7 +2403,12 @@ fn run_steps<'a>(
                         }
                         counter = for_each_counter;
                         if let Some(result) = stop_result {
-                            return Ok((result, counter, Flow::Stop, steps_outputs));
+                            return Ok(StepsOutcome {
+                                output: result,
+                                counter,
+                                flow: Flow::Stop,
+                                steps_outputs,
+                            });
                         }
                         results
                     } else {
@@ -2368,12 +2430,14 @@ fn run_steps<'a>(
                                 run_steps(
                                     &for_each.steps,
                                     item_input,
-                                    scope,
-                                    env,
-                                    0,
-                                    item_prefix,
                                     steps_outputs.clone(),
-                                    cancellation.clone(),
+                                    RunStepsFrame {
+                                        scope,
+                                        env,
+                                        start_counter: 0,
+                                        progress_prefix: item_prefix,
+                                        cancellation: cancellation.clone(),
+                                    },
                                 )
                             },
                         );
@@ -2385,14 +2449,14 @@ fn run_steps<'a>(
                         // got its own clone of `steps_outputs` (see this
                         // function's doc comment), so nothing it records leaks
                         // back here.
-                        let item_results: Vec<(String, usize, Flow, workflow::StepOutputs)> =
+                        let item_results: Vec<StepsOutcome> =
                             futures_util::stream::iter(item_futures)
                                 .buffered(max_concurrency)
                                 .try_collect()
                                 .await?;
                         item_results
                             .into_iter()
-                            .map(|(output, _, _, _)| template::parse_input(&output))
+                            .map(|outcome| template::parse_input(&outcome.output))
                             .collect()
                     };
 
@@ -2468,15 +2532,22 @@ fn run_steps<'a>(
                                 });
                                 let error_input_json = serde_json::to_string(&error_input)
                                     .context("failed to serialize 'on_error' input")?;
-                                let (result, new_counter, flow, new_steps_outputs) = run_steps(
+                                let StepsOutcome {
+                                    output: result,
+                                    counter: new_counter,
+                                    flow,
+                                    steps_outputs: new_steps_outputs,
+                                } = run_steps(
                                     &on_error.steps,
                                     error_input_json,
-                                    scope,
-                                    env,
-                                    counter,
-                                    progress_prefix,
                                     steps_outputs.clone(),
-                                    cancellation.clone(),
+                                    RunStepsFrame {
+                                        scope,
+                                        env,
+                                        start_counter: counter,
+                                        progress_prefix,
+                                        cancellation: cancellation.clone(),
+                                    },
                                 )
                                 .await?;
                                 counter = new_counter;
@@ -2487,7 +2558,12 @@ fn run_steps<'a>(
                                     // output before bubbling the control-flow signal,
                                     // just like the router branches above do.
                                     record_step_output(&mut steps_outputs, step, &result);
-                                    return Ok((result, counter, flow, steps_outputs));
+                                    return Ok(StepsOutcome {
+                                        output: result,
+                                        counter,
+                                        flow,
+                                        steps_outputs,
+                                    });
                                 }
                                 result
                             }
@@ -2500,13 +2576,28 @@ fn run_steps<'a>(
             record_step_output(&mut steps_outputs, step, &current_input);
 
             if step.r#break == Some(true) {
-                return Ok((current_input, counter, Flow::Break, steps_outputs));
+                return Ok(StepsOutcome {
+                    output: current_input,
+                    counter,
+                    flow: Flow::Break,
+                    steps_outputs,
+                });
             }
             if step.stop == Some(true) {
-                return Ok((current_input, counter, Flow::Stop, steps_outputs));
+                return Ok(StepsOutcome {
+                    output: current_input,
+                    counter,
+                    flow: Flow::Stop,
+                    steps_outputs,
+                });
             }
         }
-        Ok((current_input, counter, Flow::Continue, steps_outputs))
+        Ok(StepsOutcome {
+            output: current_input,
+            counter,
+            flow: Flow::Continue,
+            steps_outputs,
+        })
     })
 }
 
@@ -2977,15 +3068,17 @@ async fn execute_step(
         // this step's own concern, not the caller's — only its final output
         // crosses back.
         let sub_progress_prefix = format!("{progress_prefix}    ");
-        let (result, ..) = run_steps(
+        let StepsOutcome { output: result, .. } = run_steps(
             &sub_wf.steps,
             current_input.to_string(),
-            &sub_scope,
-            env,
-            0,
-            &sub_progress_prefix,
             workflow::StepOutputs::new(),
-            step_cancel.clone(),
+            RunStepsFrame {
+                scope: &sub_scope,
+                env,
+                start_counter: 0,
+                progress_prefix: &sub_progress_prefix,
+                cancellation: step_cancel.clone(),
+            },
         )
         .await
         .with_context(|| format!("step '{label}'"))?;
@@ -3210,7 +3303,7 @@ fn write_nonblocking_special_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppContext, WorkflowScope, apply_jq, run_steps, write_output_file};
+    use super::{AppContext, RunStepsFrame, WorkflowScope, apply_jq, run_steps, write_output_file};
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
@@ -3281,12 +3374,14 @@ steps:
         let execution = run_steps(
             &workflow.steps,
             "null".to_owned(),
-            &scope,
-            &env,
-            0,
-            "",
             crate::workflow::StepOutputs::new(),
-            Some(token.clone()),
+            RunStepsFrame {
+                scope: &scope,
+                env: &env,
+                start_counter: 0,
+                progress_prefix: "",
+                cancellation: Some(token.clone()),
+            },
         );
         tokio::pin!(execution);
         let result = tokio::select! {
