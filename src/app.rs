@@ -1,10 +1,8 @@
 use std::{
     borrow::Cow,
     future::Future,
-    io::Write,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -3010,7 +3008,7 @@ async fn execute_step(
     }
 
     if let Some(path) = &node.write_file {
-        write_output_file(path, &step_output, step_cancel)
+        async_io::write_output_file(path, &step_output, step_cancel)
             .await
             .with_context(|| format!("step '{label}'"))?;
     }
@@ -3037,202 +3035,10 @@ async fn apply_jq(
     jq::apply_cancellable_async(filter, input, steps_outputs, cancellation).await
 }
 
-/// Writes a node's output from a dedicated OS thread. The worker is kept off
-/// Tokio's runtime because a write to a special file such as a FIFO can block
-/// indefinitely. A timeout sets the worker's cancellation flag and waits for
-/// it to finish; Unix special files are opened non-blocking so that this
-/// cleanup cannot itself get stuck. Regular files use the same direct
-/// create/truncate/write behavior as `fs::write`, with cancellation checks
-/// between bounded chunks so existing inode, permission, hard-link, and
-/// symlink semantics remain intact.
-async fn write_output_file(
-    path: &Path,
-    output: &str,
-    step_cancel: Option<tokio_util::sync::CancellationToken>,
-) -> Result<()> {
-    let path = path.to_owned();
-    let output = output.to_owned();
-    // `run_blocking_with_path_lock` deliberately returns after a bounded
-    // cancellation cleanup even when an OS/network filesystem call ignores
-    // the cancellation flag; transferring the lease to the worker prevents a
-    // retry from writing the same path concurrently with that still-running
-    // worker.
-    let worker_path = path.clone();
-    async_io::run_blocking_with_path_lock(
-        &path,
-        move |cancelled| {
-            write_output_file_blocking(&worker_path, &output, cancelled)
-                .with_context(|| format!("failed to write output to '{}'", worker_path.display()))
-        },
-        step_cancel,
-    )
-    .await
-}
-
-/// Performs the blocking half of [`write_output_file`]. On Unix, the target is
-/// opened once with `O_NONBLOCK` and classified from that same handle. This
-/// removes the metadata-then-open TOCTOU window while preserving symlink,
-/// inode, permission, and hard-link behavior for regular files. FIFOs and
-/// other non-regular files continue through non-blocking I/O. Other platforms
-/// reject non-regular handles after a conservative path preflight, rather than
-/// attempting to write a device, named pipe, or reparse point.
-fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool) -> Result<()> {
-    if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
-    }
-    #[cfg(unix)]
-    {
-        use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
-
-        let file = loop {
-            if cancelled.load(Ordering::Acquire) {
-                bail!("output file write was cancelled");
-            }
-            match OpenOptions::new()
-                .write(true)
-                .create(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(path)
-            {
-                Ok(file) => break file,
-                // Opening a FIFO for writing without a reader reports ENXIO
-                // when O_NONBLOCK is set. Poll until a reader appears or the
-                // workflow cancellation flag asks us to stop.
-                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-
-        if !file.metadata()?.file_type().is_file() {
-            return write_nonblocking_special_file(file, output, cancelled);
-        }
-
-        write_regular_output_file(file, output, cancelled)
-    }
-
-    #[cfg(not(unix))]
-    {
-        // Windows has no portable non-blocking File API. Reject an already
-        // visible special/reparse target before opening it, then repeat the
-        // check on the opened handle to keep a path swap from turning into a
-        // write to a device or named pipe. Symlinks to regular files retain
-        // the existing follow-and-overwrite behavior.
-        match std::fs::metadata(path) {
-            Ok(metadata) if !metadata.file_type().is_file() => {
-                bail!(
-                    "refusing to write non-regular output path '{}'",
-                    path.display()
-                );
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            bail!(
-                "refusing to write non-regular output path '{}'",
-                path.display()
-            );
-        }
-        write_regular_output_file(file, output, cancelled)
-    }
-}
-
-/// Writes an ordinary file directly, preserving the target inode and the
-/// overwrite/permission behavior of `fs::write`. Chunking only exists to give
-/// a timed worker a bounded opportunity to observe cancellation.
-fn write_regular_output_file(
-    mut file: std::fs::File,
-    output: &str,
-    cancelled: &AtomicBool,
-) -> Result<()> {
-    if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
-    }
-    // Truncate only after the handle has been classified as a regular file.
-    // A timeout after this point intentionally leaves an empty/partial file:
-    // direct truncation is what preserves the existing inode, permissions,
-    // hard links, and symlink-following semantics of `fs::write`, but it is
-    // not an atomic replacement. The caller receives an error and must not
-    // treat the partial bytes as a completed node output.
-    file.set_len(0)?;
-    for chunk in output.as_bytes().chunks(64 * 1024) {
-        if cancelled.load(Ordering::Acquire) {
-            bail!("output file write was cancelled");
-        }
-        file.write_all(chunk)?;
-    }
-    file.flush()?;
-    if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-/// Writes FIFOs and other Unix special files with non-blocking I/O. Opening
-/// the descriptor with `O_NONBLOCK` by the caller means no system
-/// call can hold the worker past cancellation. The same handle is used for
-/// classification and writing; reopening the path here would reintroduce a
-/// metadata/open TOCTOU race.
-fn write_nonblocking_special_file(
-    mut file: std::fs::File,
-    output: &str,
-    cancelled: &AtomicBool,
-) -> Result<()> {
-    let bytes = output.as_bytes();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        if cancelled.load(Ordering::Acquire) {
-            bail!("output file write was cancelled");
-        }
-        match file.write(&bytes[offset..]) {
-            Ok(0) => bail!("output file write made no progress"),
-            Ok(written) => offset += written,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AppContext, RunStepsFrame, WorkflowScope, apply_jq, run_steps, write_output_file};
+    use super::{AppContext, RunStepsFrame, WorkflowScope, apply_jq, run_steps};
     use tokio_util::sync::CancellationToken;
-
-    #[tokio::test]
-    async fn a_cancelled_regular_write_does_not_truncate_an_existing_file() {
-        let path = std::env::temp_dir().join(format!(
-            "lait-cancelled-output-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after Unix epoch")
-                .as_nanos()
-        ));
-        std::fs::write(&path, "original").expect("failed to create output fixture");
-        let token = CancellationToken::new();
-        token.cancel();
-
-        let result = write_output_file(&path, "replacement", Some(token)).await;
-        let contents = std::fs::read_to_string(&path).expect("output fixture should remain");
-        std::fs::remove_file(&path).expect("failed to remove output fixture");
-
-        assert!(result.is_err(), "a cancelled write should fail");
-        assert_eq!(contents, "original");
-    }
 
     #[tokio::test]
     async fn an_already_cancelled_jq_stops_before_returning_a_value() {
@@ -3306,109 +3112,5 @@ steps:
             "router cancellation took too long: {:?}",
             started.elapsed()
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_cancelled_fifo_write_is_joined_before_a_retry_can_write() {
-        use std::{
-            fs::OpenOptions,
-            io::{ErrorKind, Read},
-            os::unix::fs::OpenOptionsExt,
-            sync::mpsc,
-            time::Duration,
-        };
-
-        let path = crate::test_support::unique_temp_path("lait-retry-output-fifo", "");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .expect("mkfifo should be available on Unix");
-        assert!(status.success());
-
-        // Keep a reader open without consuming anything. The first writer
-        // therefore fills the pipe and remains blocked, which makes a
-        // detached writer observable when the retry starts.
-        let reader = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-            .expect("FIFO reader should open without a writer");
-        let first_output = "x".repeat(512 * 1024);
-        let retry_output = "y".repeat(512 * 1024);
-        let cancel_token = CancellationToken::new();
-        let first_path = path.clone();
-        let first_output_for_task = first_output.clone();
-        let first_token = cancel_token.clone();
-        let first = tokio::spawn(async move {
-            write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cancel_token.cancel();
-        let first_result = tokio::time::timeout(Duration::from_secs(1), first)
-            .await
-            .expect("cancelling the first FIFO writer should finish promptly")
-            .unwrap();
-        assert!(first_result.is_err());
-
-        // Start the retry while the reader is still paused. If the first
-        // writer was not joined above, both writers will eventually publish
-        // their complete payload into the same FIFO.
-        let second_path = path.clone();
-        let second_output = retry_output.clone();
-        let second =
-            tokio::spawn(
-                async move { write_output_file(&second_path, &second_output, None).await },
-            );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let (read_done, read_result) = mpsc::channel();
-        let reader_thread = std::thread::spawn(move || {
-            let mut reader = reader;
-            let mut received = Vec::new();
-            let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => received.extend_from_slice(&buffer[..read]),
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error) => panic!("failed to read retry FIFO: {error}"),
-                }
-            }
-            read_done.send(received).unwrap();
-        });
-
-        tokio::time::timeout(Duration::from_secs(2), second)
-            .await
-            .expect("the retry writer should finish after the reader drains the FIFO")
-            .unwrap()
-            .expect("the retry writer should succeed");
-        reader_thread.join().unwrap();
-        let received = read_result
-            .recv_timeout(Duration::from_secs(1))
-            .expect("FIFO reader should observe EOF after the retry writer closes");
-
-        assert!(
-            received.len() >= retry_output.len(),
-            "retry FIFO received {} bytes, less than the retry payload of {}",
-            received.len(),
-            retry_output.len()
-        );
-        let first_prefix_len = received.len() - retry_output.len();
-        assert!(
-            first_prefix_len <= first_output.len(),
-            "cancelled FIFO writer published {} bytes after the retry started",
-            first_prefix_len.saturating_sub(first_output.len())
-        );
-        assert!(
-            received[..first_prefix_len]
-                .iter()
-                .all(|byte| *byte == b'x'),
-            "the cancelled writer's bytes must precede the retry payload"
-        );
-        assert_eq!(&received[first_prefix_len..], retry_output.as_bytes());
-        std::fs::remove_file(path).unwrap();
     }
 }
