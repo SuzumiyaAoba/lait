@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-This repository is primarily a Rust 2024 CLI (Rust 1.88, stable). `src/main.rs` is the module root; feature modules live in `src/`, with workflow parsing and validation under `src/workflow/`. Rust integration tests are in `tests/`, and `tests/support/` provides temporary-file fixtures and mock OpenAI-compatible servers. Japanese user documentation is in `docs/usage/ja/`. The `website/` directory is an Astro/Starlight TypeScript site; follow its existing `website/AGENTS.md` instructions for any work there. Configuration and development metadata are in `Cargo.toml`, `Makefile.toml`, `rust-toolchain.toml`, `lait.config.yml`, and `scripts/`.
+This repository is primarily a Rust 2024 CLI (Rust 1.88, stable). `src/main.rs` is the module root; feature modules live in `src/`, with workflow parsing and validation under `src/workflow/`. Rust integration tests are in `tests/`, and `tests/support/` provides temporary-file fixtures and mock OpenAI-compatible servers. Japanese user documentation is in `docs/usage/ja/` — this is the single source of truth; edit it, never the generated copy. The `website/` directory is an Astro/Starlight TypeScript site whose doc pages are generated from `docs/usage/ja/` by `website/scripts/sync-docs.mjs` (run `pnpm sync-docs` after editing docs, or just `pnpm build`/`pnpm dev`, which run it automatically); follow its existing `website/AGENTS.md` instructions for any other work there. Configuration and development metadata are in `Cargo.toml`, `Makefile.toml`, `rust-toolchain.toml`, `lait.config.yml`, and `scripts/`.
 
 ## Build, Test, and Development Commands
 
