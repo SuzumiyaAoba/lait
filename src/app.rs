@@ -2445,12 +2445,14 @@ fn run_steps<'a>(
                     let attempt_result = execute_step_with_retry(
                         node,
                         &current_input,
-                        scope,
-                        env,
-                        &label,
-                        progress_prefix,
-                        &steps_outputs,
-                        cancellation.clone(),
+                        StepContext {
+                            scope,
+                            env,
+                            label: &label,
+                            progress_prefix,
+                            steps_outputs: &steps_outputs,
+                            step_cancel: cancellation.clone(),
+                        },
                     )
                     .await;
                     match attempt_result {
@@ -2531,20 +2533,20 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
 /// `on_error` or propagate it. `label` is the calling `use:` site's label
 /// (not the node's own id), so error messages point at where in the flow the
 /// failure happened.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "retry execution threads explicit workflow, display, output, and cancellation state"
-)]
 async fn execute_step_with_retry(
     node: &workflow::NodeDefinition,
     current_input: &str,
-    scope: &WorkflowScope,
-    env: &AppContext<'_>,
-    label: &str,
-    progress_prefix: &str,
-    steps_outputs: &workflow::StepOutputs,
-    workflow_cancel: Option<tokio_util::sync::CancellationToken>,
+    context: StepContext<'_, '_>,
 ) -> Result<String> {
+    let StepContext {
+        scope,
+        env,
+        label,
+        progress_prefix,
+        steps_outputs,
+        step_cancel: workflow_cancel,
+    } = context;
+
     let calls_model = node.calls_model();
     let effective_retry = node.retry.as_ref().or(calls_model
         .then_some(scope.defaults.retry.as_ref())
@@ -2591,7 +2593,7 @@ async fn execute_step_with_retry(
                 let execution = execute_step(
                     node,
                     current_input,
-                    StepExecutionContext {
+                    StepContext {
                         scope,
                         env,
                         label,
@@ -2616,7 +2618,7 @@ async fn execute_step_with_retry(
                 execute_step(
                     node,
                     current_input,
-                    StepExecutionContext {
+                    StepContext {
                         scope,
                         env,
                         label,
@@ -2677,7 +2679,16 @@ async fn wait_retry_delay(
     }
 }
 
-struct StepExecutionContext<'a, 'env> {
+/// The state a single node execution needs, bundled so
+/// `execute_step_with_retry`/`execute_step` take one parameter instead of
+/// six. `step_cancel` is the cancellation in effect for this particular
+/// attempt — the caller's own cancellation on the first attempt of a node
+/// with no `timeout`, or a child token scoped to just that attempt when a
+/// `timeout` is set (see `execute_step_with_retry`) — which is why it lives
+/// here rather than on `AppContext`: it changes across attempts and nesting
+/// depths, unlike everything on `AppContext`, which does not.
+#[derive(Clone)]
+struct StepContext<'a, 'env> {
     scope: &'a WorkflowScope,
     env: &'a AppContext<'env>,
     label: &'a str,
@@ -2805,9 +2816,9 @@ async fn resolve_attachments<'a>(
 async fn execute_step(
     node: &workflow::NodeDefinition,
     current_input: &str,
-    context: StepExecutionContext<'_, '_>,
+    context: StepContext<'_, '_>,
 ) -> Result<String> {
-    let StepExecutionContext {
+    let StepContext {
         scope,
         env,
         label,
