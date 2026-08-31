@@ -2,7 +2,10 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{jq, template};
+use crate::jq;
+
+#[cfg(test)]
+use crate::template;
 
 mod model;
 mod validate;
@@ -44,11 +47,25 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
 /// to reference.
 pub(crate) type StepOutputs = jq::Steps;
 
-/// Evaluates a `when`/case-condition jq filter against the current input,
-/// using the same JSON-or-string coercion as `{{ input }}` templates
-/// (`template::parse_input`) so a `when:` right after a plain-text `prompt:`
-/// step doesn't fail just because the input isn't JSON. `steps` is exposed to
-/// the filter as `$steps` (see `StepOutputs`).
+/// Evaluates a `when`/case-condition jq filter against the current input on a
+/// bounded blocking worker. Input coercion/serialization is performed by the
+/// worker as well, so a very large plain-text input cannot block a Tokio
+/// executor thread before jq starts evaluating it. `steps` is exposed to the
+/// filter as `$steps` (see `StepOutputs`).
+pub(crate) async fn eval_when_async(
+    filter: &str,
+    current_input: &str,
+    steps: &StepOutputs,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<bool> {
+    jq::apply_bool_cancellable_async(filter, current_input, steps, cancellation)
+        .await
+        .context("failed to evaluate 'when' condition")
+}
+
+/// Synchronous helper retained for the pure workflow unit tests. Runtime
+/// execution uses [`eval_when_async`] so jq never runs on Tokio's executor.
+#[cfg(test)]
 pub(crate) fn eval_when(filter: &str, current_input: &str, steps: &StepOutputs) -> Result<bool> {
     let value = template::parse_input(current_input);
     let input_json = serde_json::to_string(&value)

@@ -3,7 +3,7 @@
 //! valid scaffold instead of a blank page. An existing file is never
 //! overwritten.
 
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -122,13 +122,27 @@ pub(crate) fn run(args: InitArgs) -> Result<()> {
         ),
     };
 
-    if path.exists() {
-        bail!(
-            "'{}' already exists; refusing to overwrite it (move it aside or pass another PATH)",
-            path.display()
-        );
-    }
-    std::fs::write(&path, contents)
+    // `exists()` followed by `write()` has a TOCTOU window: another process
+    // (or a symlink swap) could make us overwrite a file after the check.  A
+    // single `create_new` open is atomic and enforces init's promise never to
+    // overwrite an existing path.
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "'{}' already exists; refusing to overwrite it (move it aside or pass another PATH)",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create '{}'", path.display()));
+        }
+    };
+    file.write_all(contents.as_bytes())
         .with_context(|| format!("failed to write '{}'", path.display()))?;
     println!("created '{}'", path.display());
     Ok(())

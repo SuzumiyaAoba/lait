@@ -90,7 +90,7 @@ nodes:
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.md#mcp-ツールの利用) と
-[ワークフロー（workflow.yml）](./workflow.md#mcp-ツールの利用-mcp) にもあります。
+[ワークフロー（workflow.yml）](./workflow.md#mcp-ツールの利用mcp) にもあります。
 
 ## ツール名の扱い
 

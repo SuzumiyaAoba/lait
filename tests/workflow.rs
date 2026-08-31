@@ -2,6 +2,9 @@ mod support;
 
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::path::Path;
+
 use support::{
     AgentMarkdownFile, ConfigDirectory, JsonSchemaFile, MINIMAL_PNG_BYTES, MockServer,
     WorkflowFile, run_lait_workflow, test_command, without_json_whitespace,
@@ -10,6 +13,101 @@ use support::{
 const SERVER_ERROR_BODY: &str = r#"{"error":{"message":"mock failure","type":"server_error"}}"#;
 
 const CHAT_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
+
+#[cfg(unix)]
+fn create_fifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("failed to create FIFO for timeout test");
+    assert!(status.success(), "mkfifo failed: {status}");
+}
+
+#[cfg(unix)]
+fn timeout_workflow(node_fields: &str) -> WorkflowFile {
+    WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: http://127.0.0.1:1/v1
+      model_id: workflow-model
+nodes:
+  call:
+{node_fields}
+steps:
+  - use: call
+"#,
+    ))
+}
+
+#[cfg(unix)]
+fn run_workflow_until_timeout(workflow: &Path) -> (std::process::Output, Duration) {
+    use std::process::Stdio;
+
+    let started = Instant::now();
+    let mut child = test_command()
+        .args([
+            "run",
+            workflow
+                .to_str()
+                .expect("workflow path should be valid UTF-8"),
+            "hello",
+            "--no-history",
+            "--no-config",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn timed workflow");
+    let deadline = started + Duration::from_secs(3);
+
+    loop {
+        if child
+            .try_wait()
+            .expect("failed to poll timed workflow")
+            .is_some()
+        {
+            let elapsed = started.elapsed();
+            let output = child
+                .wait_with_output()
+                .expect("failed to collect timed workflow output");
+            return (output, elapsed);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("failed to reap a hung timed workflow");
+            panic!(
+                "timed workflow did not return after cancellation: elapsed={:?}, output={output:?}",
+                started.elapsed()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn assert_fifo_read_times_out(workflow: &Path) {
+    let (output, elapsed) = run_workflow_until_timeout(workflow);
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "workflow timeout did not return promptly: {elapsed:?}"
+    );
+    assert!(
+        !output.status.success(),
+        "expected the blocked workflow to time out: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed out"),
+        "expected a timeout error, stderr: {stderr}"
+    );
+}
 
 #[test]
 fn resolves_model_and_base_url_from_models_embedded_in_the_workflow_file() {
@@ -1526,6 +1624,74 @@ steps:
 }
 
 #[test]
+fn switch_records_its_named_output_before_bubbling_break() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  read_route:
+    jq: '$steps.route'
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 1
+      steps:
+        - id: route
+          switch:
+            cases:
+              - when: 'true'
+                steps:
+                  - break: true
+  - use: read_route
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "route input");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "route input",
+        "the switch's named output should remain available after its branch breaks"
+    );
+}
+
+#[test]
+fn on_error_records_its_named_output_before_bubbling_break() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  fail:
+    command: ["sh", "-c", "exit 1"]
+  recover:
+    jq: '"recovered"'
+  read_failure:
+    jq: '$steps.failed'
+steps:
+  - loop:
+      until: 'true'
+      max_iterations: 1
+      steps:
+        - id: failed
+          use: fail
+          on_error:
+            steps:
+              - use: recover
+              - break: true
+  - use: read_failure
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "input");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "recovered",
+        "the failed step's on_error output should remain available after it breaks"
+    );
+}
+
+#[test]
 fn break_stops_a_loop_before_its_until_condition_or_max_iterations() {
     let workflow = WorkflowFile::new(
         r#"
@@ -2224,6 +2390,229 @@ steps:
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn write_file_preserves_existing_inode_and_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let config = ConfigDirectory::empty();
+    let output_path = config.path().join("output.txt");
+    let hard_link_path = config.path().join("output-hard-link.txt");
+    std::fs::write(&output_path, "before").expect("failed to create output fixture");
+    let mut permissions = std::fs::metadata(&output_path)
+        .expect("output fixture should exist")
+        .permissions();
+    permissions.set_mode(0o640);
+    std::fs::set_permissions(&output_path, permissions)
+        .expect("failed to set output fixture permissions");
+    std::fs::hard_link(&output_path, &hard_link_path).expect("failed to create hard link");
+    let original_inode = std::fs::metadata(&output_path)
+        .expect("output fixture should exist")
+        .ino();
+
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  emit:
+    write_file: "{}"
+steps:
+  - use: emit
+"#,
+        output_path.display()
+    ));
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "after",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("output file should exist"),
+        "after"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&hard_link_path).expect("hard link should still exist"),
+        "after",
+        "write_file should truncate the existing inode rather than replacing it"
+    );
+    assert_eq!(
+        std::fs::metadata(&output_path)
+            .expect("output file should exist")
+            .ino(),
+        original_inode,
+        "write_file should preserve the existing inode"
+    );
+    assert_eq!(
+        std::fs::metadata(&output_path)
+            .expect("output file should exist")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640,
+        "write_file should preserve existing permissions"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_file_follows_a_symlink_to_an_existing_file() {
+    use std::os::unix::fs::symlink;
+
+    let config = ConfigDirectory::empty();
+    let target_path = config.path().join("target.txt");
+    let link_path = config.path().join("output-link.txt");
+    std::fs::write(&target_path, "before").expect("failed to create target fixture");
+    symlink(&target_path, &link_path).expect("failed to create output symlink");
+
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  emit:
+    write_file: "{}"
+steps:
+  - use: emit
+"#,
+        link_path.display()
+    ));
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "after",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        std::fs::read_to_string(&target_path).expect("target file should exist"),
+        "after"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link_path)
+            .expect("output symlink should still exist")
+            .file_type()
+            .is_symlink(),
+        "write_file should follow, not replace, an output symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_file_respects_an_existing_read_only_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config = ConfigDirectory::empty();
+    let output_path = config.path().join("read-only-output.txt");
+    std::fs::write(&output_path, "original").expect("failed to create output fixture");
+    let mut permissions = std::fs::metadata(&output_path)
+        .expect("output fixture should exist")
+        .permissions();
+    permissions.set_mode(0o444);
+    std::fs::set_permissions(&output_path, permissions)
+        .expect("failed to make output fixture read-only");
+
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  emit:
+    write_file: "{}"
+steps:
+  - use: emit
+"#,
+        output_path.display()
+    ));
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "replacement",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(!output.status.success(), "a read-only output should fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to write output"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("output file should remain readable"),
+        "original",
+        "a failed read-only write must not alter the existing content"
+    );
+    let mut writable_permissions = std::fs::metadata(&output_path)
+        .expect("output file should still exist")
+        .permissions();
+    writable_permissions.set_mode(0o644);
+    std::fs::set_permissions(&output_path, writable_permissions)
+        .expect("failed to restore output fixture permissions");
+}
+
+#[cfg(windows)]
+#[test]
+fn write_file_respects_an_existing_read_only_file() {
+    let config = ConfigDirectory::empty();
+    let output_path = config.path().join("read-only-output.txt");
+    std::fs::write(&output_path, "original").expect("failed to create output fixture");
+    let mut permissions = std::fs::metadata(&output_path)
+        .expect("output fixture should exist")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&output_path, permissions)
+        .expect("failed to make output fixture read-only");
+
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  emit:
+    write_file: "{}"
+steps:
+  - use: emit
+"#,
+        output_path.display()
+    ));
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "replacement",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(!output.status.success(), "a read-only output should fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to write output"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("output file should remain readable"),
+        "original",
+        "a failed read-only write must not alter the existing content"
+    );
+    let mut writable_permissions = std::fs::metadata(&output_path)
+        .expect("output file should still exist")
+        .permissions();
+    writable_permissions.set_readonly(false);
+    std::fs::set_permissions(&output_path, writable_permissions)
+        .expect("failed to restore output fixture permissions");
+}
+
 #[test]
 fn a_default_retry_recovers_a_step_without_its_own_retry() {
     let server = MockServer::start_sequence(&[
@@ -2506,6 +2895,123 @@ steps:
 
 #[cfg(unix)]
 #[test]
+fn a_timed_out_command_kills_descendants_in_its_process_group() {
+    let config = ConfigDirectory::empty();
+    let pid_path = config.path().join("timed-out-descendant.pid");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  stuck:
+    command: ["sh", "-c", "sleep 5 & echo $! > '{}'; wait"]
+    timeout: 1
+steps:
+  - use: stuck
+"#,
+        pid_path.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(!output.status.success(), "expected the command to time out");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "stderr: {stderr}");
+    let descendant_pid = std::fs::read_to_string(&pid_path)
+        .expect("the command should have written its descendant pid")
+        .trim()
+        .to_owned();
+
+    // `kill -0` also succeeds for a zombie, so inspect the process state and
+    // only consider a non-zombie process to be a leaked descendant. Poll
+    // briefly because an orphaned child may take a moment to be reaped by
+    // the system's init process after the command's shell is killed.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let state = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &descendant_pid])
+            .output()
+            .expect("failed to inspect the timed-out descendant");
+        let state = String::from_utf8_lossy(&state.stdout);
+        let running = state
+            .trim()
+            .chars()
+            .next()
+            .is_some_and(|state| state != 'Z');
+        if !running || Instant::now() >= deadline {
+            assert!(
+                !running,
+                "timed-out descendant {descendant_pid} is still running"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_command_kills_descendants_in_its_job_object() {
+    let config = ConfigDirectory::empty();
+    let pid_path = config.path().join("timed-out-descendant.pid");
+    // PowerShell accepts forward-slash paths on Windows, which keeps this
+    // inline YAML command independent of backslash escape rules.
+    let pid_path = pid_path.to_string_lossy().replace('\\', "/");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  stuck:
+    command: ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$p = Start-Process -FilePath powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Start-Sleep -Seconds 5"]
+    timeout: 1
+steps:
+  - use: stuck
+"#,
+        pid_path
+    ));
+
+    let started = Instant::now();
+    let output = run_lait_workflow(&workflow.path, "hello");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "Windows Job cleanup did not honor the command timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(!output.status.success(), "expected the command to time out");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "stderr: {stderr}");
+
+    let descendant_pid = std::fs::read_to_string(config.path().join("timed-out-descendant.pid"))
+        .expect("the command should have written its descendant pid")
+        .trim()
+        .to_owned();
+    let filter = format!("PID eq {descendant_pid}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let tasklist = std::process::Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+            .expect("failed to inspect the timed-out descendant");
+        let listed = String::from_utf8_lossy(&tasklist.stdout).contains(&descendant_pid);
+        if !listed || Instant::now() >= deadline {
+            assert!(
+                !listed,
+                "timed-out descendant {descendant_pid} is still running"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn command_timeout_covers_a_blocking_write_file_action() {
     use std::process::Stdio;
 
@@ -2550,6 +3056,150 @@ steps:
     assert!(!output.status.success(), "expected write_file to time out");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("timed out"), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timed_out_write_file_does_not_reach_a_later_on_error_reader() {
+    use std::process::Stdio;
+
+    let config = ConfigDirectory::empty();
+    let fifo_path = config.path().join("cancelled-output.fifo");
+    let fifo_status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("failed to create a FIFO for the cancellation test");
+    assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  emit:
+    write_file: "{}"
+    timeout: 1
+  consume:
+    command: ["sh", "-c", "IFS= read -r value < '{}' && printf 'stale:%s' \"$value\""]
+    timeout: 1
+  recover:
+    jq: '"recovered"'
+steps:
+  - use: emit
+    on_error:
+      steps:
+        - use: consume
+          on_error:
+            steps:
+              - use: recover
+"#,
+        fifo_path.display(),
+        fifo_path.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(
+        output.status.success(),
+        "the nested on_error recovery should succeed: {output:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "recovered",
+        "a timed-out write must not be allowed to feed a later reader"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timed_out_write_file_is_finished_before_a_retry_reuses_the_path() {
+    use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, process::Stdio};
+
+    let config = ConfigDirectory::empty();
+    let fifo_path = config.path().join("retry-output.fifo");
+    let counter_path = config.path().join("attempt.txt");
+    create_fifo(&fifo_path);
+
+    // Keep one FIFO descriptor open from just after the first timeout.  A
+    // detached writer from that attempt would win this reader and feed it
+    // "attempt1"; a cleaned-up writer leaves it for the retry, which must
+    // feed "attempt2" instead.
+    let reader_path = fifo_path.clone();
+    let reader = std::thread::spawn(move || -> std::io::Result<String> {
+        std::thread::sleep(Duration::from_millis(1_300));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(reader_path)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut value = String::new();
+        let mut buffer = [0_u8; 64];
+        while value.is_empty() {
+            match file.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(length) => value.push_str(&String::from_utf8_lossy(&buffer[..length])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            if !value.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(value)
+    });
+
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  emit:
+    command: ["sh", "-c", "n=0; test -f '{}' && n=$(cat '{}'); n=$((n+1)); printf '%s' \"$n\" > '{}'; printf 'attempt%s' \"$n\""]
+    write_file: "{}"
+    timeout: 1
+    retry:
+      max_attempts: 2
+      delay_seconds: 1
+steps:
+  - use: emit
+"#,
+        counter_path.display(),
+        counter_path.display(),
+        counter_path.display(),
+        fifo_path.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+    let read_value = reader
+        .join()
+        .expect("FIFO reader thread should not panic")
+        .expect("FIFO reader should receive the retry output");
+
+    assert!(
+        output.status.success(),
+        "a retry should succeed after the timed-out writer is cleaned up: {output:?}"
+    );
+    assert_eq!(
+        read_value, "attempt2",
+        "the reader must not receive bytes from the timed-out attempt"
+    );
 }
 
 #[test]
@@ -2612,6 +3262,48 @@ steps:
     assert!(!output.status.success(), "expected the command to time out");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("timed out"), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timed_out_jq_worker_is_reaped_before_on_error_and_cannot_write_output() {
+    let config = ConfigDirectory::empty();
+    let output_path = config.path().join("jq-timeout-output.txt");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+nodes:
+  spin:
+    jq: 'range(0; 1000000000)'
+    write_file: "{}"
+    timeout: 1
+  recover:
+    jq: '"recovered"'
+steps:
+  - use: spin
+    on_error:
+      steps:
+        - use: recover
+"#,
+        output_path.display()
+    ));
+
+    let started = Instant::now();
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "timed-out jq evaluation delayed on_error recovery: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        output.status.success(),
+        "on_error should run after the jq worker is cancelled: {output:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "recovered");
+    assert!(
+        !output_path.exists(),
+        "write_file must not run after jq cancellation"
+    );
 }
 
 #[test]
@@ -2792,4 +3484,144 @@ steps:
             .contains("note content")
     );
     assert_eq!(content[1]["type"], "image_url");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_prompt_input_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let schema_path = config.path().join("prompt-input-schema.fifo");
+    create_fifo(&schema_path);
+    let workflow = timeout_workflow(&format!(
+        "    prompt: \"{{{{ input }}}}\"\n    input_schema: \"{}\"\n    timeout: 1",
+        schema_path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_agent_input_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let schema_path = config.path().join("agent-input-schema.fifo");
+    create_fifo(&schema_path);
+    let agent = AgentMarkdownFile::new(&format!(
+        "---\ninput_schema:\n  file_path: \"{}\"\n---\nExtract the input.\n",
+        schema_path.display()
+    ));
+    let workflow = timeout_workflow(&format!(
+        "    agent: \"{}\"\n    timeout: 1",
+        agent.path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_agent_file_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let agent_path = config.path().join("blocked-agent.md.fifo");
+    create_fifo(&agent_path);
+    let workflow = timeout_workflow(&format!(
+        "    agent: \"{}\"\n    timeout: 1",
+        agent_path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_agent_output_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let schema_path = config.path().join("agent-output-schema.fifo");
+    create_fifo(&schema_path);
+    let agent = AgentMarkdownFile::new(&format!(
+        "---\nstructured_output: true\noutput_schema:\n  file_path: \"{}\"\n---\nExtract the answer.\n",
+        schema_path.display()
+    ));
+    let workflow = timeout_workflow(&format!(
+        "    agent: \"{}\"\n    timeout: 1",
+        agent.path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_prompt_output_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let schema_path = config.path().join("prompt-output-schema.fifo");
+    create_fifo(&schema_path);
+    let workflow = timeout_workflow(&format!(
+        "    prompt: \"{{{{ input }}}}\"\n    output_schema: \"{}\"\n    schema_name: answer\n    timeout: 1",
+        schema_path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_single_file_attachment_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let file_path = config.path().join("single-file.fifo");
+    create_fifo(&file_path);
+    let workflow = timeout_workflow(&format!(
+        "    prompt: \"{{{{ input }}}}\"\n    files: [\"{}\"]\n    timeout: 1",
+        file_path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn multiple_file_attachments_read_from_fifos_are_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let first_path = config.path().join("first-file.fifo");
+    let second_path = config.path().join("second-file.fifo");
+    create_fifo(&first_path);
+    create_fifo(&second_path);
+    let workflow = timeout_workflow(&format!(
+        "    prompt: \"{{{{ input }}}}\"\n    files: [\"{}\", \"{}\"]\n    timeout: 1",
+        first_path.display(),
+        second_path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_single_image_attachment_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let image_path = config.path().join("single-image.fifo");
+    create_fifo(&image_path);
+    let workflow = timeout_workflow(&format!(
+        "    prompt: \"{{{{ input }}}}\"\n    images: [\"{}\"]\n    timeout: 1",
+        image_path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
+}
+
+#[cfg(unix)]
+#[test]
+fn multiple_image_attachments_read_from_fifos_are_cancelled_by_the_step_timeout() {
+    let config = ConfigDirectory::empty();
+    let first_path = config.path().join("first-image.fifo");
+    let second_path = config.path().join("second-image.fifo");
+    create_fifo(&first_path);
+    create_fifo(&second_path);
+    let workflow = timeout_workflow(&format!(
+        "    prompt: \"{{{{ input }}}}\"\n    images: [\"{}\", \"{}\"]\n    timeout: 1",
+        first_path.display(),
+        second_path.display()
+    ));
+
+    assert_fifo_read_times_out(&workflow.path);
 }

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 
+use crate::async_io;
+
 /// The combined size limit across every `--file` attachment, chosen to keep a
 /// request body well within what a local server accepts while still allowing
 /// a handful of real source files. Exceeding it is a clear user error rather
@@ -24,29 +26,27 @@ const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// UTF-8 text (binary attachments aren't supported), or the combined size of
 /// every attachment exceeds `MAX_TOTAL_ATTACHMENT_BYTES`.
 ///
-/// Every file's metadata is checked against the size limit up front, before
-/// any content is read, so a limit violation never pays for reading content
-/// it's about to discard; the reads themselves then run concurrently (see
-/// `read_all`) since they're otherwise independent.
+/// The reads run concurrently (see `read_all`) since they are otherwise
+/// independent. The shared read budget is enforced while bytes are
+/// materialized, using the same descriptor that was opened for the read; this
+/// avoids a metadata-then-open TOCTOU window for paths that are replaced while
+/// attachments are being resolved.
 pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>> {
+    read_file_attachments_cancellable(files, None).await
+}
+
+/// The cancellation-aware form used by workflow nodes. Every content read
+/// runs on a dedicated worker, so a timeout can interrupt a FIFO or a slow
+/// filesystem even before the first model request is made.
+pub(crate) async fn read_file_attachments_cancellable(
+    files: &[PathBuf],
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<Option<String>> {
     if files.is_empty() {
         return Ok(None);
     }
 
-    let mut total_bytes: u64 = 0;
-    for path in files {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to read file '{}'", path.display()))?;
-        total_bytes += metadata.len();
-        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
-            bail!(
-                "'--file' attachments exceed the combined size limit of {} bytes",
-                MAX_TOTAL_ATTACHMENT_BYTES
-            );
-        }
-    }
-
-    let texts = read_all(files).await?;
+    let texts = read_all(files, cancellation).await?;
     let blocks: Vec<String> = files
         .iter()
         .zip(texts)
@@ -55,37 +55,56 @@ pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<St
     Ok(Some(blocks.join("\n\n")))
 }
 
-/// Reads and UTF-8-decodes every path in `files`, in order. A single file (the
-/// overwhelmingly common case for `--file`) is read inline with no task
-/// overhead; two or more run concurrently via `spawn_blocking`, since each
-/// read is independent of the others.
-async fn read_all(files: &[PathBuf]) -> Result<Vec<String>> {
-    match files {
-        [] => Ok(Vec::new()),
-        [single] => Ok(vec![read_text_file(single)?]),
-        many => {
-            // `.cloned()` isn't redundant here despite what clippy's lint
-            // thinks: `spawn_blocking`'s closure must be `'static`, so it
-            // can't borrow from `files`, which only lives for this `async
-            // fn`'s body.
-            #[allow(clippy::redundant_iter_cloned)]
-            let reads = many.iter().cloned().map(|path| async move {
-                tokio::task::spawn_blocking(move || read_text_file(&path))
-                    .await
-                    .context("file read task panicked")?
-            });
-            futures_util::future::try_join_all(reads).await
-        }
-    }
+/// Reads and UTF-8-decodes every path in `files`, in order. Each independent
+/// read has its own dedicated worker rather than a Tokio `spawn_blocking`
+/// task: dropping one read after a timeout signals its worker instead of
+/// leaving it running in the runtime's blocking pool.
+async fn read_all(
+    files: &[PathBuf],
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<Vec<String>> {
+    let budget = async_io::ReadBudget::new(MAX_TOTAL_ATTACHMENT_BYTES as usize);
+    // Preserve the historical `fs::read` behavior for all callers: a FIFO
+    // attachment waits until a writer appears. The cancellation-aware worker
+    // still polls its descriptor, so a timed workflow can interrupt that wait
+    // through the shared flag.
+    let wait_for_fifo_writer = true;
+    let reads = files.iter().cloned().map(|path| {
+        read_text_file_cancellable(
+            path,
+            cancellation.clone(),
+            budget.clone(),
+            wait_for_fifo_writer,
+        )
+    });
+    futures_util::future::try_join_all(reads).await
 }
 
-fn read_text_file(path: &Path) -> Result<String> {
-    let contents =
-        std::fs::read(path).with_context(|| format!("failed to read file '{}'", path.display()))?;
+async fn read_text_file_cancellable(
+    path: PathBuf,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    budget: async_io::ReadBudget,
+    wait_for_fifo_writer: bool,
+) -> Result<String> {
+    let error_path = path.clone();
+    let contents = async_io::run_blocking(
+        move |cancelled| {
+            async_io::read_file_with_budget(
+                &path,
+                cancelled,
+                MAX_TOTAL_ATTACHMENT_BYTES as usize,
+                &budget,
+                wait_for_fifo_writer,
+            )
+        },
+        cancellation,
+    )
+    .await
+    .with_context(|| format!("failed to read file '{}'", error_path.display()))?;
     String::from_utf8(contents).map_err(|_| {
         anyhow::anyhow!(
             "'--file {}' is not valid UTF-8 text; binary files are not supported",
-            path.display()
+            error_path.display()
         )
     })
 }
@@ -100,31 +119,69 @@ fn read_text_file(path: &Path) -> Result<String> {
 /// single image is resolved inline; two or more run concurrently, the same
 /// way `read_all` above handles multiple `--file` attachments.
 pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<String>> {
+    resolve_image_urls_cancellable(images, None).await
+}
+
+/// The cancellation-aware form used by workflow nodes. Local image files use
+/// the same worker/non-blocking read path as text attachments; HTTP URLs still
+/// pass through without touching the filesystem.
+pub(crate) async fn resolve_image_urls_cancellable(
+    images: &[String],
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<Vec<String>> {
     match images {
         [] => Ok(Vec::new()),
-        [single] => Ok(vec![resolve_one(single)?]),
-        many => {
-            // See `read_all`'s identical `#[allow]`: `spawn_blocking` needs a
-            // `'static` closure, so this can't borrow from `images`.
-            #[allow(clippy::redundant_iter_cloned)]
-            let resolutions = many.iter().cloned().map(|image| async move {
-                tokio::task::spawn_blocking(move || resolve_one(&image))
-                    .await
-                    .context("image resolution task panicked")?
+        _ => {
+            let budget = async_io::ReadBudget::new(async_io::MAX_READ_BYTES);
+            // A local image path follows the same FIFO semantics as a text
+            // attachment. HTTP(S) values return immediately and never touch
+            // the filesystem.
+            let wait_for_fifo_writer = true;
+            let resolutions = images.iter().cloned().map(|image| {
+                resolve_one_cancellable(
+                    image,
+                    cancellation.clone(),
+                    budget.clone(),
+                    wait_for_fifo_writer,
+                )
             });
             futures_util::future::try_join_all(resolutions).await
         }
     }
 }
 
-fn resolve_one(image: &str) -> Result<String> {
+async fn resolve_one_cancellable(
+    image: String,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    budget: async_io::ReadBudget,
+    wait_for_fifo_writer: bool,
+) -> Result<String> {
+    async_io::run_blocking(
+        move |cancelled| resolve_one_blocking(&image, cancelled, &budget, wait_for_fifo_writer),
+        cancellation,
+    )
+    .await
+}
+
+fn resolve_one_blocking(
+    image: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+    budget: &async_io::ReadBudget,
+    wait_for_fifo_writer: bool,
+) -> Result<String> {
     if image.starts_with("http://") || image.starts_with("https://") {
         return Ok(image.to_owned());
     }
 
     let path = Path::new(image);
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read image file '{}'", path.display()))?;
+    let bytes = async_io::read_file_with_budget(
+        path,
+        cancelled,
+        async_io::MAX_READ_BYTES,
+        budget,
+        wait_for_fifo_writer,
+    )
+    .with_context(|| format!("failed to read image file '{}'", path.display()))?;
     let mime = sniff_image_mime(&bytes, path).with_context(|| {
         format!(
             "could not determine the image format of '{}'; supported formats are PNG/JPEG/WebP/GIF",
@@ -195,7 +252,10 @@ fn longest_backtick_run(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{fenced_block, longest_backtick_run, read_file_attachments, resolve_image_urls};
+    use super::{
+        fenced_block, longest_backtick_run, read_file_attachments,
+        read_file_attachments_cancellable, resolve_image_urls,
+    };
     use std::path::Path;
 
     #[tokio::test]
@@ -321,6 +381,82 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_cancellable_fifo_attachment_waits_for_a_writer() {
+        use std::{io::Write, sync::mpsc, time::Duration};
+
+        let path = crate::test_support::unique_temp_path("lait-test-attachment-fifo", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let read_path = path.clone();
+        let read_task =
+            tokio::spawn(
+                async move { read_file_attachments(std::slice::from_ref(&read_path)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !read_task.is_finished(),
+            "a non-cancellable FIFO attachment must wait for a writer"
+        );
+
+        // Open the writer in a separate thread because a normal blocking FIFO
+        // open waits for the reader. The reader worker has already opened the
+        // FIFO non-blocking by the time this thread can proceed.
+        let writer_path = path.clone();
+        let (writer_done, writer_result) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .open(writer_path)
+                .and_then(|mut file| file.write_all(b"from fifo\n"));
+            writer_done.send(result).unwrap();
+        });
+
+        let result = read_task.await.unwrap().unwrap().unwrap();
+        writer.join().unwrap();
+        writer_result.recv().unwrap().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.contains("from fifo"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellable_fifo_attachment_can_stop_while_waiting_for_a_writer() {
+        use std::time::Duration;
+
+        let path = crate::test_support::unique_temp_path("lait-test-cancellable-fifo", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let read_path = path.clone();
+        let read_task = tokio::spawn(async move {
+            read_file_attachments_cancellable(std::slice::from_ref(&read_path), Some(receiver))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !read_task.is_finished(),
+            "a FIFO attachment should wait for a writer before cancellation"
+        );
+
+        sender.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), read_task)
+            .await
+            .expect("cancelling a FIFO wait must finish promptly")
+            .unwrap();
+        assert!(result.is_err(), "a cancelled FIFO read must fail");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

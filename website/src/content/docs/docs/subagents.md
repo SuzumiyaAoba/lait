@@ -95,7 +95,7 @@ nodes:
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/#サブエージェントの利用) と
-[ワークフロー（workflow.yml）](/lait/docs/workflow/#サブエージェントの利用-subagents) にもあります。
+[ワークフロー（workflow.yml）](/lait/docs/workflow/#サブエージェントの利用subagents) にもあります。
 
 ## ツール名とツール引数の扱い
 
@@ -164,4 +164,3 @@ CLI フラグ（`--base-url`/`--api-key` など）や `--model` は、サブエ�
 関連: [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/)、
 [ワークフロー（workflow.yml）](/lait/docs/workflow/)、[MCP サーバーのツールを使う](/lait/docs/mcp/)、
 [設定ファイル](/lait/docs/config/#サブエージェント)
-

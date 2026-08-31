@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::{
+    async_io,
     cli::ReasoningEffort,
     frontmatter, llm,
     schema::{self, JsonSchemaEntry},
@@ -83,6 +84,35 @@ impl AgentFile {
 pub(crate) fn load_agent(path: &Path) -> Result<AgentFile> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read agent file '{}'", path.display()))?;
+    parse_agent(&contents)
+        .with_context(|| format!("failed to parse agent file '{}'", path.display()))
+}
+
+/// Loads an agent file through the cancellation-aware filesystem worker used
+/// by timed workflow steps. The synchronous [`load_agent`] remains for local
+/// commands (lint/init/top-level `agent run`) that do not have a step timeout.
+pub(crate) async fn load_agent_cancellable(
+    path: &Path,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<AgentFile> {
+    let error_path = path.to_owned();
+    let wait_for_fifo_writer = cancellation.is_some();
+    let contents = async_io::run_blocking(
+        move |cancelled| {
+            if wait_for_fifo_writer {
+                async_io::read_to_string_wait_for_fifo_writer(
+                    &error_path,
+                    cancelled,
+                    async_io::MAX_READ_BYTES,
+                )
+            } else {
+                async_io::read_to_string(&error_path, cancelled, async_io::MAX_READ_BYTES)
+            }
+        },
+        cancellation,
+    )
+    .await
+    .with_context(|| format!("failed to read agent file '{}'", path.display()))?;
     parse_agent(&contents)
         .with_context(|| format!("failed to parse agent file '{}'", path.display()))
 }

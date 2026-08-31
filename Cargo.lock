@@ -1290,6 +1290,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "clap",
  "clap_complete",
@@ -1301,13 +1302,16 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "libc",
+ "process-wrap",
  "reqwest",
  "rmcp",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sse-stream",
  "termimad",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2444,6 +2448,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

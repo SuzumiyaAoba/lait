@@ -1,4 +1,9 @@
 /target/
 
+# Local credentials and environment-specific configuration
+.env
+.env.*
+!.env.example
+
 # APM dependencies
 apm_modules/

@@ -119,15 +119,23 @@ fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
     match workflow::load_workflow(path) {
         Err(error) => issues.push(LintIssue::error(format!("{error:#}"))),
         Ok(wf) => {
-            let base_dir = path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
             // Seeded with this file's own canonical path so a `workflow:`
             // chain that loops back to it is caught the same way
             // `WorkflowScope::nested` catches it at `run` time.
             let mut visited = Vec::new();
-            if let Ok(canonical) = std::fs::canonicalize(path) {
+            let canonical = std::fs::canonicalize(path).ok();
+            // Runtime resolves nested workflow paths from the canonical
+            // top-level file's parent (`WorkflowScope::top_level`).  Keep
+            // linting on that same base so invoking lint through a symlink
+            // cannot inspect a different set of relative sub-workflows than
+            // `run` would execute.
+            let base_dir = canonical
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .or_else(|| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+            if let Some(canonical) = canonical {
                 visited.push(canonical);
             }
             lint_workflow_contents(&wf, &base_dir, &mut ctx, &mut issues, &mut visited);

@@ -29,9 +29,15 @@ impl Usage {
     /// Accumulates `other` into `self`, for summing usage across a tool
     /// loop's rounds or a workflow's steps.
     pub(crate) fn add(&mut self, other: Usage) {
-        self.prompt_tokens += other.prompt_tokens;
-        self.completion_tokens += other.completion_tokens;
-        self.total_tokens += other.total_tokens;
+        // Usage is reported by the remote server, so it is untrusted input.
+        // Saturating here keeps a malicious or simply overflowing aggregate
+        // from panicking in debug builds (or wrapping in release builds) and
+        // preserves the useful upper-bound information we already have.
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
     }
 }
 
@@ -234,9 +240,32 @@ fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool)
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCompletionResponse, ChatCompletionStreamChunk, format_response, response_content,
-        response_reasoning, stream_chunk_deltas,
+        ChatCompletionResponse, ChatCompletionStreamChunk, Usage, format_response,
+        response_content, response_reasoning, stream_chunk_deltas,
     };
+
+    #[test]
+    fn usage_add_saturates_untrusted_token_counts() {
+        let mut usage = Usage {
+            prompt_tokens: u64::MAX,
+            completion_tokens: u64::MAX - 1,
+            total_tokens: 1,
+        };
+        usage.add(Usage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: u64::MAX,
+        });
+
+        assert_eq!(
+            usage,
+            Usage {
+                prompt_tokens: u64::MAX,
+                completion_tokens: u64::MAX,
+                total_tokens: u64::MAX,
+            }
+        );
+    }
 
     #[test]
     fn rejects_empty_choices_or_content() {

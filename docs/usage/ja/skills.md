@@ -99,7 +99,7 @@ nodes:
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.md#スキルの利用) と
-[ワークフロー（workflow.yml）](./workflow.md#スキルの利用-skills) にもあります。
+[ワークフロー（workflow.yml）](./workflow.md#スキルの利用skills) にもあります。
 
 ## システムプロンプトへの追記のされ方
 

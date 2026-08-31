@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use async_openai::types::chat::{ResponseFormat, ResponseFormatJsonSchema};
 use serde::Deserialize;
 
+use crate::async_io;
+
 /// A map of schema name to its definition, as used by a workflow file's
 /// top-level `json_schemas:` and an agent file's `input_schema:`/`output_schema:`.
 pub(crate) type JsonSchemaMap = HashMap<String, JsonSchemaEntry>;
@@ -38,12 +40,55 @@ pub(crate) fn load_schema_value(entry: &JsonSchemaEntry) -> Result<serde_json::V
     }
 }
 
-/// Resolves an entry to a Structured Outputs `response_format`, under `name`.
-pub(crate) fn build_response_format_from_entry(
+/// Resolves a schema entry through the cancellation-aware filesystem worker
+/// used by timed workflow steps. Inline schemas remain an inexpensive clone;
+/// file-backed schemas are read in bounded chunks and Unix special files are
+/// opened non-blocking by [`async_io::read_file`].
+pub(crate) async fn load_schema_value_cancellable(
+    entry: &JsonSchemaEntry,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<serde_json::Value> {
+    match entry {
+        JsonSchemaEntry::Inline { schema } => Ok(schema.clone()),
+        JsonSchemaEntry::FilePath { file_path } => {
+            let error_path = file_path.clone();
+            let wait_for_fifo_writer = cancellation.is_some();
+            let contents = async_io::run_blocking(
+                move |cancelled| {
+                    if wait_for_fifo_writer {
+                        async_io::read_to_string_wait_for_fifo_writer(
+                            &error_path,
+                            cancelled,
+                            async_io::MAX_READ_BYTES,
+                        )
+                    } else {
+                        async_io::read_to_string(&error_path, cancelled, async_io::MAX_READ_BYTES)
+                    }
+                },
+                cancellation,
+            )
+            .await
+            .with_context(|| {
+                format!("failed to read JSON schema file '{}'", file_path.display())
+            })?;
+            serde_json::from_str(&contents).with_context(|| {
+                format!("failed to parse JSON schema file '{}'", file_path.display())
+            })
+        }
+    }
+}
+
+/// Resolves an entry to a Structured Outputs `response_format`, under `name`,
+/// while allowing timed workflow steps to cancel file-backed schema reads.
+pub(crate) async fn build_response_format_from_entry_cancellable(
     entry: &JsonSchemaEntry,
     name: &str,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<ResponseFormat> {
-    build_json_schema(load_schema_value(entry)?, name)
+    build_json_schema(
+        load_schema_value_cancellable(entry, cancellation).await?,
+        name,
+    )
 }
 
 /// Resolves a `StepDefinition::input_schema` value to its schema body: first
@@ -61,6 +106,45 @@ pub(crate) fn resolve_named_schema_value(
                 .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
             serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse JSON schema file '{name_or_path}'"))
+        }
+    }
+}
+
+/// Cancellation-aware counterpart to [`resolve_named_schema_value`], used for
+/// a workflow node's `input_schema` before its model call starts.
+pub(crate) async fn resolve_named_schema_value_cancellable(
+    json_schemas: &JsonSchemaMap,
+    name_or_path: &str,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<serde_json::Value> {
+    match json_schemas.get(name_or_path) {
+        Some(entry) => load_schema_value_cancellable(entry, cancellation).await,
+        None => {
+            let path = PathBuf::from(name_or_path);
+            let error_path = path.clone();
+            let wait_for_fifo_writer = cancellation.is_some();
+            let contents = async_io::run_blocking(
+                move |cancelled| {
+                    if wait_for_fifo_writer {
+                        async_io::read_to_string_wait_for_fifo_writer(
+                            &path,
+                            cancelled,
+                            async_io::MAX_READ_BYTES,
+                        )
+                    } else {
+                        async_io::read_to_string(&path, cancelled, async_io::MAX_READ_BYTES)
+                    }
+                },
+                cancellation,
+            )
+            .await
+            .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
+            serde_json::from_str(&contents).with_context(|| {
+                format!(
+                    "failed to parse JSON schema file '{}'",
+                    error_path.display()
+                )
+            })
         }
     }
 }
@@ -201,6 +285,36 @@ fn validate_value_against_schema(
 pub(crate) fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
+    let schema = serde_json::from_str::<serde_json::Value>(&contents)
+        .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))?;
+    build_json_schema(schema, name)
+}
+
+/// Cancellation-aware counterpart to [`load_json_schema`], used for a
+/// workflow node's file-backed `output_schema`.
+pub(crate) async fn load_json_schema_cancellable(
+    path: &Path,
+    name: &str,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<ResponseFormat> {
+    let error_path = path.to_owned();
+    let wait_for_fifo_writer = cancellation.is_some();
+    let contents = async_io::run_blocking(
+        move |cancelled| {
+            if wait_for_fifo_writer {
+                async_io::read_to_string_wait_for_fifo_writer(
+                    &error_path,
+                    cancelled,
+                    async_io::MAX_READ_BYTES,
+                )
+            } else {
+                async_io::read_to_string(&error_path, cancelled, async_io::MAX_READ_BYTES)
+            }
+        },
+        cancellation,
+    )
+    .await
+    .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
     let schema = serde_json::from_str::<serde_json::Value>(&contents)
         .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))?;
     build_json_schema(schema, name)

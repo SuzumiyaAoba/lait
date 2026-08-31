@@ -16,6 +16,7 @@ use async_openai::{
 };
 use futures_util::Stream;
 
+use std::future::Future;
 use std::time::Duration;
 
 use crate::{
@@ -70,6 +71,12 @@ pub(crate) struct CompletionRequest<'a> {
     /// default — only set when the caller will actually read the usage, so
     /// servers that don't know `stream_options` aren't sent one needlessly.
     pub(crate) stream_include_usage: bool,
+    /// Cancellation signal for a workflow/agent attempt.  This is optional
+    /// because top-level chat requests have no enclosing step timeout.  Keep
+    /// the receiver on the request so cancellation is observed by the HTTP
+    /// future itself rather than only by a caller that may drop that future
+    /// before a nested MCP/subagent operation has cleaned up.
+    pub(crate) cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// Builds the initial message history shared by every completion request
@@ -321,8 +328,10 @@ fn client(base_url: &str, api_key: &str) -> Client<OpenAIConfig> {
 
 pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompletionResponse> {
     let client = client(request.base_url, request.api_key);
+    let cancellation = request.cancellation.clone();
     let chat_request = build_chat_request(request, false)?;
-    let response: ChatCompletionResponse = client.chat().create_byot(chat_request).await?;
+    let response: ChatCompletionResponse =
+        await_cancellation(client.chat().create_byot(chat_request), cancellation).await?;
     Ok(response)
 }
 
@@ -330,9 +339,50 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
 /// stream of response chunks instead of waiting for the full response.
 pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<CompletionStream> {
     let client = client(request.base_url, request.api_key);
+    let cancellation = request.cancellation.clone();
     let chat_request = build_chat_request(request, true)?;
-    let stream = client.chat().create_stream_byot(chat_request).await?;
+    let stream =
+        await_cancellation(client.chat().create_stream_byot(chat_request), cancellation).await?;
     Ok(stream)
+}
+
+/// Awaits one LLM request while keeping the enclosing workflow attempt's
+/// cancellation visible to the request future.  Merely dropping a reqwest
+/// future is not enough for callers that are also driving MCP/subagent work:
+/// the outer timeout can win a `select!` and drop this future before those
+/// operations observe cancellation.  The request itself therefore watches
+/// the same receiver and exits as soon as the attempt is cancelled.
+async fn await_cancellation<F, T>(
+    future: F,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<T>
+where
+    F: Future<Output = Result<T, OpenAIError>>,
+{
+    let Some(mut cancellation) = cancellation else {
+        return Ok(future.await?);
+    };
+
+    let mut future = Box::pin(future);
+    loop {
+        if *cancellation.borrow() {
+            bail!("LLM completion was cancelled");
+        }
+        tokio::select! {
+            biased;
+            result = &mut future => {
+                if *cancellation.borrow() {
+                    bail!("LLM completion was cancelled");
+                }
+                return Ok(result?);
+            },
+            changed = cancellation.changed() => {
+                if changed.is_err() || *cancellation.borrow() {
+                    bail!("LLM completion was cancelled");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

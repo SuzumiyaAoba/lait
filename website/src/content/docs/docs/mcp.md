@@ -91,7 +91,7 @@ nodes:
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/#mcp-ツールの利用) と
-[ワークフロー（workflow.yml）](/lait/docs/workflow/#mcp-ツールの利用-mcp) にもあります。
+[ワークフロー（workflow.yml）](/lait/docs/workflow/#mcp-ツールの利用mcp) にもあります。
 
 ## ツール名の扱い
 
@@ -130,4 +130,3 @@ lait は LM Studio のローカルモデルを主な想定用途としていま�
 （tool calling）への対応度が様々です。ツール呼び出しに対応していないモデルでは `tool_calls` が
 一切返らず、`mcp:` を指定していてもツールは呼ばれません。ツール対応モデル（`qwen3` 系など）を
 使って手元で確認してください。
-
