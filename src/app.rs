@@ -20,8 +20,8 @@ use crate::{
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, PromptArgs, ReasoningEffort, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
-    history, jq, lint, llm, mcp, prompt, render, repl, response, schema, session, skill, subagent,
-    template, workflow,
+    docgen, history, jq, lint, llm, mcp, prompt, render, repl, response, schema, session, skill,
+    subagent, template, usage, workflow,
 };
 
 pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
@@ -64,118 +64,6 @@ fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>
         (Some(argument), None) => Some(argument),
         (None, piped) => piped,
     })
-}
-
-/// Records each completion request's server-reported token usage under the
-/// label of whatever drove it (a workflow step, an agent, "chat"), so
-/// `--show-usage` can print a per-label and total summary once a run
-/// finishes. Lives in `RunEnv`, so recording must tolerate concurrent
-/// callers (`parallel`/concurrent `for_each` steps record from concurrently
-/// running tasks).
-#[derive(Default)]
-struct UsageTally {
-    events: std::sync::Mutex<Vec<(String, response::Usage)>>,
-    /// The running sum of every event recorded so far, kept incrementally so
-    /// `total()` never has to refold `events` — `run_repl_turn` calls it
-    /// twice per REPL turn purely to compute that turn's own delta, so an
-    /// O(n) refold there would make an n-turn session cost O(n²) overall.
-    running_total: std::sync::Mutex<Option<response::Usage>>,
-}
-
-impl UsageTally {
-    /// Records `usage` under `label`.
-    fn record(&self, label: &str, usage: response::Usage) {
-        self.events
-            .lock()
-            .expect("usage tally lock should not be poisoned")
-            .push((label.to_owned(), usage));
-        let mut running_total = self
-            .running_total
-            .lock()
-            .expect("usage tally lock should not be poisoned");
-        let mut total = running_total.unwrap_or_default();
-        total.add(usage);
-        *running_total = Some(total);
-    }
-
-    /// Records `response`'s usage under `label`; a no-op when the server
-    /// reported none (absence stays distinguishable from zero in the
-    /// summary).
-    fn record_response(&self, label: &str, response: &response::ChatCompletionResponse) {
-        if let Some(usage) = response.usage {
-            self.record(label, usage);
-        }
-    }
-
-    /// Aggregates recorded events per label, in first-recorded order, as
-    /// `(label, summed usage, request count)`.
-    fn summarize(&self) -> Vec<(String, response::Usage, usize)> {
-        let events = self
-            .events
-            .lock()
-            .expect("usage tally lock should not be poisoned");
-        let mut per_label: Vec<(String, response::Usage, usize)> = Vec::new();
-        for (label, usage) in events.iter() {
-            match per_label
-                .iter_mut()
-                .find(|(existing, _, _)| existing == label)
-            {
-                Some((_, sum, count)) => {
-                    sum.add(*usage);
-                    *count += 1;
-                }
-                None => per_label.push((label.clone(), *usage, 1)),
-            }
-        }
-        per_label
-    }
-
-    /// The sum of every event recorded so far, across every label —
-    /// `lait history`'s per-run `usage` field (see `record_history`).
-    /// `None` when nothing has been recorded yet (never zero-vs-absent
-    /// ambiguity, same convention as `response::Usage`'s own optionality).
-    fn total(&self) -> Option<response::Usage> {
-        *self
-            .running_total
-            .lock()
-            .expect("usage tally lock should not be poisoned")
-    }
-}
-
-/// Prints the `--show-usage` summary to stderr: one line for a single-label
-/// run (chat, a lone agent), a per-label breakdown plus total for a
-/// workflow. Usage counts every request made under a label — a tool loop's
-/// rounds, retries, and subagent calls (recorded under their own label) all
-/// count toward what the run actually consumed.
-fn print_usage_summary(tally: &UsageTally) {
-    let per_label = tally.summarize();
-    if per_label.is_empty() {
-        eprintln!("usage: (the server reported no usage)");
-        return;
-    }
-    let mut total = response::Usage::default();
-    let mut requests = 0usize;
-    for (_, usage, count) in &per_label {
-        total.add(*usage);
-        requests += count;
-    }
-    if per_label.len() == 1 {
-        eprintln!("usage: {total}{}", requests_suffix(requests));
-        return;
-    }
-    eprintln!("usage:");
-    for (label, usage, count) in &per_label {
-        eprintln!("  {label}: {usage}{}", requests_suffix(*count));
-    }
-    eprintln!("  total: {total}{}", requests_suffix(requests));
-}
-
-fn requests_suffix(count: usize) -> String {
-    if count > 1 {
-        format!(" ({count} requests)")
-    } else {
-        String::new()
-    }
 }
 
 /// Records a completed chat/agent/workflow/prompt run in `lait history`,
@@ -243,10 +131,10 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
         Some(Command::Models(models_args)) => crate::models::run(models_args, cli.no_config).await,
         Some(Command::Completions(completions_args)) => {
-            generate_completions(completions_args);
+            docgen::generate_completions(completions_args);
             Ok(())
         }
-        Some(Command::Man(man_args)) => generate_man_pages(man_args),
+        Some(Command::Man(man_args)) => docgen::generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Chat(chat_repl_args)) => run_chat_repl(chat_repl_args, cli.no_config).await,
@@ -320,10 +208,10 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
             crate::models::run_local(models_args, cli.no_config)
         }
         Some(Command::Completions(completions_args)) => {
-            generate_completions(completions_args);
+            docgen::generate_completions(completions_args);
             Ok(())
         }
-        Some(Command::Man(man_args)) => generate_man_pages(man_args),
+        Some(Command::Man(man_args)) => docgen::generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Prompt(prompt_args)) => {
@@ -337,54 +225,6 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
             bail!("internal error: an async command reached run_blocking")
         }
     }
-}
-
-/// Writes the completion script for the requested shell to stdout, derived
-/// from the same clap `Command` tree `--help` is.
-fn generate_completions(args: crate::cli::CompletionsArgs) {
-    let mut command = <Cli as clap::CommandFactory>::command();
-    clap_complete::generate(args.shell, &mut command, "lait", &mut std::io::stdout());
-}
-
-/// Writes a man page for lait and one per (sub)subcommand into `args.dir`,
-/// derived from the same clap `Command` tree `--help` is. Pages are named
-/// the conventional way (`lait.1`, `lait-run.1`, `lait-agent-run.1`, ...).
-fn generate_man_pages(args: crate::cli::ManArgs) -> Result<()> {
-    std::fs::create_dir_all(&args.dir).with_context(|| {
-        format!(
-            "failed to create man page directory '{}'",
-            args.dir.display()
-        )
-    })?;
-    let mut command = <Cli as clap::CommandFactory>::command();
-    // Propagates global flags into subcommands so their pages show them.
-    command.build();
-    let count = render_man_pages(&args.dir, &command, "lait")?;
-    eprintln!("generated {count} man page(s) in '{}'", args.dir.display());
-    Ok(())
-}
-
-/// Renders `command`'s own page as `<name>.1` under `dir`, then recurses
-/// into its subcommands as `<name>-<subcommand>.1`, returning how many pages
-/// were written. The auto-generated `help` subcommand gets no page.
-fn render_man_pages(dir: &Path, command: &clap::Command, name: &str) -> Result<usize> {
-    let page = clap_mangen::Man::new(command.clone().name(name.to_owned()));
-    let mut buffer = Vec::new();
-    page.render(&mut buffer)
-        .with_context(|| format!("failed to render the man page for '{name}'"))?;
-    let path = dir.join(format!("{name}.1"));
-    std::fs::write(&path, buffer)
-        .with_context(|| format!("failed to write man page '{}'", path.display()))?;
-
-    let mut count = 1;
-    for subcommand in command.get_subcommands() {
-        if subcommand.get_name() == "help" {
-            continue;
-        }
-        let full_name = format!("{name}-{}", subcommand.get_name());
-        count += render_man_pages(dir, subcommand, &full_name)?;
-    }
-    Ok(count)
 }
 
 /// Statically checks every file in `lint_args.files` (see `lint::lint_file`)
@@ -1477,7 +1317,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
             env.usage.total(),
         )?;
         if show_usage {
-            print_usage_summary(&env.usage);
+            usage::print_usage_summary(&env.usage);
         }
         return Ok(());
     }
@@ -1523,7 +1363,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         env.usage.total(),
     )?;
     if show_usage {
-        print_usage_summary(&env.usage);
+        usage::print_usage_summary(&env.usage);
     }
     Ok(())
 }
@@ -1675,7 +1515,7 @@ async fn run_repl_turn(
             env.usage.record(&settings.usage_label, usage);
         }
         if show_usage {
-            print_usage_summary(&env.usage);
+            usage::print_usage_summary(&env.usage);
         }
         outcome.content
     } else {
@@ -1683,7 +1523,7 @@ async fn run_repl_turn(
         let rendered = response::render_response(&response, false, show_reasoning)?;
         println!("{rendered}");
         if show_usage {
-            print_usage_summary(&env.usage);
+            usage::print_usage_summary(&env.usage);
         }
         response::content_text(&response).to_owned()
     };
@@ -1759,7 +1599,7 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
         env.usage.total(),
     )?;
     if args.show_usage {
-        print_usage_summary(&env.usage);
+        usage::print_usage_summary(&env.usage);
     }
     Ok(())
 }
@@ -1830,7 +1670,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         env.usage.total(),
     )?;
     if args.show_usage {
-        print_usage_summary(&env.usage);
+        usage::print_usage_summary(&env.usage);
     }
     Ok(())
 }
@@ -1871,7 +1711,7 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
         env.usage.total(),
     )?;
     if run_args.show_usage {
-        print_usage_summary(&env.usage);
+        usage::print_usage_summary(&env.usage);
     }
     Ok(())
 }
@@ -1942,7 +1782,7 @@ struct RunEnv<'a> {
     /// Every completion request's server-reported token usage, recorded by
     /// `RequestSettings::complete` and summarized when `--show-usage` asks
     /// for it.
-    usage: UsageTally,
+    usage: usage::UsageTally,
 }
 
 impl<'a> RunEnv<'a> {
@@ -1955,7 +1795,7 @@ impl<'a> RunEnv<'a> {
             registry: mcp::McpRegistry::new(&file_config.mcp_servers),
             skill_cache: skill::SkillCache::new(&file_config.skills),
             agent_registry: subagent::AgentRegistry::new(&file_config.agents),
-            usage: UsageTally::default(),
+            usage: usage::UsageTally::default(),
         }
     }
 

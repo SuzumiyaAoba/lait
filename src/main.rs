@@ -6,6 +6,7 @@ mod async_io;
 mod attachment;
 mod cli;
 mod config;
+mod docgen;
 mod dotenv;
 mod frontmatter;
 mod history;
@@ -28,6 +29,7 @@ mod subagent;
 mod template;
 #[cfg(test)]
 mod test_support;
+mod usage;
 mod workflow;
 
 fn main() {
