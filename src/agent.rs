@@ -95,24 +95,10 @@ pub(crate) async fn load_agent_cancellable(
     path: &Path,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<AgentFile> {
-    let error_path = path.to_owned();
-    let wait_for_fifo_writer = cancellation.is_some();
-    let contents = async_io::run_blocking(
-        move |cancelled| {
-            if wait_for_fifo_writer {
-                async_io::read_to_string_wait_for_fifo_writer(
-                    &error_path,
-                    cancelled,
-                    async_io::MAX_READ_BYTES,
-                )
-            } else {
-                async_io::read_to_string(&error_path, cancelled, async_io::MAX_READ_BYTES)
-            }
-        },
-        cancellation,
-    )
-    .await
-    .with_context(|| format!("failed to read agent file '{}'", path.display()))?;
+    let contents =
+        async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+            .with_context(|| format!("failed to read agent file '{}'", path.display()))?;
     parse_agent(&contents)
         .with_context(|| format!("failed to parse agent file '{}'", path.display()))
 }

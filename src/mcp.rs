@@ -499,7 +499,10 @@ impl<'a> McpRegistry<'a> {
     /// transport has finished its cleanup. This must be called at the end of a
     /// successful invocation as well as on an error: relying on `Drop` can
     /// only signal cancellation and cannot await process-tree reaping.
-    #[allow(dead_code, reason = "the top-level run owner may call this during final cleanup")]
+    #[allow(
+        dead_code,
+        reason = "the top-level run owner may call this during final cleanup"
+    )]
     pub(crate) async fn shutdown(&self) {
         let cells = {
             let mut connections = self.connections.lock().await;
@@ -1051,49 +1054,24 @@ impl LimitedHttpClient {
         )
     }
 
-    async fn read_body(
+    /// Drains a bounded response body, tracking the running size against
+    /// `max_body_bytes` either way. `collect` chooses whether chunks are also
+    /// buffered: [`read_body`](Self::read_body) needs the bytes back,
+    /// [`drain_body`](Self::drain_body) only needs the body off the wire, so
+    /// it passes `false` to avoid holding a response it is about to discard
+    /// in memory.
+    async fn read_body_bounded(
         &self,
         response: reqwest::Response,
+        collect: bool,
     ) -> Result<Vec<u8>, StreamableHttpError<LimitedHttpClientError>> {
         self.check_content_length(&response)?;
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = tokio::select! {
-            biased;
-            _ = self.cancellation.cancelled() => {
-                return Err(StreamableHttpError::Client(
-                    LimitedHttpClientError::Cancelled,
-                ));
-            }
-            chunk = stream.next() => chunk,
-        } {
-            let chunk = chunk
-                .map_err(LimitedHttpClientError::Request)
-                .map_err(StreamableHttpError::Client)?;
-            let Some(next_len) = body.len().checked_add(chunk.len()) else {
-                return Err(StreamableHttpError::Client(
-                    LimitedHttpClientError::BodyTooLarge {
-                        limit: self.max_body_bytes,
-                    },
-                ));
-            };
-            if next_len > self.max_body_bytes {
-                return Err(StreamableHttpError::Client(
-                    LimitedHttpClientError::BodyTooLarge {
-                        limit: self.max_body_bytes,
-                    },
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
-    }
-
-    async fn drain_body(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<(), StreamableHttpError<LimitedHttpClientError>> {
-        self.check_content_length(&response)?;
+        let capacity = if collect {
+            (response.content_length().unwrap_or(0) as usize).min(self.max_body_bytes)
+        } else {
+            0
+        };
+        let mut body = Vec::with_capacity(capacity);
         let mut total = 0usize;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = tokio::select! {
@@ -1123,7 +1101,25 @@ impl LimitedHttpClient {
                 ));
             }
             total = next_total;
+            if collect {
+                body.extend_from_slice(&chunk);
+            }
         }
+        Ok(body)
+    }
+
+    async fn read_body(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<Vec<u8>, StreamableHttpError<LimitedHttpClientError>> {
+        self.read_body_bounded(response, true).await
+    }
+
+    async fn drain_body(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<(), StreamableHttpError<LimitedHttpClientError>> {
+        self.read_body_bounded(response, false).await?;
         Ok(())
     }
 

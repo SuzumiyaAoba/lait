@@ -164,16 +164,12 @@ impl<'a> SkillCache<'a> {
         {
             anyhow::bail!("skill rendering was cancelled");
         }
-        let mut sections = Vec::with_capacity(names.len());
-        for name in names {
-            if cancellation
-                .as_ref()
-                .is_some_and(|receiver| *receiver.borrow())
-            {
-                anyhow::bail!("skill rendering was cancelled");
-            }
-            sections.push(self.section(name, cancellation.clone()).await?);
-        }
+        let sections = futures_util::future::try_join_all(
+            names
+                .iter()
+                .map(|name| self.section(name, cancellation.clone())),
+        )
+        .await?;
         let joined = sections
             .iter()
             .map(|section| section.as_str())

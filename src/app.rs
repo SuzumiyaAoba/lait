@@ -2850,36 +2850,6 @@ struct StepExecutionContext<'a, 'env> {
     step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
-/// Awaits one part of a timed node while listening for its cancellation
-/// signal. Model calls are normally cancellation-safe when their future is
-/// dropped, but they still need to be polled through this helper so the
-/// timeout handler can wait for `execute_step` to unwind before starting a
-/// retry or an `on_error` branch. The same helper is also used for attachment
-/// resolution, whose blocking reads run in Tokio's blocking pool.
-async fn await_step_cancellation<F, T>(
-    future: F,
-    step_cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
-) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
-    let Some(step_cancel) = step_cancel else {
-        return future.await;
-    };
-
-    tokio::pin!(future);
-    loop {
-        tokio::select! {
-            result = &mut future => return result,
-            changed = step_cancel.changed() => {
-                if changed.is_err() || *step_cancel.borrow() {
-                    bail!("step execution was cancelled")
-                }
-            }
-        }
-    }
-}
-
 /// Resolves the model/reasoning-effort settings for a node's model call,
 /// applying the node > agent file (when this node has one) > workflow
 /// default precedence chain shared by `execute_step`'s `agent` and `prompt`
@@ -3043,11 +3013,8 @@ async fn execute_step(
             resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?
                 .with_usage_label(label);
 
-        let (prompt, image_urls) = await_step_cancellation(
-            resolve_attachments(node, current_input, label, step_cancel.clone()),
-            step_cancel.as_mut(),
-        )
-        .await?;
+        let (prompt, image_urls) =
+            resolve_attachments(node, current_input, label, step_cancel.clone()).await?;
 
         call_agent(
             agent_file,
@@ -3111,11 +3078,8 @@ async fn execute_step(
             ),
             None => Cow::Borrowed(current_input),
         };
-        let (prompt, image_urls) = await_step_cancellation(
-            resolve_attachments(node, &prompt, label, step_cancel.clone()),
-            step_cancel.as_mut(),
-        )
-        .await?;
+        let (prompt, image_urls) =
+            resolve_attachments(node, &prompt, label, step_cancel.clone()).await?;
         let system_prompt = node
             .system_prompt
             .as_deref()
@@ -3705,33 +3669,27 @@ async fn terminate_command_process_tree(
     let reap_error = child.wait().await.err().map(|error| error.to_string());
     let second_tree_kill_error = process_tree.kill().err().map(|error| error.to_string());
 
-    if let Some(error) = tree_kill_error.as_deref() {
-        if let Some(direct_error) = direct_kill_error.as_deref() {
-            if let Some(reap_error) = reap_error.as_deref() {
-                bail!(
-                    "failed to terminate command process tree: {error}; failed to kill the direct child: {direct_error}; failed to reap it: {reap_error}"
-                );
-            }
-            bail!(
-                "failed to terminate command process tree: {error}; failed to kill the direct child: {direct_error}"
-            );
+    if let Some(error) = &tree_kill_error {
+        let mut message = format!("failed to terminate command process tree: {error}");
+        if let Some(direct_error) = &direct_kill_error {
+            message.push_str(&format!(
+                "; failed to kill the direct child: {direct_error}"
+            ));
         }
-        if let Some(reap_error) = reap_error.as_deref() {
-            bail!(
-                "failed to terminate command process tree: {error}; failed to reap it: {reap_error}"
-            );
+        if let Some(reap_error) = &reap_error {
+            message.push_str(&format!("; failed to reap it: {reap_error}"));
         }
-        bail!("failed to terminate command process tree: {error}");
+        bail!(message);
     }
-    if let Some(error) = second_tree_kill_error.as_deref() {
-        if let Some(reap_error) = reap_error.as_deref() {
-            bail!(
-                "failed to terminate command process tree after reaping: {error}; failed to reap it: {reap_error}"
-            );
+    if let Some(error) = &second_tree_kill_error {
+        let mut message =
+            format!("failed to terminate command process tree after reaping: {error}");
+        if let Some(reap_error) = &reap_error {
+            message.push_str(&format!("; failed to reap it: {reap_error}"));
         }
-        bail!("failed to terminate command process tree after reaping: {error}");
+        bail!(message);
     }
-    if let Some(error) = reap_error.as_deref() {
+    if let Some(error) = &reap_error {
         bail!("failed to reap command: {error}");
     }
     Ok(())

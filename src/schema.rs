@@ -51,21 +51,10 @@ pub(crate) async fn load_schema_value_cancellable(
     match entry {
         JsonSchemaEntry::Inline { schema } => Ok(schema.clone()),
         JsonSchemaEntry::FilePath { file_path } => {
-            let error_path = file_path.clone();
-            let wait_for_fifo_writer = cancellation.is_some();
-            let contents = async_io::run_blocking(
-                move |cancelled| {
-                    if wait_for_fifo_writer {
-                        async_io::read_to_string_wait_for_fifo_writer(
-                            &error_path,
-                            cancelled,
-                            async_io::MAX_READ_BYTES,
-                        )
-                    } else {
-                        async_io::read_to_string(&error_path, cancelled, async_io::MAX_READ_BYTES)
-                    }
-                },
+            let contents = async_io::read_to_string_cancellable(
+                file_path,
                 cancellation,
+                async_io::MAX_READ_BYTES,
             )
             .await
             .with_context(|| {
@@ -121,30 +110,12 @@ pub(crate) async fn resolve_named_schema_value_cancellable(
         Some(entry) => load_schema_value_cancellable(entry, cancellation).await,
         None => {
             let path = PathBuf::from(name_or_path);
-            let error_path = path.clone();
-            let wait_for_fifo_writer = cancellation.is_some();
-            let contents = async_io::run_blocking(
-                move |cancelled| {
-                    if wait_for_fifo_writer {
-                        async_io::read_to_string_wait_for_fifo_writer(
-                            &path,
-                            cancelled,
-                            async_io::MAX_READ_BYTES,
-                        )
-                    } else {
-                        async_io::read_to_string(&path, cancelled, async_io::MAX_READ_BYTES)
-                    }
-                },
-                cancellation,
-            )
-            .await
-            .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
-            serde_json::from_str(&contents).with_context(|| {
-                format!(
-                    "failed to parse JSON schema file '{}'",
-                    error_path.display()
-                )
-            })
+            let contents =
+                async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+                    .await
+                    .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
+            serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))
         }
     }
 }
@@ -297,24 +268,10 @@ pub(crate) async fn load_json_schema_cancellable(
     name: &str,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<ResponseFormat> {
-    let error_path = path.to_owned();
-    let wait_for_fifo_writer = cancellation.is_some();
-    let contents = async_io::run_blocking(
-        move |cancelled| {
-            if wait_for_fifo_writer {
-                async_io::read_to_string_wait_for_fifo_writer(
-                    &error_path,
-                    cancelled,
-                    async_io::MAX_READ_BYTES,
-                )
-            } else {
-                async_io::read_to_string(&error_path, cancelled, async_io::MAX_READ_BYTES)
-            }
-        },
-        cancellation,
-    )
-    .await
-    .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
+    let contents =
+        async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+            .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
     let schema = serde_json::from_str::<serde_json::Value>(&contents)
         .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))?;
     build_json_schema(schema, name)

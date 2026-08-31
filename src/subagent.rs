@@ -141,10 +141,16 @@ impl<'a> AgentRegistry<'a> {
         if let Some(cached) = self.loaded.borrow().get(path) {
             return Ok(Rc::clone(cached));
         }
-        let file = agent::load_agent_cancellable(path, cancellation.clone()).await?;
-        let canonical_path = async_io::canonicalize(path, cancellation.clone())
-            .await
-            .with_context(|| format!("failed to resolve agent file path '{}'", path.display()))?;
+        let (file, canonical_path) = tokio::try_join!(
+            agent::load_agent_cancellable(path, cancellation.clone()),
+            async {
+                async_io::canonicalize(path, cancellation.clone())
+                    .await
+                    .with_context(|| {
+                        format!("failed to resolve agent file path '{}'", path.display())
+                    })
+            },
+        )?;
         let tool_parameters = match &file.input_schema {
             Some(entry) => schema::load_schema_value_cancellable(entry, cancellation).await?,
             None => serde_json::json!({
@@ -179,10 +185,16 @@ impl<'a> AgentRegistry<'a> {
         names: &[String],
         cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<ToolSet> {
+        let loaded_agents = futures_util::future::try_join_all(
+            names
+                .iter()
+                .map(|name| self.load_cancellable(name, cancellation.clone())),
+        )
+        .await?;
+
         let mut tools = Vec::with_capacity(names.len());
         let mut index = HashMap::with_capacity(names.len());
-        for name in names {
-            let loaded = self.load_cancellable(name, cancellation.clone()).await?;
+        for (name, loaded) in names.iter().zip(loaded_agents) {
             let qualified = mcp::qualify_tool_name("subagent tool", "agent", name)?;
             if index.contains_key(&qualified) {
                 bail!("duplicate subagent name '{name}' in 'subagents:'");

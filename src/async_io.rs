@@ -601,6 +601,31 @@ pub(crate) fn read_to_string_wait_for_fifo_writer(
     String::from_utf8(bytes).context("file contents were not valid UTF-8")
 }
 
+/// Reads UTF-8 text through the cancellation-aware blocking worker, waiting
+/// for a FIFO writer only when a cancellation channel is present (a caller
+/// with no channel has no way to be told to give up on one, so there is
+/// nothing to wait for). Shared by every loader (agent files, skills, JSON
+/// schemas) that reads exactly one file and returns its contents as a string.
+pub(crate) async fn read_to_string_cancellable(
+    path: &Path,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    max_bytes: usize,
+) -> Result<String> {
+    let path = path.to_owned();
+    let wait_for_fifo_writer = cancellation.is_some();
+    run_blocking(
+        move |cancelled| {
+            if wait_for_fifo_writer {
+                read_to_string_wait_for_fifo_writer(&path, cancelled, max_bytes)
+            } else {
+                read_to_string(&path, cancelled, max_bytes)
+            }
+        },
+        cancellation,
+    )
+    .await
+}
+
 /// Resolves a path on a worker so cancellation cannot be delayed by a slow
 /// network/FUSE filesystem. `canonicalize` is metadata I/O rather than a file
 /// read, but it belongs to the same timeout-sensitive loader paths.

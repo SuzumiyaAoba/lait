@@ -12,7 +12,7 @@ use jaq_core::{
 };
 use jaq_json::{Val, read};
 
-use crate::async_io;
+use crate::{async_io, template};
 
 /// jq is intentionally run in a bounded worker rather than on Tokio's
 /// executor. These limits keep a filter that emits an unbounded stream from
@@ -47,11 +47,7 @@ pub(crate) type Steps = serde_json::Map<String, serde_json::Value>;
 /// value is rendered as compact JSON.
 #[cfg(test)]
 pub(crate) fn apply(filter_source: &str, input_json: &str, steps: &Steps) -> Result<String> {
-    let mut output = OutputWriter::new(None);
-    run_filter_with(filter_source, input_json, steps, None, |value| {
-        output.render(filter_source, &value)
-    })?;
-    output.finish(filter_source)
+    apply_cancellable(filter_source, input_json, steps, &AtomicBool::new(false))
 }
 
 /// Runs a jq filter while allowing a caller that owns the evaluation worker
@@ -74,6 +70,36 @@ pub(crate) fn apply_cancellable(
     output.finish(filter_source)
 }
 
+/// Shared scaffolding for the three `*_cancellable_async` entry points below:
+/// owns the input/steps so the operation can run on a dedicated blocking
+/// worker, normalizes the input once inside that worker (so parsing a large
+/// plain-text input cannot monopolize a Tokio executor thread before the
+/// worker gets a chance to observe cancellation), then delegates to the
+/// synchronous, already-cancellable variant.
+async fn run_cancellable_async<T, F>(
+    filter_source: &str,
+    input: &str,
+    steps: &Steps,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    op: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&str, &str, &Steps, &AtomicBool) -> Result<T> + Send + 'static,
+{
+    let filter_source = filter_source.to_owned();
+    let input = input.to_owned();
+    let steps = steps.clone();
+    async_io::run_blocking(
+        move |cancelled| {
+            let input_json = normalize_input(&input)?;
+            op(&filter_source, &input_json, &steps, cancelled)
+        },
+        cancellation,
+    )
+    .await
+}
+
 /// Runs a cancellable jq transform through the same bounded blocking-worker
 /// pool as filesystem operations. Keeping worker admission here means every
 /// node jq call shares one global thread limit instead of creating an
@@ -84,38 +110,22 @@ pub(crate) async fn apply_cancellable_async(
     steps: &Steps,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<String> {
-    let filter_source = filter_source.to_owned();
-    let input = input.to_owned();
-    let steps = steps.clone();
-    async_io::run_blocking(
-        move |cancelled| {
-            let input_json = normalize_input(&input)?;
-            apply_cancellable(&filter_source, &input_json, &steps, cancelled)
-        },
-        cancellation,
-    )
-    .await
+    run_cancellable_async(filter_source, input, steps, cancellation, apply_cancellable).await
 }
 
 /// Runs a jq filter as a boolean condition on a bounded blocking worker.
-/// Input coercion and serialization happen in the worker too: parsing a large
-/// plain-text input must not monopolize a Tokio executor thread before the
-/// worker gets a chance to observe cancellation.
 pub(crate) async fn apply_bool_cancellable_async(
     filter_source: &str,
     input: &str,
     steps: &Steps,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<bool> {
-    let filter_source = filter_source.to_owned();
-    let input = input.to_owned();
-    let steps = steps.clone();
-    async_io::run_blocking(
-        move |cancelled| {
-            let input_json = normalize_input(&input)?;
-            apply_bool_cancellable(&filter_source, &input_json, &steps, cancelled)
-        },
+    run_cancellable_async(
+        filter_source,
+        input,
+        steps,
         cancellation,
+        apply_bool_cancellable,
     )
     .await
 }
@@ -129,15 +139,12 @@ pub(crate) async fn apply_one_cancellable_async(
     steps: &Steps,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<String> {
-    let filter_source = filter_source.to_owned();
-    let input = input.to_owned();
-    let steps = steps.clone();
-    async_io::run_blocking(
-        move |cancelled| {
-            let input_json = normalize_input(&input)?;
-            apply_one_cancellable(&filter_source, &input_json, &steps, cancelled)
-        },
+    run_cancellable_async(
+        filter_source,
+        input,
+        steps,
         cancellation,
+        apply_one_cancellable,
     )
     .await
 }
@@ -221,36 +228,18 @@ fn apply_bool_inner(
     steps: &Steps,
     cancelled: Option<&AtomicBool>,
 ) -> Result<bool> {
-    let mut result = None;
-    let mut count = 0usize;
-    run_filter_with(filter_source, input_json, steps, cancelled, |value| {
-        count += 1;
-        if count > 1 {
-            bail!(
-                "jq condition {filter_source:?} produced {count} outputs; expected exactly one value"
-            );
-        }
-        // Conditions do not return this value to the caller, but they
-        // still must not be able to materialize an arbitrarily large
-        // result. Render into a bounded scratch buffer; importantly, this
-        // happens before the filter is asked for its next value.
-        let mut rendered = Vec::new();
-        render_value_into(
-            &value,
-            false,
-            &mut rendered,
-            0,
-            MAX_RENDERED_BYTES,
-            MAX_RENDERED_BYTES,
-            cancelled,
-        )
-        .with_context(|| format!("jq condition {filter_source:?}"))?;
-        result = Some(!matches!(value, Val::Null | Val::Bool(false)));
-        Ok(())
-    })?;
-    result.ok_or_else(|| {
-        anyhow!("jq condition {filter_source:?} produced no output; expected exactly one value")
-    })
+    // Conditions do not return their value to the caller, but they still
+    // must not be able to materialize an arbitrarily large result, so the
+    // shared helper below still renders into a bounded scratch buffer before
+    // this closure derives the boolean.
+    run_single_value(
+        filter_source,
+        input_json,
+        steps,
+        cancelled,
+        "condition",
+        |value, _| Ok(!matches!(value, Val::Null | Val::Bool(false))),
+    )
 }
 
 fn apply_one_inner(
@@ -259,13 +248,38 @@ fn apply_one_inner(
     steps: &Steps,
     cancelled: Option<&AtomicBool>,
 ) -> Result<String> {
+    run_single_value(
+        filter_source,
+        input_json,
+        steps,
+        cancelled,
+        "filter",
+        |_, rendered| String::from_utf8(rendered).context("jq rendered output was not valid UTF-8"),
+    )
+}
+
+/// Shared scaffolding for a jq evaluation that must produce exactly one
+/// value: tracks the output count, rejects a second value, and renders the
+/// (sole) value into a bounded scratch buffer before handing it to `extract`
+/// — importantly, that render happens before the filter is asked for its
+/// next value, so a second, oversized value cannot slip through uncounted.
+/// `label` distinguishes the two callers' error text ("condition" for
+/// `when:` guards, "filter" for `for_each.items`).
+fn run_single_value<T>(
+    filter_source: &str,
+    input_json: &str,
+    steps: &Steps,
+    cancelled: Option<&AtomicBool>,
+    label: &str,
+    mut extract: impl FnMut(Val, Vec<u8>) -> Result<T>,
+) -> Result<T> {
     let mut result = None;
     let mut count = 0usize;
     run_filter_with(filter_source, input_json, steps, cancelled, |value| {
         count += 1;
         if count > 1 {
             bail!(
-                "jq filter {filter_source:?} produced {count} outputs; expected exactly one value"
+                "jq {label} {filter_source:?} produced {count} outputs; expected exactly one value"
             );
         }
         let mut rendered = Vec::new();
@@ -278,13 +292,12 @@ fn apply_one_inner(
             MAX_RENDERED_BYTES,
             cancelled,
         )
-        .map_err(|error| anyhow!("jq filter {filter_source:?} rendered output: {error}"))?;
-        result =
-            Some(String::from_utf8(rendered).context("jq rendered output was not valid UTF-8")?);
+        .with_context(|| format!("jq {label} {filter_source:?}"))?;
+        result = Some(extract(value, rendered)?);
         Ok(())
     })?;
     result.ok_or_else(|| {
-        anyhow!("jq filter {filter_source:?} produced no output; expected exactly one value")
+        anyhow!("jq {label} {filter_source:?} produced no output; expected exactly one value")
     })
 }
 
@@ -431,11 +444,11 @@ fn validate_filter_source(filter_source: &str) -> Result<()> {
 /// the blocking worker's closure so even the serialization of a very large
 /// plain-text input cannot block a Tokio executor thread.
 fn normalize_input(input: &str) -> Result<String> {
-    match serde_json::from_str::<serde_json::Value>(input) {
-        Ok(_) => Ok(input.to_owned()),
-        Err(_) => serde_json::to_string(&serde_json::Value::String(input.to_owned()))
-            .context("failed to serialize plain-text jq input"),
+    if serde_json::from_str::<serde_json::Value>(input).is_ok() {
+        return Ok(input.to_owned());
     }
+    serde_json::to_string(&template::parse_input(input))
+        .context("failed to serialize plain-text jq input")
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
