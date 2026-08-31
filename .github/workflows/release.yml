@@ -20,8 +20,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify-version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Match tag to Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "lait") | .version')"
+          expected_tag="v${package_version}"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "release tag $GITHUB_REF_NAME does not match Cargo package version $package_version" >&2
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

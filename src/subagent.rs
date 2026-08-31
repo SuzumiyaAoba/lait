@@ -10,7 +10,7 @@ use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, Functio
 
 use crate::{
     agent::{self, AgentFile},
-    config, mcp, schema,
+    async_io, config, mcp, schema,
 };
 
 /// One agent file (an `agents:` entry, or a workflow node's `agent:` path),
@@ -104,15 +104,22 @@ impl<'a> AgentRegistry<'a> {
     }
 
     /// Returns the named subagent's `LoadedAgent`, resolving `name` against
-    /// the `agents:` map and loading its file through `load_path`'s cache.
-    pub(crate) fn load(&self, name: &str) -> Result<Rc<LoadedAgent>> {
+    /// the `agents:` map. Agent files and
+    /// file-backed input schemas are loaded on dedicated workers so a timed
+    /// workflow step cannot get stuck in the synchronous registry cache miss.
+    pub(crate) async fn load_cancellable(
+        &self,
+        name: &str,
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Rc<LoadedAgent>> {
         let path = self.agents_map.get(name).ok_or_else(|| {
             anyhow!(
                 "unknown subagent '{name}'; define it under 'agents:' in {}",
                 config::CONFIG_FILE_NAME
             )
         })?;
-        self.load_path(path)
+        self.load_path_cancellable(path, cancellation)
+            .await
             .with_context(|| format!("subagent '{name}'"))
     }
 
@@ -125,16 +132,27 @@ impl<'a> AgentRegistry<'a> {
     /// subagent's own structured input; an agent with no `input_schema` gets
     /// a generic single-field `{ "input": ... }` schema instead — see
     /// `app::subagent_tool_input`, the matching unwrap logic on the call
-    /// side.
-    pub(crate) fn load_path(&self, path: &Path) -> Result<Rc<LoadedAgent>> {
+    /// side. The cache is checked before any await.
+    pub(crate) async fn load_path_cancellable(
+        &self,
+        path: &Path,
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Rc<LoadedAgent>> {
         if let Some(cached) = self.loaded.borrow().get(path) {
             return Ok(Rc::clone(cached));
         }
-        let file = agent::load_agent(path)?;
-        let canonical_path = std::fs::canonicalize(path)
-            .with_context(|| format!("failed to resolve agent file path '{}'", path.display()))?;
+        let (file, canonical_path) = tokio::try_join!(
+            agent::load_agent_cancellable(path, cancellation.clone()),
+            async {
+                async_io::canonicalize(path, cancellation.clone())
+                    .await
+                    .with_context(|| {
+                        format!("failed to resolve agent file path '{}'", path.display())
+                    })
+            },
+        )?;
         let tool_parameters = match &file.input_schema {
-            Some(entry) => schema::load_schema_value(entry)?,
+            Some(entry) => schema::load_schema_value_cancellable(entry, cancellation).await?,
             None => serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -160,12 +178,23 @@ impl<'a> AgentRegistry<'a> {
 
     /// Builds the OpenAI-shaped tool definitions for `names` (a resolved
     /// `subagents:` list, already merged through every fallback layer), from
-    /// each named subagent's cached `LoadedAgent` (see `load`).
-    pub(crate) fn tools(&self, names: &[String]) -> Result<ToolSet> {
+    /// each named subagent's cached `LoadedAgent`. Tool construction itself is
+    /// cheap; only the lazy registry loads need the worker path.
+    pub(crate) async fn tools_cancellable(
+        &self,
+        names: &[String],
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<ToolSet> {
+        let loaded_agents = futures_util::future::try_join_all(
+            names
+                .iter()
+                .map(|name| self.load_cancellable(name, cancellation.clone())),
+        )
+        .await?;
+
         let mut tools = Vec::with_capacity(names.len());
         let mut index = HashMap::with_capacity(names.len());
-        for name in names {
-            let loaded = self.load(name)?;
+        for (name, loaded) in names.iter().zip(loaded_agents) {
             let qualified = mcp::qualify_tool_name("subagent tool", "agent", name)?;
             if index.contains_key(&qualified) {
                 bail!("duplicate subagent name '{name}' in 'subagents:'");
@@ -194,11 +223,14 @@ mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
 
-    #[test]
-    fn errors_on_an_unknown_subagent_name() {
+    #[tokio::test]
+    async fn errors_on_an_unknown_subagent_name() {
         let agents_map: config::AgentMap = StdHashMap::new();
         let registry = AgentRegistry::new(&agents_map);
-        let error = registry.load("missing").unwrap_err();
+        let error = registry
+            .load_cancellable("missing", None)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("missing"));
     }
 }

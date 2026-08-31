@@ -1,8 +1,10 @@
 use std::{
     borrow::Cow,
     future::Future,
+    io::Write,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -14,7 +16,7 @@ use futures_util::{StreamExt, TryStreamExt};
 
 use crate::{
     agent::{self, AgentFile},
-    attachment,
+    async_io, attachment,
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
     cli::{AgentRunArgs, PromptArgs, ReasoningEffort, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
@@ -560,6 +562,7 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &'a [ChatCompletionTools],
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> llm::CompletionRequest<'a> {
         llm::CompletionRequest {
             base_url: &self.base_url,
@@ -573,6 +576,7 @@ impl RequestSettings {
             messages,
             tools,
             stream_include_usage: false,
+            cancellation,
         }
     }
 
@@ -612,15 +616,18 @@ impl RequestSettings {
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<response::ChatCompletionResponse> {
-        let system_prompt = self.system_prompt_with_skills(&env.skill_cache, turn.system_prompt)?;
+        let system_prompt = self
+            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, cancellation.clone())
+            .await?;
         let system_prompt = system_prompt.as_deref();
 
         if self.mcp.is_empty() && self.subagents.is_empty() {
             let messages =
                 llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             return self
-                .complete_recorded(env, response_format, messages, &[])
+                .complete_recorded(env, response_format, messages, &[], cancellation)
                 .await;
         }
 
@@ -628,10 +635,11 @@ impl RequestSettings {
         // files), so joining it with the MCP round trip lets both proceed
         // together instead of paying the MCP latency before ever touching
         // disk.
-        let (mut mcp_tool_set, mut subagent_tool_set) =
-            tokio::try_join!(env.registry.tools(&self.mcp), async {
-                env.agent_registry.tools(&self.subagents)
-            },)?;
+        let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
+            env.registry.tools(&self.mcp, cancellation.clone()),
+            env.agent_registry
+                .tools_cancellable(&self.subagents, cancellation.clone()),
+        )?;
         for name in subagent_tool_set.names() {
             if mcp_tool_set.contains(name) {
                 bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
@@ -658,7 +666,7 @@ impl RequestSettings {
             }
 
             let response = self
-                .complete_recorded(env, None, messages.clone(), &tools)
+                .complete_recorded(env, None, messages.clone(), &tools, cancellation.clone())
                 .await?;
 
             let tool_calls = response::first_message(&response)
@@ -673,7 +681,7 @@ impl RequestSettings {
                 // once more with `response_format` attached, now that doing
                 // so can no longer suppress a tool call.
                 return self
-                    .complete_recorded(env, response_format, messages, &[])
+                    .complete_recorded(env, response_format, messages, &[], cancellation.clone())
                     .await;
             };
 
@@ -691,7 +699,12 @@ impl RequestSettings {
                     let name = &tool_call.function.name;
                     let result = if mcp_tool_set.contains(name) {
                         env.registry
-                            .call(&mcp_tool_set, name, &tool_call.function.arguments)
+                            .call(
+                                &mcp_tool_set,
+                                name,
+                                &tool_call.function.arguments,
+                                cancellation.clone(),
+                            )
                             .await?
                     } else if let Some(subagent_name) = subagent_tool_set.subagent_name(name) {
                         call_subagent_tool(
@@ -699,6 +712,7 @@ impl RequestSettings {
                             &tool_call.function.arguments,
                             env,
                             active_agent_paths,
+                            cancellation.clone(),
                         )
                         .await?
                     } else {
@@ -721,8 +735,10 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<response::ChatCompletionResponse> {
-        let response = llm::complete(self.request(response_format, messages, tools)).await?;
+        let response =
+            llm::complete(self.request(response_format, messages, tools, cancellation)).await?;
         env.usage.record_response(&self.usage_label, &response);
         Ok(response)
     }
@@ -757,14 +773,16 @@ impl RequestSettings {
                  of them"
             );
         }
-        let system_prompt = self.system_prompt_with_skills(skill_cache, turn.system_prompt)?;
+        let system_prompt = self
+            .system_prompt_with_skills(skill_cache, turn.system_prompt, None)
+            .await?;
         let messages = llm::initial_messages(
             system_prompt.as_deref(),
             turn.history,
             turn.prompt,
             turn.image_urls,
         )?;
-        let mut request = self.request(response_format, messages, &[]);
+        let mut request = self.request(response_format, messages, &[], None);
         request.stream_include_usage = include_usage;
         llm::complete_stream(request).await
     }
@@ -772,12 +790,13 @@ impl RequestSettings {
     /// Shared by `complete`/`complete_stream`: resolves `self.skills` against
     /// `skill_cache` and appends the result to `system_prompt` — see
     /// `with_skills`.
-    fn system_prompt_with_skills<'a>(
+    async fn system_prompt_with_skills<'a>(
         &self,
         skill_cache: &skill::SkillCache<'_>,
         system_prompt: Option<&'a str>,
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<Option<Cow<'a, str>>> {
-        let skills_text = skill_cache.render(&self.skills)?;
+        let skills_text = skill_cache.render(&self.skills, cancellation).await?;
         Ok(with_skills(system_prompt, skills_text.as_deref()))
     }
 }
@@ -927,6 +946,7 @@ async fn call_agent(
     turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<String> {
     let system_prompt = template::render(
         &agent_file.system_prompt_template,
@@ -934,17 +954,20 @@ async fn call_agent(
         steps_outputs,
         &serde_json::Map::new(),
     )?;
-    let response_format = agent_file
-        .structured_output
-        .then(|| {
-            schema::build_response_format_from_entry(
+    let response_format = if agent_file.structured_output {
+        Some(
+            schema::build_response_format_from_entry_cancellable(
                 agent_file.output_schema.as_ref().expect(
                     "load_agent validates structured_output implies output_schema is present",
                 ),
                 agent_file.schema_name(),
+                cancellation.clone(),
             )
-        })
-        .transpose()?;
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let response = settings
         .complete(
@@ -957,6 +980,7 @@ async fn call_agent(
                 image_urls: turn.image_urls,
             },
             response_format,
+            cancellation,
         )
         .await?;
     response::render_response(&response, false, false)
@@ -1043,13 +1067,17 @@ fn call_subagent_tool<'a>(
     arguments_json: &'a str,
     env: &'a RunEnv<'a>,
     active_paths: &'a [PathBuf],
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
     Box::pin(async move {
         // `Copy` (it only captures `name: &str`), so it can back every
         // `with_context` call below without re-typing the same `format!`.
         let context = || format!("subagent '{name}'");
 
-        let loaded = env.agent_registry.load(name)?;
+        let loaded = env
+            .agent_registry
+            .load_cancellable(name, cancellation.clone())
+            .await?;
 
         if let Err(error) =
             check_nesting_depth(active_paths, &loaded.canonical_path, MAX_SUBAGENT_DEPTH)
@@ -1084,6 +1112,7 @@ fn call_subagent_tool<'a>(
             AgentTurn::simple(&input, &prompt),
             &workflow::StepOutputs::new(),
             &next_active_paths,
+            cancellation,
         )
         .await
         .with_context(context)
@@ -1424,10 +1453,14 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     };
 
     if chat.stream {
-        let stream = settings
-            .complete_stream(&env.skill_cache, turn, response_format, show_usage)
+        let outcome = env
+            .finish(async {
+                let stream = settings
+                    .complete_stream(&env.skill_cache, turn, response_format, show_usage)
+                    .await?;
+                stream_response(stream, show_reasoning, output_path).await
+            })
             .await?;
-        let outcome = stream_response(stream, show_reasoning, output_path).await?;
         // Streamed usage arrives on the final chunk rather than through
         // `complete`; feed it into the same tally so both chat paths share
         // one summary format and so `env.usage.total()` below reflects it.
@@ -1449,7 +1482,9 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         return Ok(());
     }
 
-    let response = settings.complete(&env, &[], turn, response_format).await?;
+    let response = env
+        .finish(settings.complete(&env, &[], turn, response_format, None))
+        .await?;
 
     match output_path {
         Some(path) => {
@@ -1521,85 +1556,88 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
     let mut settings: Option<RequestSettings> = None;
 
     let stdin = std::io::stdin();
-    loop {
-        eprint!("> ");
-        std::io::stderr().flush()?;
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break; // end-of-input (Ctrl-D)
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if let Some(command) = repl::parse_meta_command(line) {
-            match command {
-                repl::MetaCommand::Exit => break,
-                repl::MetaCommand::Clear => {
-                    history.clear();
-                    eprintln!("(history cleared — a --session log, if any, is unaffected)");
-                }
-                repl::MetaCommand::Model(name) if !name.is_empty() => {
-                    shared.model = Some(name.to_owned());
-                    settings = None;
-                    eprintln!("(model set to '{name}')");
-                }
-                repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
-                repl::MetaCommand::System(text) if !text.is_empty() => {
-                    system_prompt = Some(text.to_owned());
-                    eprintln!("(system prompt updated)");
-                }
-                repl::MetaCommand::System(_) => eprintln!("usage: /system <text>"),
-                repl::MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+    let repl = async {
+        loop {
+            eprint!("> ");
+            std::io::stderr().flush()?;
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break; // end-of-input (Ctrl-D)
             }
-            continue;
-        }
-
-        if settings.is_none() {
-            settings = match resolve_chat_settings(&shared, None, &file_config) {
-                Ok(resolved) => Some(resolved),
-                Err(error) => {
-                    eprintln!("lait: {error:#}");
-                    continue;
-                }
-            };
-        }
-        let settings = settings
-            .as_ref()
-            .expect("just resolved above, or the loop continued before reaching here");
-
-        match run_repl_turn(
-            settings,
-            &env,
-            &system_prompt,
-            &history,
-            line,
-            shared.show_reasoning,
-            shared.show_usage,
-        )
-        .await
-        {
-            Ok((assistant_text, turn_usage)) => {
-                history.push(llm::user_message(line, &[])?);
-                history.push(llm::assistant_message(&assistant_text)?);
-                finish_chat_turn(
-                    shared.session.as_deref(),
-                    shared.no_history,
-                    &file_config,
-                    &settings.resolved_model.model_id,
-                    line,
-                    &assistant_text,
-                    turn_usage,
-                )?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-            // One bad turn (a request error, a bad `/model` name that only
-            // fails once actually resolved) shouldn't end the whole session
-            // — report it and let the user try again or `/exit`.
-            Err(error) => eprintln!("lait: {error:#}"),
+
+            if let Some(command) = repl::parse_meta_command(line) {
+                match command {
+                    repl::MetaCommand::Exit => break,
+                    repl::MetaCommand::Clear => {
+                        history.clear();
+                        eprintln!("(history cleared — a --session log, if any, is unaffected)");
+                    }
+                    repl::MetaCommand::Model(name) if !name.is_empty() => {
+                        shared.model = Some(name.to_owned());
+                        settings = None;
+                        eprintln!("(model set to '{name}')");
+                    }
+                    repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
+                    repl::MetaCommand::System(text) if !text.is_empty() => {
+                        system_prompt = Some(text.to_owned());
+                        eprintln!("(system prompt updated)");
+                    }
+                    repl::MetaCommand::System(_) => eprintln!("usage: /system <text>"),
+                    repl::MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+                }
+                continue;
+            }
+
+            if settings.is_none() {
+                settings = match resolve_chat_settings(&shared, None, &file_config) {
+                    Ok(resolved) => Some(resolved),
+                    Err(error) => {
+                        eprintln!("lait: {error:#}");
+                        continue;
+                    }
+                };
+            }
+            let settings = settings
+                .as_ref()
+                .expect("just resolved above, or the loop continued before reaching here");
+
+            match run_repl_turn(
+                settings,
+                &env,
+                &system_prompt,
+                &history,
+                line,
+                shared.show_reasoning,
+                shared.show_usage,
+            )
+            .await
+            {
+                Ok((assistant_text, turn_usage)) => {
+                    history.push(llm::user_message(line, &[])?);
+                    history.push(llm::assistant_message(&assistant_text)?);
+                    finish_chat_turn(
+                        shared.session.as_deref(),
+                        shared.no_history,
+                        &file_config,
+                        &settings.resolved_model.model_id,
+                        line,
+                        &assistant_text,
+                        turn_usage,
+                    )?;
+                }
+                // One bad turn (a request error, a bad `/model` name that only
+                // fails once actually resolved) shouldn't end the whole session
+                // — report it and let the user try again or `/exit`.
+                Err(error) => eprintln!("lait: {error:#}"),
+            }
         }
-    }
-    Ok(())
+        Ok::<(), anyhow::Error>(())
+    };
+    env.finish(repl).await
 }
 
 /// Runs one `lait chat` turn: streams the response to stdout (the REPL's
@@ -1641,7 +1679,7 @@ async fn run_repl_turn(
         }
         outcome.content
     } else {
-        let response = settings.complete(env, &[], turn, None).await?;
+        let response = settings.complete(env, &[], turn, None, None).await?;
         let rendered = response::render_response(&response, false, show_reasoning)?;
         println!("{rendered}");
         if show_usage {
@@ -1700,8 +1738,14 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
     .with_usage_label(format!("prompt '{}'", args.name));
 
     let env = RunEnv::new(&file_config);
-    let response = settings
-        .complete(&env, &[], PromptTurn::simple(None, &prompt_text), None)
+    let response = env
+        .finish(settings.complete(
+            &env,
+            &[],
+            PromptTurn::simple(None, &prompt_text),
+            None,
+            None,
+        ))
         .await?;
     let output = response::render_response(&response, false, false)?;
     println!("{output}");
@@ -1763,16 +1807,18 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
     let env = RunEnv::new(&file_config);
-    let output = call_agent(
-        &agent_file,
-        &settings,
-        &env,
-        AgentTurn::simple(&input, &raw_input),
-        &workflow::StepOutputs::new(),
-        std::slice::from_ref(&canonical_agent_path),
-    )
-    .await
-    .with_context(|| format!("agent '{}'", args.file.display()))?;
+    let output = env
+        .finish(call_agent(
+            &agent_file,
+            &settings,
+            &env,
+            AgentTurn::simple(&input, &raw_input),
+            &workflow::StepOutputs::new(),
+            std::slice::from_ref(&canonical_agent_path),
+            None,
+        ))
+        .await
+        .with_context(|| format!("agent '{}'", args.file.display()))?;
     println!("{output}");
     record_history(
         args.no_history,
@@ -1800,16 +1846,18 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let env = RunEnv::new(&file_config);
     let initial_prompt = prompt.clone();
-    let (current_input, _, _, _) = run_steps(
-        &wf.steps,
-        prompt,
-        &scope,
-        &env,
-        0,
-        "",
-        workflow::StepOutputs::new(),
-    )
-    .await?;
+    let (current_input, _, _, _) = env
+        .finish(run_steps(
+            &wf.steps,
+            prompt,
+            &scope,
+            &env,
+            0,
+            "",
+            workflow::StepOutputs::new(),
+            None,
+        ))
+        .await?;
     println!("{current_input}");
     // A workflow can touch several models across its steps, so no single
     // `model` is recorded here — see `history::HistoryEntry::model`.
@@ -1909,6 +1957,17 @@ impl<'a> RunEnv<'a> {
             agent_registry: subagent::AgentRegistry::new(&file_config.agents),
             usage: UsageTally::default(),
         }
+    }
+
+    /// Drives `fut` to completion, then unconditionally shuts down the MCP
+    /// registry before handing back `fut`'s result — on success or failure
+    /// alike, so callers don't have to re-derive that ordering themselves.
+    /// Every top-level `lait`/`lait agent run`/`lait run` invocation must
+    /// call this once, at the end, instead of awaiting its work directly.
+    async fn finish<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
+        let result = fut.await;
+        self.registry.shutdown().await;
+        result
     }
 }
 
@@ -2068,6 +2127,20 @@ enum Flow {
 /// `run_steps`.
 type StepsOutcome = Result<(String, usize, Flow, workflow::StepOutputs)>;
 
+/// Returns an error as soon as the cancellation inherited from an enclosing
+/// timed step/workflow is observed. Router frames use this check between
+/// child operations as well as passing the receiver into jq itself, so a
+/// cancellation cannot be lost merely because a router has no model node of
+/// its own.
+fn check_workflow_cancellation(
+    cancellation: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    if cancellation.is_some_and(|receiver| *receiver.borrow()) {
+        bail!("workflow execution was cancelled");
+    }
+    Ok(())
+}
+
 /// Runs a sequence of steps (the workflow's top-level `steps`, the nested
 /// `steps` of a `switch` case/`else`, or a `parallel` branch), returning the
 /// final input and the running progress counter so nested calls keep
@@ -2086,7 +2159,13 @@ type StepsOutcome = Result<(String, usize, Flow, workflow::StepOutputs)>;
 /// recording into a shared namespace would race, and there is no well-defined
 /// "the" value for an id set differently by two branches. Boxed because a
 /// `switch`/`parallel` step recurses into this function from within an
-/// `async` body, which Rust cannot size otherwise.
+/// `async` body, which Rust cannot size otherwise. `cancellation` is cloned
+/// into every nested frame and router jq operation, preserving the timeout of
+/// the enclosing step/workflow across control-flow boundaries.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recursive workflow state is intentionally explicit at each call site"
+)]
 fn run_steps<'a>(
     steps: &'a [workflow::FlowStep],
     current_input: String,
@@ -2095,12 +2174,14 @@ fn run_steps<'a>(
     start_counter: usize,
     progress_prefix: &'a str,
     steps_outputs: workflow::StepOutputs,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Pin<Box<dyn Future<Output = StepsOutcome> + 'a>> {
     Box::pin(async move {
         let mut current_input = current_input;
         let mut counter = start_counter;
         let mut steps_outputs = steps_outputs;
         for step in steps {
+            check_workflow_cancellation(cancellation.as_ref())?;
             counter += 1;
             let label = step.label_or(counter);
 
@@ -2115,8 +2196,14 @@ fn run_steps<'a>(
 
                     let mut matched = None;
                     for (case_index, case) in switch.cases.iter().enumerate() {
-                        if workflow::eval_when(&case.when, &current_input, &steps_outputs)
-                            .with_context(|| format!("step '{label}'"))?
+                        if workflow::eval_when_async(
+                            &case.when,
+                            &current_input,
+                            &steps_outputs,
+                            cancellation.clone(),
+                        )
+                        .await
+                        .with_context(|| format!("step '{label}'"))?
                         {
                             let case_label = case
                                 .id
@@ -2132,6 +2219,7 @@ fn run_steps<'a>(
                                     counter,
                                     progress_prefix,
                                     steps_outputs.clone(),
+                                    cancellation.clone(),
                                 )
                                 .await?,
                             );
@@ -2153,6 +2241,7 @@ fn run_steps<'a>(
                                     counter,
                                     progress_prefix,
                                     steps_outputs.clone(),
+                                    cancellation.clone(),
                                 )
                                 .await?
                             }
@@ -2200,6 +2289,7 @@ fn run_steps<'a>(
                                 0,
                                 branch_prefix,
                                 steps_outputs.clone(),
+                                cancellation.clone(),
                             )
                         },
                     );
@@ -2222,8 +2312,14 @@ fn run_steps<'a>(
                     eprintln!("{progress_prefix}    -> branches joined");
 
                     current_input = match &parallel.join {
-                        Some(filter) => jq::apply(filter, &joined_json, &steps_outputs)
-                            .with_context(|| format!("step '{label}'"))?,
+                        Some(filter) => jq::apply_cancellable_async(
+                            filter,
+                            &joined_json,
+                            &steps_outputs,
+                            cancellation.clone(),
+                        )
+                        .await
+                        .with_context(|| format!("step '{label}'"))?,
                         None => joined_json,
                     };
                     record_step_output(&mut steps_outputs, step, &current_input);
@@ -2254,8 +2350,14 @@ fn run_steps<'a>(
                     // with `satisfied` = false, an error either way.
                     let satisfied = loop {
                         if let Some(while_cond) = &loop_def.r#while
-                            && !workflow::eval_when(while_cond, &iteration_input, &steps_outputs)
-                                .with_context(|| format!("step '{label}'"))?
+                            && !workflow::eval_when_async(
+                                while_cond,
+                                &iteration_input,
+                                &steps_outputs,
+                                cancellation.clone(),
+                            )
+                            .await
+                            .with_context(|| format!("step '{label}'"))?
                         {
                             break true;
                         }
@@ -2274,6 +2376,7 @@ fn run_steps<'a>(
                             loop_counter,
                             progress_prefix,
                             steps_outputs.clone(),
+                            cancellation.clone(),
                         )
                         .await?;
                         iteration_input = result;
@@ -2292,8 +2395,14 @@ fn run_steps<'a>(
                             }
                         }
                         if let Some(until_cond) = &loop_def.until
-                            && workflow::eval_when(until_cond, &iteration_input, &steps_outputs)
-                                .with_context(|| format!("step '{label}'"))?
+                            && workflow::eval_when_async(
+                                until_cond,
+                                &iteration_input,
+                                &steps_outputs,
+                                cancellation.clone(),
+                            )
+                            .await
+                            .with_context(|| format!("step '{label}'"))?
                         {
                             break true;
                         }
@@ -2316,8 +2425,14 @@ fn run_steps<'a>(
 
                 Some(workflow::Router::ForEach(for_each)) => {
                     eprintln!("{progress_prefix}[{counter}] {label}");
-                    let items_json = jq::apply_one(&for_each.items, &current_input, &steps_outputs)
-                        .with_context(|| format!("step '{label}'"))?;
+                    let items_json = jq::apply_one_cancellable_async(
+                        &for_each.items,
+                        &current_input,
+                        &steps_outputs,
+                        cancellation.clone(),
+                    )
+                    .await
+                    .with_context(|| format!("step '{label}'"))?;
                     let items_value: serde_json::Value = serde_json::from_str(&items_json)
                         .with_context(|| {
                             format!(
@@ -2362,6 +2477,7 @@ fn run_steps<'a>(
                                 for_each_counter,
                                 progress_prefix,
                                 steps_outputs.clone(),
+                                cancellation.clone(),
                             )
                             .await?;
                             for_each_counter = new_counter;
@@ -2404,6 +2520,7 @@ fn run_steps<'a>(
                                     0,
                                     item_prefix,
                                     steps_outputs.clone(),
+                                    cancellation.clone(),
                                 )
                             },
                         );
@@ -2430,8 +2547,14 @@ fn run_steps<'a>(
                         .context("failed to serialize 'for_each' results")?;
 
                     current_input = match &for_each.join {
-                        Some(filter) => jq::apply(filter, &results_json, &steps_outputs)
-                            .with_context(|| format!("step '{label}'"))?,
+                        Some(filter) => jq::apply_cancellable_async(
+                            filter,
+                            &results_json,
+                            &steps_outputs,
+                            cancellation.clone(),
+                        )
+                        .await
+                        .with_context(|| format!("step '{label}'"))?,
                         None => results_json,
                     };
                     record_step_output(&mut steps_outputs, step, &current_input);
@@ -2442,8 +2565,14 @@ fn run_steps<'a>(
             }
 
             if let Some(when) = &step.when {
-                let truthy = workflow::eval_when(when, &current_input, &steps_outputs)
-                    .with_context(|| format!("step '{label}'"))?;
+                let truthy = workflow::eval_when_async(
+                    when,
+                    &current_input,
+                    &steps_outputs,
+                    cancellation.clone(),
+                )
+                .await
+                .with_context(|| format!("step '{label}'"))?;
                 if !truthy {
                     eprintln!("{progress_prefix}[{counter}] {label} (skipped)");
                     continue;
@@ -2468,6 +2597,7 @@ fn run_steps<'a>(
                         &label,
                         progress_prefix,
                         &steps_outputs,
+                        cancellation.clone(),
                     )
                     .await;
                     match attempt_result {
@@ -2491,11 +2621,17 @@ fn run_steps<'a>(
                                     counter,
                                     progress_prefix,
                                     steps_outputs.clone(),
+                                    cancellation.clone(),
                                 )
                                 .await?;
                                 counter = new_counter;
                                 steps_outputs = new_steps_outputs;
                                 if flow != Flow::Continue {
+                                    // The handler's Break/Stop still completes this
+                                    // step with `result`. Record that outer site's
+                                    // output before bubbling the control-flow signal,
+                                    // just like the router branches above do.
+                                    record_step_output(&mut steps_outputs, step, &result);
                                     return Ok((result, counter, flow, steps_outputs));
                                 }
                                 result
@@ -2542,6 +2678,10 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
 /// `on_error` or propagate it. `label` is the calling `use:` site's label
 /// (not the node's own id), so error messages point at where in the flow the
 /// failure happened.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "retry execution threads explicit workflow, display, output, and cancellation state"
+)]
 async fn execute_step_with_retry(
     node: &workflow::NodeDefinition,
     current_input: &str,
@@ -2550,6 +2690,7 @@ async fn execute_step_with_retry(
     label: &str,
     progress_prefix: &str,
     steps_outputs: &workflow::StepOutputs,
+    mut workflow_cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<String> {
     let calls_model = node.calls_model();
     let effective_retry = node.retry.as_ref().or(calls_model
@@ -2575,15 +2716,19 @@ async fn execute_step_with_retry(
     let mut attempt = 0usize;
     loop {
         attempt += 1;
+        check_workflow_cancellation(workflow_cancel.as_ref())?;
         let outcome = match effective_timeout {
             // Keep the timeout around the whole node action (including its
-            // later jq/write_file work), but give a command attempt a
-            // cancellation channel so a timeout can ask `run_command` to
-            // kill and reap its child before a retry starts. The future stays
-            // borrowed until that cleanup finishes, avoiding a second timer
-            // racing the child-owning future.
-            Some(seconds) if node.command.is_some() => {
+            // later jq/write_file work). A cancellation channel is passed to
+            // every timed node, not just command nodes: jq and write_file
+            // also run outside Tokio and must be told to stop waiting before
+            // a retry or an on_error branch starts. The future stays borrowed
+            // until cancellation cleanup finishes, avoiding a second attempt
+            // racing the child-owning or file-writing future.
+            Some(seconds) => {
                 let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+                let _forwarder =
+                    CancellationForwarder::new(workflow_cancel.clone(), cancel_sender.clone());
                 let execution = execute_step(
                     node,
                     current_input,
@@ -2608,30 +2753,6 @@ async fn execute_step_with_retry(
                     }
                 }
             }
-            Some(seconds) => {
-                match tokio::time::timeout(
-                    Duration::from_secs(seconds),
-                    execute_step(
-                        node,
-                        current_input,
-                        StepExecutionContext {
-                            scope,
-                            env,
-                            label,
-                            progress_prefix,
-                            steps_outputs,
-                            step_cancel: None,
-                        },
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow!(
-                        "step '{label}' timed out after {seconds}s (attempt {attempt}/{max_attempts})"
-                    )),
-                }
-            }
             None => {
                 execute_step(
                     node,
@@ -2642,7 +2763,7 @@ async fn execute_step_with_retry(
                         label,
                         progress_prefix,
                         steps_outputs,
-                        step_cancel: None,
+                        step_cancel: workflow_cancel.clone(),
                     },
                 )
                 .await
@@ -2652,13 +2773,12 @@ async fn execute_step_with_retry(
         match outcome {
             Ok(output) => return Ok(output),
             Err(error) if attempt < max_attempts => {
+                check_workflow_cancellation(workflow_cancel.as_ref())?;
                 eprintln!(
                     "{progress_prefix}    -> attempt {attempt}/{max_attempts} failed: {error}; retrying in {:.1}s",
                     delay.as_secs_f64()
                 );
-                if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
-                }
+                wait_retry_delay(delay, workflow_cancel.as_mut()).await?;
                 // `try_from_secs_f64` + the `MAX_RETRY_DELAY` clamp keep an
                 // exponentially growing (or pathological) delay from
                 // overflowing `Duration` — `Duration::from_secs_f64` would
@@ -2668,6 +2788,83 @@ async fn execute_step_with_retry(
                     .min(MAX_RETRY_DELAY);
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+/// For a timed node there are two independent cancellation sources: the
+/// node's own timeout and the cancellation inherited from an enclosing
+/// workflow/step. The low-level operations accept one watch receiver, so a
+/// short-lived forwarding task combines the two sources into one channel.
+/// Dropping the guard aborts that task after the node has completed, avoiding
+/// one permanently-live task per workflow step.
+struct CancellationForwarder {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CancellationForwarder {
+    fn new(
+        source: Option<tokio::sync::watch::Receiver<bool>>,
+        sender: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        let task = source.map(|mut source| {
+            tokio::spawn(async move {
+                loop {
+                    if *source.borrow() {
+                        let _ = sender.send(true);
+                        break;
+                    }
+                    if source.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+        Self { task }
+    }
+}
+
+impl Drop for CancellationForwarder {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Sleeps between retries while still honoring cancellation inherited from a
+/// surrounding workflow. A plain `sleep` would allow a cancelled nested
+/// workflow to wait for an arbitrarily large backoff before returning.
+async fn wait_retry_delay(
+    delay: Duration,
+    cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    let Some(cancellation) = cancellation else {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        return Ok(());
+    };
+    if *cancellation.borrow() {
+        bail!("workflow execution was cancelled");
+    }
+    if delay.is_zero() {
+        return Ok(());
+    }
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+        biased;
+        changed = cancellation.changed() => {
+            if changed.is_err() || *cancellation.borrow() {
+                bail!("workflow execution was cancelled");
+            }
+                // A non-cancelling update does not shorten the backoff; keep
+                // waiting on the same deadline.
+                continue;
+        }
+            _ = &mut sleep => return Ok(()),
         }
     }
 }
@@ -2774,10 +2971,17 @@ async fn resolve_attachments<'a>(
     node: &workflow::NodeDefinition,
     base_prompt: &'a str,
     label: &str,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(Cow<'a, str>, Vec<String>)> {
     let (file_context, image_urls) = tokio::try_join!(
-        attachment::read_file_attachments(node.files.as_deref().unwrap_or(&[])),
-        attachment::resolve_image_urls(node.images.as_deref().unwrap_or(&[])),
+        attachment::read_file_attachments_cancellable(
+            node.files.as_deref().unwrap_or(&[]),
+            cancellation.clone(),
+        ),
+        attachment::resolve_image_urls_cancellable(
+            node.images.as_deref().unwrap_or(&[]),
+            cancellation,
+        ),
     )
     .with_context(|| format!("step '{label}'"))?;
     let prompt = match file_context {
@@ -2804,8 +3008,13 @@ async fn execute_step(
         mut step_cancel,
     } = context;
     if let Some(name_or_path) = &node.input_schema {
-        let schema = schema::resolve_named_schema_value(&scope.json_schemas, name_or_path)
-            .with_context(|| format!("step '{label}'"))?;
+        let schema = schema::resolve_named_schema_value_cancellable(
+            &scope.json_schemas,
+            name_or_path,
+            step_cancel.clone(),
+        )
+        .await
+        .with_context(|| format!("step '{label}'"))?;
         let input = template::parse_input(current_input);
         schema::validate_input_against_schema(&schema, &input)
             .with_context(|| format!("step '{label}'"))?;
@@ -2818,7 +3027,8 @@ async fn execute_step(
         // both from disk on every iteration.
         let loaded = env
             .agent_registry
-            .load_path(agent_path)
+            .load_path_cancellable(agent_path, step_cancel.clone())
+            .await
             .with_context(|| format!("step '{label}'"))?;
         let agent_file = &loaded.file;
 
@@ -2831,7 +3041,8 @@ async fn execute_step(
             resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?
                 .with_usage_label(label);
 
-        let (prompt, image_urls) = resolve_attachments(node, current_input, label).await?;
+        let (prompt, image_urls) =
+            resolve_attachments(node, current_input, label, step_cancel.clone()).await?;
 
         call_agent(
             agent_file,
@@ -2844,6 +3055,7 @@ async fn execute_step(
             },
             steps_outputs,
             std::slice::from_ref(&loaded.canonical_path),
+            step_cancel.clone(),
         )
         .await
         .with_context(|| format!("step '{label}'"))?
@@ -2851,20 +3063,31 @@ async fn execute_step(
         let settings = resolve_step_settings(node, scope, env.file_config, None, label)?
             .with_usage_label(label);
 
-        let response_format = node
-            .output_schema
-            .as_deref()
-            .map(|name_or_path| {
+        let response_format = match node.output_schema.as_deref() {
+            Some(name_or_path) => {
                 let schema_name = node.schema_name.as_deref().unwrap_or("structured_output");
-                match scope.json_schemas.get(name_or_path) {
-                    Some(entry) => schema::build_response_format_from_entry(entry, schema_name),
-                    None => {
-                        schema::load_json_schema(std::path::Path::new(name_or_path), schema_name)
+                let response_format = match scope.json_schemas.get(name_or_path) {
+                    Some(entry) => {
+                        schema::build_response_format_from_entry_cancellable(
+                            entry,
+                            schema_name,
+                            step_cancel.clone(),
+                        )
+                        .await
                     }
-                }
-            })
-            .transpose()
-            .with_context(|| format!("step '{label}'"))?;
+                    None => {
+                        schema::load_json_schema_cancellable(
+                            Path::new(name_or_path),
+                            schema_name,
+                            step_cancel.clone(),
+                        )
+                        .await
+                    }
+                };
+                Some(response_format.with_context(|| format!("step '{label}'"))?)
+            }
+            None => None,
+        };
 
         let input = template::parse_input(current_input);
         // A `system_prompt`-only node (no `prompt`) sends the current input
@@ -2883,7 +3106,8 @@ async fn execute_step(
             ),
             None => Cow::Borrowed(current_input),
         };
-        let (prompt, image_urls) = resolve_attachments(node, &prompt, label).await?;
+        let (prompt, image_urls) =
+            resolve_attachments(node, &prompt, label, step_cancel.clone()).await?;
         let system_prompt = node
             .system_prompt
             .as_deref()
@@ -2910,6 +3134,7 @@ async fn execute_step(
                     image_urls: &image_urls,
                 },
                 response_format,
+                step_cancel.clone(),
             )
             .await
             .with_context(|| format!("step '{label}'"))?;
@@ -2941,6 +3166,7 @@ async fn execute_step(
             0,
             &sub_progress_prefix,
             workflow::StepOutputs::new(),
+            step_cancel.clone(),
         )
         .await
         .with_context(|| format!("step '{label}'"))?;
@@ -2977,78 +3203,522 @@ async fn execute_step(
 /// Applies a node's jq transform off the Tokio workers. jq evaluation is
 /// synchronous and can be expensive for a large input; running it on a
 /// dedicated OS thread means the enclosing node timeout remains effective.
-/// When the caller supplies a cancellation receiver (the command-node path),
-/// cancellation is observed without waiting for the jq thread to finish.
+/// The worker receives a cooperative cancellation flag and is awaited after a
+/// timeout, so a cancelled evaluation does not continue as a detached thread
+/// after the workflow attempt has moved on.
 async fn apply_jq(
     filter: &str,
     input: &str,
     steps_outputs: &workflow::StepOutputs,
     step_cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<String> {
-    let filter = filter.to_owned();
-    let input = input.to_owned();
-    let steps_outputs = steps_outputs.clone();
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    tokio::pin!(receiver);
-    std::thread::spawn(move || {
-        let result = jq::apply(&filter, &input, &steps_outputs);
-        let _ = sender.send(result);
-    });
-
-    if let Some(step_cancel) = step_cancel {
-        let result = tokio::select! {
-            result = &mut receiver => result.context("jq evaluation task was cancelled")?,
-            changed = step_cancel.changed() => {
-                if changed.is_err() || *step_cancel.borrow() {
-                    bail!("jq evaluation was cancelled")
-                }
-                Ok(receiver.await.context("jq evaluation task was cancelled")??)
-            }
-        };
-        result
-    } else {
-        Ok(receiver
-            .await
-            .context("jq evaluation task was cancelled")??)
-    }
+    let cancellation = step_cancel.as_ref().map(|receiver| (**receiver).clone());
+    // Input normalization is deliberately performed inside the bounded jq
+    // worker. A large plain-text model/command result must not be parsed and
+    // re-serialized on a Tokio executor thread before cancellation can win.
+    jq::apply_cancellable_async(filter, input, steps_outputs, cancellation).await
 }
 
-/// Writes a node's output from a dedicated OS thread. `fs::write` can block
-/// indefinitely for special files such as a FIFO; keeping that blocking call
-/// off the Tokio workers lets the enclosing node timeout still fire. The
-/// thread is intentionally detached if the caller times out — unlike a
-/// `spawn_blocking` task, Tokio runtime shutdown will not wait forever for a
-/// blocked filesystem call to finish.
+/// Writes a node's output from a dedicated OS thread. The worker is kept off
+/// Tokio's runtime because a write to a special file such as a FIFO can block
+/// indefinitely. A timeout sets the worker's cancellation flag and waits for
+/// it to finish; Unix special files are opened non-blocking so that this
+/// cleanup cannot itself get stuck. Regular files use the same direct
+/// create/truncate/write behavior as `fs::write`, with cancellation checks
+/// between bounded chunks so existing inode, permission, hard-link, and
+/// symlink semantics remain intact.
 async fn write_output_file(
     path: &Path,
     output: &str,
-    mut step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    step_cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     let path = path.to_owned();
     let output = output.to_owned();
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    tokio::pin!(receiver);
-    std::thread::spawn(move || {
-        let result = std::fs::write(&path, output)
-            .with_context(|| format!("failed to write output to '{}'", path.display()));
-        let _ = sender.send(result);
-    });
+    // `run_blocking_with_path_lock` deliberately returns after a bounded
+    // cancellation cleanup even when an OS/network filesystem call ignores
+    // the cancellation flag; transferring the lease to the worker prevents a
+    // retry from writing the same path concurrently with that still-running
+    // worker.
+    let worker_path = path.clone();
+    async_io::run_blocking_with_path_lock(
+        &path,
+        move |cancelled| {
+            write_output_file_blocking(&worker_path, &output, cancelled)
+                .with_context(|| format!("failed to write output to '{}'", worker_path.display()))
+        },
+        step_cancel,
+    )
+    .await
+}
 
-    if let Some(step_cancel) = &mut step_cancel {
-        let result = tokio::select! {
-            result = &mut receiver => result.context("output file write task was cancelled")?,
-            changed = step_cancel.changed() => {
-                if changed.is_err() || *step_cancel.borrow() {
-                    bail!("output file write was cancelled")
+/// Performs the blocking half of [`write_output_file`]. On Unix, the target is
+/// opened once with `O_NONBLOCK` and classified from that same handle. This
+/// removes the metadata-then-open TOCTOU window while preserving symlink,
+/// inode, permission, and hard-link behavior for regular files. FIFOs and
+/// other non-regular files continue through non-blocking I/O. Other platforms
+/// reject non-regular handles after a conservative path preflight, rather than
+/// attempting to write a device, named pipe, or reparse point.
+fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    #[cfg(unix)]
+    {
+        use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+        let file = loop {
+            if cancelled.load(Ordering::Acquire) {
+                bail!("output file write was cancelled");
+            }
+            match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => break file,
+                // Opening a FIFO for writing without a reader reports ENXIO
+                // when O_NONBLOCK is set. Poll until a reader appears or the
+                // workflow cancellation flag asks us to stop.
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                Ok(receiver.await.context("output file write task was cancelled")??)
+                Err(error) => return Err(error.into()),
             }
         };
-        result?;
+
+        if !file.metadata()?.file_type().is_file() {
+            return write_nonblocking_special_file(file, output, cancelled);
+        }
+
+        write_regular_output_file(file, output, cancelled)
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows has no portable non-blocking File API. Reject an already
+        // visible special/reparse target before opening it, then repeat the
+        // check on the opened handle to keep a path swap from turning into a
+        // write to a device or named pipe. Symlinks to regular files retain
+        // the existing follow-and-overwrite behavior.
+        match std::fs::metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                bail!(
+                    "refusing to write non-regular output path '{}'",
+                    path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            bail!(
+                "refusing to write non-regular output path '{}'",
+                path.display()
+            );
+        }
+        write_regular_output_file(file, output, cancelled)
+    }
+}
+
+/// Writes an ordinary file directly, preserving the target inode and the
+/// overwrite/permission behavior of `fs::write`. Chunking only exists to give
+/// a timed worker a bounded opportunity to observe cancellation.
+fn write_regular_output_file(
+    mut file: std::fs::File,
+    output: &str,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    // Truncate only after the handle has been classified as a regular file.
+    // A timeout after this point intentionally leaves an empty/partial file:
+    // direct truncation is what preserves the existing inode, permissions,
+    // hard links, and symlink-following semantics of `fs::write`, but it is
+    // not an atomic replacement. The caller receives an error and must not
+    // treat the partial bytes as a completed node output.
+    file.set_len(0)?;
+    for chunk in output.as_bytes().chunks(64 * 1024) {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("output file write was cancelled");
+        }
+        file.write_all(chunk)?;
+    }
+    file.flush()?;
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Writes FIFOs and other Unix special files with non-blocking I/O. Opening
+/// the descriptor with `O_NONBLOCK` by the caller means no system
+/// call can hold the worker past cancellation. The same handle is used for
+/// classification and writing; reopening the path here would reintroduce a
+/// metadata/open TOCTOU race.
+fn write_nonblocking_special_file(
+    mut file: std::fs::File,
+    output: &str,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let bytes = output.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("output file write was cancelled");
+        }
+        match file.write(&bytes[offset..]) {
+            Ok(0) => bail!("output file write made no progress"),
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    Ok(())
+}
+
+/// Tracks the OS primitive that owns a command's process tree.
+///
+/// Unix commands are put in a fresh process group before they are spawned,
+/// so a negative-PGID SIGKILL reaches the command and every descendant that
+/// inherits the group. Windows uses a Job Object for the same ownership
+/// boundary; terminating the job is the only reliable way to stop descendants
+/// when the command itself is a shell or has forked workers.
+#[cfg(unix)]
+struct CommandProcessTree {
+    process_group: libc::pid_t,
+    cleanup_on_drop: bool,
+}
+
+#[cfg(windows)]
+struct CommandProcessTree {
+    job: std::os::windows::io::OwnedHandle,
+    cleanup_on_drop: bool,
+}
+
+#[cfg(not(any(unix, windows)))]
+struct CommandProcessTree {
+    cleanup_on_drop: bool,
+}
+
+#[cfg(unix)]
+impl CommandProcessTree {
+    fn configure(command: &mut tokio::process::Command) {
+        // PGID 0 asks the OS to use the child's PID as its process-group ID.
+        // Tokio forwards this to std::process::Command before fork/exec, so
+        // there is no parent-side race between spawning and setpgid(2).
+        command.process_group(0);
+    }
+
+    fn attach(child: &tokio::process::Child) -> Result<Self> {
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow!("command exited before its process group was attached"))?;
+        let process_group = libc::pid_t::try_from(pid)
+            .map_err(|_| anyhow!("command process id {pid} does not fit in a process-group id"))?;
+        Ok(Self {
+            process_group,
+            cleanup_on_drop: true,
+        })
+    }
+
+    fn kill(&self) -> std::io::Result<()> {
+        // A negative PID targets the process group whose ID is -PID. ESRCH
+        // means that the group is already empty, which is successful cleanup.
+        let result = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CommandProcessTree {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = self.kill();
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows_command_job {
+    use std::{
+        ffi::c_void,
+        io,
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
+        ptr,
+    };
+
+    type Bool = i32;
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
+    const INVALID_RESUME_COUNT: u32 = u32::MAX;
+
+    #[repr(C)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "CreateJobObjectW"]
+        fn create_job_object_w(lp_job_attributes: *mut c_void, lp_name: *const u16) -> RawHandle;
+        #[link_name = "AssignProcessToJobObject"]
+        fn assign_process_to_job_object(job: RawHandle, process: RawHandle) -> Bool;
+        #[link_name = "TerminateJobObject"]
+        fn terminate_job_object(job: RawHandle, exit_code: u32) -> Bool;
+        #[link_name = "CreateToolhelp32Snapshot"]
+        fn create_toolhelp32_snapshot(flags: u32, process_id: u32) -> RawHandle;
+        #[link_name = "Thread32First"]
+        fn thread32_first(snapshot: RawHandle, entry: *mut ThreadEntry32) -> Bool;
+        #[link_name = "Thread32Next"]
+        fn thread32_next(snapshot: RawHandle, entry: *mut ThreadEntry32) -> Bool;
+        #[link_name = "OpenThread"]
+        fn open_thread(access: u32, inherit_handle: Bool, thread_id: u32) -> RawHandle;
+        #[link_name = "ResumeThread"]
+        fn resume_thread(thread: RawHandle) -> u32;
+        #[link_name = "CloseHandle"]
+        fn close_handle(handle: RawHandle) -> Bool;
+        #[link_name = "GetProcessId"]
+        fn get_process_id(process: RawHandle) -> u32;
+    }
+
+    pub(super) fn configure(command: &mut tokio::process::Command) {
+        // Keep the primary thread stopped until the process has been assigned
+        // to our Job Object.  Without this, a shell can create descendants in
+        // the interval between CreateProcess and AssignProcessToJobObject;
+        // those descendants would not inherit the job and would survive a
+        // later timeout.
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    fn resume_process(process: RawHandle) -> io::Result<()> {
+        let process_id = unsafe { get_process_id(process) };
+        if process_id == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let snapshot = unsafe { create_toolhelp32_snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let result = (|| {
+            let mut entry = ThreadEntry32 {
+                size: std::mem::size_of::<ThreadEntry32>() as u32,
+                usage: 0,
+                thread_id: 0,
+                owner_process_id: 0,
+                base_priority: 0,
+                delta_priority: 0,
+                flags: 0,
+            };
+            let mut found_thread = false;
+            let mut has_entry = unsafe { thread32_first(snapshot, &mut entry) } != 0;
+            while has_entry {
+                if entry.owner_process_id == process_id {
+                    found_thread = true;
+                    let thread = unsafe { open_thread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
+                    if thread.is_null() {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let resume_result = unsafe { resume_thread(thread) };
+                    let close_result = unsafe { close_handle(thread) };
+                    if resume_result == INVALID_RESUME_COUNT {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if close_result == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                has_entry = unsafe { thread32_next(snapshot, &mut entry) } != 0;
+            }
+
+            if !found_thread {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "suspended command thread was not found",
+                ));
+            }
+            Ok(())
+        })();
+        let close_result = unsafe { close_handle(snapshot) };
+        if result.is_ok() && close_result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        result
+    }
+
+    pub(super) fn attach(process: RawHandle) -> io::Result<OwnedHandle> {
+        // A private, unnamed job has no ambient permissions or namespace
+        // concerns. The handle remains owned by CommandProcessTree until the
+        // command completes or cancellation cleanup runs.
+        let job = unsafe { create_job_object_w(ptr::null_mut(), ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateJobObjectW returned a newly-owned kernel handle.
+        let job = unsafe { OwnedHandle::from_raw_handle(job) };
+        let result = unsafe { assign_process_to_job_object(job.as_raw_handle(), process) };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Err(error) = resume_process(process) {
+            // The process is still suspended if resuming failed.  Terminate
+            // the Job before returning so a partially resumed process (or any
+            // descendant it managed to create) cannot escape this failed
+            // attach path.  The caller also kills/reaps the direct child.
+            let _ = unsafe { terminate_job_object(job.as_raw_handle(), 1) };
+            return Err(error);
+        }
+        Ok(job)
+    }
+
+    pub(super) fn terminate(job: RawHandle) -> io::Result<()> {
+        let result = unsafe { terminate_job_object(job, 1) };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl CommandProcessTree {
+    fn configure(command: &mut tokio::process::Command) {
+        windows_command_job::configure(command);
+    }
+
+    fn attach(child: &tokio::process::Child) -> Result<Self> {
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| anyhow!("command exited before its Windows job was attached"))?;
+        let job = windows_command_job::attach(process)
+            .context("failed to assign command process to a Windows Job Object")?;
+        Ok(Self {
+            job,
+            cleanup_on_drop: true,
+        })
+    }
+
+    fn kill(&self) -> std::io::Result<()> {
+        windows_command_job::terminate(std::os::windows::io::AsRawHandle::as_raw_handle(&self.job))
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CommandProcessTree {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = self.kill();
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl CommandProcessTree {
+    fn configure(_command: &mut tokio::process::Command) {}
+
+    fn attach(_child: &tokio::process::Child) -> Result<Self> {
+        Ok(Self {
+            cleanup_on_drop: false,
+        })
+    }
+
+    fn kill(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl Drop for CommandProcessTree {
+    fn drop(&mut self) {}
+}
+
+/// Terminates a command's process tree and reaps its direct child. The
+/// containment primitive is intentionally attempted twice: a child can fork
+/// a descendant in the small interval between the first termination request
+/// and the direct child's exit, and that descendant inherits the same group or
+/// Job Object.
+async fn terminate_command_process_tree(
+    process_tree: &CommandProcessTree,
+    child: &mut tokio::process::Child,
+) -> Result<()> {
+    let tree_kill_error = process_tree.kill().err().map(|error| error.to_string());
+    let direct_kill_error = if tree_kill_error.is_some() {
+        // Keep a direct-child fallback for an unavailable or rejected OS
+        // containment primitive. The caller still receives the containment
+        // error, so it cannot mistake this fallback for tree cleanup.
+        child.kill().await.err().map(|error| error.to_string())
     } else {
-        receiver
-            .await
-            .context("output file write task was cancelled")??;
+        None
+    };
+    let reap_error = child.wait().await.err().map(|error| error.to_string());
+    let second_tree_kill_error = process_tree.kill().err().map(|error| error.to_string());
+
+    if let Some(error) = &tree_kill_error {
+        let mut message = format!("failed to terminate command process tree: {error}");
+        if let Some(direct_error) = &direct_kill_error {
+            message.push_str(&format!(
+                "; failed to kill the direct child: {direct_error}"
+            ));
+        }
+        if let Some(reap_error) = &reap_error {
+            message.push_str(&format!("; failed to reap it: {reap_error}"));
+        }
+        bail!(message);
+    }
+    if let Some(error) = &second_tree_kill_error {
+        let mut message =
+            format!("failed to terminate command process tree after reaping: {error}");
+        if let Some(reap_error) = &reap_error {
+            message.push_str(&format!("; failed to reap it: {reap_error}"));
+        }
+        bail!(message);
+    }
+    if let Some(error) = &reap_error {
+        bail!("failed to reap command: {error}");
     }
     Ok(())
 }
@@ -3071,7 +3741,8 @@ async fn run_command(
         .split_first()
         .expect("validate::validate_node rejects an empty 'command' list");
 
-    let mut child = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    command
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3079,9 +3750,22 @@ async fn run_command(
         // The enclosing node timeout sends a cancellation signal that
         // performs kill + wait, while this also protects the child if this
         // future is cancelled by a caller.
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    CommandProcessTree::configure(&mut command);
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to run command '{program}'"))?;
+    let mut process_tree = match CommandProcessTree::attach(&child) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            // On Windows, a process can already be inside an incompatible
+            // outer Job Object. Do not leave the just-spawned child running if
+            // attaching our containment boundary fails.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error).with_context(|| format!("failed to contain command '{program}'"));
+        }
+    };
 
     let mut stdin = child.stdin.take().expect("stdin was requested as piped");
     let stdin_input = stdin_input.to_owned();
@@ -3114,11 +3798,12 @@ async fn run_command(
 
                     // Closing the parent's stdin first prevents a writer
                     // blocked behind a descendant-inherited pipe from
-                    // delaying child cleanup. `Child::kill` then waits for
-                    // the direct child, so the retry cannot overlap it.
+                    // delaying command cleanup. Terminate the process group /
+                    // Job Object so the retry cannot overlap any descendant.
                     write_stdin.abort();
                     let _ = write_stdin.await;
-                    let kill_result = child.kill().await;
+                    let cleanup_result =
+                        terminate_command_process_tree(&process_tree, &mut child).await;
 
                     // A descendant may retain stdout/stderr after the direct
                     // child exits. Those readers are no longer needed once
@@ -3128,16 +3813,7 @@ async fn run_command(
                     read_stderr.abort();
                     let _ = read_stdout.await;
                     let _ = read_stderr.await;
-
-                    if let Err(error) = kill_result {
-                        let reap_result = child.wait().await;
-                        if let Err(reap_error) = reap_result {
-                            bail!(
-                                "command '{program}' was cancelled; failed to kill it: {error}; failed to reap it: {reap_error}"
-                            );
-                        }
-                        bail!("command '{program}' was cancelled; failed to kill it: {error}");
-                    }
+                    cleanup_result.with_context(|| format!("command '{program}' was cancelled"))?;
                     bail!("command '{program}' was cancelled");
                 }
             }
@@ -3177,10 +3853,16 @@ async fn run_command(
                     if changed.is_ok() && !*step_cancel.borrow() {
                         continue;
                     }
+                    let tree_kill_result = process_tree.kill();
                     read_stdout.abort();
                     read_stderr.abort();
                     let _ = read_stdout.await;
                     let _ = read_stderr.await;
+                    if let Err(error) = tree_kill_result {
+                        bail!(
+                            "command '{program}' was cancelled; failed to terminate its process tree: {error}"
+                        );
+                    }
                     bail!("command '{program}' was cancelled");
                 }
             }
@@ -3202,6 +3884,12 @@ async fn run_command(
             .with_context(|| format!("failed to read stderr from command '{program}'"))?;
         (stdout, stderr)
     };
+
+    // No cancellation path remains after both readers have completed. Keep
+    // intentionally backgrounded processes from being killed on a successful
+    // command return; cancellation and future-drop paths remain armed until
+    // they have explicitly terminated the process tree.
+    process_tree.disarm();
 
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
@@ -3228,4 +3916,209 @@ fn strip_one_trailing_line_ending(mut output: String) -> String {
         output.truncate(output.len() - 1);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunEnv, WorkflowScope, apply_jq, run_steps, write_output_file};
+
+    #[tokio::test]
+    async fn a_cancelled_regular_write_does_not_truncate_an_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "lait-cancelled-output-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "original").expect("failed to create output fixture");
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        sender
+            .send(true)
+            .expect("the cancellation receiver should still be connected");
+
+        let result = write_output_file(&path, "replacement", Some(receiver)).await;
+        let contents = std::fs::read_to_string(&path).expect("output fixture should remain");
+        std::fs::remove_file(&path).expect("failed to remove output fixture");
+
+        assert!(result.is_err(), "a cancelled write should fail");
+        assert_eq!(contents, "original");
+    }
+
+    #[tokio::test]
+    async fn an_already_cancelled_jq_stops_before_returning_a_value() {
+        let (_sender, mut receiver) = tokio::sync::watch::channel(true);
+        let steps = crate::workflow::StepOutputs::new();
+        let started = std::time::Instant::now();
+
+        // The filter is intentionally expensive if it is allowed to run. A
+        // pre-set step cancellation must be observed immediately, before a
+        // caller can mistake a value from the worker for a successful step.
+        let result = apply_jq("range(0; 1000000000)", "null", &steps, Some(&mut receiver)).await;
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "pre-cancelled jq took too long to stop: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_router_condition_observes_the_enclosing_workflow_cancellation() {
+        let path = crate::test_support::unique_temp_path("lait-router-cancel", ".yml");
+        std::fs::write(
+            &path,
+            r#"
+steps:
+  - switch:
+      cases:
+        - when: 'reduce range(0; 100000000) as $i (false; .)'
+          steps:
+            - stop: true
+      else:
+        - stop: true
+"#,
+        )
+        .expect("router workflow fixture should be writable");
+        let mut workflow = crate::workflow::load_workflow(&path).unwrap();
+        let scope = WorkflowScope::top_level(&mut workflow, &path).unwrap();
+        let config = crate::config::ConfigFile::default();
+        let env = RunEnv::new(&config);
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        let execution = run_steps(
+            &workflow.steps,
+            "null".to_owned(),
+            &scope,
+            &env,
+            0,
+            "",
+            crate::workflow::StepOutputs::new(),
+            Some(receiver),
+        );
+        tokio::pin!(execution);
+        let result = tokio::select! {
+            result = &mut execution => result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                sender.send(true).expect("router should still observe cancellation");
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut execution)
+                    .await
+                    .expect("cancelled router should stop promptly")
+            }
+        };
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_err(), "a cancelled router must not succeed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "router cancellation took too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_fifo_write_is_joined_before_a_retry_can_write() {
+        use std::{
+            fs::OpenOptions,
+            io::{ErrorKind, Read},
+            os::unix::fs::OpenOptionsExt,
+            sync::mpsc,
+            time::Duration,
+        };
+
+        let path = crate::test_support::unique_temp_path("lait-retry-output-fifo", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo should be available on Unix");
+        assert!(status.success());
+
+        // Keep a reader open without consuming anything. The first writer
+        // therefore fills the pipe and remains blocked, which makes a
+        // detached writer observable when the retry starts.
+        let reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .expect("FIFO reader should open without a writer");
+        let first_output = "x".repeat(512 * 1024);
+        let retry_output = "y".repeat(512 * 1024);
+        let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let first_path = path.clone();
+        let first_output_for_task = first_output.clone();
+        let first = tokio::spawn(async move {
+            write_output_file(&first_path, &first_output_for_task, Some(cancel_receiver)).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_sender
+            .send(true)
+            .expect("the first writer should still be observing cancellation");
+        let first_result = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("cancelling the first FIFO writer should finish promptly")
+            .unwrap();
+        assert!(first_result.is_err());
+
+        // Start the retry while the reader is still paused. If the first
+        // writer was not joined above, both writers will eventually publish
+        // their complete payload into the same FIFO.
+        let second_path = path.clone();
+        let second_output = retry_output.clone();
+        let second =
+            tokio::spawn(
+                async move { write_output_file(&second_path, &second_output, None).await },
+            );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (read_done, read_result) = mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => received.extend_from_slice(&buffer[..read]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("failed to read retry FIFO: {error}"),
+                }
+            }
+            read_done.send(received).unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the retry writer should finish after the reader drains the FIFO")
+            .unwrap()
+            .expect("the retry writer should succeed");
+        reader_thread.join().unwrap();
+        let received = read_result
+            .recv_timeout(Duration::from_secs(1))
+            .expect("FIFO reader should observe EOF after the retry writer closes");
+
+        assert!(
+            received.len() >= retry_output.len(),
+            "retry FIFO received {} bytes, less than the retry payload of {}",
+            received.len(),
+            retry_output.len()
+        );
+        let first_prefix_len = received.len() - retry_output.len();
+        assert!(
+            first_prefix_len <= first_output.len(),
+            "cancelled FIFO writer published {} bytes after the retry started",
+            first_prefix_len.saturating_sub(first_output.len())
+        );
+        assert!(
+            received[..first_prefix_len]
+                .iter()
+                .all(|byte| *byte == b'x'),
+            "the cancelled writer's bytes must precede the retry payload"
+        );
+        assert_eq!(&received[first_prefix_len..], retry_output.as_bytes());
+        std::fs::remove_file(path).unwrap();
+    }
 }

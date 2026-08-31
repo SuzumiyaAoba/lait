@@ -1,14 +1,79 @@
 mod support;
 
-use std::io::Write;
-use std::net::TcpListener;
-use std::time::{Duration, Instant};
-
-use support::{
-    ConfigDirectory, MockServer, WorkflowFile, read_request, test_command, without_json_whitespace,
+use std::{
+    io::Write,
+    net::TcpListener,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::{fs, path::Path};
+
+use support::{
+    ConfigDirectory, HttpRequest, MockServer, WorkflowFile, read_request, test_command,
+    without_json_whitespace,
+};
+
+#[cfg(unix)]
+use support::next_temp_path;
+
 const CHAT_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
+
+#[cfg(unix)]
+const STDIO_MCP_BLOCKING_TOOL_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+(
+  sleep 3
+  printf alive > "$ALIVE"
+) &
+printf '%s' "$!" > "$MARKER"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"stdio","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echoes input","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      sleep 30
+      ;;
+  esac
+done
+"#;
+
+#[cfg(unix)]
+const STDIO_MCP_BLOCKING_INITIALIZE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+(
+  sleep 3
+  printf alive > "$ALIVE"
+) &
+printf '%s' "$!" > "$MARKER"
+sleep 30
+"#;
+
+#[cfg(unix)]
+fn write_stdio_script(contents: &str) -> std::path::PathBuf {
+    let path = next_temp_path("lait-test-mcp-stdio", ".sh");
+    fs::write(&path, contents).expect("failed to write stdio MCP script");
+    path
+}
+
+#[cfg(unix)]
+fn stdio_mcp_config(script: &Path, marker: &Path, alive: &Path) -> ConfigDirectory {
+    ConfigDirectory::new(&format!(
+        "mcp_servers:\n  mock:\n    command: sh\n    args: [\"{}\"]\n    env:\n      MARKER: \"{}\"\n      ALIVE: \"{}\"\n",
+        script.display(),
+        marker.display(),
+        alive.display(),
+    ))
+}
 
 /// A hand-rolled streamable-HTTP MCP server for integration tests: routes on
 /// the JSON-RPC `method` field (something `support::MockServer` can't do,
@@ -20,6 +85,182 @@ const CHAT_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.compl
 /// header/`Content-Length`/body reader `support::MockServer` uses.
 fn start_mock_mcp_server() -> (String, std::thread::JoinHandle<()>) {
     start_mock_mcp_server_with_list_cursor(None)
+}
+
+/// Starts a bounded OpenAI-compatible server for timeout/retry tests. Unlike
+/// `MockServer::start_sequence`, this helper returns after a short deadline
+/// when a buggy client never reaches the final request, so a stale MCP
+/// connection cannot leave the test fixture blocked forever.
+fn start_sequence_llm_server(
+    responses: &[&'static str],
+) -> (String, std::thread::JoinHandle<Vec<HttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock LLM server");
+    listener
+        .set_nonblocking(true)
+        .expect("failed to make mock LLM server non-blocking");
+    let addr = listener
+        .local_addr()
+        .expect("failed to read mock LLM server address");
+    let responses: Vec<String> = responses
+        .iter()
+        .map(|response| (*response).to_owned())
+        .collect();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut requests = Vec::new();
+        while requests.len() < responses.len() && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("failed to accept mock LLM request: {error}"),
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("failed to make accepted mock LLM connection blocking");
+            let request = read_request(&mut stream).expect("failed to read mock LLM request");
+            let response_body = &responses[requests.len()];
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("failed to write mock LLM response");
+            stream.flush().expect("failed to flush mock LLM response");
+            requests.push(request);
+        }
+        requests
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+/// Starts an MCP server whose first `tools/call` is intentionally left
+/// unanswered. A workflow timeout must evict that service before its retry;
+/// the second round therefore has to perform a fresh handshake and receives
+/// a normal tool result. Each HTTP request is handled on its own thread so the
+/// unanswered first call does not prevent the listener from accepting retry
+/// traffic.
+fn start_timeout_retry_mcp_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock MCP server");
+    listener
+        .set_nonblocking(true)
+        .expect("failed to make mock MCP server non-blocking");
+    let addr = listener
+        .local_addr()
+        .expect("failed to read mock MCP server address");
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let handle = std::thread::spawn({
+        let methods = Arc::clone(&methods);
+        let call_count = Arc::clone(&call_count);
+        move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut workers = Vec::new();
+            while Instant::now() < deadline && methods.lock().unwrap().len() < 8 {
+                let (stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("failed to accept mock MCP request: {error}"),
+                };
+                let methods = Arc::clone(&methods);
+                let call_count = Arc::clone(&call_count);
+                workers.push(std::thread::spawn(move || {
+                    let mut stream = stream;
+                    stream
+                        .set_nonblocking(false)
+                        .expect("failed to make accepted mock MCP connection blocking");
+                    let request = read_request(&mut stream).expect("failed to read MCP request");
+                    let request: serde_json::Value = serde_json::from_str(&request.body)
+                        .expect("mock MCP server got non-JSON body");
+                    let method = request
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let id = request.get("id").cloned();
+                    methods.lock().unwrap().push(method.clone());
+
+                    if method == "tools/call" {
+                        let call_index = call_count.fetch_add(1, Ordering::AcqRel);
+                        if call_index == 0 {
+                            // Keep the first request in flight long enough for
+                            // the one-second workflow timeout to fire. The
+                            // client must not be able to reuse this service on
+                            // its retry while it is still pending.
+                            std::thread::sleep(Duration::from_secs(2));
+                            return;
+                        }
+                    }
+
+                    let (status, response_body) = match method.as_str() {
+                        "initialize" => (
+                            "200 OK",
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "protocolVersion": "2025-06-18",
+                                    "capabilities": {},
+                                    "serverInfo": {"name": "timeout-retry-mcp", "version": "0.0.1"}
+                                }
+                            })
+                            .to_string(),
+                        ),
+                        "notifications/initialized" => ("202 Accepted", String::new()),
+                        "tools/list" => (
+                            "200 OK",
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "tools": [{
+                                        "name": "echo",
+                                        "description": "returns a fresh result",
+                                        "inputSchema": {"type": "object"}
+                                    }]
+                                }
+                            })
+                            .to_string(),
+                        ),
+                        "tools/call" => (
+                            "200 OK",
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "content": [{"type": "text", "text": "fresh-result"}]
+                                }
+                            })
+                            .to_string(),
+                        ),
+                        other => panic!("mock MCP server received an unexpected method '{other}'"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                        response_body.len(),
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("failed to write mock MCP response");
+                    stream.flush().expect("failed to flush mock MCP response");
+                }));
+            }
+            for worker in workers {
+                worker.join().expect("mock MCP request worker panicked");
+            }
+            Arc::try_unwrap(methods)
+                .expect("mock MCP methods still have outstanding references")
+                .into_inner()
+                .expect("mock MCP methods mutex was poisoned")
+        }
+    });
+    (format!("http://{addr}/mcp"), handle)
 }
 
 /// Starts the same test server but includes `nextCursor` in every
@@ -139,6 +380,9 @@ fn start_recovering_mcp_server() -> (String, std::thread::JoinHandle<Vec<String>
                 }
                 Err(error) => panic!("failed to accept connection: {error}"),
             };
+            stream
+                .set_nonblocking(false)
+                .expect("failed to make accepted mock MCP connection blocking");
             let request = read_request(&mut stream).expect("failed to read MCP request");
             let request: serde_json::Value =
                 serde_json::from_str(&request.body).expect("mock MCP server got non-JSON body");
@@ -344,4 +588,229 @@ steps:
         2,
         "MCP methods: {methods:?}"
     );
+}
+
+#[test]
+fn a_timed_out_mcp_call_is_evicted_before_the_retry_uses_a_fresh_connection() {
+    let (llm_url, llm_thread) = start_sequence_llm_server(&[
+        r#"{"id":"chatcmpl-1","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"mock__echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        r#"{"id":"chatcmpl-2","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_2","type":"function","function":{"name":"mock__echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        r#"{"id":"chatcmpl-3","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"retry succeeded"},"finish_reason":"stop"}]}"#,
+    ]);
+    let (mcp_url, mcp_thread) = start_timeout_retry_mcp_server();
+    let config = ConfigDirectory::new(&format!("mcp_servers:\n  mock:\n    url: \"{mcp_url}\"\n",));
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: test-model
+nodes:
+  call:
+    prompt: "{{{{ input }}}}"
+    mcp: [mock]
+    timeout: 1
+    retry:
+      max_attempts: 2
+steps:
+  - use: call
+"#,
+        llm_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("run")
+        .arg(&workflow.path)
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait run");
+    let llm_requests = llm_thread.join().expect("mock LLM server thread panicked");
+    let methods = mcp_thread.join().expect("mock MCP server thread panicked");
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "retry succeeded"
+    );
+    assert_eq!(llm_requests.len(), 3, "LLM requests: {llm_requests:?}");
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| method.as_str() == "initialize")
+            .count(),
+        2,
+        "the retry must initialize a fresh MCP connection: {methods:?}"
+    );
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| method.as_str() == "tools/call")
+            .count(),
+        2,
+        "both attempts should reach tools/call: {methods:?}"
+    );
+}
+
+#[cfg(unix)]
+fn assert_stdio_descendant_was_stopped(marker: &Path, alive: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker.exists(),
+        "the stdio MCP server did not start its descendant"
+    );
+
+    // The descendant is deliberately scheduled to create this file after the
+    // timeout. A process-group cleanup that only kills the direct shell would
+    // leave the marker behind, making the failure deterministic without
+    // relying on a potentially-zombie PID and `kill -0`.
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        !alive.exists(),
+        "MCP descendant survived process-tree shutdown: {}",
+        alive.display()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn timed_out_stdio_mcp_tool_call_stops_and_reaps_its_descendant() {
+    let script = write_stdio_script(STDIO_MCP_BLOCKING_TOOL_SCRIPT);
+    let marker = next_temp_path("lait-test-mcp-descendant", ".pid");
+    let alive = next_temp_path("lait-test-mcp-descendant", ".alive");
+    let config = stdio_mcp_config(&script, &marker, &alive);
+    let (llm_url, llm_thread) = start_sequence_llm_server(&[
+        r#"{"id":"chatcmpl-stdio","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_stdio","type":"function","function":{"name":"mock__echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: test-model
+nodes:
+  call:
+    prompt: "{{{{ input }}}}"
+    mcp: [mock]
+    timeout: 1
+steps:
+  - use: call
+"#,
+        llm_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["run", workflow.path.to_str().unwrap(), "hello"])
+        .output()
+        .expect("failed to execute lait run");
+    let llm_requests = llm_thread.join().expect("mock LLM server thread panicked");
+
+    assert!(!output.status.success(), "a blocked MCP call must time out");
+    assert_eq!(
+        llm_requests.len(),
+        1,
+        "LLM requests: {llm_requests:?}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_stdio_descendant_was_stopped(&marker, &alive);
+
+    let _ = fs::remove_file(script);
+    let _ = fs::remove_file(marker);
+    let _ = fs::remove_file(alive);
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_run_stops_and_reaps_its_stdio_mcp_descendant() {
+    let script = write_stdio_script(STDIO_MCP_BLOCKING_TOOL_SCRIPT);
+    let marker = next_temp_path("lait-test-mcp-success-descendant", ".pid");
+    let alive = next_temp_path("lait-test-mcp-success-descendant", ".alive");
+    let config = stdio_mcp_config(&script, &marker, &alive);
+    let llm_server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: test-model
+nodes:
+  call:
+    prompt: "{{{{ input }}}}"
+    mcp: [mock]
+steps:
+  - use: call
+"#,
+        llm_server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["run", workflow.path.to_str().unwrap(), "hello"])
+        .output()
+        .expect("failed to execute lait run");
+    let _ = llm_server.receive_request();
+    llm_server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_stdio_descendant_was_stopped(&marker, &alive);
+
+    let _ = fs::remove_file(script);
+    let _ = fs::remove_file(marker);
+    let _ = fs::remove_file(alive);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_stdio_mcp_initialization_stops_and_reaps_its_descendant() {
+    let script = write_stdio_script(STDIO_MCP_BLOCKING_INITIALIZE_SCRIPT);
+    let marker = next_temp_path("lait-test-mcp-init-descendant", ".pid");
+    let alive = next_temp_path("lait-test-mcp-init-descendant", ".alive");
+    let config = stdio_mcp_config(&script, &marker, &alive);
+    let workflow = WorkflowFile::new(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "http://127.0.0.1:1/v1"
+      model_id: test-model
+nodes:
+  call:
+    prompt: "{{ input }}"
+    mcp: [mock]
+    timeout: 1
+steps:
+  - use: call
+"#,
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["run", workflow.path.to_str().unwrap(), "hello"])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(
+        !output.status.success(),
+        "an MCP handshake that never responds must be cancelled"
+    );
+    assert_stdio_descendant_was_stopped(&marker, &alive);
+
+    let _ = fs::remove_file(script);
+    let _ = fs::remove_file(marker);
+    let _ = fs::remove_file(alive);
 }

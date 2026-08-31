@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod agent;
 mod app;
+mod async_io;
 mod attachment;
 mod cli;
 mod config;

@@ -10,17 +10,19 @@ rust-version = "1.88"
 # `cargo binstall lait` resolves release artifacts through this metadata
 # (the release workflow names its archives to match).
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
 bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
 pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1"
 async-openai = { version = "0.41.3", default-features = false, features = ["byot", "chat-completion", "rustls"] }
 base64 = "0.23.1"
+bytes = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env", "string"] }
 clap_complete = "4.6.9"
@@ -29,6 +31,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 handlebars = "6.4.4"
 http = "1"
 libc = "0.2"
+process-wrap = { version = "9.1", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 jaq-core = "3.1.0"
 jaq-json = "2.0.2"
 jaq-std = "3.0.2"
@@ -37,5 +40,7 @@ rmcp = { version = "3.1.4", default-features = false, features = ["client", "tra
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+sse-stream = "0.2.5"
 termimad = "0.35.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process", "io-util", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }

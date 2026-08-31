@@ -100,7 +100,7 @@ nodes:
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](/lait/docs/agent/#スキルの利用) と
-[ワークフロー（workflow.yml）](/lait/docs/workflow/#スキルの利用-skills) にもあります。
+[ワークフロー（workflow.yml）](/lait/docs/workflow/#スキルの利用skills) にもあります。
 
 ## システムプロンプトへの追記のされ方
 
@@ -136,4 +136,3 @@ nodes:
 - `--stream` との併用に制限はありません。
 - `structured_output`（`output_schema`）との併用にも追加のラウンドトリップは発生しません。
 - `max_tool_rounds` の消費対象にはなりません。
-

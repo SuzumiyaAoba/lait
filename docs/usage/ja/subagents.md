@@ -94,7 +94,7 @@ nodes:
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.md#サブエージェントの利用) と
-[ワークフロー（workflow.yml）](./workflow.md#サブエージェントの利用-subagents) にもあります。
+[ワークフロー（workflow.yml）](./workflow.md#サブエージェントの利用subagents) にもあります。
 
 ## ツール名とツール引数の扱い
 
