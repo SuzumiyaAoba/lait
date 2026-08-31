@@ -1453,10 +1453,14 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     };
 
     if chat.stream {
-        let stream = settings
-            .complete_stream(&env.skill_cache, turn, response_format, show_usage)
+        let outcome = env
+            .finish(async {
+                let stream = settings
+                    .complete_stream(&env.skill_cache, turn, response_format, show_usage)
+                    .await?;
+                stream_response(stream, show_reasoning, output_path).await
+            })
             .await?;
-        let outcome = stream_response(stream, show_reasoning, output_path).await?;
         // Streamed usage arrives on the final chunk rather than through
         // `complete`; feed it into the same tally so both chat paths share
         // one summary format and so `env.usage.total()` below reflects it.
@@ -1478,8 +1482,8 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         return Ok(());
     }
 
-    let response = settings
-        .complete(&env, &[], turn, response_format, None)
+    let response = env
+        .finish(settings.complete(&env, &[], turn, response_format, None))
         .await?;
 
     match output_path {
@@ -1552,85 +1556,88 @@ async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
     let mut settings: Option<RequestSettings> = None;
 
     let stdin = std::io::stdin();
-    loop {
-        eprint!("> ");
-        std::io::stderr().flush()?;
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break; // end-of-input (Ctrl-D)
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if let Some(command) = repl::parse_meta_command(line) {
-            match command {
-                repl::MetaCommand::Exit => break,
-                repl::MetaCommand::Clear => {
-                    history.clear();
-                    eprintln!("(history cleared — a --session log, if any, is unaffected)");
-                }
-                repl::MetaCommand::Model(name) if !name.is_empty() => {
-                    shared.model = Some(name.to_owned());
-                    settings = None;
-                    eprintln!("(model set to '{name}')");
-                }
-                repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
-                repl::MetaCommand::System(text) if !text.is_empty() => {
-                    system_prompt = Some(text.to_owned());
-                    eprintln!("(system prompt updated)");
-                }
-                repl::MetaCommand::System(_) => eprintln!("usage: /system <text>"),
-                repl::MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+    let repl = async {
+        loop {
+            eprint!("> ");
+            std::io::stderr().flush()?;
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break; // end-of-input (Ctrl-D)
             }
-            continue;
-        }
-
-        if settings.is_none() {
-            settings = match resolve_chat_settings(&shared, None, &file_config) {
-                Ok(resolved) => Some(resolved),
-                Err(error) => {
-                    eprintln!("lait: {error:#}");
-                    continue;
-                }
-            };
-        }
-        let settings = settings
-            .as_ref()
-            .expect("just resolved above, or the loop continued before reaching here");
-
-        match run_repl_turn(
-            settings,
-            &env,
-            &system_prompt,
-            &history,
-            line,
-            shared.show_reasoning,
-            shared.show_usage,
-        )
-        .await
-        {
-            Ok((assistant_text, turn_usage)) => {
-                history.push(llm::user_message(line, &[])?);
-                history.push(llm::assistant_message(&assistant_text)?);
-                finish_chat_turn(
-                    shared.session.as_deref(),
-                    shared.no_history,
-                    &file_config,
-                    &settings.resolved_model.model_id,
-                    line,
-                    &assistant_text,
-                    turn_usage,
-                )?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-            // One bad turn (a request error, a bad `/model` name that only
-            // fails once actually resolved) shouldn't end the whole session
-            // — report it and let the user try again or `/exit`.
-            Err(error) => eprintln!("lait: {error:#}"),
+
+            if let Some(command) = repl::parse_meta_command(line) {
+                match command {
+                    repl::MetaCommand::Exit => break,
+                    repl::MetaCommand::Clear => {
+                        history.clear();
+                        eprintln!("(history cleared — a --session log, if any, is unaffected)");
+                    }
+                    repl::MetaCommand::Model(name) if !name.is_empty() => {
+                        shared.model = Some(name.to_owned());
+                        settings = None;
+                        eprintln!("(model set to '{name}')");
+                    }
+                    repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
+                    repl::MetaCommand::System(text) if !text.is_empty() => {
+                        system_prompt = Some(text.to_owned());
+                        eprintln!("(system prompt updated)");
+                    }
+                    repl::MetaCommand::System(_) => eprintln!("usage: /system <text>"),
+                    repl::MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+                }
+                continue;
+            }
+
+            if settings.is_none() {
+                settings = match resolve_chat_settings(&shared, None, &file_config) {
+                    Ok(resolved) => Some(resolved),
+                    Err(error) => {
+                        eprintln!("lait: {error:#}");
+                        continue;
+                    }
+                };
+            }
+            let settings = settings
+                .as_ref()
+                .expect("just resolved above, or the loop continued before reaching here");
+
+            match run_repl_turn(
+                settings,
+                &env,
+                &system_prompt,
+                &history,
+                line,
+                shared.show_reasoning,
+                shared.show_usage,
+            )
+            .await
+            {
+                Ok((assistant_text, turn_usage)) => {
+                    history.push(llm::user_message(line, &[])?);
+                    history.push(llm::assistant_message(&assistant_text)?);
+                    finish_chat_turn(
+                        shared.session.as_deref(),
+                        shared.no_history,
+                        &file_config,
+                        &settings.resolved_model.model_id,
+                        line,
+                        &assistant_text,
+                        turn_usage,
+                    )?;
+                }
+                // One bad turn (a request error, a bad `/model` name that only
+                // fails once actually resolved) shouldn't end the whole session
+                // — report it and let the user try again or `/exit`.
+                Err(error) => eprintln!("lait: {error:#}"),
+            }
         }
-    }
-    Ok(())
+        Ok::<(), anyhow::Error>(())
+    };
+    env.finish(repl).await
 }
 
 /// Runs one `lait chat` turn: streams the response to stdout (the REPL's
@@ -1731,14 +1738,14 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
     .with_usage_label(format!("prompt '{}'", args.name));
 
     let env = RunEnv::new(&file_config);
-    let response = settings
-        .complete(
+    let response = env
+        .finish(settings.complete(
             &env,
             &[],
             PromptTurn::simple(None, &prompt_text),
             None,
             None,
-        )
+        ))
         .await?;
     let output = response::render_response(&response, false, false)?;
     println!("{output}");
@@ -1800,17 +1807,18 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
     let env = RunEnv::new(&file_config);
-    let output = call_agent(
-        &agent_file,
-        &settings,
-        &env,
-        AgentTurn::simple(&input, &raw_input),
-        &workflow::StepOutputs::new(),
-        std::slice::from_ref(&canonical_agent_path),
-        None,
-    )
-    .await
-    .with_context(|| format!("agent '{}'", args.file.display()))?;
+    let output = env
+        .finish(call_agent(
+            &agent_file,
+            &settings,
+            &env,
+            AgentTurn::simple(&input, &raw_input),
+            &workflow::StepOutputs::new(),
+            std::slice::from_ref(&canonical_agent_path),
+            None,
+        ))
+        .await
+        .with_context(|| format!("agent '{}'", args.file.display()))?;
     println!("{output}");
     record_history(
         args.no_history,
@@ -1838,17 +1846,18 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let env = RunEnv::new(&file_config);
     let initial_prompt = prompt.clone();
-    let (current_input, _, _, _) = run_steps(
-        &wf.steps,
-        prompt,
-        &scope,
-        &env,
-        0,
-        "",
-        workflow::StepOutputs::new(),
-        None,
-    )
-    .await?;
+    let (current_input, _, _, _) = env
+        .finish(run_steps(
+            &wf.steps,
+            prompt,
+            &scope,
+            &env,
+            0,
+            "",
+            workflow::StepOutputs::new(),
+            None,
+        ))
+        .await?;
     println!("{current_input}");
     // A workflow can touch several models across its steps, so no single
     // `model` is recorded here — see `history::HistoryEntry::model`.
@@ -1948,6 +1957,17 @@ impl<'a> RunEnv<'a> {
             agent_registry: subagent::AgentRegistry::new(&file_config.agents),
             usage: UsageTally::default(),
         }
+    }
+
+    /// Drives `fut` to completion, then unconditionally shuts down the MCP
+    /// registry before handing back `fut`'s result — on success or failure
+    /// alike, so callers don't have to re-derive that ordering themselves.
+    /// Every top-level `lait`/`lait agent run`/`lait run` invocation must
+    /// call this once, at the end, instead of awaiting its work directly.
+    async fn finish<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
+        let result = fut.await;
+        self.registry.shutdown().await;
+        result
     }
 }
 
@@ -2142,6 +2162,10 @@ fn check_workflow_cancellation(
 /// `async` body, which Rust cannot size otherwise. `cancellation` is cloned
 /// into every nested frame and router jq operation, preserving the timeout of
 /// the enclosing step/workflow across control-flow boundaries.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recursive workflow state is intentionally explicit at each call site"
+)]
 fn run_steps<'a>(
     steps: &'a [workflow::FlowStep],
     current_input: String,
@@ -2654,6 +2678,10 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
 /// `on_error` or propagate it. `label` is the calling `use:` site's label
 /// (not the node's own id), so error messages point at where in the flow the
 /// failure happened.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "retry execution threads explicit workflow, display, output, and cancellation state"
+)]
 async fn execute_step_with_retry(
     node: &workflow::NodeDefinition,
     current_input: &str,

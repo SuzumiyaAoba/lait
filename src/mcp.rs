@@ -274,13 +274,19 @@ struct ManagedStdioTransport {
 struct FrameLimitedReader<R> {
     inner: R,
     frame_bytes: usize,
+    limit: usize,
 }
 
 impl<R> FrameLimitedReader<R> {
     fn new(inner: R) -> Self {
+        Self::with_limit(inner, MAX_STDIO_JSON_RPC_FRAME_BYTES)
+    }
+
+    fn with_limit(inner: R, limit: usize) -> Self {
         Self {
             inner,
             frame_bytes: 0,
+            limit,
         }
     }
 }
@@ -316,15 +322,13 @@ where
                         self.frame_bytes = 0;
                     } else {
                         self.frame_bytes = match self.frame_bytes.checked_add(1) {
-                            Some(frame_bytes) if frame_bytes <= MAX_STDIO_JSON_RPC_FRAME_BYTES => {
-                                frame_bytes
-                            }
+                            Some(frame_bytes) if frame_bytes <= self.limit => frame_bytes,
                             _ => {
                                 return std::task::Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!(
                                         "MCP stdio JSON-RPC frame exceeds {} bytes",
-                                        MAX_STDIO_JSON_RPC_FRAME_BYTES
+                                        self.limit
                                     ),
                                 )));
                             }
@@ -412,15 +416,13 @@ impl Transport<RoleClient> for ManagedStdioTransport {
         self.transport.receive()
     }
 
-    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            // Close stdin first so a cooperative MCP server may exit, then
-            // kill the entire owned tree and await its reaping.  Even if the
-            // pipe close reports an error, process cleanup must still happen.
-            let transport_result = self.transport.close().await;
-            let child_result = self.close_child().await;
-            transport_result.and(child_result)
-        }
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        // Close stdin first so a cooperative MCP server may exit, then
+        // kill the entire owned tree and await its reaping.  Even if the
+        // pipe close reports an error, process cleanup must still happen.
+        let transport_result = self.transport.close().await;
+        let child_result = self.close_child().await;
+        transport_result.and(child_result)
     }
 }
 
@@ -499,10 +501,6 @@ impl<'a> McpRegistry<'a> {
     /// transport has finished its cleanup. This must be called at the end of a
     /// successful invocation as well as on an error: relying on `Drop` can
     /// only signal cancellation and cannot await process-tree reaping.
-    #[allow(
-        dead_code,
-        reason = "the top-level run owner may call this during final cleanup"
-    )]
     pub(crate) async fn shutdown(&self) {
         let cells = {
             let mut connections = self.connections.lock().await;
@@ -1736,9 +1734,10 @@ fn render_tool_result(result: rmcp::model::CallToolResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{qualify_tool_name, render_tool_result};
+    use super::{FrameLimitedReader, qualify_tool_name, render_tool_result, serialized_json_bytes};
     use rmcp::model::CallToolResult;
     use serde_json::json;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn qualifies_a_tool_name_with_its_server() {
@@ -1803,5 +1802,48 @@ mod tests {
             render_tool_result(result),
             "isError: true\n\ndetails\n\nstructuredContent:\n{\"code\":\"invalid\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn stdio_frame_limit_rejects_an_oversized_line() {
+        let input = b"12345\n".as_slice();
+        let mut reader = FrameLimitedReader::with_limit(input, 4);
+        let mut output = Vec::new();
+
+        let error = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("an oversized MCP frame must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 4 bytes"));
+    }
+
+    #[tokio::test]
+    async fn stdio_frame_limit_resets_at_each_newline() {
+        let input = b"1234\n5678\n".as_slice();
+        let mut reader = FrameLimitedReader::with_limit(input, 4);
+        let mut output = Vec::new();
+
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("separate frames at the limit should succeed");
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn serialized_schema_size_is_checked_without_a_second_buffer() {
+        let schema = json!({"type": "object", "description": "large"});
+        let exact_size = serde_json::to_vec(&schema).unwrap().len();
+
+        assert_eq!(
+            serialized_json_bytes(&schema, exact_size).unwrap(),
+            exact_size
+        );
+        let error = serialized_json_bytes(&schema, exact_size - 1)
+            .expect_err("schema over the remaining metadata budget must fail");
+        assert!(error.to_string().contains("metadata limit"));
     }
 }

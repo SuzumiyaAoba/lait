@@ -731,6 +731,49 @@ steps:
 
 #[cfg(unix)]
 #[test]
+fn successful_run_stops_and_reaps_its_stdio_mcp_descendant() {
+    let script = write_stdio_script(STDIO_MCP_BLOCKING_TOOL_SCRIPT);
+    let marker = next_temp_path("lait-test-mcp-success-descendant", ".pid");
+    let alive = next_temp_path("lait-test-mcp-success-descendant", ".alive");
+    let config = stdio_mcp_config(&script, &marker, &alive);
+    let llm_server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: test-model
+nodes:
+  call:
+    prompt: "{{{{ input }}}}"
+    mcp: [mock]
+steps:
+  - use: call
+"#,
+        llm_server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["run", workflow.path.to_str().unwrap(), "hello"])
+        .output()
+        .expect("failed to execute lait run");
+    let _ = llm_server.receive_request();
+    llm_server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_stdio_descendant_was_stopped(&marker, &alive);
+
+    let _ = fs::remove_file(script);
+    let _ = fs::remove_file(marker);
+    let _ = fs::remove_file(alive);
+}
+
+#[cfg(unix)]
+#[test]
 fn cancelled_stdio_mcp_initialization_stops_and_reaps_its_descendant() {
     let script = write_stdio_script(STDIO_MCP_BLOCKING_INITIALIZE_SCRIPT);
     let marker = next_temp_path("lait-test-mcp-init-descendant", ".pid");

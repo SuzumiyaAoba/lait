@@ -396,14 +396,14 @@ pub(crate) fn read_file_with_budget(
             .open(path)?;
         let file_type = file.metadata()?.file_type();
         let fifo_path = file_type.is_fifo().then_some(path);
-        return read_from_file(
+        read_from_file(
             &mut file,
             file_type.is_fifo() && wait_for_fifo_writer,
             fifo_path,
             cancelled,
             max_bytes,
             budget,
-        );
+        )
     }
 
     #[cfg(not(unix))]

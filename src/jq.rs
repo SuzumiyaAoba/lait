@@ -363,8 +363,7 @@ where
     check_cancelled_opt(cancelled)?;
 
     let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([steps_val]));
-    let mut output_count = 0usize;
-    for result in filter.id.run((ctx, input)).map(unwrap_valr) {
+    for (output_count, result) in filter.id.run((ctx, input)).map(unwrap_valr).enumerate() {
         check_cancelled_opt(cancelled)?;
         if output_count >= MAX_OUTPUT_VALUES {
             bail!(
@@ -372,7 +371,6 @@ where
                 MAX_OUTPUT_VALUES
             );
         }
-        output_count += 1;
         let value =
             result.map_err(|error| anyhow!("jq filter {filter_source:?} failed: {error}"))?;
         // `on_value` is invoked before jaq is asked to produce its next value.
@@ -612,31 +610,29 @@ fn render_value_into(
     check_cancelled_opt(cancelled)?;
     validate_value_structure(value)?;
 
-    if raw_strings {
-        if let Val::TStr(string_bytes) = value {
-            // JSON input and the standard jq string functions produce UTF-8,
-            // but jaq also permits a TStr containing invalid bytes. Reject by
-            // the source byte count before `from_utf8_lossy` can expand it.
-            if string_bytes.len() > value_limit {
-                bail!("jq rendered output exceeds the configured limit");
-            }
-            let mut writer = LimitedWriter::new(
-                output_bytes,
-                value_start,
-                total_limit,
-                value_limit,
-                cancelled,
-            );
-            write_raw_string(&mut writer, string_bytes).map_err(|error| {
-                if writer.exceeded {
-                    anyhow!("jq rendered output exceeds the configured limit")
-                } else {
-                    anyhow!("failed to render jq output: {error}")
-                }
-            })?;
-            check_cancelled_opt(cancelled)?;
-            return Ok(());
+    if raw_strings && let Val::TStr(string_bytes) = value {
+        // JSON input and the standard jq string functions produce UTF-8,
+        // but jaq also permits a TStr containing invalid bytes. Reject by
+        // the source byte count before `from_utf8_lossy` can expand it.
+        if string_bytes.len() > value_limit {
+            bail!("jq rendered output exceeds the configured limit");
         }
+        let mut writer = LimitedWriter::new(
+            output_bytes,
+            value_start,
+            total_limit,
+            value_limit,
+            cancelled,
+        );
+        write_raw_string(&mut writer, string_bytes).map_err(|error| {
+            if writer.exceeded {
+                anyhow!("jq rendered output exceeds the configured limit")
+            } else {
+                anyhow!("failed to render jq output: {error}")
+            }
+        })?;
+        check_cancelled_opt(cancelled)?;
+        return Ok(());
     }
 
     let mut writer = LimitedWriter::new(
