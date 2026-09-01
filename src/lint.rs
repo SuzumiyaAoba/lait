@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
+    cli::LintArgs,
     config::{self, ConfigFile},
     jq,
     nesting::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
@@ -92,6 +93,62 @@ pub(crate) fn lint_file(path: &Path, config: Option<&ConfigFile>) -> Result<Lint
             path.display()
         ),
     }
+}
+
+/// Runs `lait lint <FILES>...`: statically checks every file in
+/// `lint_args.files` (see [`lint_file`]) and prints a per-file report to
+/// stdout. Synchronous, like `history::run`/`session::run` — every check is
+/// a local file read/parse, none of it needs the async runtime `app::run`
+/// otherwise sets up for a model request (see `app::needs_async_runtime`).
+/// Unlike `run_workflow`/`run_agent`, one bad file doesn't stop the rest:
+/// every file is linted and reported before this returns `Err` (which only
+/// happens if at least one file has an `Error`-level issue, so CI can rely
+/// on the exit code).
+pub(crate) fn run(lint_args: LintArgs, no_config: bool) -> Result<()> {
+    // Unlike `config::load_config`, which returns an empty `ConfigFile` both
+    // when `lait.config.yml` is absent and when `--no-config` was passed,
+    // the linter needs to tell "absent/skipped" apart from "present but
+    // empty" so it can skip `mcp:`/`skills:` name checks (and say why)
+    // instead of reporting every referenced name as unknown.
+    let config_present = !no_config && Path::new(config::CONFIG_FILE_NAME).exists();
+    let file_config = config::load_config(no_config)?;
+    let config = config_present.then_some(&file_config);
+
+    let mut failed_files = 0usize;
+    for file in &lint_args.files {
+        // `lint_file` only ever returns `Err` for a file whose type it can't
+        // determine (an unrecognized extension) — treated here as one more
+        // failure to report, not a reason to stop linting the rest of
+        // `lint_args.files`.
+        let report = match lint_file(file, config) {
+            Ok(report) => report,
+            Err(error) => {
+                println!("{}:", file.display());
+                println!("  error: {error:#}");
+                failed_files += 1;
+                continue;
+            }
+        };
+        if report.issues.is_empty() {
+            println!("{}: OK", report.file.display());
+            continue;
+        }
+        println!("{}:", report.file.display());
+        for issue in &report.issues {
+            println!("  {}: {}", issue.severity, issue.message);
+        }
+        if report.has_errors() {
+            failed_files += 1;
+        }
+    }
+
+    if failed_files > 0 {
+        bail!(
+            "{failed_files} of {} file(s) had errors",
+            lint_args.files.len()
+        );
+    }
+    Ok(())
 }
 
 /// Threaded through every check in one `lint_file` call: `config` is looked

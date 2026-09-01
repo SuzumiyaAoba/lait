@@ -1,11 +1,9 @@
-use std::path::Path;
-
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
     agent, attachment,
-    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, LintArgs, RunArgs},
+    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, RunArgs},
     cli::{AgentRunArgs, PromptArgs, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
     docgen,
@@ -93,7 +91,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Agent(agent_command)) => match agent_command.action {
             AgentAction::Run(args) => run_agent(args, cli.no_config).await,
         },
-        Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
+        Some(Command::Lint(lint_args)) => lint::run(lint_args, cli.no_config),
         Some(Command::Models(models_args)) => crate::models::run(models_args, cli.no_config).await,
         Some(Command::Completions(completions_args)) => {
             docgen::generate_completions(completions_args);
@@ -165,7 +163,7 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
 /// without any async runtime behind them.
 pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
     match cli.command {
-        Some(Command::Lint(lint_args)) => lint_files(lint_args, cli.no_config),
+        Some(Command::Lint(lint_args)) => lint::run(lint_args, cli.no_config),
         Some(Command::Models(models_args)) => {
             if models_args.remote {
                 bail!("internal error: `models --remote` must run on the async path");
@@ -190,60 +188,6 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
             bail!("internal error: an async command reached run_blocking")
         }
     }
-}
-
-/// Statically checks every file in `lint_args.files` (see `lint::lint_file`)
-/// and prints a per-file report to stdout. Runs synchronously — every check
-/// is a local file read/parse, none of it needs the async runtime `run`
-/// otherwise sets up for a model request. Unlike `run_workflow`/`run_agent`,
-/// one bad file doesn't stop the rest: every file is linted and reported
-/// before this returns `Err` (which only happens if at least one file has an
-/// `Error`-level issue, so CI can rely on the exit code).
-fn lint_files(lint_args: LintArgs, no_config: bool) -> Result<()> {
-    // Unlike `config::load_config`, which returns an empty `ConfigFile` both
-    // when `lait.config.yml` is absent and when `--no-config` was passed,
-    // the linter needs to tell "absent/skipped" apart from "present but
-    // empty" so it can skip `mcp:`/`skills:` name checks (and say why)
-    // instead of reporting every referenced name as unknown.
-    let config_present = !no_config && Path::new(config::CONFIG_FILE_NAME).exists();
-    let file_config = config::load_config(no_config)?;
-    let config = config_present.then_some(&file_config);
-
-    let mut failed_files = 0usize;
-    for file in &lint_args.files {
-        // `lint::lint_file` only ever returns `Err` for a file whose type it
-        // can't determine (an unrecognized extension) — treated here as one
-        // more failure to report, not a reason to stop linting the rest of
-        // `lint_args.files`.
-        let report = match lint::lint_file(file, config) {
-            Ok(report) => report,
-            Err(error) => {
-                println!("{}:", file.display());
-                println!("  error: {error:#}");
-                failed_files += 1;
-                continue;
-            }
-        };
-        if report.issues.is_empty() {
-            println!("{}: OK", report.file.display());
-            continue;
-        }
-        println!("{}:", report.file.display());
-        for issue in &report.issues {
-            println!("  {}: {}", issue.severity, issue.message);
-        }
-        if report.has_errors() {
-            failed_files += 1;
-        }
-    }
-
-    if failed_files > 0 {
-        bail!(
-            "{failed_files} of {} file(s) had errors",
-            lint_args.files.len()
-        );
-    }
-    Ok(())
 }
 
 /// Resolves chat mode's system prompt: `--system` text, else `--system-file`
