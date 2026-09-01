@@ -24,7 +24,7 @@ pub(crate) struct WorkflowScope {
     /// The `default:` block in effect for this scope's steps. Merged across
     /// `workflow:` nesting field by field — a sub-workflow's own entry wins,
     /// falling back to its caller's when unset (see
-    /// `workflow::WorkflowDefaults::or_fallback`); only `retry` falls back as
+    /// `workflow::WorkflowDefaults::fold`); only `retry` falls back as
     /// a whole struct rather than field-by-field.
     pub(crate) defaults: WorkflowDefaults,
     pub(crate) models: ModelMap,
@@ -124,7 +124,10 @@ impl WorkflowScope {
             .unwrap_or_else(|| PathBuf::from("."));
 
         Ok(Self {
-            defaults: std::mem::take(&mut sub_wf.default).or_fallback(&self.defaults),
+            defaults: WorkflowDefaults::fold(&[
+                std::mem::take(&mut sub_wf.default),
+                self.defaults.clone(),
+            ]),
             models,
             json_schemas,
             nodes: std::mem::take(&mut sub_wf.nodes),
