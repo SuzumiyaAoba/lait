@@ -28,7 +28,8 @@ default:
 `default:` にはこの他、`mcp:`/`skills:`/`subagents:`（後述の各節を参照）、`max_tool_rounds:`
 （既定 8）、および次の 2 項目も指定できます。
 
-- `render: true` — `--render` を渡さなくてもチャットの応答を Markdown として端末表示します
+- `render: true` — `--render` を渡さなくても応答を Markdown として端末表示します。
+  チャット・`lait run`・`lait agent run`・`lait prompt run` のいずれにも効きます
   （[出力例](./output.md) を参照）。
 - `history: false` — `--no-history` を渡さなくても `lait history` への記録を止めます
   （[実行履歴](./history.md) を参照）。
