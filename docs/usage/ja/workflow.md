@@ -306,7 +306,9 @@ steps:
 `pattern`・数値の範囲・`additionalProperties`・`oneOf`/`anyOf`/`allOf`・`$ref` などは検査しない
 簡易的なものです。また、スキーマに書かれていないフィールドが入力に含まれていても拒否しません
 （`output_schema`／Structured Outputs 用の strict スキーマは `additionalProperties: false` を
-要求しますが、同じスキーマを `input_schema` としても使い回せるようにするためです）。必須
+要求しますが、同じスキーマを `input_schema` としても使い回せるようにするためです）。`type` に
+JSON Schema が定義していない名前（タイプミスなど）を書いた場合、その `type` 制約は検査されず
+何にでもマッチしたことになります（`lait lint` が未知の `type` 名を警告として報告します）。必須
 フィールドの欠落や型の不一致を早期に（モデルを呼び出す前に）エラーとして弾くためのものです。
 `agent` を指定したノードでは agent ファイル側の `input_schema` が使われるため、ノードに
 `input_schema` を重ねて指定することはできません。

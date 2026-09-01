@@ -402,12 +402,17 @@ fn lint_node(
                     issues,
                 );
             }
-            if let Some(name_or_path) = &prompt.input_schema
-                && let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path)
-            {
-                issues.push(LintIssue::error(format!(
-                    "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
-                )));
+            if let Some(name_or_path) = &prompt.input_schema {
+                match schema::resolve_named_schema_value(json_schemas, name_or_path) {
+                    Ok(resolved) => check_unrecognized_schema_types(
+                        &format!("node '{node_id}''s 'input_schema'"),
+                        &resolved,
+                        issues,
+                    ),
+                    Err(error) => issues.push(LintIssue::error(format!(
+                        "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
+                    ))),
+                }
             }
             if let Some(name_or_path) = &prompt.output_schema {
                 if let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path) {
@@ -503,9 +508,36 @@ fn check_schema_entry(
     issues: &mut Vec<LintIssue>,
 ) {
     let Some(entry) = entry else { return };
-    if let Err(error) = schema::load_schema_value(entry) {
-        issues.push(LintIssue::error(format!(
+    match schema::load_schema_value(entry) {
+        // Only `input_schema` is actually checked against the runtime input
+        // locally (`schema::validate_input_against_schema`) — `output_schema`
+        // is sent to the model as-is for Structured Outputs, so an
+        // unrecognized `type` there is the server's problem, not lait's.
+        Ok(resolved) if field == "input_schema" => {
+            check_unrecognized_schema_types(&format!("{context}'s '{field}'"), &resolved, issues);
+        }
+        Ok(_) => {}
+        Err(error) => issues.push(LintIssue::error(format!(
             "{context}'s '{field}' is invalid: {error:#}"
+        ))),
+    }
+}
+
+/// Warns about every `type` keyword value in `schema` that isn't one of
+/// JSON Schema's recognized primitive type names (`schema::
+/// unrecognized_type_names`) — `validate_input_against_schema` silently
+/// treats an unrecognized name as matching any value, so a typo like
+/// `type: sting` would otherwise leave that field completely unchecked
+/// without any indication why.
+fn check_unrecognized_schema_types(
+    context: &str,
+    schema: &serde_json::Value,
+    issues: &mut Vec<LintIssue>,
+) {
+    for type_name in schema::unrecognized_type_names(schema) {
+        issues.push(LintIssue::warning(format!(
+            "{context} uses 'type: {type_name}', which is not a JSON Schema type lait recognizes; \
+             it will not be enforced (treated as matching any value)"
         )));
     }
 }

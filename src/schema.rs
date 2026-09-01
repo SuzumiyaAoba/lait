@@ -160,11 +160,22 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// JSON Schema's seven primitive `type` keyword names. Kept alongside
+/// `matches_json_type`'s match arms (each name below has one there) so
+/// [`unrecognized_type_names`] can tell `lint` about a name neither
+/// recognizes, such as a typo (`type: sting`) that would otherwise silently
+/// match any value.
+const RECOGNIZED_JSON_SCHEMA_TYPES: &[&str] = &[
+    "object", "array", "string", "boolean", "null", "integer", "number",
+];
+
 /// Whether `value` satisfies a single JSON Schema `type` keyword value (e.g.
 /// `"string"`, or `"integer"` for a number with no fractional part). An
 /// unrecognized type name is treated as satisfied by anything, the same way
 /// an unrecognized schema keyword elsewhere is silently ignored rather than
-/// rejected.
+/// rejected — `lint` surfaces this case separately (see
+/// [`unrecognized_type_names`]) since it can't be caught here without
+/// turning every request into a hard failure over what might be a typo.
 fn matches_json_type(type_name: &str, value: &serde_json::Value) -> bool {
     match type_name {
         "object" => value.is_object(),
@@ -175,6 +186,43 @@ fn matches_json_type(type_name: &str, value: &serde_json::Value) -> bool {
         "integer" => value.as_f64().is_some_and(|number| number.fract() == 0.0),
         "number" => value.is_number(),
         _ => true,
+    }
+}
+
+/// Collects every distinct `type` keyword value found anywhere in `schema`
+/// (recursing through `properties`/`items`, the same nesting
+/// `validate_value_against_schema` walks) that isn't one of JSON Schema's
+/// recognized primitive type names — for `lint` to warn about, since
+/// `matches_json_type` otherwise treats such a name as matching any value
+/// without any indication why a field went unchecked.
+pub(crate) fn unrecognized_type_names(schema: &serde_json::Value) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_unrecognized_type_names(schema, &mut found);
+    found
+}
+
+fn collect_unrecognized_type_names(schema: &serde_json::Value, found: &mut Vec<String>) {
+    if let Some(type_value) = schema.get("type") {
+        let names: Vec<&str> = match type_value {
+            serde_json::Value::String(name) => vec![name.as_str()],
+            serde_json::Value::Array(names) => {
+                names.iter().filter_map(|name| name.as_str()).collect()
+            }
+            _ => Vec::new(),
+        };
+        for name in names {
+            if !RECOGNIZED_JSON_SCHEMA_TYPES.contains(&name) && !found.iter().any(|f| f == name) {
+                found.push(name.to_owned());
+            }
+        }
+    }
+    if let Some(properties) = schema.get("properties").and_then(|value| value.as_object()) {
+        for property_schema in properties.values() {
+            collect_unrecognized_type_names(property_schema, found);
+        }
+    }
+    if let Some(items_schema) = schema.get("items") {
+        collect_unrecognized_type_names(items_schema, found);
     }
 }
 
@@ -314,8 +362,58 @@ pub(crate) fn build_json_schema(schema: serde_json::Value, name: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::validate_input_against_schema;
+    use super::{unrecognized_type_names, validate_input_against_schema};
     use serde_json::json;
+
+    #[test]
+    fn finds_no_unrecognized_types_in_an_ordinary_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "age": {"type": "integer"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+        });
+        assert!(unrecognized_type_names(&schema).is_empty());
+    }
+
+    #[test]
+    fn finds_an_unrecognized_top_level_type() {
+        let schema = json!({"type": "sting"});
+        assert_eq!(unrecognized_type_names(&schema), vec!["sting".to_owned()]);
+    }
+
+    #[test]
+    fn finds_an_unrecognized_type_nested_in_properties_and_items() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "age": {"type": "int"},
+                "tags": {"type": "array", "items": {"type": "txt"}},
+            },
+        });
+        let mut found = unrecognized_type_names(&schema);
+        found.sort();
+        assert_eq!(found, vec!["int".to_owned(), "txt".to_owned()]);
+    }
+
+    #[test]
+    fn finds_an_unrecognized_type_inside_an_array_of_types() {
+        let schema = json!({"type": ["string", "nullish"]});
+        assert_eq!(unrecognized_type_names(&schema), vec!["nullish".to_owned()]);
+    }
+
+    #[test]
+    fn deduplicates_a_repeated_unrecognized_type_name() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "sting"},
+                "b": {"type": "sting"},
+            },
+        });
+        assert_eq!(unrecognized_type_names(&schema), vec!["sting".to_owned()]);
+    }
 
     #[test]
     fn accepts_an_object_with_every_required_field() {

@@ -314,6 +314,23 @@ fn lint_flags_an_invalid_workflow_default_system_prompt_template() {
 }
 
 #[test]
+fn lint_warns_about_an_unrecognized_type_in_an_input_schema() {
+    let workflow = WorkflowFile::new(
+        "json_schemas:\n  bad:\n    schema:\n      type: object\n      properties:\n        age:\n          type: sting\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    input_schema: bad\nsteps:\n  - use: a\n",
+    );
+
+    let output = run_lait_lint(&[&workflow.path]);
+
+    assert!(
+        output.status.success(),
+        "an unrecognized schema type should warn, not fail: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("warning:"), "stdout: {stdout}");
+    assert!(stdout.contains("type: sting"), "stdout: {stdout}");
+}
+
+#[test]
 fn lint_flags_an_empty_command_program() {
     let workflow = WorkflowFile::new(
         "nodes:\n  a:\n    type: command\n    command: [\"  \"]\nsteps:\n  - use: a\n",
