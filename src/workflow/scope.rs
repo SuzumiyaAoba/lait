@@ -3,7 +3,10 @@
 //! bookkeeping for `workflow:` nesting. Read by every
 //! `resolve_step_settings`/`execute_step` call in `super::exec`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -27,8 +30,13 @@ pub(crate) struct WorkflowScope {
     /// `workflow::WorkflowDefaults::fold`); only `retry` falls back as
     /// a whole struct rather than field-by-field.
     pub(crate) defaults: WorkflowDefaults,
-    pub(crate) models: ModelMap,
-    pub(crate) json_schemas: schema::JsonSchemaMap,
+    /// `Arc`-wrapped so a nested scope that defines no local `models:`/
+    /// `json_schemas:` of its own (the common case) can share its parent's
+    /// map with a cheap `Arc::clone` instead of cloning every entry again —
+    /// see `nested`. Only a scope that actually overrides an alias/schema
+    /// pays for a fresh merged map.
+    pub(crate) models: Arc<ModelMap>,
+    pub(crate) json_schemas: Arc<schema::JsonSchemaMap>,
     /// This scope's own `nodes:` map, resolved by every `steps[].use` in this
     /// file. Unlike `models`/`json_schemas`, a `workflow:` node's sub-scope
     /// does *not* fall back to this scope's `nodes` for entries it lacks —
@@ -43,9 +51,9 @@ pub(crate) struct WorkflowScope {
 
 impl WorkflowScope {
     /// The scope for the workflow file passed on the command line. Takes
-    /// `wf.default`/`wf.nodes` by move (via `mem::take`) rather than cloning
-    /// them: neither is ever read again after this call, only `wf.steps`
-    /// (see `run_workflow`).
+    /// every field but `wf.steps` by move (via `mem::take`) rather than
+    /// cloning it: none of them are ever read again after this call, only
+    /// `wf.steps` (see `run_workflow`).
     pub(crate) fn top_level(wf: &mut WorkflowFile, file_path: &Path) -> Result<Self> {
         let canonical = std::fs::canonicalize(file_path).with_context(|| {
             format!(
@@ -59,8 +67,8 @@ impl WorkflowScope {
             .unwrap_or_else(|| PathBuf::from("."));
         Ok(Self {
             defaults: std::mem::take(&mut wf.default),
-            models: wf.models.clone(),
-            json_schemas: wf.json_schemas.clone(),
+            models: Arc::new(std::mem::take(&mut wf.models)),
+            json_schemas: Arc::new(std::mem::take(&mut wf.json_schemas)),
             nodes: std::mem::take(&mut wf.nodes),
             base_dir,
             active_paths: vec![canonical],
@@ -71,12 +79,18 @@ impl WorkflowScope {
     /// `relative_path` (as given in the node) against this scope's
     /// `base_dir`, merges `sub_wf`'s `default`/`models`/`json_schemas` over
     /// this scope's (the sub-workflow's own entries win; an entry it doesn't
-    /// define falls back to this scope's), takes `sub_wf`'s `default`/`nodes:`
-    /// by move (`nodes` gets no fallback — see `WorkflowScope::nodes` — and
-    /// neither is ever read again after this call, only `sub_wf.steps`), and
-    /// extends the cycle/depth bookkeeping. Fails if `relative_path`
+    /// define falls back to this scope's), takes every `sub_wf` field but
+    /// `steps` by move (none are ever read again after this call, only
+    /// `sub_wf.steps` — `nodes` gets no fallback, see `WorkflowScope::nodes`),
+    /// and extends the cycle/depth bookkeeping. Fails if `relative_path`
     /// resolves to a workflow file already executing (a cycle) or nesting
     /// has reached `MAX_WORKFLOW_DEPTH`.
+    ///
+    /// When `sub_wf` defines no local `models:`/`json_schemas:` of its own
+    /// (the common case for a deeply nested `workflow:` chain), this scope's
+    /// own `Arc<ModelMap>`/`Arc<JsonSchemaMap>` are shared as-is rather than
+    /// rebuilt — avoiding the O(depth × map size) clone cost a full
+    /// re-merge at every nesting level would otherwise add.
     pub(crate) fn nested(
         &self,
         relative_path: &Path,
@@ -104,18 +118,26 @@ impl WorkflowScope {
             }
         }
 
-        let mut models = sub_wf.models.clone();
-        for (name, definitions) in &self.models {
-            models
-                .entry(name.clone())
-                .or_insert_with(|| definitions.clone());
-        }
-        let mut json_schemas = sub_wf.json_schemas.clone();
-        for (name, entry) in &self.json_schemas {
-            json_schemas
-                .entry(name.clone())
-                .or_insert_with(|| entry.clone());
-        }
+        let models = if sub_wf.models.is_empty() {
+            Arc::clone(&self.models)
+        } else {
+            let mut merged = std::mem::take(&mut sub_wf.models);
+            for (name, definitions) in self.models.iter() {
+                merged
+                    .entry(name.clone())
+                    .or_insert_with(|| definitions.clone());
+            }
+            Arc::new(merged)
+        };
+        let json_schemas = if sub_wf.json_schemas.is_empty() {
+            Arc::clone(&self.json_schemas)
+        } else {
+            let mut merged = std::mem::take(&mut sub_wf.json_schemas);
+            for (name, entry) in self.json_schemas.iter() {
+                merged.entry(name.clone()).or_insert_with(|| entry.clone());
+            }
+            Arc::new(merged)
+        };
         let mut active_paths = self.active_paths.clone();
         active_paths.push(canonical.clone());
         let base_dir = canonical
