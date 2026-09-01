@@ -6,7 +6,8 @@ use support::{
 
 #[test]
 fn lint_reports_ok_for_a_valid_workflow_file() {
-    let workflow = WorkflowFile::new("nodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n");
+    let workflow =
+        WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
@@ -28,7 +29,7 @@ fn lint_reports_ok_for_a_valid_agent_file() {
 
 #[test]
 fn lint_fails_on_a_workflow_file_with_no_steps() {
-    let workflow = WorkflowFile::new("nodes:\n  a:\n    prompt: hi\nsteps: []\n");
+    let workflow = WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps: []\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
@@ -55,7 +56,7 @@ fn lint_fails_on_an_agent_file_without_frontmatter() {
 #[test]
 fn lint_warns_about_an_unused_node() {
     let workflow = WorkflowFile::new(
-        "nodes:\n  used:\n    prompt: hi\n  unused:\n    prompt: hi\nsteps:\n  - use: used\n",
+        "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
     );
 
     let output = run_lait_lint(&[&workflow.path]);
@@ -73,8 +74,9 @@ fn lint_flags_an_unknown_mcp_server_name() {
     // rather than report every name as unknown), this exercises the "found a
     // config, but this name isn't in it" path.
     let config = ConfigDirectory::new("mcp_servers: {}\n");
-    let workflow =
-        WorkflowFile::new("nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n");
+    let workflow = WorkflowFile::new(
+        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
+    );
 
     let output = test_command()
         .current_dir(config.path())
@@ -97,8 +99,9 @@ fn lint_flags_an_unknown_mcp_server_name() {
 #[test]
 fn lint_accepts_a_known_mcp_server_name() {
     let config = ConfigDirectory::new("mcp_servers:\n  known:\n    command: \"true\"\n");
-    let workflow =
-        WorkflowFile::new("nodes:\n  a:\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n");
+    let workflow = WorkflowFile::new(
+        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
+    );
 
     let output = test_command()
         .current_dir(config.path())
@@ -135,8 +138,9 @@ fn lint_flags_an_unknown_skill_name_in_an_agent_file() {
 #[test]
 fn lint_skips_mcp_and_skill_checks_and_still_succeeds_without_a_config_file() {
     let config = ConfigDirectory::empty();
-    let workflow =
-        WorkflowFile::new("nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n");
+    let workflow = WorkflowFile::new(
+        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
+    );
 
     // `--no-config` is a global flag, but `Cli::args_conflicts_with_subcommands`
     // means it must come after the subcommand's own args, not before (see
@@ -209,7 +213,7 @@ fn lint_detects_a_workflow_call_cycle() {
     std::fs::write(
         &a_path,
         format!(
-            "nodes:\n  sub:\n    workflow: {}\nsteps:\n  - use: sub\n",
+            "nodes:\n  sub:\n    type: workflow\n    workflow: {}\nsteps:\n  - use: sub\n",
             b_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -217,7 +221,7 @@ fn lint_detects_a_workflow_call_cycle() {
     std::fs::write(
         &b_path,
         format!(
-            "nodes:\n  sub:\n    workflow: {}\nsteps:\n  - use: sub\n",
+            "nodes:\n  sub:\n    type: workflow\n    workflow: {}\nsteps:\n  - use: sub\n",
             a_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -243,7 +247,7 @@ fn lint_detects_a_workflow_call_cycle() {
 #[test]
 fn lint_flags_an_agent_referenced_by_a_node_that_does_not_exist() {
     let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    agent: /nonexistent/lait-lint-test-agent.md\nsteps:\n  - use: a\n",
+        "nodes:\n  a:\n    type: agent\n    agent: /nonexistent/lait-lint-test-agent.md\nsteps:\n  - use: a\n",
     );
 
     let output = run_lait_lint(&[&workflow.path]);
@@ -258,8 +262,9 @@ fn lint_flags_an_agent_referenced_by_a_node_that_does_not_exist() {
 
 #[test]
 fn lint_flags_an_invalid_jq_filter_in_a_when_condition() {
-    let workflow =
-        WorkflowFile::new("nodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n");
+    let workflow = WorkflowFile::new(
+        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
+    );
 
     let output = run_lait_lint(&[&workflow.path]);
 
@@ -274,7 +279,7 @@ fn lint_flags_an_invalid_jq_filter_in_a_when_condition() {
 #[test]
 fn lint_flags_an_invalid_node_system_prompt_template() {
     let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    prompt: hi\n    system_prompt: \"{{ input\"\nsteps:\n  - use: a\n",
+        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    system_prompt: \"{{ input\"\nsteps:\n  - use: a\n",
     );
 
     let output = run_lait_lint(&[&workflow.path]);
@@ -290,7 +295,7 @@ fn lint_flags_an_invalid_node_system_prompt_template() {
 #[test]
 fn lint_flags_an_invalid_workflow_default_system_prompt_template() {
     let workflow = WorkflowFile::new(
-        "default:\n  system_prompt: \"{{ input\"\nnodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n",
+        "default:\n  system_prompt: \"{{ input\"\nnodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
     );
 
     let output = run_lait_lint(&[&workflow.path]);
@@ -305,7 +310,9 @@ fn lint_flags_an_invalid_workflow_default_system_prompt_template() {
 
 #[test]
 fn lint_flags_an_empty_command_program() {
-    let workflow = WorkflowFile::new("nodes:\n  a:\n    command: [\"  \"]\nsteps:\n  - use: a\n");
+    let workflow = WorkflowFile::new(
+        "nodes:\n  a:\n    type: command\n    command: [\"  \"]\nsteps:\n  - use: a\n",
+    );
 
     let output = run_lait_lint(&[&workflow.path]);
 

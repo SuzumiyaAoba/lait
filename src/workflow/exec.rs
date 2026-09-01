@@ -3,7 +3,13 @@
 //! its retry/timeout handling). Everything here ultimately calls into
 //! `crate::engine` for anything that talks to a model.
 
-use std::{borrow::Cow, future::Future, path::Path, pin::Pin, time::Duration};
+use std::{
+    borrow::Cow,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{StreamExt, TryStreamExt};
@@ -746,11 +752,11 @@ async fn execute_step_with_retry(
     } = context;
 
     let calls_model = node.calls_model();
-    let effective_retry = node.retry.as_ref().or(calls_model
+    let effective_retry = node.retry().or(calls_model
         .then_some(scope.defaults.retry.as_ref())
         .flatten());
     let effective_timeout = node
-        .timeout
+        .timeout()
         .or(calls_model.then_some(scope.defaults.timeout).flatten());
 
     let max_attempts = effective_retry
@@ -909,8 +915,8 @@ fn resolve_step_settings(
     label: &str,
 ) -> Result<RequestSettings> {
     let model_name = node
-        .model
-        .clone()
+        .model()
+        .map(str::to_owned)
         .or_else(|| agent_file.and_then(|agent_file| agent_file.model.clone()))
         .or_else(|| scope.defaults.model.clone())
         .or_else(|| file_config.default.model.clone())
@@ -927,10 +933,10 @@ fn resolve_step_settings(
     // `CapabilityOverrides::fold` then pick the first layer with each field
     // set, independently per field.
     let node_sampling = SamplingOverrides {
-        reasoning_effort: node.reasoning_effort,
-        temperature: node.temperature,
-        top_p: node.top_p,
-        max_tokens: node.max_tokens,
+        reasoning_effort: node.reasoning_effort(),
+        temperature: node.temperature(),
+        top_p: node.top_p(),
+        max_tokens: node.max_tokens(),
     };
     let agent_sampling = agent_file
         .map(|agent_file| SamplingOverrides {
@@ -949,10 +955,10 @@ fn resolve_step_settings(
     let overrides = SamplingOverrides::fold(&[node_sampling, agent_sampling, workflow_sampling]);
 
     let node_capability = CapabilityOverrides {
-        mcp: node.mcp.clone(),
-        max_tool_rounds: node.max_tool_rounds,
-        skills: node.skills.clone(),
-        subagents: node.subagents.clone(),
+        mcp: node.mcp().map(<[String]>::to_vec),
+        max_tool_rounds: node.max_tool_rounds(),
+        skills: node.skills().map(<[String]>::to_vec),
+        subagents: node.subagents().map(<[String]>::to_vec),
     };
     let agent_capability = agent_file
         .map(|agent_file| CapabilityOverrides {
@@ -989,24 +995,21 @@ fn resolve_step_settings(
 /// resolve into `image_url` content parts for the caller's eventual
 /// `AgentTurn`/`PromptTurn`. The two kinds are read/resolved concurrently
 /// since they're otherwise-independent I/O. Shared by `execute_step`'s
-/// `agent` and `sends_prompt` branches, which each attach to a different
-/// "base" user message (the current input passed through unchanged, vs. the
-/// rendered `prompt` template).
+/// `Agent` and `Prompt` arms, which each attach to a different "base" user
+/// message (the current input passed through unchanged, vs. the rendered
+/// `prompt` template) — takes `files`/`images` directly (rather than a
+/// `&workflow::NodeDefinition`) since only those two variants have either
+/// field.
 async fn resolve_attachments<'a>(
-    node: &workflow::NodeDefinition,
+    files: Option<&[PathBuf]>,
+    images: Option<&[String]>,
     base_prompt: &'a str,
     label: &str,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<(Cow<'a, str>, Vec<String>)> {
     let (file_context, image_urls) = tokio::try_join!(
-        attachment::read_file_attachments_cancellable(
-            node.files.as_deref().unwrap_or(&[]),
-            cancellation.clone(),
-        ),
-        attachment::resolve_image_urls_cancellable(
-            node.images.as_deref().unwrap_or(&[]),
-            cancellation,
-        ),
+        attachment::read_file_attachments_cancellable(files.unwrap_or(&[]), cancellation.clone(),),
+        attachment::resolve_image_urls_cancellable(images.unwrap_or(&[]), cancellation),
     )
     .with_context(|| format!("step '{label}'"))?;
     let prompt = match file_context {
@@ -1016,9 +1019,10 @@ async fn resolve_attachments<'a>(
     Ok((prompt, image_urls))
 }
 
-/// Runs a single node (agent call, prompt call, or `jq`-only data transform)
-/// and returns its output, with `jq` applied afterward if set. `label` is the
-/// calling `use:` site's label, used only for progress output/error messages.
+/// Runs a single node (agent call, prompt call, sub-workflow, command, or
+/// `jq`/`write_file`-only data transform) and returns its output, with `jq`
+/// applied afterward if set. `label` is the calling `use:` site's label,
+/// used only for progress output/error messages.
 async fn execute_step(
     node: &workflow::NodeDefinition,
     current_input: &str,
@@ -1032,193 +1036,215 @@ async fn execute_step(
         steps_outputs,
         step_cancel,
     } = context;
-    if let Some(name_or_path) = &node.input_schema {
-        let schema = schema::resolve_named_schema_value_cancellable(
-            &scope.json_schemas,
-            name_or_path,
-            step_cancel.clone(),
-        )
-        .await
-        .with_context(|| format!("step '{label}'"))?;
-        let input = template::parse_input(current_input);
-        schema::validate_input_against_schema(&schema, &input)
-            .with_context(|| format!("step '{label}'"))?;
-    }
 
-    let mut step_output = if let Some(agent_path) = &node.agent {
-        // Loaded through the registry's path cache (not `agent::load_agent`
-        // directly) so a `for_each`/`loop` body re-running this node reuses
-        // the parsed file and its resolved input schema instead of re-reading
-        // both from disk on every iteration.
-        let loaded = env
-            .agent_registry
-            .load_path_cancellable(agent_path, step_cancel.clone())
-            .await
-            .with_context(|| format!("step '{label}'"))?;
-        let agent_file = &loaded.file;
+    let mut step_output = match node {
+        workflow::NodeDefinition::Prompt(prompt_node) => {
+            if let Some(name_or_path) = &prompt_node.input_schema {
+                let schema = schema::resolve_named_schema_value_cancellable(
+                    &scope.json_schemas,
+                    name_or_path,
+                    step_cancel.clone(),
+                )
+                .await
+                .with_context(|| format!("step '{label}'"))?;
+                let input = template::parse_input(current_input);
+                schema::validate_input_against_schema(&schema, &input)
+                    .with_context(|| format!("step '{label}'"))?;
+            }
 
-        let input = template::parse_input(current_input);
-        loaded
-            .validate_input(&input)
-            .with_context(|| format!("step '{label}'"))?;
-
-        let settings =
-            resolve_step_settings(node, scope, &env.file_config, Some(agent_file), label)?
+            let settings = resolve_step_settings(node, scope, &env.file_config, None, label)?
                 .with_usage_label(label);
 
-        let (prompt, image_urls) =
-            resolve_attachments(node, current_input, label, step_cancel.clone()).await?;
+            let response_format = match prompt_node.output_schema.as_deref() {
+                Some(name_or_path) => {
+                    let schema_name = prompt_node
+                        .schema_name
+                        .as_deref()
+                        .unwrap_or("structured_output");
+                    let response_format = match scope.json_schemas.get(name_or_path) {
+                        Some(entry) => {
+                            schema::build_response_format_from_entry_cancellable(
+                                entry,
+                                schema_name,
+                                step_cancel.clone(),
+                            )
+                            .await
+                        }
+                        None => {
+                            schema::load_json_schema_cancellable(
+                                Path::new(name_or_path),
+                                schema_name,
+                                step_cancel.clone(),
+                            )
+                            .await
+                        }
+                    };
+                    Some(response_format.with_context(|| format!("step '{label}'"))?)
+                }
+                None => None,
+            };
 
-        call_agent(
-            agent_file,
-            &settings,
-            env,
-            AgentTurn {
-                input: &input,
-                prompt: &prompt,
-                image_urls: &image_urls,
-            },
-            steps_outputs,
-            std::slice::from_ref(&loaded.canonical_path),
-            step_cancel.clone(),
-        )
-        .await
-        .with_context(|| format!("step '{label}'"))?
-    } else if node.sends_prompt() {
-        let settings = resolve_step_settings(node, scope, &env.file_config, None, label)?
-            .with_usage_label(label);
+            let input = template::parse_input(current_input);
+            // A `system_prompt`-only node (no `prompt`) sends the current
+            // input unchanged as the user message, the same way an `agent`
+            // node's `current_input` passes straight through `call_agent`
+            // without going through `template::render`.
+            let prompt: Cow<'_, str> = match &prompt_node.prompt {
+                Some(prompt_template) => Cow::Owned(
+                    template::render(
+                        prompt_template,
+                        &input,
+                        steps_outputs,
+                        &serde_json::Map::new(),
+                    )
+                    .with_context(|| format!("step '{label}'"))?,
+                ),
+                None => Cow::Borrowed(current_input),
+            };
+            let (prompt, image_urls) = resolve_attachments(
+                prompt_node.files.as_deref(),
+                prompt_node.images.as_deref(),
+                &prompt,
+                label,
+                step_cancel.clone(),
+            )
+            .await?;
+            let system_prompt = prompt_node
+                .system_prompt
+                .as_deref()
+                .or(scope.defaults.system_prompt.as_deref())
+                .map(|system_prompt_template| {
+                    template::render(
+                        system_prompt_template,
+                        &input,
+                        steps_outputs,
+                        &serde_json::Map::new(),
+                    )
+                })
+                .transpose()
+                .with_context(|| format!("step '{label}'"))?;
 
-        let response_format = match node.output_schema.as_deref() {
-            Some(name_or_path) => {
-                let schema_name = node.schema_name.as_deref().unwrap_or("structured_output");
-                let response_format = match scope.json_schemas.get(name_or_path) {
-                    Some(entry) => {
-                        schema::build_response_format_from_entry_cancellable(
-                            entry,
-                            schema_name,
-                            step_cancel.clone(),
-                        )
-                        .await
-                    }
-                    None => {
-                        schema::load_json_schema_cancellable(
-                            Path::new(name_or_path),
-                            schema_name,
-                            step_cancel.clone(),
-                        )
-                        .await
-                    }
-                };
-                Some(response_format.with_context(|| format!("step '{label}'"))?)
-            }
-            None => None,
-        };
-
-        let input = template::parse_input(current_input);
-        // A `system_prompt`-only node (no `prompt`) sends the current input
-        // unchanged as the user message, the same way an `agent` node's
-        // `current_input` passes straight through `call_agent` without going
-        // through `template::render`.
-        let prompt: Cow<'_, str> = match &node.prompt {
-            Some(prompt_template) => Cow::Owned(
-                template::render(
-                    prompt_template,
-                    &input,
-                    steps_outputs,
-                    &serde_json::Map::new(),
+            let response = settings
+                .complete(
+                    env,
+                    &[],
+                    PromptTurn {
+                        system_prompt: system_prompt.as_deref(),
+                        history: &[],
+                        prompt: &prompt,
+                        image_urls: &image_urls,
+                    },
+                    response_format,
+                    step_cancel.clone(),
                 )
-                .with_context(|| format!("step '{label}'"))?,
-            ),
-            None => Cow::Borrowed(current_input),
-        };
-        let (prompt, image_urls) =
-            resolve_attachments(node, &prompt, label, step_cancel.clone()).await?;
-        let system_prompt = node
-            .system_prompt
-            .as_deref()
-            .or(scope.defaults.system_prompt.as_deref())
-            .map(|system_prompt_template| {
-                template::render(
-                    system_prompt_template,
-                    &input,
-                    steps_outputs,
-                    &serde_json::Map::new(),
-                )
-            })
-            .transpose()
-            .with_context(|| format!("step '{label}'"))?;
+                .await
+                .with_context(|| format!("step '{label}'"))?;
 
-        let response = settings
-            .complete(
+            response::render_response(&response, false, false)
+                .with_context(|| format!("step '{label}'"))?
+        }
+        workflow::NodeDefinition::Agent(agent_node) => {
+            // Loaded through the registry's path cache (not
+            // `agent::load_agent` directly) so a `for_each`/`loop` body
+            // re-running this node reuses the parsed file and its resolved
+            // input schema instead of re-reading both from disk on every
+            // iteration.
+            let loaded = env
+                .agent_registry
+                .load_path_cancellable(&agent_node.agent, step_cancel.clone())
+                .await
+                .with_context(|| format!("step '{label}'"))?;
+            let agent_file = &loaded.file;
+
+            let input = template::parse_input(current_input);
+            loaded
+                .validate_input(&input)
+                .with_context(|| format!("step '{label}'"))?;
+
+            let settings =
+                resolve_step_settings(node, scope, &env.file_config, Some(agent_file), label)?
+                    .with_usage_label(label);
+
+            let (prompt, image_urls) = resolve_attachments(
+                agent_node.files.as_deref(),
+                agent_node.images.as_deref(),
+                current_input,
+                label,
+                step_cancel.clone(),
+            )
+            .await?;
+
+            call_agent(
+                agent_file,
+                &settings,
                 env,
-                &[],
-                PromptTurn {
-                    system_prompt: system_prompt.as_deref(),
-                    history: &[],
+                AgentTurn {
+                    input: &input,
                     prompt: &prompt,
                     image_urls: &image_urls,
                 },
-                response_format,
+                steps_outputs,
+                std::slice::from_ref(&loaded.canonical_path),
                 step_cancel.clone(),
             )
             .await
-            .with_context(|| format!("step '{label}'"))?;
-
-        response::render_response(&response, false, false)
             .with_context(|| format!("step '{label}'"))?
-    } else if let Some(sub_workflow_path) = &node.workflow {
-        let resolved_path = scope.base_dir.join(sub_workflow_path);
-        let mut sub_wf =
-            workflow::load_workflow(&resolved_path).with_context(|| format!("step '{label}'"))?;
-        let sub_scope = scope.nested(sub_workflow_path, &mut sub_wf, label)?;
-        announce_named_file(
-            &format!("{progress_prefix}    ->"),
-            sub_wf.name.as_deref(),
-            sub_wf.description.as_deref(),
-        );
-        // Isolated like an `agent:` call, not threaded like a `switch` case:
-        // the sub-workflow is a separate file with its own step ids, so it
-        // starts with an empty `steps_outputs` and its Flow (whether it
-        // ended via `stop`/`break` internally or just ran out of steps) is
-        // this step's own concern, not the caller's — only its final output
-        // crosses back.
-        let sub_progress_prefix = format!("{progress_prefix}    ");
-        let StepsOutcome { output: result, .. } = run_steps(
-            &sub_wf.steps,
-            current_input.to_string(),
-            workflow::StepOutputs::new(),
-            RunStepsFrame {
-                scope: &sub_scope,
-                env,
-                start_counter: 0,
-                progress_prefix: &sub_progress_prefix,
-                cancellation: step_cancel.clone(),
-            },
-        )
-        .await
-        .with_context(|| format!("step '{label}'"))?;
-        result
-    } else if let Some(argv) = &node.command {
-        let input = template::parse_input(current_input);
-        let rendered_argv: Vec<String> = argv
-            .iter()
-            .map(|arg| template::render(arg, &input, steps_outputs, &serde_json::Map::new()))
-            .collect::<Result<_>>()
-            .with_context(|| format!("step '{label}'"))?;
-        crate::process::run_command(&rendered_argv, current_input, step_cancel.clone())
+        }
+        workflow::NodeDefinition::Workflow(workflow_node) => {
+            let resolved_path = scope.base_dir.join(&workflow_node.workflow);
+            let mut sub_wf = workflow::load_workflow(&resolved_path)
+                .with_context(|| format!("step '{label}'"))?;
+            let sub_scope = scope.nested(&workflow_node.workflow, &mut sub_wf, label)?;
+            announce_named_file(
+                &format!("{progress_prefix}    ->"),
+                sub_wf.name.as_deref(),
+                sub_wf.description.as_deref(),
+            );
+            // Isolated like an `agent:` call, not threaded like a `switch`
+            // case: the sub-workflow is a separate file with its own step
+            // ids, so it starts with an empty `steps_outputs` and its Flow
+            // (whether it ended via `stop`/`break` internally or just ran
+            // out of steps) is this step's own concern, not the caller's —
+            // only its final output crosses back.
+            let sub_progress_prefix = format!("{progress_prefix}    ");
+            let StepsOutcome { output: result, .. } = run_steps(
+                &sub_wf.steps,
+                current_input.to_string(),
+                workflow::StepOutputs::new(),
+                RunStepsFrame {
+                    scope: &sub_scope,
+                    env,
+                    start_counter: 0,
+                    progress_prefix: &sub_progress_prefix,
+                    cancellation: step_cancel.clone(),
+                },
+            )
             .await
-            .with_context(|| format!("step '{label}'"))?
-    } else {
-        current_input.to_string()
+            .with_context(|| format!("step '{label}'"))?;
+            result
+        }
+        workflow::NodeDefinition::Command(command_node) => {
+            let input = template::parse_input(current_input);
+            let rendered_argv: Vec<String> = command_node
+                .command
+                .iter()
+                .map(|arg| template::render(arg, &input, steps_outputs, &serde_json::Map::new()))
+                .collect::<Result<_>>()
+                .with_context(|| format!("step '{label}'"))?;
+            crate::process::run_command(&rendered_argv, current_input, step_cancel.clone())
+                .await
+                .with_context(|| format!("step '{label}'"))?
+        }
+        workflow::NodeDefinition::Transform(_) => current_input.to_string(),
     };
 
-    if let Some(filter) = &node.jq {
+    if let Some(filter) = node.jq() {
         step_output = apply_jq(filter, &step_output, steps_outputs, step_cancel.as_ref())
             .await
             .with_context(|| format!("step '{label}'"))?;
     }
 
-    if let Some(path) = &node.write_file {
+    if let Some(path) = node.write_file() {
         async_io::write_output_file(path, &step_output, step_cancel)
             .await
             .with_context(|| format!("step '{label}'"))?;

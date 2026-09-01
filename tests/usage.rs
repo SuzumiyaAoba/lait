@@ -139,6 +139,7 @@ models:
       model_id: workflow-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - id: step-one

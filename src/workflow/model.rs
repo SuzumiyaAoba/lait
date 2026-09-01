@@ -4,6 +4,12 @@ use serde::Deserialize;
 
 use crate::{cli::ReasoningEffort, config::ModelMap, schema::JsonSchemaMap};
 
+/// The only workflow schema version this build understands. `WorkflowFile`'s
+/// `version:` is optional (omitted means "latest"); an explicit but
+/// unrecognized number is rejected outright rather than silently misparsed
+/// — see `super::parse_workflow`.
+pub(crate) const CURRENT_WORKFLOW_VERSION: u32 = 1;
+
 /// The workflow-file-scoped map of reusable action definitions, keyed by the
 /// name used in `steps[].use`. Unlike `models`/`json_schemas`, this is never
 /// merged into a nested `workflow:` step's sub-workflow scope — each file's
@@ -14,6 +20,13 @@ pub(crate) type NodeMap = BTreeMap<String, NodeDefinition>;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowFile {
+    /// This file's schema version. `None` (the field omitted) means "the
+    /// latest version this build supports" — the common case, and the only
+    /// option before this field existed. An explicit version that isn't
+    /// [`CURRENT_WORKFLOW_VERSION`] is rejected with a clear error instead
+    /// of silently (mis)parsing against a schema the file wasn't written
+    /// for, once a future schema change actually introduces a version 2.
+    pub(crate) version: Option<u32>,
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
     #[serde(default)]
@@ -112,15 +125,47 @@ impl WorkflowDefaults {
 /// A reusable action definition, referenced by id from `steps[].use`. Carries
 /// only "what to do" — model call or data transform — never "when"/"how many
 /// times", which lives on the `FlowStep` reference site instead.
+///
+/// Tagged by a required `type:` field (`prompt`/`agent`/`workflow`/`command`/
+/// `transform`) rather than inferred from which fields are set: each variant
+/// is its own struct with only the fields that make sense for it, so e.g.
+/// `type: workflow` cannot also carry a `model:` — a typo/misunderstanding
+/// that used to need one of `validate_node`'s ~15 hand-written mutual-
+/// exclusion checks to catch is now simply a field the type doesn't have
+/// (`#[serde(deny_unknown_fields)]` rejects it at parse time, before
+/// `validate_node` ever runs). Fields shared by more than one variant (`jq`/
+/// `write_file`/`retry`/`timeout`/sampling/capability knobs) are duplicated
+/// per variant rather than `#[serde(flatten)]`ed out of a common struct:
+/// `flatten` is documented as incompatible with `deny_unknown_fields` (see
+/// `WorkflowDefaults`'s doc comment, which hit the same constraint first),
+/// and losing the typo-rejection this DSL leans on for every field would
+/// cost far more than the duplication does. `NodeDefinition`'s own methods
+/// below (`model`/`jq`/`retry`/... ) read through to whichever variant has
+/// that field, `None` for one that doesn't, so most call sites outside
+/// `workflow::validate`/`workflow::exec` never have to match on the variant
+/// themselves.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum NodeDefinition {
+    Prompt(PromptNode),
+    Agent(AgentNode),
+    Workflow(WorkflowNode),
+    Command(CommandNode),
+    Transform(TransformNode),
+}
+
+/// `type: prompt` — sends `prompt` (rendered as a handlebars template) and/or
+/// `system_prompt` to the model. At least one of the two is required: a
+/// `prompt` node that sends neither has nothing to distinguish it from
+/// `type: transform`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NodeDefinition {
+pub(crate) struct PromptNode {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     /// Sampling temperature (0.0-2.0) for this node's model call. Falls back
     /// independently to the workflow's `default.temperature` when unset (like
-    /// `reasoning_effort`, not like `retry`'s whole-unit fallback). Only
-    /// meaningful for a node that calls a model (`prompt`/`agent`).
+    /// `reasoning_effort`, not like `retry`'s whole-unit fallback).
     pub(crate) temperature: Option<f64>,
     /// Nucleus sampling probability mass (0.0-1.0) for this node's model
     /// call. Falls back independently to `default.top_p`, like `temperature`.
@@ -131,103 +176,53 @@ pub(crate) struct NodeDefinition {
     pub(crate) max_tokens: Option<u32>,
     /// The user-message prompt template sent to the model. When unset but
     /// `system_prompt` is set, the node's current input is sent unchanged (no
-    /// template rendering) as the user message instead, the same way an
-    /// `agent` node passes its current input straight through. A node with
-    /// neither `prompt` nor `system_prompt` and without an `agent` does not
-    /// call the model at all; it must then have a `jq` filter, making it a
-    /// data-only transformation node. Mutually exclusive with `agent`.
+    /// template rendering) as the user message instead.
     pub(crate) prompt: Option<String>,
     /// A system prompt template, rendered the same way as `prompt` (see
     /// `template::render`) and sent ahead of it as the system message. Falls
     /// back to the workflow's `default.system_prompt` when unset, the same
-    /// way as `skills`. An `agent` node already has its own system prompt
-    /// (the agent file's body), so `system_prompt` is rejected alongside
-    /// `agent`.
+    /// way as `skills`.
     pub(crate) system_prompt: Option<String>,
     /// Paths whose contents are attached as context, like the CLI's
     /// `--file`: each is read as UTF-8 text and appended (as named fenced
     /// code blocks, see `attachment::read_file_attachments`) after the
     /// rendered `prompt` (or, for a `system_prompt`-only node, after the
-    /// current input passed through unchanged). Only meaningful for a node
-    /// that calls a model (`prompt`/`system_prompt`/`agent`); rejected
-    /// alongside `workflow`/`command`, neither of which sends a message of
-    /// its own for this to attach to.
+    /// current input passed through unchanged).
     pub(crate) files: Option<Vec<PathBuf>>,
     /// Images attached for a vision-capable model, like the CLI's `--image`:
     /// each entry is a local file path (sent as a base64 data URL) or an
     /// `http(s)://` URL (sent as-is); see `attachment::resolve_image_urls`.
-    /// Same restriction as `files` above.
     pub(crate) images: Option<Vec<String>>,
-    /// Path to an agent Markdown file (see `agent::load_agent`) whose system
-    /// prompt, model/reasoning defaults, and input/output schema drive this
-    /// node instead of `prompt`/`input_schema`/`output_schema`/`schema_name`.
-    /// Mutually exclusive with `prompt`, `input_schema`, `output_schema`, and
-    /// `schema_name`.
-    pub(crate) agent: Option<PathBuf>,
-    /// Path to another workflow YAML file (resolved relative to the
-    /// directory containing the workflow file this node is defined in, not
-    /// the current working directory), run against this node's input; that
-    /// sub-workflow's final output becomes this node's output. Its own
-    /// `default:`/`models:`/`json_schemas:` take precedence, falling back to
-    /// this workflow's when it doesn't define an entry. Mutually exclusive
-    /// with `prompt`, `agent`, `command`, `model`, `reasoning_effort`,
-    /// `temperature`/`top_p`/`max_tokens`,
-    /// `input_schema`/`output_schema`/`schema_name` (which the sub-workflow's
-    /// own steps supply), and `retry`/`timeout` (set those on the
-    /// sub-workflow's own steps instead). `on_error` is not excluded — it
-    /// lives on the calling `FlowStep`, not this node, and is free to catch
-    /// this sub-workflow failing as a whole.
-    pub(crate) workflow: Option<PathBuf>,
-    /// Runs `command[0]` as a child process with `command[1..]` as its
-    /// arguments, each rendered via `template::render` like `prompt` (this
-    /// never goes through a shell, so a rendered value can't inject an extra
-    /// argument or command the way string concatenation into a shell command
-    /// line could — see `docs/usage/ja/attachments.md`'s note on why
-    /// `--file` exists for the same reason). This node's current input is
-    /// piped to the process's stdin; its captured stdout (a single trailing
-    /// newline stripped, like a shell `$(...)` substitution) becomes this
-    /// node's output, then goes through `jq`/`write_file` like any other
-    /// node's output. A non-UTF-8 stdout is rejected, matching `--file`'s
-    /// text-only restriction. A non-zero exit status fails this node's
-    /// action (stderr included in the error), the same as any other
-    /// failure — subject to the calling `FlowStep`'s `on_error` and this
-    /// node's own `retry`. Mutually exclusive with `prompt`, `system_prompt`,
-    /// `agent`, `workflow`, `files`, and `images`.
-    pub(crate) command: Option<Vec<String>>,
-    /// Validates this node's input before it runs (before rendering `prompt`,
-    /// or before `jq` for a transform-only node). Resolved against the
-    /// workflow's top-level `json_schemas:` first; if no such key exists,
-    /// treated as a path to a JSON schema file instead. Mutually exclusive
-    /// with `agent`, whose agent file supplies its own `input_schema`.
+    /// Validates this node's input before it runs (before rendering
+    /// `prompt`). Resolved against the workflow's top-level `json_schemas:`
+    /// first; if no such key exists, treated as a path to a JSON schema file
+    /// instead.
     pub(crate) input_schema: Option<String>,
     /// Request a structured JSON response using the named schema, like the CLI's
     /// `--json-schema`. Resolved against the workflow's top-level `json_schemas:`
     /// first; if no such key exists, treated as a path to a JSON schema file
-    /// instead. Requires `prompt`.
+    /// instead.
     pub(crate) output_schema: Option<String>,
     /// The name of the structured output schema. Defaults to `structured_output`,
     /// like the CLI's `--schema-name`. Only used together with `output_schema`.
     pub(crate) schema_name: Option<String>,
-    /// A jq filter applied to this node's output (the model's response, or the
-    /// running input if there is no `prompt`) before it becomes `{{ input }}` for
-    /// the next step. The filtered value must be valid JSON.
+    /// A jq filter applied to this node's output (the model's response)
+    /// before it becomes `{{ input }}` for the next step. The filtered value
+    /// must be valid JSON.
     pub(crate) jq: Option<String>,
     /// Writes this node's final output (after `jq`, if set) to this path,
     /// overwriting it if it already exists (parent directories are not
     /// created automatically). Resolved relative to the current working
-    /// directory, like `agent:` (not relative to the workflow file, unlike
-    /// `workflow:`). Does not change what becomes `{{ input }}` for the next
+    /// directory. Does not change what becomes `{{ input }}` for the next
     /// step. Rejected on a node used inside a `for_each` body whose
     /// `max_concurrency` is above 1, where every concurrently running item
     /// would write the same static path.
     pub(crate) write_file: Option<PathBuf>,
-    /// Retries this node's action (`input_schema` check, `prompt`/`agent`
-    /// call, and `jq`, as one unit) up to `max_attempts` times on failure.
-    /// Applies before the calling `FlowStep`'s `on_error`, which only runs
-    /// once every attempt here has failed. Falls back to the workflow's
-    /// `default.retry` (as a whole struct, not merged field-by-field) when
-    /// unset on a node that calls a model (`prompt`/`agent`); a `jq`-only or
-    /// `workflow:` node never retries on its own account.
+    /// Retries this node's action (`input_schema` check, model call, and
+    /// `jq`, as one unit) up to `max_attempts` times on failure. Applies
+    /// before the calling `FlowStep`'s `on_error`, which only runs once every
+    /// attempt here has failed. Falls back to the workflow's `default.retry`
+    /// (as a whole struct, not merged field-by-field) when unset.
     pub(crate) retry: Option<RetryDefinition>,
     /// A per-attempt time limit, in seconds, on this node's action. A timed
     /// out attempt counts as a failure for `retry`, the same as any other
@@ -235,47 +230,273 @@ pub(crate) struct NodeDefinition {
     /// rule as `retry` above.
     pub(crate) timeout: Option<u64>,
     /// Names of `mcp_servers:` entries (from `lait.config.yml`) whose tools
-    /// this node's model call may use. Only meaningful for a node that calls
-    /// a model (`prompt`/`agent`); falls back to the agent file's own `mcp:`
-    /// (for an `agent` node), then to the workflow's `default.mcp`, the same
-    /// way as `reasoning_effort`.
+    /// this node's model call may use. Falls back to the workflow's
+    /// `default.mcp`, the same way as `reasoning_effort`.
     pub(crate) mcp: Option<Vec<String>>,
     /// The maximum number of tool-call round trips this node's model call may
     /// take before lait errors, when `mcp` (from any fallback layer) names at
     /// least one server. Falls back the same way as `mcp`.
     pub(crate) max_tool_rounds: Option<usize>,
     /// Names of `skills:` entries (from `lait.config.yml`) whose content is
-    /// appended to this node's system prompt. Only meaningful for a node that
-    /// calls a model (`prompt`/`agent`); falls back to the agent file's own
-    /// `skills:` (for an `agent` node), then to the workflow's
+    /// appended to this node's system prompt. Falls back to the workflow's
     /// `default.skills`, the same way as `mcp`.
     pub(crate) skills: Option<Vec<String>>,
     /// Names of `agents:` entries (from `lait.config.yml`) made available as
-    /// callable subagent tools during this node's model call. Only
-    /// meaningful for a node that calls a model (`prompt`/`agent`); falls
-    /// back to the agent file's own `subagents:` (for an `agent` node), then
-    /// to the workflow's `default.subagents`, the same way as `mcp`.
+    /// callable subagent tools during this node's model call. Falls back to
+    /// the workflow's `default.subagents`, the same way as `mcp`.
     pub(crate) subagents: Option<Vec<String>>,
 }
 
+/// `type: agent` — runs an agent Markdown file (see `agent::load_agent`)
+/// against this node's current input, the same way `lait agent run` does.
+/// The agent file supplies its own system prompt and input/output schema, so
+/// this variant has no `system_prompt`/`input_schema`/`output_schema`/
+/// `schema_name` of its own — only `model`/sampling/capability overrides, all
+/// applied on top of the agent file's own settings.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentNode {
+    /// Path to an agent Markdown file, resolved relative to the current
+    /// working directory (not relative to the workflow file, unlike
+    /// `type: workflow`'s `workflow:`).
+    pub(crate) agent: PathBuf,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) max_tokens: Option<u32>,
+    /// Same as `PromptNode::files` — attached after the current input, which
+    /// this node's agent call sends unchanged as its user message.
+    pub(crate) files: Option<Vec<PathBuf>>,
+    /// Same as `PromptNode::images`.
+    pub(crate) images: Option<Vec<String>>,
+    pub(crate) jq: Option<String>,
+    pub(crate) write_file: Option<PathBuf>,
+    pub(crate) retry: Option<RetryDefinition>,
+    pub(crate) timeout: Option<u64>,
+    /// Falls back to the agent file's own `mcp:`, then the workflow's
+    /// `default.mcp`.
+    pub(crate) mcp: Option<Vec<String>>,
+    pub(crate) max_tool_rounds: Option<usize>,
+    /// Falls back to the agent file's own `skills:`, then the workflow's
+    /// `default.skills`.
+    pub(crate) skills: Option<Vec<String>>,
+    /// Falls back to the agent file's own `subagents:`, then the workflow's
+    /// `default.subagents`.
+    pub(crate) subagents: Option<Vec<String>>,
+}
+
+/// `type: workflow` — runs another workflow YAML file against this node's
+/// input; that sub-workflow's final output becomes this node's output. Its
+/// own `default:`/`models:`/`json_schemas:` take precedence, falling back to
+/// this workflow's when it doesn't define an entry (see
+/// `WorkflowScope::nested`). Every model-call/capability knob
+/// (`model`/sampling/`mcp`/`skills`/`subagents`/`retry`/`timeout`/
+/// `input_schema`/`output_schema`/`schema_name`/`system_prompt`/`files`/
+/// `images`) lives on the sub-workflow's own steps instead — this variant
+/// simply has none of those fields, so setting one is a parse-time "unknown
+/// field" error rather than a `validate_node` bail. `on_error` is still
+/// available — it lives on the calling `FlowStep`, not this node, and is
+/// free to catch this sub-workflow failing as a whole.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowNode {
+    /// Resolved relative to the directory containing the workflow file this
+    /// node is defined in (not the current working directory, unlike
+    /// `type: agent`'s `agent:`).
+    pub(crate) workflow: PathBuf,
+    pub(crate) jq: Option<String>,
+    pub(crate) write_file: Option<PathBuf>,
+}
+
+/// `type: command` — runs `command[0]` as a child process with `command[1..]`
+/// as its arguments, each rendered via `template::render` like `prompt` (this
+/// never goes through a shell, so a rendered value can't inject an extra
+/// argument or command the way string concatenation into a shell command
+/// line could — see `docs/usage/ja/attachments.md`'s note on why `--file`
+/// exists for the same reason). This node's current input is piped to the
+/// process's stdin; its captured stdout (a single trailing newline stripped,
+/// like a shell `$(...)` substitution) becomes this node's output, then goes
+/// through `jq`/`write_file` like any other node's output. A non-UTF-8
+/// stdout is rejected, matching `--file`'s text-only restriction. A non-zero
+/// exit status fails this node's action (stderr included in the error), the
+/// same as any other failure — subject to the calling `FlowStep`'s
+/// `on_error` and this node's own `retry`. No model call, so no
+/// `model`/sampling/`mcp`/`skills`/`subagents`/`system_prompt`/`files`/
+/// `images`/schema fields.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommandNode {
+    pub(crate) command: Vec<String>,
+    pub(crate) jq: Option<String>,
+    pub(crate) write_file: Option<PathBuf>,
+    pub(crate) retry: Option<RetryDefinition>,
+    pub(crate) timeout: Option<u64>,
+}
+
+/// `type: transform` — a data-only node with no model call, agent, sub-
+/// workflow, or command: `jq` reshapes the current input, `write_file` saves
+/// it, or both. At least one of the two is required — the explicit form of
+/// what used to be an implicit "no action fields set at all" case inferred
+/// from a `NodeDefinition` with nothing else on it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransformNode {
+    pub(crate) jq: Option<String>,
+    pub(crate) write_file: Option<PathBuf>,
+    pub(crate) retry: Option<RetryDefinition>,
+    pub(crate) timeout: Option<u64>,
+}
+
 impl NodeDefinition {
-    /// Whether this node sends a user-message prompt to the model: it has a
-    /// `prompt` template to render, or (with `prompt` unset) sends its
-    /// current input unchanged as one — see the doc comment on `prompt`.
-    /// Shared by `execute_step`'s branch dispatch and `calls_model` below, so
-    /// the two stay in sync as fields are added.
-    pub(crate) fn sends_prompt(&self) -> bool {
-        self.prompt.is_some() || self.system_prompt.is_some()
+    /// Whether this node's action is a model call that participates in the
+    /// node > agent file > workflow `default:` sampling/capability/retry/
+    /// timeout fallback chain (see `workflow::exec::resolve_step_settings`) —
+    /// `Prompt`/`Agent` only. `Workflow`'s own fallback happens inside the
+    /// sub-workflow's own steps instead (never on this node, which has no
+    /// `retry`/`timeout`/sampling fields to fall back in the first place);
+    /// `Command`/`Transform` make no model call at all, though either may
+    /// still set its own `retry`/`timeout` explicitly — they just never
+    /// inherit the workflow's `default.retry`/`default.timeout`.
+    pub(crate) fn calls_model(&self) -> bool {
+        matches!(self, NodeDefinition::Prompt(_) | NodeDefinition::Agent(_))
     }
 
-    /// Whether this node makes its own single model call — `sends_prompt`
-    /// (a `prompt`/`system_prompt` node) or `agent`. `false` for a
-    /// `workflow:` node, whose model calls happen inside the referenced
-    /// workflow's own steps instead; callers that also need to count those
-    /// (e.g. "does this node have any action at all") add
-    /// `|| self.workflow.is_some()` explicitly.
-    pub(crate) fn calls_model(&self) -> bool {
-        self.sends_prompt() || self.agent.is_some()
+    pub(crate) fn model(&self) -> Option<&str> {
+        match self {
+            NodeDefinition::Prompt(node) => node.model.as_deref(),
+            NodeDefinition::Agent(node) => node.model.as_deref(),
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        match self {
+            NodeDefinition::Prompt(node) => node.reasoning_effort,
+            NodeDefinition::Agent(node) => node.reasoning_effort,
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn temperature(&self) -> Option<f64> {
+        match self {
+            NodeDefinition::Prompt(node) => node.temperature,
+            NodeDefinition::Agent(node) => node.temperature,
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn top_p(&self) -> Option<f64> {
+        match self {
+            NodeDefinition::Prompt(node) => node.top_p,
+            NodeDefinition::Agent(node) => node.top_p,
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn max_tokens(&self) -> Option<u32> {
+        match self {
+            NodeDefinition::Prompt(node) => node.max_tokens,
+            NodeDefinition::Agent(node) => node.max_tokens,
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn mcp(&self) -> Option<&[String]> {
+        match self {
+            NodeDefinition::Prompt(node) => node.mcp.as_deref(),
+            NodeDefinition::Agent(node) => node.mcp.as_deref(),
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn max_tool_rounds(&self) -> Option<usize> {
+        match self {
+            NodeDefinition::Prompt(node) => node.max_tool_rounds,
+            NodeDefinition::Agent(node) => node.max_tool_rounds,
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn skills(&self) -> Option<&[String]> {
+        match self {
+            NodeDefinition::Prompt(node) => node.skills.as_deref(),
+            NodeDefinition::Agent(node) => node.skills.as_deref(),
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    pub(crate) fn subagents(&self) -> Option<&[String]> {
+        match self {
+            NodeDefinition::Prompt(node) => node.subagents.as_deref(),
+            NodeDefinition::Agent(node) => node.subagents.as_deref(),
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_) => None,
+        }
+    }
+
+    /// `retry`/`timeout` have no fallback of their own (unlike sampling/
+    /// capability knobs above): `Workflow` has neither field at all, and
+    /// `Command`/`Transform` may set their own but never inherit
+    /// `default.retry`/`default.timeout` (see `calls_model`'s doc comment).
+    pub(crate) fn retry(&self) -> Option<&RetryDefinition> {
+        match self {
+            NodeDefinition::Prompt(node) => node.retry.as_ref(),
+            NodeDefinition::Agent(node) => node.retry.as_ref(),
+            NodeDefinition::Workflow(_) => None,
+            NodeDefinition::Command(node) => node.retry.as_ref(),
+            NodeDefinition::Transform(node) => node.retry.as_ref(),
+        }
+    }
+
+    pub(crate) fn timeout(&self) -> Option<u64> {
+        match self {
+            NodeDefinition::Prompt(node) => node.timeout,
+            NodeDefinition::Agent(node) => node.timeout,
+            NodeDefinition::Workflow(_) => None,
+            NodeDefinition::Command(node) => node.timeout,
+            NodeDefinition::Transform(node) => node.timeout,
+        }
+    }
+
+    /// A jq filter applied to this node's output, common to every variant.
+    pub(crate) fn jq(&self) -> Option<&str> {
+        match self {
+            NodeDefinition::Prompt(node) => node.jq.as_deref(),
+            NodeDefinition::Agent(node) => node.jq.as_deref(),
+            NodeDefinition::Workflow(node) => node.jq.as_deref(),
+            NodeDefinition::Command(node) => node.jq.as_deref(),
+            NodeDefinition::Transform(node) => node.jq.as_deref(),
+        }
+    }
+
+    /// Where this node's output (after `jq`, if set) is written, common to
+    /// every variant.
+    pub(crate) fn write_file(&self) -> Option<&std::path::Path> {
+        match self {
+            NodeDefinition::Prompt(node) => node.write_file.as_deref(),
+            NodeDefinition::Agent(node) => node.write_file.as_deref(),
+            NodeDefinition::Workflow(node) => node.write_file.as_deref(),
+            NodeDefinition::Command(node) => node.write_file.as_deref(),
+            NodeDefinition::Transform(node) => node.write_file.as_deref(),
+        }
     }
 }
 
@@ -327,12 +548,12 @@ pub(crate) struct FlowStep {
     /// JSON array. Mutually exclusive with every other field except `id`.
     pub(crate) for_each: Option<ForEachDefinition>,
     /// Ends the workflow successfully right after this site's node runs
-    /// (after its own `prompt`/`agent`/`jq` action, if any), using its output
-    /// as the workflow's final result; no further steps run. Rejected inside
-    /// a `parallel` branch, where concurrently running sibling branches make
-    /// "stop the workflow" ambiguous. Mutually exclusive with `break`. May
-    /// accompany `use` (checked after the node runs and its output is
-    /// recorded), or stand alone.
+    /// (after its own action, if any), using its output as the workflow's
+    /// final result; no further steps run. Rejected inside a `parallel`
+    /// branch, where concurrently running sibling branches make "stop the
+    /// workflow" ambiguous. Mutually exclusive with `break`. May accompany
+    /// `use` (checked after the node runs and its output is recorded), or
+    /// stand alone.
     pub(crate) stop: Option<bool>,
     /// Exits the nearest enclosing `loop`/`for_each` body right after this
     /// site's node runs, using its output as that iteration's result (the

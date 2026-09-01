@@ -552,6 +552,7 @@ models:
       model_id: test-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
     mcp: [mock]
     retry:
@@ -610,6 +611,7 @@ models:
       model_id: test-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
     mcp: [mock]
     timeout: 1
@@ -699,6 +701,7 @@ models:
       model_id: test-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
     mcp: [mock]
     timeout: 1
@@ -748,6 +751,7 @@ models:
       model_id: test-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
     mcp: [mock]
 steps:
@@ -790,6 +794,7 @@ models:
       model_id: test-model
 nodes:
   call:
+    type: prompt
     prompt: "{{ input }}"
     mcp: [mock]
     timeout: 1

@@ -214,7 +214,7 @@ fn requires_model_option() {
 fn rejects_an_empty_or_whitespace_command_program_before_execution() {
     for program in ["", "  "] {
         let workflow = WorkflowFile::new(&format!(
-            "nodes:\n  n:\n    command: [\"{program}\"]\nsteps:\n  - use: n\n"
+            "nodes:\n  n:\n    type: command\n    command: [\"{program}\"]\nsteps:\n  - use: n\n"
         ));
         let output = run_lait_workflow(&workflow.path, "input");
 

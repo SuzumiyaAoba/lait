@@ -382,84 +382,95 @@ fn lint_node(
 ) {
     let node_context = format!("node '{node_id}'");
 
-    if let Some(filter) = &node.jq {
+    if let Some(filter) = node.jq() {
         check_jq(filter, &format!("{node_context}: 'jq'"), issues);
     }
-    if let Some(prompt) = &node.prompt {
-        check_prompt_template(&node_context, "'prompt' template", prompt, issues);
-    }
-    if let Some(system_prompt) = &node.system_prompt {
-        check_prompt_template(
-            &node_context,
-            "'system_prompt' template",
-            system_prompt,
-            issues,
-        );
-    }
-    if let Some(argv) = &node.command {
-        if argv
-            .first()
-            .is_some_and(|program| program.trim().is_empty())
-        {
-            issues.push(LintIssue::error(format!(
-                "{node_context} has an empty 'command[0]' program; it must name an executable"
-            )));
-        }
-        for arg in argv {
-            check_prompt_template(&node_context, "'command' argument template", arg, issues);
-        }
-    }
-    if let Some(name_or_path) = &node.input_schema
-        && let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path)
-    {
-        issues.push(LintIssue::error(format!(
-            "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
-        )));
-    }
-    if let Some(name_or_path) = &node.output_schema {
-        if let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path) {
-            issues.push(LintIssue::error(format!(
-                "node '{node_id}' has an unresolvable 'output_schema': {error:#}"
-            )));
-        }
-        // `output_schema` implies a `schema_name` (the node's own, or the
-        // "structured_output" default) is sent as the Structured Outputs
-        // request's schema name — validated only at request time otherwise
-        // (see `schema::build_json_schema`).
-        let schema_name = node.schema_name.as_deref().unwrap_or("structured_output");
-        if let Err(error) = schema::validate_schema_name(schema_name) {
-            issues.push(LintIssue::error(format!(
-                "node '{node_id}' has an invalid 'schema_name': {error:#}"
-            )));
-        }
-    }
+    check_mcp_names(&node_context, node.mcp(), ctx, issues);
+    check_skill_names(&node_context, node.skills(), ctx, issues);
+    check_subagent_names(&node_context, node.subagents(), ctx, issues);
 
-    check_mcp_names(&node_context, node.mcp.as_deref(), ctx, issues);
-    check_skill_names(&node_context, node.skills.as_deref(), ctx, issues);
-    check_subagent_names(&node_context, node.subagents.as_deref(), ctx, issues);
-
-    if let Some(agent_path) = &node.agent {
-        // Matches `execute_step`: `agent:` is loaded as given, relative to
-        // the current working directory (unlike `workflow:`, which resolves
-        // against the workflow file's own directory) — see
-        // `NodeDefinition::agent`'s doc comment.
-        match agent::load_agent(agent_path) {
-            Ok(agent_file) => lint_agent_contents(
-                &format!("node '{node_id}''s agent"),
-                &agent_file,
+    match node {
+        workflow::NodeDefinition::Prompt(prompt) => {
+            if let Some(template) = &prompt.prompt {
+                check_prompt_template(&node_context, "'prompt' template", template, issues);
+            }
+            if let Some(system_prompt) = &prompt.system_prompt {
+                check_prompt_template(
+                    &node_context,
+                    "'system_prompt' template",
+                    system_prompt,
+                    issues,
+                );
+            }
+            if let Some(name_or_path) = &prompt.input_schema
+                && let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path)
+            {
+                issues.push(LintIssue::error(format!(
+                    "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
+                )));
+            }
+            if let Some(name_or_path) = &prompt.output_schema {
+                if let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path) {
+                    issues.push(LintIssue::error(format!(
+                        "node '{node_id}' has an unresolvable 'output_schema': {error:#}"
+                    )));
+                }
+                // `output_schema` implies a `schema_name` (the node's own, or
+                // the "structured_output" default) is sent as the Structured
+                // Outputs request's schema name — validated only at request
+                // time otherwise (see `schema::build_json_schema`).
+                let schema_name = prompt.schema_name.as_deref().unwrap_or("structured_output");
+                if let Err(error) = schema::validate_schema_name(schema_name) {
+                    issues.push(LintIssue::error(format!(
+                        "node '{node_id}' has an invalid 'schema_name': {error:#}"
+                    )));
+                }
+            }
+        }
+        workflow::NodeDefinition::Agent(agent_node) => {
+            // Matches `execute_step`: `agent:` is loaded as given, relative
+            // to the current working directory (unlike `workflow:`, which
+            // resolves against the workflow file's own directory) — see
+            // `AgentNode::agent`'s doc comment.
+            match agent::load_agent(&agent_node.agent) {
+                Ok(agent_file) => lint_agent_contents(
+                    &format!("node '{node_id}''s agent"),
+                    &agent_file,
+                    ctx,
+                    issues,
+                ),
+                Err(error) => issues.push(LintIssue::error(format!(
+                    "node '{node_id}' has 'agent: {}' (resolved relative to the current working \
+                     directory, not this workflow file), which failed to load: {error:#}",
+                    agent_node.agent.display()
+                ))),
+            }
+        }
+        workflow::NodeDefinition::Workflow(workflow_node) => {
+            lint_sub_workflow(
+                node_id,
+                &workflow_node.workflow,
+                base_dir,
                 ctx,
                 issues,
-            ),
-            Err(error) => issues.push(LintIssue::error(format!(
-                "node '{node_id}' has 'agent: {}' (resolved relative to the current working \
-                 directory, not this workflow file), which failed to load: {error:#}",
-                agent_path.display()
-            ))),
+                visited,
+            );
         }
-    }
-
-    if let Some(sub_workflow_path) = &node.workflow {
-        lint_sub_workflow(node_id, sub_workflow_path, base_dir, ctx, issues, visited);
+        workflow::NodeDefinition::Command(command) => {
+            if command
+                .command
+                .first()
+                .is_some_and(|program| program.trim().is_empty())
+            {
+                issues.push(LintIssue::error(format!(
+                    "{node_context} has an empty 'command[0]' program; it must name an executable"
+                )));
+            }
+            for arg in &command.command {
+                check_prompt_template(&node_context, "'command' argument template", arg, issues);
+            }
+        }
+        workflow::NodeDefinition::Transform(_) => {}
     }
 }
 
@@ -728,7 +739,7 @@ mod tests {
     #[test]
     fn warns_about_a_node_defined_but_never_used() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  used:\n    prompt: hi\n  unused:\n    prompt: hi\nsteps:\n  - use: used\n",
+            "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -745,7 +756,9 @@ mod tests {
 
     #[test]
     fn does_not_warn_when_every_node_is_used() {
-        let wf = parse_workflow_fixture("nodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n");
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
+        );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(issues.is_empty(), "{issues:?}");
     }
@@ -753,7 +766,7 @@ mod tests {
     #[test]
     fn counts_a_node_used_only_inside_a_switch_case_as_used() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\nsteps:\n  - switch:\n      cases:\n        - when: \".x\"\n          steps:\n            - use: a\n      else:\n        - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - switch:\n      cases:\n        - when: \".x\"\n          steps:\n            - use: a\n      else:\n        - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -767,7 +780,7 @@ mod tests {
     #[test]
     fn flags_an_invalid_jq_when_filter() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -781,7 +794,7 @@ mod tests {
     #[test]
     fn flags_an_invalid_jq_for_each_items_filter() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\nsteps:\n  - for_each:\n      items: \".[\"\n      steps:\n        - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - for_each:\n      items: \".[\"\n      steps:\n        - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -792,8 +805,9 @@ mod tests {
 
     #[test]
     fn flags_an_invalid_prompt_template() {
-        let wf =
-            parse_workflow_fixture("nodes:\n  a:\n    prompt: \"{{ input\"\nsteps:\n  - use: a\n");
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input\"\nsteps:\n  - use: a\n",
+        );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
             issues.iter().any(|issue| issue.severity == Severity::Error
@@ -805,7 +819,7 @@ mod tests {
     #[test]
     fn flags_an_invalid_command_argument_template() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    command: [\"echo\", \"{{ input\"]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: command\n    command: [\"echo\", \"{{ input\"]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -823,7 +837,7 @@ mod tests {
         // will be an object/array — see `template::check_syntax`'s doc
         // comment.
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: \"{{ input }}\"\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(issues.is_empty(), "{issues:?}");
@@ -832,7 +846,7 @@ mod tests {
     #[test]
     fn flags_an_unknown_mcp_server_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -858,7 +872,7 @@ mod tests {
             },
         );
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&config));
         assert!(
@@ -870,7 +884,7 @@ mod tests {
     #[test]
     fn flags_an_unknown_skill_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    skills: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    skills: [nope]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -884,7 +898,7 @@ mod tests {
     #[test]
     fn flags_an_unknown_subagent_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    subagents: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [nope]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -902,7 +916,7 @@ mod tests {
             .agents
             .insert("known".to_owned(), PathBuf::from("agents/known.md"));
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&config));
         assert!(
@@ -916,7 +930,7 @@ mod tests {
     #[test]
     fn skips_mcp_and_skill_checks_and_notes_it_when_there_is_no_config() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
         );
         let mut ctx = LintCtx::new(None);
         let mut issues = Vec::new();
@@ -939,7 +953,7 @@ mod tests {
     #[test]
     fn flags_an_unresolvable_output_schema_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    output_schema: nonexistent.json\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: nonexistent.json\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -953,7 +967,7 @@ mod tests {
     #[test]
     fn accepts_an_output_schema_name_defined_in_json_schemas() {
         let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
+            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -971,7 +985,7 @@ mod tests {
         // trigger this — the invalid character has to actually be spelled
         // out in `schema_name`.
         let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    prompt: hi\n    output_schema: city\n    schema_name: \"bad name!\"\nsteps:\n  - use: a\n",
+            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\n    schema_name: \"bad name!\"\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -985,7 +999,7 @@ mod tests {
     #[test]
     fn accepts_the_default_schema_name_when_none_is_set() {
         let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
+            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -999,7 +1013,7 @@ mod tests {
     #[test]
     fn flags_a_missing_agent_file() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    agent: /nonexistent/agent-does-not-exist.md\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: agent\n    agent: /nonexistent/agent-does-not-exist.md\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
