@@ -96,6 +96,23 @@ fn check_workflow_cancellation(
 /// `workflow:` node's own call (from `execute_step`) builds one with a new
 /// `scope` (see `WorkflowScope::nested`) and `cancellation` set to the
 /// node's own `step_cancel`.
+///
+/// `+ Send` on `run_steps`'s return type (below) means a `parallel`/
+/// concurrent `for_each` branch's future *could* run on `tokio::spawn`, but
+/// none do yet — they're still driven concurrently in-task via
+/// `try_join_all`/`.buffered()`, which interleaves I/O-bound work (the
+/// common case here) but never uses more than one OS thread. Actually
+/// spawning needs every borrow in this frame's `'a` to become `'static`,
+/// and `scope: &'a WorkflowScope`/`env: &'a AppContext` already could (both
+/// are already `Arc`-friendly), but `steps: &'a [FlowStep]` (below) can't:
+/// it's borrowed from the top-level `WorkflowFile` on `run_workflow`'s
+/// stack, reachable through `SwitchCase`/`ParallelBranch`/
+/// `LoopDefinition`/`ForEachDefinition`/`OnError`'s own `Vec<FlowStep>`
+/// fields. Making the whole step AST `Arc`-shared is a bigger change than
+/// it looks (`Arc<[FlowStep]>` doesn't `Deserialize` the way `Vec<FlowStep>`
+/// does) and lands on exactly the structs the design review's Phase B-1
+/// (`NodeDefinition` → a `type:`-tagged enum) is going to rewrite anyway —
+/// better done together than as two passes over the same types.
 pub(crate) struct RunStepsFrame<'a> {
     pub(crate) scope: &'a WorkflowScope,
     pub(crate) env: &'a AppContext,
