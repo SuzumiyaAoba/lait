@@ -152,6 +152,38 @@ steps:
 }
 
 #[test]
+fn run_emits_json_with_the_same_shape_as_chat() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\ndefault:\n  model: test-model\n",
+        server.base_url
+    ));
+    let workflow = WorkflowFile::new(
+        "nodes:\n  echo:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: echo\n",
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["run", workflow.path.to_str().unwrap(), "hello", "--json"])
+        .output()
+        .expect("failed to execute lait run");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--json output should be valid JSON");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "content": "mock response",
+            "reasoning": null,
+            "usage": null,
+        })
+    );
+}
+
+#[test]
 fn workflow_level_alias_takes_precedence_over_a_config_file_alias_of_the_same_name() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let config = ConfigDirectory::new(

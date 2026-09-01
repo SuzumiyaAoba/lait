@@ -108,6 +108,9 @@ pub(crate) struct PromptArgs {
 
     #[command(flatten)]
     pub(crate) reporting: ReportingArgs,
+
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
 }
 
 /// `--var KEY=VALUE`, shared by `lait prompt <NAME>` and `-p`/
@@ -148,6 +151,37 @@ pub(crate) struct EndpointArgs {
     /// The API key. LM Studio does not require one.
     #[arg(long, env = "OPENAI_API_KEY")]
     pub(crate) api_key: Option<String>,
+}
+
+/// `-o`/`--render`/`--json`, shared by every subcommand that produces a
+/// single finished response body: single-shot chat, `lait run`, `lait agent
+/// run`, and `lait prompt <NAME>`. Previously only `ChatArgs` had these (see
+/// the design plan's B-2) — `--session` is deliberately not part of this
+/// bundle, since a workflow/agent run has no single conversation turn to
+/// append a session entry for.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct OutputArgs {
+    /// Write the response body to PATH instead of stdout (`-o -` writes to
+    /// stdout explicitly). With `--json`, the JSON object goes to the file.
+    /// Without `--stream` (single-shot chat only), the file is only written
+    /// after the request succeeds, so a failed run leaves no empty file
+    /// behind.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub(crate) output: Option<PathBuf>,
+
+    /// Print the response as JSON (`{"content", "reasoning", "usage"}`;
+    /// `reasoning` is always `null` outside single-shot chat).
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// Render the response as Markdown for terminal display (headings,
+    /// lists, emphasis, code blocks, tables, ...) instead of printing it as
+    /// raw text. Falls back to raw text automatically when stdout isn't a
+    /// terminal, or when combined with `--stream` (single-shot chat only).
+    /// Ignored with `--json`. Falls back to `default.render` in
+    /// lait.config.yml when this is unset.
+    #[arg(long)]
+    pub(crate) render: bool,
 }
 
 #[derive(Debug, Args)]
@@ -236,6 +270,9 @@ pub(crate) struct RunArgs {
 
     #[command(flatten)]
     pub(crate) reporting: ReportingArgs,
+
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -266,6 +303,9 @@ pub(crate) struct AgentRunArgs {
 
     #[command(flatten)]
     pub(crate) reporting: ReportingArgs,
+
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -359,13 +399,8 @@ pub(crate) struct ChatArgs {
     #[command(flatten)]
     pub(crate) shared: SharedChatArgs,
 
-    /// Write the response body to PATH instead of stdout (`-o -` writes to
-    /// stdout explicitly). With `--json`, the JSON object goes to the file;
-    /// with `--show-reasoning`, reasoning goes to stderr so the file holds
-    /// the body alone. Without `--stream`, the file is only written after
-    /// the request succeeds, so a failed run leaves no empty file behind.
-    #[arg(short = 'o', long, value_name = "PATH")]
-    pub(crate) output: Option<PathBuf>,
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
 
     /// Print nothing but the response body: notes outside it (reasoning
     /// display, usage display) are suppressed, overriding
@@ -373,14 +408,10 @@ pub(crate) struct ChatArgs {
     #[arg(long)]
     pub(crate) quiet: bool,
 
-    /// Print the response as JSON.
-    #[arg(long, conflicts_with = "stream")]
-    pub(crate) json: bool,
-
     /// Stream the response to stdout as it is generated, instead of waiting
     /// for the full completion. Incompatible with `--json`, which needs the
     /// full response to build its JSON object.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     pub(crate) stream: bool,
 
     /// Request a structured JSON response using the schema in FILE.
@@ -417,14 +448,6 @@ pub(crate) struct ChatArgs {
 
     #[command(flatten)]
     pub(crate) var: VarArgs,
-
-    /// Render the response as Markdown for terminal display (headings,
-    /// lists, emphasis, code blocks, tables, ...) instead of printing it as
-    /// raw text. Falls back to raw text automatically when stdout isn't a
-    /// terminal, or when combined with `--stream`. Falls back to
-    /// `default.render` in lait.config.yml when unset here.
-    #[arg(long)]
-    pub(crate) render: bool,
 }
 
 /// `lait chat`'s own arguments: just the options a REPL turn can use — see

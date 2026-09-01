@@ -314,9 +314,10 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
     let show_usage = chat.shared.reporting.show_usage && !chat.quiet;
-    let render_enabled = chat.render || file_config.default.render.unwrap_or(false);
+    let render_enabled = chat.output.render || file_config.default.render.unwrap_or(false);
     // `-o -` is an explicit "stdout", the same as no `-o` at all.
     let output_path = chat
+        .output
         .output
         .as_deref()
         .filter(|path| path.as_os_str() != "-");
@@ -369,16 +370,16 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
             if show_reasoning && let Some(reasoning) = response::response_reasoning(&response) {
                 eprintln!("Reasoning:\n{reasoning}\n");
             }
-            let body = response::render_response(&response, chat.json, false)?;
+            let body = response::render_response(&response, chat.output.json, false)?;
             report::emit_output(&body, Some(path), false)?;
         }
         None => {
-            let output = response::render_response(&response, chat.json, show_reasoning)?;
+            let output = response::render_response(&response, chat.output.json, show_reasoning)?;
             // `--json`'s output is machine-readable and never rendered as
             // Markdown; `chat.stream`'s branch above already returned before
             // reaching here, so `--render` never has to reckon with a
             // partial streamed response either — see `render::maybe_render`.
-            report::emit_output(&output, None, !chat.json && render_enabled)?;
+            report::emit_output(&output, None, !chat.output.json && render_enabled)?;
         }
     }
     let content = response::content_text(&response);
@@ -402,8 +403,10 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
 /// `run_blocking`): renders the named prompt (see `prompt::render_named`)
 /// and sends the result as a plain, tool-free, non-streamed request. This
 /// subcommand form is intentionally narrower than `-p`/`--prompt-name` on
-/// the main chat invocation (no `--model`/`--stream`/`-o`/... overrides —
+/// the main chat invocation (no `--model`/`--stream`/`--mcp`/... overrides —
 /// see `docs/usage/ja/prompts.md`); reach for `-p` when those are needed.
+/// `-o`/`--render`/`--json`/`--show-usage`/`--no-history` work the same as
+/// every other `run_*` entry point (see `cli::OutputArgs`).
 async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
     let file_config = Arc::new(config::load_config(no_config)?);
     if args.name == "list" {
@@ -455,7 +458,7 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
         ))
         .await?;
     let output = response::render_response(&response, false, false)?;
-    report::emit_output(&output, None, false)?;
+    report::emit_run_output(&output, env.usage.total(), &args.output, &file_config)?;
     report::finish_run(
         report::RunRecord {
             kind: "prompt",
@@ -513,7 +516,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         ))
         .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;
-    report::emit_output(&output, None, false)?;
+    report::emit_run_output(&output, env.usage.total(), &args.output, &file_config)?;
     report::finish_run(
         report::RunRecord {
             kind: "agent",
@@ -556,7 +559,12 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
             },
         ))
         .await?;
-    report::emit_output(&current_input, None, false)?;
+    report::emit_run_output(
+        &current_input,
+        env.usage.total(),
+        &run_args.output,
+        &file_config,
+    )?;
     report::finish_run(
         // A workflow can touch several models across its steps, so no
         // single `model` is recorded here — see `history::HistoryEntry::model`.

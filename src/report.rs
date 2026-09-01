@@ -1,12 +1,13 @@
 //! The shared tail every `run_*` subcommand reaches once it has produced a
-//! finished response body: `-o`/`--render` output routing (currently
-//! `run_chat`'s own concern — see the design plan's B-2 for extending these
-//! flags to `run_prompt`/`run_agent`/`run_workflow`), `lait history`
-//! recording (unless `--no-history`/`default.history: false` opts out), and
-//! the `--show-usage` summary. Chat has its own richer version of the
-//! record/summary half, `app::finish_chat_turn`, which also appends to a
-//! `--session` log — this module's [`finish_run`] is for the three `run_*`
-//! entry points that don't have a session concept.
+//! finished response body: `-o`/`--render`/`--json` output routing
+//! ([`emit_output`] for chat's own richer response-object path,
+//! [`emit_run_output`] for `run_prompt`/`run_agent`/`run_workflow`'s plain-text
+//! path), `lait history` recording (unless `--no-history`/
+//! `default.history: false` opts out), and the `--show-usage` summary. Chat
+//! has its own richer version of the record/summary half,
+//! `app::finish_chat_turn`, which also appends to a `--session` log — this
+//! module's [`finish_run`] is for the three `run_*` entry points that don't
+//! have a session concept.
 
 use std::path::Path;
 
@@ -19,10 +20,11 @@ use crate::{
 };
 
 /// Writes `body` to stdout — Markdown-rendered when `render_enabled` — or to
-/// `output_path` verbatim with a trailing newline. `output_path`/
-/// `render_enabled` are `None`/`false` from every caller but `run_chat`'s
-/// non-streamed path until B-2 extends `-o`/`--render` to the rest, which
-/// reduces this to a plain `println!`. The file branch writes directly via
+/// `output_path` verbatim with a trailing newline. The chat streamed path
+/// (`app::run_chat`) never reaches here — see `engine::stream_response` for
+/// its own `-o` handling — every other caller goes through here, either
+/// directly (chat's non-streamed path) or via [`emit_run_output`]
+/// (`run_prompt`/`run_agent`/`run_workflow`). The file branch writes directly via
 /// `std::fs::write` rather than through `async_io::write_output_file` (the
 /// cancellable, path-locked primitive workflow's `write_file` node and
 /// `execute_step`'s retry path use): this is a single, already-complete
@@ -45,6 +47,32 @@ pub(crate) fn emit_output(
             println!("{}", render::maybe_render(body, render_enabled));
             Ok(())
         }
+    }
+}
+
+/// Writes a `run_prompt`/`run_agent`/`run_workflow` response body per
+/// `-o`/`--render`/`--json` (`cli::OutputArgs`, extended to these three entry
+/// points by the design plan's B-2). `--json`'s shape
+/// (`response::render_text_json`) matches chat's own `--json`, so the flag
+/// means the same thing everywhere it appears; `--render` is ignored when
+/// combined with `--json`, matching [`emit_output`]'s chat behavior.
+pub(crate) fn emit_run_output(
+    body: &str,
+    usage: Option<response::Usage>,
+    output: &crate::cli::OutputArgs,
+    file_config: &ConfigFile,
+) -> Result<()> {
+    // `-o -` is an explicit "stdout", the same as no `-o` at all.
+    let output_path = output
+        .output
+        .as_deref()
+        .filter(|path| path.as_os_str() != "-");
+    let render_enabled = output.render || file_config.default.render.unwrap_or(false);
+    if output.json {
+        let json = response::render_text_json(body, usage)?;
+        emit_output(&json, output_path, false)
+    } else {
+        emit_output(body, output_path, render_enabled)
     }
 }
 
