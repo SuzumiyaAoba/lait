@@ -51,9 +51,10 @@ pub(crate) enum Command {
     Sessions(SessionsCommand),
     /// Start an interactive, multi-turn chat REPL (see docs/usage/ja/chat.md).
     Chat(ChatReplArgs),
-    /// Run a named prompt template from `prompts:` in lait.config.yml, or
-    /// `lait prompt list` to show every configured prompt.
-    Prompt(PromptArgs),
+    /// Run a named prompt template from `prompts:` in lait.config.yml
+    /// (`lait prompt run <NAME>`), or list every configured prompt
+    /// (`lait prompt list`).
+    Prompt(PromptCommand),
     /// List, show, or search recorded chat/agent/workflow/prompt runs (see
     /// docs/usage/ja/history.md).
     History(HistoryArgs),
@@ -92,9 +93,22 @@ pub(crate) struct HistorySearchArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct PromptArgs {
-    /// Name of a `prompts:` entry in lait.config.yml, or the literal `list`
-    /// to print every configured prompt instead of running one.
+pub(crate) struct PromptCommand {
+    #[command(subcommand)]
+    pub(crate) action: PromptAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PromptAction {
+    /// List every `prompts:` entry configured in lait.config.yml.
+    List,
+    /// Run a named prompt template from `prompts:` in lait.config.yml.
+    Run(PromptRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PromptRunArgs {
+    /// Name of a `prompts:` entry in lait.config.yml.
     #[arg(value_name = "NAME")]
     pub(crate) name: String,
 
@@ -113,14 +127,14 @@ pub(crate) struct PromptArgs {
     pub(crate) output: OutputArgs,
 }
 
-/// `--var KEY=VALUE`, shared by `lait prompt <NAME>` and `-p`/
+/// `--var KEY=VALUE`, shared by `lait prompt run <NAME>` and `-p`/
 /// `--prompt-name` on single-shot chat — the two entry points that render a
 /// named prompt's `vars:` template.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct VarArgs {
     /// Override a named prompt's `vars:` default: `--var KEY=VALUE`.
     /// Repeatable; a later `--var` for the same key wins. Only meaningful
-    /// when running a named prompt (`lait prompt <NAME>` or
+    /// when running a named prompt (`lait prompt run <NAME>` or
     /// `-p`/`--prompt-name`).
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub(crate) var: Vec<String>,
@@ -155,7 +169,7 @@ pub(crate) struct EndpointArgs {
 
 /// `-o`/`--render`/`--json`, shared by every subcommand that produces a
 /// single finished response body: single-shot chat, `lait run`, `lait agent
-/// run`, and `lait prompt <NAME>`. Previously only `ChatArgs` had these (see
+/// run`, and `lait prompt run <NAME>`. Previously only `ChatArgs` had these (see
 /// the design plan's B-2) — `--session` is deliberately not part of this
 /// bundle, since a workflow/agent run has no single conversation turn to
 /// append a session entry for.
@@ -442,7 +456,7 @@ pub(crate) struct ChatArgs {
     /// Run a named prompt template (a `prompts.<NAME>` entry in
     /// lait.config.yml) instead of sending PROMPT/stdin directly as the
     /// request text: PROMPT/stdin becomes the template's `{{ input }}`. See
-    /// `lait prompt <NAME>`/`lait prompt list` for the equivalent subcommand.
+    /// `lait prompt run <NAME>`/`lait prompt list` for the equivalent subcommand.
     #[arg(short = 'p', long = "prompt-name", value_name = "NAME")]
     pub(crate) prompt_name: Option<String>,
 

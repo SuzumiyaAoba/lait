@@ -184,7 +184,7 @@ mcp_servers:
 ## 名前付きプロンプト
 
 `prompts:` に名前付きプロンプトを登録すると、`-p/--prompt-name <NAME>`（チャット）または
-`lait prompt <NAME>` から実行できます。詳しい使い方は
+`lait prompt run <NAME>` から実行できます。詳しい使い方は
 [名前付きプロンプトを使う](./prompts.md) を参照してください。
 
 ```yaml

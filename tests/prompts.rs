@@ -109,11 +109,9 @@ fn prompt_subcommand_renders_and_runs_the_named_prompt() {
     let dir = config_with_translate_prompt_and_base_url(&server.base_url);
     let output = test_command()
         .current_dir(dir.path())
-        .arg("prompt")
-        .arg("translate")
-        .arg("Hello")
+        .args(["prompt", "run", "translate", "Hello"])
         .output()
-        .expect("failed to execute lait prompt");
+        .expect("failed to execute lait prompt run");
     let request = server.receive_request();
     server.finish();
 
@@ -129,9 +127,9 @@ fn prompt_subcommand_emits_json_with_the_same_shape_as_chat() {
     let dir = config_with_translate_prompt_and_base_url(&server.base_url);
     let output = test_command()
         .current_dir(dir.path())
-        .args(["prompt", "translate", "Hello", "--json"])
+        .args(["prompt", "run", "translate", "Hello", "--json"])
         .output()
-        .expect("failed to execute lait prompt");
+        .expect("failed to execute lait prompt run");
     server.receive_request();
     server.finish();
 

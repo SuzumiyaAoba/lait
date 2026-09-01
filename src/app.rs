@@ -5,8 +5,8 @@ use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
     agent, attachment,
-    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, RunArgs},
-    cli::{AgentRunArgs, PromptArgs, SharedChatArgs},
+    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction, RunArgs},
+    cli::{AgentRunArgs, PromptRunArgs, SharedChatArgs},
     config::{self, ConfigFile, ModelMap},
     docgen,
     engine::{
@@ -103,7 +103,12 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Chat(chat_repl_args)) => repl::run(chat_repl_args, cli.no_config).await,
-        Some(Command::Prompt(prompt_args)) => run_prompt(prompt_args, cli.no_config).await,
+        Some(Command::Prompt(prompt_command)) => match prompt_command.action {
+            PromptAction::List => {
+                bail!("internal error: `prompt list` must run on the sync path")
+            }
+            PromptAction::Run(run_args) => run_prompt(run_args, cli.no_config).await,
+        },
         Some(Command::History(history_args)) => history::run(history_args),
         None => run_chat_or_repl(cli.chat, cli.no_config).await,
     }
@@ -156,7 +161,9 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::History(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
-        Some(Command::Prompt(prompt_args)) => prompt_args.name != "list",
+        Some(Command::Prompt(prompt_command)) => {
+            matches!(prompt_command.action, PromptAction::Run(_))
+        }
         Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => true,
     }
 }
@@ -179,12 +186,12 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Man(man_args)) => docgen::generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
-        Some(Command::Prompt(prompt_args)) => {
-            if prompt_args.name != "list" {
-                bail!("internal error: `prompt <NAME>` must run on the async path");
+        Some(Command::Prompt(prompt_command)) => match prompt_command.action {
+            PromptAction::List => crate::prompt::list(&config::load_config(cli.no_config)?),
+            PromptAction::Run(_) => {
+                bail!("internal error: `prompt run` must run on the async path")
             }
-            crate::prompt::list(&config::load_config(cli.no_config)?)
-        }
+        },
         Some(Command::History(history_args)) => crate::history::run(history_args),
         Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
@@ -398,7 +405,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     Ok(())
 }
 
-/// Runs `lait prompt <NAME> [INPUT]` (`args.name == "list"` is handled
+/// Runs `lait prompt run <NAME> [INPUT]` (`lait prompt list` is handled
 /// separately, synchronously, by `prompt::list` — see `needs_async_runtime`/
 /// `run_blocking`): renders the named prompt (see `prompt::render_named`)
 /// and sends the result as a plain, tool-free, non-streamed request. This
@@ -407,11 +414,8 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
 /// see `docs/usage/ja/prompts.md`); reach for `-p` when those are needed.
 /// `-o`/`--render`/`--json`/`--show-usage`/`--no-history` work the same as
 /// every other `run_*` entry point (see `cli::OutputArgs`).
-async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
+async fn run_prompt(args: PromptRunArgs, no_config: bool) -> Result<()> {
     let file_config = Arc::new(config::load_config(no_config)?);
-    if args.name == "list" {
-        return prompt::list(&file_config);
-    }
 
     let raw_input = resolve_input_with_stdin(args.input.clone())?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
