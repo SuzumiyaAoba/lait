@@ -130,7 +130,7 @@ pub(crate) fn run_steps<'a>(
     current_input: String,
     steps_outputs: workflow::StepOutputs,
     frame: RunStepsFrame<'a>,
-) -> Pin<Box<dyn Future<Output = Result<StepsOutcome>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<StepsOutcome>> + Send + 'a>> {
     let RunStepsFrame {
         scope,
         env,
@@ -507,22 +507,30 @@ pub(crate) fn run_steps<'a>(
                         let item_prefixes: Vec<String> = (0..item_inputs.len())
                             .map(|index| format!("{progress_prefix}[item-{}] ", index + 1))
                             .collect();
-                        let item_futures = item_inputs.into_iter().zip(&item_prefixes).map(
-                            |(item_input, item_prefix)| {
-                                run_steps(
-                                    &for_each.steps,
-                                    item_input,
-                                    steps_outputs.clone(),
-                                    RunStepsFrame {
-                                        scope,
-                                        env,
-                                        start_counter: 0,
-                                        progress_prefix: item_prefix,
-                                        cancellation: cancellation.clone(),
-                                    },
-                                )
-                            },
-                        );
+                        // Built with an explicit loop rather than
+                        // `.zip(&item_prefixes).map(...)`: a closure handed to
+                        // `.map()` here must type-check for a fully generic
+                        // borrow lifetime, but `run_steps`'s boxed return
+                        // type ties its `Send + 'a` bound to this specific
+                        // `item_prefix`'s lifetime, which rustc's closure
+                        // inference cannot unify through a combinator ("not
+                        // general enough").
+                        let mut item_futures = Vec::with_capacity(item_prefixes.len());
+                        for (item_input, item_prefix) in item_inputs.into_iter().zip(&item_prefixes)
+                        {
+                            item_futures.push(run_steps(
+                                &for_each.steps,
+                                item_input,
+                                steps_outputs.clone(),
+                                RunStepsFrame {
+                                    scope,
+                                    env,
+                                    start_counter: 0,
+                                    progress_prefix: item_prefix,
+                                    cancellation: cancellation.clone(),
+                                },
+                            ));
+                        }
                         // `validate_steps` rejects `stop`/`break` inside a
                         // `for_each` body whose `max_concurrency` is above 1, for
                         // the same reason as a `parallel` branch: concurrently

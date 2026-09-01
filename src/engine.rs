@@ -758,7 +758,7 @@ pub(crate) fn call_subagent_tool<'a>(
     env: &'a AppContext,
     active_paths: &'a [PathBuf],
     cancellation: Option<tokio_util::sync::CancellationToken>,
-) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         // `Copy` (it only captures `name: &str`), so it can back every
         // `with_context` call below without re-typing the same `format!`.
