@@ -39,6 +39,11 @@ fn lint_fails_on_a_workflow_file_with_no_steps() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("error:"), "stdout: {stdout}");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a lint failure should exit with code 3: {output:?}"
+    );
 }
 
 #[test]

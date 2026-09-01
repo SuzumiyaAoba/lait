@@ -242,4 +242,9 @@ fn reports_openai_api_errors() {
         !output.stderr.is_empty(),
         "API errors should be reported on stderr"
     );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a model API failure should exit with code 4: {output:?}"
+    );
 }

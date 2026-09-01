@@ -2012,6 +2012,11 @@ steps:
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("timed out"), "stderr: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "a step timeout should exit with code 5: {output:?}"
+    );
 }
 
 #[test]
