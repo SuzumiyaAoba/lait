@@ -197,25 +197,37 @@ impl SkillCache {
                 .entry(name.to_owned())
                 .or_insert_with(|| Arc::new(OnceCell::new())),
         );
-        let section = cell
-            .get_or_try_init(|| async {
-                let configured_path = self.skills_map.get(name).ok_or_else(|| {
-                    anyhow!(
-                        "unknown skill '{name}'; define it under 'skills:' in {}",
-                        config::CONFIG_FILE_NAME
-                    )
-                })?;
-                let read_cancellation = cancellation.clone();
-                let skill = load_skill(name, configured_path, cancellation).await?;
-                if read_cancellation
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                {
-                    anyhow::bail!("skill rendering was cancelled");
-                }
-                Ok::<_, anyhow::Error>(Arc::new(format_skill(&skill)))
-            })
-            .await?;
+        // Only the caller that actually wins the race to initialize `cell`
+        // runs this closure — every other concurrent caller for the same
+        // name just awaits its result, never reaching its own cancellation
+        // checks below. Race the whole `get_or_try_init` against this call's
+        // own `cancellation` too, so a losing (non-initializing) caller can
+        // still bail out promptly on its own token instead of being stuck
+        // waiting on a load it isn't driving.
+        let init_cancellation = cancellation.clone();
+        let init = cell.get_or_try_init(|| async {
+            let configured_path = self.skills_map.get(name).ok_or_else(|| {
+                anyhow!(
+                    "unknown skill '{name}'; define it under 'skills:' in {}",
+                    config::CONFIG_FILE_NAME
+                )
+            })?;
+            let read_cancellation = init_cancellation.clone();
+            let skill = load_skill(name, configured_path, init_cancellation).await?;
+            if read_cancellation
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                anyhow::bail!("skill rendering was cancelled");
+            }
+            Ok::<_, anyhow::Error>(Arc::new(format_skill(&skill)))
+        });
+        let section = match async_io::await_cancellation(init, cancellation).await {
+            async_io::CancellationResult::Completed(result) => result?,
+            async_io::CancellationResult::Cancelled => {
+                anyhow::bail!("skill rendering was cancelled");
+            }
+        };
         Ok(Arc::clone(section))
     }
 }
@@ -316,6 +328,56 @@ mod tests {
             .expect("FIFO skill cancellation should finish promptly")
             .unwrap_err();
         assert!(result.to_string().contains("cancel"), "error: {result}");
+        let _ = fs::remove_file(path);
+    }
+
+    /// Regression test for the `OnceCell`-per-name cache (see `SkillCache`'s
+    /// doc comment): only the first caller for a given name actually runs
+    /// the load and its own cancellation checks — every other concurrent
+    /// caller just awaits that result. Confirms a losing (non-initializing)
+    /// caller still returns promptly on *its own* cancellation rather than
+    /// being stuck until the winning caller's load finishes (which, here,
+    /// never happens — the FIFO is never written to).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_waiter_can_cancel_while_the_first_is_still_loading() {
+        let path = crate::test_support::unique_temp_path("lait-test-skill-fifo-2", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut skills_map = HashMap::new();
+        skills_map.insert("blocked".to_owned(), path.clone());
+        let cache = SkillCache::new(Arc::new(skills_map));
+        let names = ["blocked".to_owned()];
+
+        // A token of its own that's never cancelled: this caller becomes the
+        // cell's initializer and blocks on the FIFO for the rest of the test
+        // (passing `None` here would skip `load_skill`'s wait-for-a-writer
+        // path entirely and return immediately instead).
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let mut first = Box::pin(cache.render(&names, Some(first_token)));
+        tokio::select! {
+            result = &mut first => panic!("first render unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut second = Box::pin(cache.render(&names, Some(token.clone())));
+        tokio::select! {
+            result = &mut second => panic!("second render unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                token.cancel();
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("a losing waiter's own cancellation should finish promptly")
+            .unwrap_err();
+        assert!(result.to_string().contains("cancel"), "error: {result}");
+
+        drop(first);
         let _ = fs::remove_file(path);
     }
 

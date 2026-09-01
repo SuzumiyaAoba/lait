@@ -146,41 +146,53 @@ impl AgentRegistry {
                 .entry(path.to_path_buf())
                 .or_insert_with(|| Arc::new(OnceCell::new())),
         );
-        let loaded = cell
-            .get_or_try_init(|| async {
-                let (file, canonical_path) = tokio::try_join!(
-                    agent::load_agent_cancellable(path, cancellation.clone()),
-                    async {
-                        async_io::canonicalize(path, cancellation.clone())
-                            .await
-                            .with_context(|| {
-                                format!("failed to resolve agent file path '{}'", path.display())
-                            })
+        // Only the caller that actually wins the race to initialize `cell`
+        // runs this closure — every other concurrent caller loading the same
+        // path just awaits its result, never reaching its own cancellation
+        // checks inside. Race the whole `get_or_try_init` against this
+        // call's own `cancellation` too (below), so a losing
+        // (non-initializing) caller can still bail out promptly on its own
+        // token instead of being stuck waiting on a load it isn't driving.
+        let init_cancellation = cancellation.clone();
+        let init = cell.get_or_try_init(|| async {
+            let (file, canonical_path) = tokio::try_join!(
+                agent::load_agent_cancellable(path, init_cancellation.clone()),
+                async {
+                    async_io::canonicalize(path, init_cancellation.clone())
+                        .await
+                        .with_context(|| {
+                            format!("failed to resolve agent file path '{}'", path.display())
+                        })
+                },
+            )?;
+            let tool_parameters = match &file.input_schema {
+                Some(entry) => {
+                    schema::load_schema_value_cancellable(entry, init_cancellation).await?
+                }
+                None => serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "description": "The task or input to pass to the subagent. A string \
+                                for a plain-text task, or a JSON object/array if the subagent \
+                                expects structured input."
+                        }
                     },
-                )?;
-                let tool_parameters = match &file.input_schema {
-                    Some(entry) => {
-                        schema::load_schema_value_cancellable(entry, cancellation).await?
-                    }
-                    None => serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "input": {
-                                "description": "The task or input to pass to the subagent. A string \
-                                    for a plain-text task, or a JSON object/array if the subagent \
-                                    expects structured input."
-                            }
-                        },
-                        "required": ["input"],
-                    }),
-                };
-                Ok::<_, anyhow::Error>(Arc::new(LoadedAgent {
-                    file,
-                    canonical_path,
-                    tool_parameters,
-                }))
-            })
-            .await?;
+                    "required": ["input"],
+                }),
+            };
+            Ok::<_, anyhow::Error>(Arc::new(LoadedAgent {
+                file,
+                canonical_path,
+                tool_parameters,
+            }))
+        });
+        let loaded = match async_io::await_cancellation(init, cancellation).await {
+            async_io::CancellationResult::Completed(result) => result?,
+            async_io::CancellationResult::Cancelled => {
+                bail!("subagent load was cancelled");
+            }
+        };
         Ok(Arc::clone(loaded))
     }
 
@@ -240,5 +252,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing"));
+    }
+
+    /// Regression test for the `OnceCell`-per-path cache (see
+    /// `AgentRegistry`'s doc comment): only the first caller for a given
+    /// path actually runs the load and its own cancellation checks — every
+    /// other concurrent caller just awaits that result. Confirms a losing
+    /// (non-initializing) caller still returns promptly on *its own*
+    /// cancellation rather than being stuck until the winning caller's load
+    /// finishes (which, here, never happens — the FIFO is never written to).
+    /// Mirrors `skill::tests::a_second_waiter_can_cancel_while_the_first_is_still_loading`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_waiter_can_cancel_while_the_first_is_still_loading() {
+        let path = crate::test_support::unique_temp_path("lait-test-agent-fifo", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let agents_map: config::AgentMap = StdHashMap::new();
+        let registry = AgentRegistry::new(Arc::new(agents_map));
+
+        // A token of its own that's never cancelled: this caller becomes the
+        // cell's initializer and blocks on the FIFO for the rest of the test
+        // (passing `None` here would skip the wait-for-a-writer path
+        // entirely and return immediately instead).
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let mut first = Box::pin(registry.load_path_cancellable(&path, Some(first_token)));
+        tokio::select! {
+            result = &mut first => panic!("first load unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut second = Box::pin(registry.load_path_cancellable(&path, Some(token.clone())));
+        tokio::select! {
+            result = &mut second => panic!("second load unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                token.cancel();
+            }
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("a losing waiter's own cancellation should finish promptly")
+            .unwrap_err();
+        assert!(result.to_string().contains("cancel"), "error: {result}");
+
+        drop(first);
+        let _ = std::fs::remove_file(path);
     }
 }
