@@ -102,6 +102,25 @@ pub(crate) struct SamplingOverrides {
     pub(crate) max_tokens: Option<u32>,
 }
 
+impl SamplingOverrides {
+    /// Folds `layers` field by field in priority order (the first layer with
+    /// a field set wins, independently per field) — the shared
+    /// implementation behind every caller's own precedence chain:
+    /// `resolve_chat_settings`'s single `SharedChatArgs` layer,
+    /// `resolve_step_settings`'s node > agent file > workflow default, and
+    /// `agent_file_settings`'s single frontmatter layer. Does not include the
+    /// model-alias/`file_config.default` tail every caller shares —
+    /// `resolve_request_settings` adds those two layers after this.
+    pub(crate) fn fold(layers: &[Self]) -> Self {
+        Self {
+            reasoning_effort: layers.iter().find_map(|layer| layer.reasoning_effort),
+            temperature: layers.iter().find_map(|layer| layer.temperature),
+            top_p: layers.iter().find_map(|layer| layer.top_p),
+            max_tokens: layers.iter().find_map(|layer| layer.max_tokens),
+        }
+    }
+}
+
 /// The `mcp`/`max_tool_rounds`/`skills`/`subagents` knobs a caller may set
 /// for a single completion request, bundled the same way as
 /// `SamplingOverrides` and for the same reason (keeps
@@ -113,6 +132,19 @@ pub(crate) struct CapabilityOverrides {
     pub(crate) max_tool_rounds: Option<usize>,
     pub(crate) skills: Option<Vec<String>>,
     pub(crate) subagents: Option<Vec<String>>,
+}
+
+impl CapabilityOverrides {
+    /// Folds `layers` field by field in priority order — see
+    /// `SamplingOverrides::fold`, which this mirrors.
+    pub(crate) fn fold(layers: &[Self]) -> Self {
+        Self {
+            mcp: layers.iter().find_map(|layer| layer.mcp.clone()),
+            max_tool_rounds: layers.iter().find_map(|layer| layer.max_tool_rounds),
+            skills: layers.iter().find_map(|layer| layer.skills.clone()),
+            subagents: layers.iter().find_map(|layer| layer.subagents.clone()),
+        }
+    }
 }
 
 /// The new-turn inputs shared by `RequestSettings::complete`/

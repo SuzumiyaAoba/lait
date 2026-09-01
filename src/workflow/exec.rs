@@ -896,54 +896,62 @@ fn resolve_step_settings(
                 config::CONFIG_FILE_NAME
             )
         })?;
-    let overrides = SamplingOverrides {
-        reasoning_effort: node
-            .reasoning_effort
-            .or(agent_file.and_then(|agent_file| agent_file.reasoning_effort))
-            .or(scope.defaults.reasoning_effort),
-        temperature: node
-            .temperature
-            .or(agent_file.and_then(|agent_file| agent_file.temperature))
-            .or(scope.defaults.temperature),
-        top_p: node
-            .top_p
-            .or(agent_file.and_then(|agent_file| agent_file.top_p))
-            .or(scope.defaults.top_p),
-        max_tokens: node
-            .max_tokens
-            .or(agent_file.and_then(|agent_file| agent_file.max_tokens))
-            .or(scope.defaults.max_tokens),
+    // Each layer mirrors one of the node > agent file > workflow default
+    // precedence chain's own sources; `agent_file`'s is absent (`Default`,
+    // all `None`/empty) when this node has none. `SamplingOverrides::fold`/
+    // `CapabilityOverrides::fold` then pick the first layer with each field
+    // set, independently per field.
+    let node_sampling = SamplingOverrides {
+        reasoning_effort: node.reasoning_effort,
+        temperature: node.temperature,
+        top_p: node.top_p,
+        max_tokens: node.max_tokens,
     };
-    let mcp = node
-        .mcp
-        .clone()
-        .or_else(|| agent_file.and_then(|agent_file| agent_file.mcp.clone()))
-        .or_else(|| scope.defaults.mcp.clone());
-    let max_tool_rounds = node
-        .max_tool_rounds
-        .or_else(|| agent_file.and_then(|agent_file| agent_file.max_tool_rounds))
-        .or(scope.defaults.max_tool_rounds);
-    let skills = node
-        .skills
-        .clone()
-        .or_else(|| agent_file.and_then(|agent_file| agent_file.skills.clone()))
-        .or_else(|| scope.defaults.skills.clone());
-    let subagents = node
-        .subagents
-        .clone()
-        .or_else(|| agent_file.and_then(|agent_file| agent_file.subagents.clone()))
-        .or_else(|| scope.defaults.subagents.clone());
+    let agent_sampling = agent_file
+        .map(|agent_file| SamplingOverrides {
+            reasoning_effort: agent_file.reasoning_effort,
+            temperature: agent_file.temperature,
+            top_p: agent_file.top_p,
+            max_tokens: agent_file.max_tokens,
+        })
+        .unwrap_or_default();
+    let workflow_sampling = SamplingOverrides {
+        reasoning_effort: scope.defaults.reasoning_effort,
+        temperature: scope.defaults.temperature,
+        top_p: scope.defaults.top_p,
+        max_tokens: scope.defaults.max_tokens,
+    };
+    let overrides = SamplingOverrides::fold(&[node_sampling, agent_sampling, workflow_sampling]);
+
+    let node_capability = CapabilityOverrides {
+        mcp: node.mcp.clone(),
+        max_tool_rounds: node.max_tool_rounds,
+        skills: node.skills.clone(),
+        subagents: node.subagents.clone(),
+    };
+    let agent_capability = agent_file
+        .map(|agent_file| CapabilityOverrides {
+            mcp: agent_file.mcp.clone(),
+            max_tool_rounds: agent_file.max_tool_rounds,
+            skills: agent_file.skills.clone(),
+            subagents: agent_file.subagents.clone(),
+        })
+        .unwrap_or_default();
+    let workflow_capability = CapabilityOverrides {
+        mcp: scope.defaults.mcp.clone(),
+        max_tool_rounds: scope.defaults.max_tool_rounds,
+        skills: scope.defaults.skills.clone(),
+        subagents: scope.defaults.subagents.clone(),
+    };
+    let capability_overrides =
+        CapabilityOverrides::fold(&[node_capability, agent_capability, workflow_capability]);
+
     resolve_request_settings(
         model_name,
         overrides,
         None,
         None,
-        CapabilityOverrides {
-            mcp,
-            max_tool_rounds,
-            skills,
-            subagents,
-        },
+        capability_overrides,
         &scope.models,
         file_config,
     )
