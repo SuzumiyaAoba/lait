@@ -102,9 +102,22 @@ pub(crate) fn append_turn(name: &str, user_content: &str, assistant_content: &st
 
 /// The number of turns (user+assistant message pairs) recorded in the
 /// session file at `path`, counted from raw lines rather than deserializing
-/// every stored message — `lait sessions list` only needs the count.
+/// every stored message — `lait sessions list` only needs the count. Errors
+/// on an odd line count instead of silently rounding down: every write to a
+/// session file is a user line immediately followed by an assistant line
+/// (see `append_turn`), so an odd count means the file was left mid-turn (a
+/// crash between the two lines) rather than a shape `count_turns` can just
+/// divide its way past.
 fn count_turns(path: &Path) -> Result<usize> {
-    Ok(jsonl::count_lines(path)? / 2)
+    let lines = jsonl::count_lines(path)?;
+    if lines % 2 != 0 {
+        bail!(
+            "session file '{}' has an odd number of lines ({lines}); it looks like it was left \
+             mid-turn (interrupted between a user and assistant line)",
+            path.display()
+        );
+    }
+    Ok(lines / 2)
 }
 
 /// One row of `lait sessions list`: a session's name and how many turns
@@ -204,7 +217,9 @@ pub(crate) fn run(command: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Role, StoredMessage, append_turn, delete, list, load, show, validate_name};
+    use super::{
+        Role, StoredMessage, append_turn, delete, list, load, session_path, show, validate_name,
+    };
 
     /// `SESSIONS_DIR` ("`.lait/sessions`") is `cwd`-relative — see
     /// `crate::test_support::in_temp_dir`, which every cwd-swapping test in
@@ -265,6 +280,25 @@ mod tests {
             assert_eq!(summaries[0].turn_count, 1);
             assert_eq!(summaries[1].name, "b");
             assert_eq!(summaries[1].turn_count, 2);
+        });
+    }
+
+    #[test]
+    fn list_reports_a_session_left_mid_turn_as_an_error_rather_than_dropping_it() {
+        in_temp_dir(|| {
+            append_turn("crashed", "1", "2").unwrap();
+            // Simulates a crash between writing the user line and the
+            // assistant line of a second turn: one more raw line than
+            // `count_turns` can pair up.
+            let path = session_path("crashed").unwrap();
+            let mut contents = std::fs::read_to_string(&path).unwrap();
+            contents.push_str("{\"role\":\"user\",\"content\":\"3\"}\n");
+            std::fs::write(&path, contents).unwrap();
+
+            match list() {
+                Err(error) => assert!(error.to_string().contains("odd number of lines")),
+                Ok(_) => panic!("expected list() to error on a session file left mid-turn"),
+            }
         });
     }
 
