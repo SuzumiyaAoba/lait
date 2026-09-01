@@ -136,7 +136,7 @@ pub(crate) async fn run(args: ChatReplArgs, no_config: bool) -> Result<()> {
                 &history,
                 line,
                 shared.show_reasoning,
-                shared.show_usage,
+                shared.reporting.show_usage,
             )
             .await
             {
@@ -145,7 +145,7 @@ pub(crate) async fn run(args: ChatReplArgs, no_config: bool) -> Result<()> {
                     history.push(llm::assistant_message(&assistant_text)?);
                     app::finish_chat_turn(
                         shared.session.as_deref(),
-                        shared.no_history,
+                        shared.reporting.no_history,
                         &file_config,
                         &settings.resolved_model.model_id,
                         line,

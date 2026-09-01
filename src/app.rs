@@ -247,8 +247,8 @@ pub(crate) fn resolve_chat_settings(
             top_p: shared.top_p,
             max_tokens: shared.max_tokens,
         },
-        shared.base_url.clone(),
-        shared.api_key.clone(),
+        shared.endpoint.base_url.clone(),
+        shared.endpoint.api_key.clone(),
         CapabilityOverrides {
             mcp: (!shared.mcp.is_empty()).then(|| shared.mcp.clone()),
             max_tool_rounds: None,
@@ -289,7 +289,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     // `--file` attachments below still append to the *rendered* text, the
     // same way they'd append to a plain prompt.
     let (prompt, prompt_model_fallback) = match &chat.prompt_name {
-        Some(name) => prompt::render_named(name, &prompt, &chat.var, &file_config)?,
+        Some(name) => prompt::render_named(name, &prompt, &chat.var.var, &file_config)?,
         None => (prompt, None),
     };
     let prompt = match attachment::read_file_attachments(&chat.files).await? {
@@ -313,7 +313,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
 
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
-    let show_usage = chat.shared.show_usage && !chat.quiet;
+    let show_usage = chat.shared.reporting.show_usage && !chat.quiet;
     let render_enabled = chat.render || file_config.default.render.unwrap_or(false);
     // `-o -` is an explicit "stdout", the same as no `-o` at all.
     let output_path = chat
@@ -345,7 +345,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         }
         finish_chat_turn(
             chat.shared.session.as_deref(),
-            chat.shared.no_history,
+            chat.shared.reporting.no_history,
             &file_config,
             &settings.resolved_model.model_id,
             &prompt,
@@ -384,7 +384,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     let content = response::content_text(&response);
     finish_chat_turn(
         chat.shared.session.as_deref(),
-        chat.shared.no_history,
+        chat.shared.reporting.no_history,
         &file_config,
         &settings.resolved_model.model_id,
         &prompt,
@@ -413,7 +413,7 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
     let raw_input = resolve_input_with_stdin(args.input.clone())?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let (prompt_text, prompt_model) =
-        prompt::render_named(&args.name, &raw_input, &args.var, &file_config)?;
+        prompt::render_named(&args.name, &raw_input, &args.var.var, &file_config)?;
 
     // `.filter` folds a blank-but-present `model:` into the same "none
     // configured" branch below, so it gets this prompt-specific hint
@@ -463,10 +463,10 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
             prompt: &prompt_text,
             response: &output,
         },
-        args.no_history,
+        args.reporting.no_history,
         &file_config,
         &env.usage,
-        args.show_usage,
+        args.reporting.show_usage,
     )
 }
 
@@ -521,10 +521,10 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
             prompt: &raw_input,
             response: &output,
         },
-        args.no_history,
+        args.reporting.no_history,
         &file_config,
         &env.usage,
-        args.show_usage,
+        args.reporting.show_usage,
     )
 }
 
@@ -566,9 +566,9 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
             prompt: &initial_prompt,
             response: &current_input,
         },
-        run_args.no_history,
+        run_args.reporting.no_history,
         &file_config,
         &env.usage,
-        run_args.show_usage,
+        run_args.reporting.show_usage,
     )
 }

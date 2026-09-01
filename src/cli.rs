@@ -103,18 +103,51 @@ pub(crate) struct PromptArgs {
     #[arg(value_name = "INPUT")]
     pub(crate) input: Option<String>,
 
-    /// Override a `vars:` default declared on the prompt: `--var
-    /// KEY=VALUE`. Repeatable; a later `--var` for the same key wins.
+    #[command(flatten)]
+    pub(crate) var: VarArgs,
+
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
+}
+
+/// `--var KEY=VALUE`, shared by `lait prompt <NAME>` and `-p`/
+/// `--prompt-name` on single-shot chat — the two entry points that render a
+/// named prompt's `vars:` template.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct VarArgs {
+    /// Override a named prompt's `vars:` default: `--var KEY=VALUE`.
+    /// Repeatable; a later `--var` for the same key wins. Only meaningful
+    /// when running a named prompt (`lait prompt <NAME>` or
+    /// `-p`/`--prompt-name`).
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub(crate) var: Vec<String>,
+}
 
-    /// Print a token usage summary to stderr when the prompt finishes.
+/// `--show-usage`/`--no-history`, shared by every `run_*` entry point that
+/// records a `lait history` entry and can print a token usage summary.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReportingArgs {
+    /// Print a token usage summary to stderr when the run finishes (for
+    /// servers that report usage).
     #[arg(long)]
     pub(crate) show_usage: bool,
 
     /// Do not record this run in `lait history`.
     #[arg(long)]
     pub(crate) no_history: bool,
+}
+
+/// `--base-url`/`--api-key`, shared by every command that talks to an
+/// OpenAI-compatible endpoint directly.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct EndpointArgs {
+    /// The OpenAI-compatible API base URL.
+    #[arg(long, env = "OPENAI_BASE_URL")]
+    pub(crate) base_url: Option<String>,
+
+    /// The API key. LM Studio does not require one.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    pub(crate) api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -185,13 +218,8 @@ pub(crate) struct ModelsArgs {
     #[arg(long)]
     pub(crate) json: bool,
 
-    /// The OpenAI-compatible API base URL to query with `--remote`.
-    #[arg(long, env = "OPENAI_BASE_URL")]
-    pub(crate) base_url: Option<String>,
-
-    /// The API key sent with `--remote`. LM Studio does not require one.
-    #[arg(long, env = "OPENAI_API_KEY")]
-    pub(crate) api_key: Option<String>,
+    #[command(flatten)]
+    pub(crate) endpoint: EndpointArgs,
 }
 
 #[derive(Debug, Args)]
@@ -206,14 +234,8 @@ pub(crate) struct RunArgs {
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
 
-    /// Print a per-step and total token usage summary to stderr when the
-    /// workflow finishes (for servers that report usage).
-    #[arg(long)]
-    pub(crate) show_usage: bool,
-
-    /// Do not record this run in `lait history`.
-    #[arg(long)]
-    pub(crate) no_history: bool,
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
 }
 
 #[derive(Debug, Args)]
@@ -242,14 +264,8 @@ pub(crate) struct AgentRunArgs {
     #[arg(value_name = "INPUT")]
     pub(crate) input: Option<String>,
 
-    /// Print a token usage summary to stderr when the agent finishes (for
-    /// servers that report usage).
-    #[arg(long)]
-    pub(crate) show_usage: bool,
-
-    /// Do not record this run in `lait history`.
-    #[arg(long)]
-    pub(crate) no_history: bool,
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
 }
 
 #[derive(Debug, Args)]
@@ -273,13 +289,8 @@ pub(crate) struct SharedChatArgs {
     #[arg(long, env = "LLM_MODEL")]
     pub(crate) model: Option<String>,
 
-    /// The OpenAI-compatible API base URL.
-    #[arg(long, env = "OPENAI_BASE_URL")]
-    pub(crate) base_url: Option<String>,
-
-    /// The API key. LM Studio does not require one.
-    #[arg(long, env = "OPENAI_API_KEY")]
-    pub(crate) api_key: Option<String>,
+    #[command(flatten)]
+    pub(crate) endpoint: EndpointArgs,
 
     /// A system prompt to send ahead of the user prompt. Falls back to
     /// `default.system` in lait.config.yml when neither this nor
@@ -295,11 +306,8 @@ pub(crate) struct SharedChatArgs {
     #[arg(long)]
     pub(crate) show_reasoning: bool,
 
-    /// Print the request's token usage to stderr after the response (so
-    /// piping stdout stays clean). With `--stream`, asks the server for
-    /// `stream_options: {"include_usage": true}`.
-    #[arg(long)]
-    pub(crate) show_usage: bool,
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
 
     /// The reasoning effort to request from the model.
     #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
@@ -344,11 +352,6 @@ pub(crate) struct SharedChatArgs {
     /// turn recorded there so far is sent ahead of this call's prompt.
     #[arg(long, value_name = "NAME")]
     pub(crate) session: Option<String>,
-
-    /// Do not record this run in `lait history` (see `--no-config`'s
-    /// counterpart `default.history: false`).
-    #[arg(long)]
-    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]
@@ -412,11 +415,8 @@ pub(crate) struct ChatArgs {
     #[arg(short = 'p', long = "prompt-name", value_name = "NAME")]
     pub(crate) prompt_name: Option<String>,
 
-    /// Override a named prompt's `vars:` default: `--var KEY=VALUE`. Only
-    /// meaningful together with `-p`/`--prompt-name`. Repeatable; a later
-    /// `--var` for the same key wins.
-    #[arg(long = "var", value_name = "KEY=VALUE")]
-    pub(crate) var: Vec<String>,
+    #[command(flatten)]
+    pub(crate) var: VarArgs,
 
     /// Render the response as Markdown for terminal display (headings,
     /// lists, emphasis, code blocks, tables, ...) instead of printing it as
@@ -501,10 +501,13 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.chat.shared.model.as_deref(), Some("local-model"));
         assert_eq!(
-            cli.chat.shared.base_url.as_deref(),
+            cli.chat.shared.endpoint.base_url.as_deref(),
             Some("http://localhost:1234/v1")
         );
-        assert_eq!(cli.chat.shared.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            cli.chat.shared.endpoint.api_key.as_deref(),
+            Some("test-key")
+        );
         assert!(cli.chat.shared.show_reasoning);
         assert_eq!(
             cli.chat.shared.reasoning_effort,
