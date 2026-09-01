@@ -1,6 +1,19 @@
 //! Shared read/write primitives for an append-only, newline-delimited JSON
 //! log — the on-disk shape both `history` (a single user-wide log) and
 //! `session` (one log per named session) use.
+//!
+//! This file has six `#[cfg(unix)]`/`#[cfg(not(unix))]` function pairs
+//! (`append_relative`, `read_relative`, `path_exists_relative`,
+//! `directory_exists_relative`, `remove_relative`, `read_dir_relative`).
+//! Collapsing them behind a `trait SafeFs` with two implementations was
+//! considered (see the design plan's A-6) and deliberately not done: this
+//! repo's CI (`ci.yml`) builds ubuntu-latest only, and Windows is compiled
+//! solely by the release workflow — so a semantic mistake introduced in the
+//! `#[cfg(not(unix))]` arm while restructuring it (as opposed to a syntax
+//! error, which `cargo check` still parses and would still catch) would be
+//! invisible until a tag build, with no local or PR-time way to check it
+//! here. The cosmetic win of one trait over six already-correct,
+//! already-documented cfg pairs doesn't justify that risk.
 
 use std::{
     ffi::OsString,

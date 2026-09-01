@@ -186,6 +186,17 @@ schema_name: city_fact
     }
 
     #[test]
+    fn rejects_a_literal_system_prompt_template_key_in_frontmatter() {
+        // `system_prompt_template` is `#[serde(skip)]` on `AgentFile` (set
+        // from the Markdown body after parsing, never from frontmatter YAML)
+        // — confirms `deny_unknown_fields` still treats it as unknown rather
+        // than silently accepting-and-discarding a frontmatter key that
+        // happens to share the field's name.
+        let result = parse_agent("---\nsystem_prompt_template: nope\n---\nbody\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn rejects_structured_output_true_without_an_output_schema() {
         let result = parse_agent("---\nstructured_output: true\n---\nbody\n");
         assert!(result.is_err());

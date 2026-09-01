@@ -129,7 +129,11 @@ pub(crate) struct SessionSummary {
 
 /// Lists every session under `SESSIONS_DIR`, sorted by name. Returns an empty
 /// `Vec` when the directory doesn't exist yet (no session has ever been
-/// created in this project).
+/// created in this project). A single problem entry — a symlink (see the
+/// `bail!` below) or a session file `count_turns` finds left mid-turn — fails
+/// the whole listing rather than silently omitting just that one row; both
+/// name a genuine integrity problem worth surfacing immediately rather than
+/// a per-row detail `lait sessions list` should degrade around.
 pub(crate) fn list() -> Result<Vec<SessionSummary>> {
     let dir = Path::new(SESSIONS_DIR);
     if !jsonl::directory_exists(dir)? {
