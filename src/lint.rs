@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use crate::{
     agent::{self, AgentFile},
     cli::LintArgs,
-    config::{self, ConfigFile},
+    config::{self, ConfigFile, ConfigSource},
     jq,
     nesting::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
     schema, template, workflow,
@@ -104,14 +104,14 @@ pub(crate) fn lint_file(path: &Path, config: Option<&ConfigFile>) -> Result<Lint
 /// every file is linted and reported before this returns `Err` (which only
 /// happens if at least one file has an `Error`-level issue, so CI can rely
 /// on the exit code).
-pub(crate) fn run(lint_args: LintArgs, no_config: bool) -> Result<()> {
+pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
     // Unlike `config::load_config`, which returns an empty `ConfigFile` both
-    // when `lait.config.yml` is absent and when `--no-config` was passed,
-    // the linter needs to tell "absent/skipped" apart from "present but
-    // empty" so it can skip `mcp:`/`skills:` name checks (and say why)
+    // when `lait.config.yml` is absent/not found and when `--no-config` was
+    // passed, the linter needs to tell "absent/skipped" apart from "present
+    // but empty" so it can skip `mcp:`/`skills:` name checks (and say why)
     // instead of reporting every referenced name as unknown.
-    let config_present = !no_config && Path::new(config::CONFIG_FILE_NAME).exists();
-    let file_config = config::load_config(no_config)?;
+    let config_present = config::resolve_config_path(&config_source)?.is_some();
+    let file_config = config::load_config(&config_source)?;
     let config = config_present.then_some(&file_config);
 
     let mut failed_files = 0usize;

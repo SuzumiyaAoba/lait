@@ -8,12 +8,12 @@ use serde::Deserialize;
 
 use crate::{
     cli::ModelsArgs,
-    config::{self, ConfigFile, ResolvedModel},
+    config::{self, ConfigFile, ConfigSource, ResolvedModel},
     llm,
 };
 
-pub(crate) async fn run(args: ModelsArgs, no_config: bool) -> Result<()> {
-    let file_config = config::load_config(no_config)?;
+pub(crate) async fn run(args: ModelsArgs, config_source: ConfigSource) -> Result<()> {
+    let file_config = config::load_config(&config_source)?;
     if args.remote {
         list_remote(&args, &file_config).await
     } else {
@@ -23,8 +23,8 @@ pub(crate) async fn run(args: ModelsArgs, no_config: bool) -> Result<()> {
 
 /// The `--remote`-less path, callable without an async runtime — see
 /// `app::run_blocking`.
-pub(crate) fn run_local(args: ModelsArgs, no_config: bool) -> Result<()> {
-    let file_config = config::load_config(no_config)?;
+pub(crate) fn run_local(args: ModelsArgs, config_source: ConfigSource) -> Result<()> {
+    let file_config = config::load_config(&config_source)?;
     list_local(&args, &file_config)
 }
 

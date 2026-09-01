@@ -1,11 +1,75 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::cli::ReasoningEffort;
+use crate::cli::{Cli, ReasoningEffort};
 
 pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
+
+/// Where `load_config` should look for `lait.config.yml`, resolved once from
+/// `Cli`'s two mutually exclusive flags (`--config`/`--no-config`, enforced
+/// at the clap level via `conflicts_with`) rather than re-read from `Cli` at
+/// every one of the ten call sites that used to take a bare `no_config: bool`.
+#[derive(Clone, Debug)]
+pub(crate) enum ConfigSource {
+    /// Neither flag was given: search `CONFIG_FILE_NAME` starting at the
+    /// current directory and walking up through its ancestors (like git
+    /// looks for `.git`), falling back to [`ConfigFile::default`] if none is
+    /// found anywhere.
+    Search,
+    /// `--config PATH`: read exactly this file. Unlike `Search`, a missing
+    /// file here is an error — the user named a specific path, so silently
+    /// falling back to defaults would hide a typo.
+    Explicit(PathBuf),
+    /// `--no-config`: always [`ConfigFile::default`], no filesystem access.
+    Disabled,
+}
+
+impl From<&Cli> for ConfigSource {
+    fn from(cli: &Cli) -> Self {
+        if cli.no_config {
+            Self::Disabled
+        } else if let Some(path) = &cli.config {
+            Self::Explicit(path.clone())
+        } else {
+            Self::Search
+        }
+    }
+}
+
+/// Walks from `start` up through its ancestors (inclusive), returning the
+/// first directory that contains `CONFIG_FILE_NAME` — the same shape a `.git`
+/// search uses, so `lait` works from a project subdirectory the way `git`
+/// does. Ancestors are compared to the walk's own directories, never
+/// symlink-resolved, matching `Path::ancestors`'s usual (lexical) behavior.
+fn find_config_upward(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| dir.join(CONFIG_FILE_NAME))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Resolves `source` to a concrete file path to read, or `None` when there is
+/// none (`Disabled`, or `Search` that found nothing) — the information
+/// `lint::run` needs to tell "no config anywhere" from "found one" apart from
+/// [`load_config`]'s own `ConfigFile::default()` fallback, which looks the
+/// same in both cases.
+pub(crate) fn resolve_config_path(source: &ConfigSource) -> Result<Option<PathBuf>> {
+    match source {
+        ConfigSource::Disabled => Ok(None),
+        ConfigSource::Explicit(path) => Ok(Some(path.clone())),
+        ConfigSource::Search => {
+            let cwd = std::env::current_dir()
+                .context("failed to determine the current directory for configuration")?;
+            Ok(find_config_upward(&cwd))
+        }
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -373,17 +437,22 @@ fn expand_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<S
     Ok(result)
 }
 
-pub(crate) fn load_config(no_config: bool) -> Result<ConfigFile> {
-    if no_config {
+pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
+    let Some(path) = resolve_config_path(source)? else {
         return Ok(ConfigFile::default());
-    }
+    };
 
-    let path = std::env::current_dir()
-        .context("failed to determine the current directory for configuration")?
-        .join(CONFIG_FILE_NAME);
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // `Search` found nothing and falls back to defaults (unchanged
+        // behavior); `Explicit` named this exact path, so a missing file
+        // here falls through to the `with_context` error below instead —
+        // the user asked for it by name, so silently using defaults would
+        // hide a typo.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !matches!(source, ConfigSource::Explicit(_)) =>
+        {
             return Ok(ConfigFile::default());
         }
         Err(error) => {

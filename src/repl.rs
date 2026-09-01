@@ -15,7 +15,7 @@ use async_openai::types::chat::ChatCompletionRequestMessage;
 use crate::{
     app,
     cli::ChatReplArgs,
-    config,
+    config::{self, ConfigSource},
     engine::{AppContext, PromptTurn, RequestSettings, stream_response},
     llm, response, usage,
 };
@@ -62,9 +62,9 @@ pub(crate) fn parse_meta_command(line: &str) -> Option<MetaCommand<'_>> {
 /// explicit `/exit`). See `parse_meta_command` for the `/exit`/`/clear`/
 /// `/model`/`/system` syntax handled below. Also reached from a prompt-less,
 /// stdin-is-a-terminal bare `lait` invocation — see `app::run_chat_or_repl`.
-pub(crate) async fn run(args: ChatReplArgs, no_config: bool) -> Result<()> {
+pub(crate) async fn run(args: ChatReplArgs, config_source: ConfigSource) -> Result<()> {
     let mut shared = args.shared;
-    let file_config = Arc::new(config::load_config(no_config)?);
+    let file_config = Arc::new(config::load_config(&config_source)?);
     let mut history = app::load_session_history(shared.session.as_deref())?;
     let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
     let env = AppContext::new(Arc::clone(&file_config));

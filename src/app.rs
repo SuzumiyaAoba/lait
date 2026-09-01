@@ -7,7 +7,7 @@ use crate::{
     agent, attachment,
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction, RunArgs},
     cli::{AgentRunArgs, PromptRunArgs, SharedChatArgs},
-    config::{self, ConfigFile, ModelMap},
+    config::{self, ConfigFile, ConfigSource, ModelMap},
     docgen,
     engine::{
         AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
@@ -88,13 +88,14 @@ pub(crate) fn finish_chat_turn(
 }
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
+    let config_source = ConfigSource::from(&cli);
     match cli.command {
-        Some(Command::Run(run_args)) => run_workflow(run_args, cli.no_config).await,
+        Some(Command::Run(run_args)) => run_workflow(run_args, config_source).await,
         Some(Command::Agent(agent_command)) => match agent_command.action {
-            AgentAction::Run(args) => run_agent(args, cli.no_config).await,
+            AgentAction::Run(args) => run_agent(args, config_source).await,
         },
-        Some(Command::Lint(lint_args)) => lint::run(lint_args, cli.no_config),
-        Some(Command::Models(models_args)) => crate::models::run(models_args, cli.no_config).await,
+        Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
+        Some(Command::Models(models_args)) => crate::models::run(models_args, config_source).await,
         Some(Command::Completions(completions_args)) => {
             docgen::generate_completions(completions_args);
             Ok(())
@@ -102,15 +103,15 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Man(man_args)) => docgen::generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
-        Some(Command::Chat(chat_repl_args)) => repl::run(chat_repl_args, cli.no_config).await,
+        Some(Command::Chat(chat_repl_args)) => repl::run(chat_repl_args, config_source).await,
         Some(Command::Prompt(prompt_command)) => match prompt_command.action {
             PromptAction::List => {
                 bail!("internal error: `prompt list` must run on the sync path")
             }
-            PromptAction::Run(run_args) => run_prompt(run_args, cli.no_config).await,
+            PromptAction::Run(run_args) => run_prompt(run_args, config_source).await,
         },
         Some(Command::History(history_args)) => history::run(history_args),
-        None => run_chat_or_repl(cli.chat, cli.no_config).await,
+        None => run_chat_or_repl(cli.chat, config_source).await,
     }
 }
 
@@ -124,17 +125,17 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 /// as "the user wants the REPL", so a script's exit-code contract never
 /// silently changes into "launched an interactive prompt that then exits
 /// immediately."
-async fn run_chat_or_repl(chat: ChatArgs, no_config: bool) -> Result<()> {
+async fn run_chat_or_repl(chat: ChatArgs, config_source: ConfigSource) -> Result<()> {
     use std::io::IsTerminal;
 
     match resolve_input_with_stdin(chat.prompt.clone())? {
-        Some(prompt) => run_chat(chat, prompt, no_config).await,
+        Some(prompt) => run_chat(chat, prompt, config_source).await,
         None if std::io::stdin().is_terminal() => {
             repl::run(
                 ChatReplArgs {
                     shared: chat.shared,
                 },
-                no_config,
+                config_source,
             )
             .await
         }
@@ -171,13 +172,14 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
 /// Runs the commands `needs_async_runtime` classifies as synchronous,
 /// without any async runtime behind them.
 pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
+    let config_source = ConfigSource::from(&cli);
     match cli.command {
-        Some(Command::Lint(lint_args)) => lint::run(lint_args, cli.no_config),
+        Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
         Some(Command::Models(models_args)) => {
             if models_args.remote {
                 bail!("internal error: `models --remote` must run on the async path");
             }
-            crate::models::run_local(models_args, cli.no_config)
+            crate::models::run_local(models_args, config_source)
         }
         Some(Command::Completions(completions_args)) => {
             docgen::generate_completions(completions_args);
@@ -187,7 +189,7 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Prompt(prompt_command)) => match prompt_command.action {
-            PromptAction::List => crate::prompt::list(&config::load_config(cli.no_config)?),
+            PromptAction::List => crate::prompt::list(&config::load_config(&config_source)?),
             PromptAction::Run(_) => {
                 bail!("internal error: `prompt run` must run on the async path")
             }
@@ -287,8 +289,8 @@ pub(crate) fn load_session_history(
 /// Runs a single-shot chat request with an already-resolved `prompt` — see
 /// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
 /// CLI argument and/or piped stdin).
-async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()> {
-    let file_config = Arc::new(config::load_config(no_config)?);
+async fn run_chat(chat: ChatArgs, prompt: String, config_source: ConfigSource) -> Result<()> {
+    let file_config = Arc::new(config::load_config(&config_source)?);
 
     // `-p`/`--prompt-name` renders a named `prompts:` template against
     // `prompt` (which, for this path, is really the template's `{{ input }}`
@@ -414,8 +416,8 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
 /// see `docs/usage/ja/prompts.md`); reach for `-p` when those are needed.
 /// `-o`/`--render`/`--json`/`--show-usage`/`--no-history` work the same as
 /// every other `run_*` entry point (see `cli::OutputArgs`).
-async fn run_prompt(args: PromptRunArgs, no_config: bool) -> Result<()> {
-    let file_config = Arc::new(config::load_config(no_config)?);
+async fn run_prompt(args: PromptRunArgs, config_source: ConfigSource) -> Result<()> {
+    let file_config = Arc::new(config::load_config(&config_source)?);
 
     let raw_input = resolve_input_with_stdin(args.input.clone())?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
@@ -477,7 +479,7 @@ async fn run_prompt(args: PromptRunArgs, no_config: bool) -> Result<()> {
     )
 }
 
-async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
+async fn run_agent(args: AgentRunArgs, config_source: ConfigSource) -> Result<()> {
     let raw_input = resolve_input_with_stdin(args.input.clone())?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let agent_file = agent::load_agent(&args.file)?;
@@ -487,7 +489,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
             args.file.display()
         )
     })?;
-    let file_config = Arc::new(config::load_config(no_config)?);
+    let file_config = Arc::new(config::load_config(&config_source)?);
 
     announce_named_file(
         "==>",
@@ -535,11 +537,11 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     )
 }
 
-async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
+async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<()> {
     let prompt = resolve_input_with_stdin(run_args.prompt.clone())?
         .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
     let mut wf = workflow::load_workflow(&run_args.file)?;
-    let file_config = Arc::new(config::load_config(no_config)?);
+    let file_config = Arc::new(config::load_config(&config_source)?);
 
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
 

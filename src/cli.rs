@@ -14,9 +14,17 @@ pub(crate) struct Cli {
     #[command(flatten)]
     pub(crate) chat: ChatArgs,
 
-    /// Do not read lait.config.yml from the current directory.
-    #[arg(long, global = true)]
+    /// Do not read lait.config.yml from the current directory or any of its
+    /// ancestors.
+    #[arg(long, global = true, conflicts_with = "config")]
     pub(crate) no_config: bool,
+
+    /// Read configuration from PATH instead of searching for
+    /// lait.config.yml starting at the current directory and walking up
+    /// through its ancestors (like git looks for `.git`). Unlike the
+    /// default search, a missing PATH is an error.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
 
     /// Do not read a `.env` file from the current directory. (Acted on
     /// before argument parsing — see `main` — so this declaration only
@@ -768,6 +776,32 @@ mod tests {
             .expect("global flags should be accepted after subcommand arguments");
 
         assert!(cli.no_config);
+    }
+
+    #[test]
+    fn run_subcommand_accepts_global_config_after_its_args() {
+        let cli = Cli::try_parse_from([
+            "lait",
+            "run",
+            "workflow.yml",
+            "hello",
+            "--config",
+            "custom.yml",
+        ])
+        .expect("global flags should be accepted after subcommand arguments");
+
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("custom.yml"))
+        );
+    }
+
+    #[test]
+    fn rejects_config_combined_with_no_config() {
+        assert!(
+            Cli::try_parse_from(["lait", "--config", "custom.yml", "--no-config", "hello"])
+                .is_err()
+        );
     }
 
     #[test]
