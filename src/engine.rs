@@ -131,7 +131,7 @@ pub(crate) struct PromptTurn<'a> {
 
 impl<'a> PromptTurn<'a> {
     /// A turn with no prior history and no image attachments — every caller
-    /// but chat's own (`run_chat`/`run_repl_turn`, which have a real
+    /// but chat's own (`run_chat`/`repl::run_turn`, which have a real
     /// `--session`/`--image` history to carry).
     pub(crate) fn simple(system_prompt: Option<&'a str>, prompt: &'a str) -> Self {
         Self {

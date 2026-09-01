@@ -15,7 +15,7 @@ use crate::response;
 pub(crate) struct UsageTally {
     events: std::sync::Mutex<Vec<(String, response::Usage)>>,
     /// The running sum of every event recorded so far, kept incrementally so
-    /// `total()` never has to refold `events` — `run_repl_turn` calls it
+    /// `total()` never has to refold `events` — `repl::run_turn` calls it
     /// twice per REPL turn purely to compute that turn's own delta, so an
     /// O(n) refold there would make an n-turn session cost O(n²) overall.
     running_total: std::sync::Mutex<Option<response::Usage>>,

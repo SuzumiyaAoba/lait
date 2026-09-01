@@ -13,7 +13,7 @@ use crate::{
         AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
         agent_file_settings, call_agent, resolve_request_settings, stream_response,
     },
-    history, lint, llm, prompt, render, repl, response, schema, session, template, usage,
+    history, lint, prompt, render, repl, response, schema, session, template, usage,
     workflow::{
         self, WorkflowScope,
         exec::{RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
@@ -84,9 +84,9 @@ fn record_history(
 
 /// Records one finished chat turn: appends it to `--session`'s log (when
 /// set) and to `lait history` (unless suppressed) — the shared tail of
-/// `run_chat`'s streamed and non-streamed paths and `run_chat_repl`'s
-/// per-turn loop.
-fn finish_chat_turn(
+/// `run_chat`'s streamed and non-streamed paths and `repl::run`'s per-turn
+/// loop.
+pub(crate) fn finish_chat_turn(
     session_name: Option<&str>,
     no_history: bool,
     file_config: &ConfigFile,
@@ -124,7 +124,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Man(man_args)) => docgen::generate_man_pages(man_args),
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
-        Some(Command::Chat(chat_repl_args)) => run_chat_repl(chat_repl_args, cli.no_config).await,
+        Some(Command::Chat(chat_repl_args)) => repl::run(chat_repl_args, cli.no_config).await,
         Some(Command::Prompt(prompt_args)) => run_prompt(prompt_args, cli.no_config).await,
         Some(Command::History(history_args)) => history::run(history_args),
         None => run_chat_or_repl(cli.chat, cli.no_config).await,
@@ -147,7 +147,7 @@ async fn run_chat_or_repl(chat: ChatArgs, no_config: bool) -> Result<()> {
     match resolve_input_with_stdin(chat.prompt.clone())? {
         Some(prompt) => run_chat(chat, prompt, no_config).await,
         None if std::io::stdin().is_terminal() => {
-            run_chat_repl(
+            repl::run(
                 ChatReplArgs {
                     shared: chat.shared,
                 },
@@ -272,7 +272,7 @@ fn lint_files(lint_args: LintArgs, no_config: bool) -> Result<()> {
 /// contents, else `default.system` from lait.config.yml (`--system` and
 /// `--system-file` conflict at the clap level, so their order here never
 /// actually decides anything).
-fn resolve_system_prompt(
+pub(crate) fn resolve_system_prompt(
     shared: &SharedChatArgs,
     file_config: &ConfigFile,
 ) -> Result<Option<String>> {
@@ -298,7 +298,7 @@ fn resolve_system_prompt(
 /// `prompt_model_fallback` is `-p`/`--prompt-name`'s own `model:`, when set
 /// and `-p` was used (`None` from every other caller, including the REPL,
 /// which has no `-p` equivalent).
-fn resolve_chat_settings(
+pub(crate) fn resolve_chat_settings(
     shared: &SharedChatArgs,
     prompt_model_fallback: Option<&str>,
     file_config: &ConfigFile,
@@ -344,7 +344,9 @@ fn resolve_chat_settings(
 /// `repl::run`'s startup (the REPL loads history once and grows its own
 /// in-memory copy turn by turn from there, rather than reloading from disk
 /// every turn).
-fn load_session_history(session_name: Option<&str>) -> Result<Vec<ChatCompletionRequestMessage>> {
+pub(crate) fn load_session_history(
+    session_name: Option<&str>,
+) -> Result<Vec<ChatCompletionRequestMessage>> {
     match session_name {
         Some(name) => session::to_request_messages(&session::load(name)?),
         None => Ok(Vec::new()),
@@ -476,177 +478,6 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
         usage::print_usage_summary(&env.usage);
     }
     Ok(())
-}
-
-/// Runs `lait chat`'s interactive REPL: reads one line at a time from stdin,
-/// sends it (plus every earlier turn this process has seen) to the model,
-/// and prints the reply, until `/exit` or end-of-input (Ctrl-D closes stdin,
-/// which a piped-stdin test also relies on to end the loop without an
-/// explicit `/exit`). See `repl::parse_meta_command` for the `/exit`/
-/// `/clear`/`/model`/`/system` syntax handled below. Also reached from a
-/// prompt-less, stdin-is-a-terminal bare `lait` invocation — see
-/// `run_chat_or_repl`.
-async fn run_chat_repl(args: ChatReplArgs, no_config: bool) -> Result<()> {
-    use std::io::{BufRead, Write};
-
-    let mut shared = args.shared;
-    let file_config = config::load_config(no_config)?;
-    let mut history = load_session_history(shared.session.as_deref())?;
-    let mut system_prompt = resolve_system_prompt(&shared, &file_config)?;
-    let env = AppContext::new(&file_config);
-
-    eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
-
-    // Resolved lazily on first use rather than up front, so a `--model`-less
-    // invocation still drops into the REPL instead of erroring immediately —
-    // the user can `/model <name>` before ever sending a line. Cached across
-    // turns after that (`resolve_chat_settings` does only cheap string/config
-    // work, but nothing here changes turn to turn except in response to
-    // `/model`, which invalidates it below).
-    let mut settings: Option<RequestSettings> = None;
-
-    let stdin = std::io::stdin();
-    let repl = async {
-        loop {
-            eprint!("> ");
-            std::io::stderr().flush()?;
-            let mut line = String::new();
-            if stdin.lock().read_line(&mut line)? == 0 {
-                break; // end-of-input (Ctrl-D)
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Some(command) = repl::parse_meta_command(line) {
-                match command {
-                    repl::MetaCommand::Exit => break,
-                    repl::MetaCommand::Clear => {
-                        history.clear();
-                        eprintln!("(history cleared — a --session log, if any, is unaffected)");
-                    }
-                    repl::MetaCommand::Model(name) if !name.is_empty() => {
-                        shared.model = Some(name.to_owned());
-                        settings = None;
-                        eprintln!("(model set to '{name}')");
-                    }
-                    repl::MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
-                    repl::MetaCommand::System(text) if !text.is_empty() => {
-                        system_prompt = Some(text.to_owned());
-                        eprintln!("(system prompt updated)");
-                    }
-                    repl::MetaCommand::System(_) => eprintln!("usage: /system <text>"),
-                    repl::MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
-                }
-                continue;
-            }
-
-            if settings.is_none() {
-                settings = match resolve_chat_settings(&shared, None, &file_config) {
-                    Ok(resolved) => Some(resolved),
-                    Err(error) => {
-                        eprintln!("lait: {error:#}");
-                        continue;
-                    }
-                };
-            }
-            let settings = settings
-                .as_ref()
-                .expect("just resolved above, or the loop continued before reaching here");
-
-            match run_repl_turn(
-                settings,
-                &env,
-                &system_prompt,
-                &history,
-                line,
-                shared.show_reasoning,
-                shared.show_usage,
-            )
-            .await
-            {
-                Ok((assistant_text, turn_usage)) => {
-                    history.push(llm::user_message(line, &[])?);
-                    history.push(llm::assistant_message(&assistant_text)?);
-                    finish_chat_turn(
-                        shared.session.as_deref(),
-                        shared.no_history,
-                        &file_config,
-                        &settings.resolved_model.model_id,
-                        line,
-                        &assistant_text,
-                        turn_usage,
-                    )?;
-                }
-                // One bad turn (a request error, a bad `/model` name that only
-                // fails once actually resolved) shouldn't end the whole session
-                // — report it and let the user try again or `/exit`.
-                Err(error) => eprintln!("lait: {error:#}"),
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    env.finish(repl).await
-}
-
-/// Runs one `lait chat` turn: streams the response to stdout (the REPL's
-/// default), or — when `settings.mcp`/`settings.subagents` names at least
-/// one tool source — falls back to a single non-streamed request printed
-/// once it completes, since `RequestSettings::complete_stream` cannot yet
-/// drive a tool loop (see its own doc comment). Returns the assistant's raw
-/// reply text (never the `Reasoning:`-prefixed display form, the shape
-/// `history`/a `--session` log need) alongside this turn's own token usage
-/// (not `env.usage`'s running session total — see the `before`/`after`
-/// delta below — since `env` persists across every REPL turn and `lait
-/// history` wants each entry's own usage, not the cumulative session total).
-async fn run_repl_turn(
-    settings: &RequestSettings,
-    env: &AppContext<'_>,
-    system_prompt: &Option<String>,
-    history: &[ChatCompletionRequestMessage],
-    prompt: &str,
-    show_reasoning: bool,
-    show_usage: bool,
-) -> Result<(String, Option<response::Usage>)> {
-    let before = env.usage.total().unwrap_or_default();
-    let turn = PromptTurn {
-        system_prompt: system_prompt.as_deref(),
-        history,
-        prompt,
-        image_urls: &[],
-    };
-    let content = if settings.mcp.is_empty() && settings.subagents.is_empty() {
-        let stream = settings
-            .complete_stream(&env.skill_cache, turn, None, show_usage)
-            .await?;
-        let outcome = stream_response(stream, show_reasoning, None).await?;
-        if show_usage && let Some(usage) = outcome.usage {
-            env.usage.record(&settings.usage_label, usage);
-        }
-        if show_usage {
-            usage::print_usage_summary(&env.usage);
-        }
-        outcome.content
-    } else {
-        let response = settings
-            .complete(env, &[], turn, None, env.cancel.clone())
-            .await?;
-        let rendered = response::render_response(&response, false, show_reasoning)?;
-        println!("{rendered}");
-        if show_usage {
-            usage::print_usage_summary(&env.usage);
-        }
-        response::content_text(&response).to_owned()
-    };
-    let turn_usage = env.usage.total().map(|after| response::Usage {
-        prompt_tokens: after.prompt_tokens.saturating_sub(before.prompt_tokens),
-        completion_tokens: after
-            .completion_tokens
-            .saturating_sub(before.completion_tokens),
-        total_tokens: after.total_tokens.saturating_sub(before.total_tokens),
-    });
-    Ok((content, turn_usage))
 }
 
 /// Runs `lait prompt <NAME> [INPUT]` (`args.name == "list"` is handled
