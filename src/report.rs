@@ -22,7 +22,13 @@ use crate::{
 /// `output_path` verbatim with a trailing newline. `output_path`/
 /// `render_enabled` are `None`/`false` from every caller but `run_chat`'s
 /// non-streamed path until B-2 extends `-o`/`--render` to the rest, which
-/// reduces this to a plain `println!`.
+/// reduces this to a plain `println!`. The file branch writes directly via
+/// `std::fs::write` rather than through `async_io::write_output_file` (the
+/// cancellable, path-locked primitive workflow's `write_file` node and
+/// `execute_step`'s retry path use): this is a single, already-complete
+/// response body written once outside any step's `timeout`, so there is no
+/// cancellation deadline or concurrent-write race here for that primitive to
+/// guard against.
 pub(crate) fn emit_output(
     body: &str,
     output_path: Option<&Path>,

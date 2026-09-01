@@ -415,6 +415,13 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
     let (prompt_text, prompt_model) =
         prompt::render_named(&args.name, &raw_input, &args.var, &file_config)?;
 
+    // `.filter` folds a blank-but-present `model:` into the same "none
+    // configured" branch below, so it gets this prompt-specific hint
+    // ('prompts.<name>.model'/'default.model') instead of
+    // `config::resolve_model`'s generic "model name must not be empty" —
+    // `resolve_request_settings` still enforces the latter as a backstop for
+    // any model name reaching it by another path, but this is the more
+    // useful message for the one a `lait prompt` author would actually see.
     let model_name = prompt_model
         .or_else(|| file_config.default.model.clone())
         .filter(|model| !model.trim().is_empty())
