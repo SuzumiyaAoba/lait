@@ -509,25 +509,30 @@ pub(crate) async fn stream_response(
     show_reasoning: bool,
     output_path: Option<&Path>,
 ) -> Result<StreamOutcome> {
-    use std::io::Write;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-    // Locked/opened once for the stream's whole lifetime: every delta write
-    // below would otherwise re-acquire stdout's mutex, and nothing else
-    // prints to the content sink while a response is streaming.
-    let mut stdout_lock;
+    // Opened once for the stream's whole lifetime: every delta write below
+    // reuses the same handle, and nothing else prints to the content sink
+    // while a response is streaming. `tokio::io::Stdout`/`tokio::fs::File`
+    // are used (rather than `std::io::stdout().lock()`/`std::fs::File`) so
+    // this async fn's writes never block the Tokio worker thread it runs
+    // on — each is dispatched to Tokio's own blocking-I/O thread pool
+    // internally.
+    let mut stdout_writer;
     let mut file_writer;
     // Whether reasoning shares the content sink (the stdout presentation:
     // a `Reasoning:` header, then a blank line before the content).
     let reasoning_inline = output_path.is_none();
-    let content_sink: &mut dyn Write = match output_path {
+    let content_sink: &mut (dyn AsyncWrite + Unpin) = match output_path {
         None => {
-            stdout_lock = std::io::stdout().lock();
-            &mut stdout_lock
+            stdout_writer = tokio::io::stdout();
+            &mut stdout_writer
         }
         Some(path) => {
-            let file = std::fs::File::create(path)
+            let file = tokio::fs::File::create(path)
+                .await
                 .with_context(|| format!("failed to create output file '{}'", path.display()))?;
-            file_writer = std::io::BufWriter::new(file);
+            file_writer = tokio::io::BufWriter::new(file);
             &mut file_writer
         }
     };
@@ -545,10 +550,10 @@ pub(crate) async fn stream_response(
         if show_reasoning && let Some(reasoning) = reasoning {
             if reasoning_inline {
                 if !wrote_reasoning {
-                    writeln!(content_sink, "Reasoning:")?;
+                    content_sink.write_all(b"Reasoning:\n").await?;
                 }
-                write!(content_sink, "{reasoning}")?;
-                content_sink.flush()?;
+                content_sink.write_all(reasoning.as_bytes()).await?;
+                content_sink.flush().await?;
             } else {
                 if !wrote_reasoning {
                     eprintln!("Reasoning:");
@@ -559,14 +564,14 @@ pub(crate) async fn stream_response(
         }
         if let Some(content) = content {
             if reasoning_inline && wrote_reasoning && !wrote_content {
-                write!(content_sink, "\n\n")?;
+                content_sink.write_all(b"\n\n").await?;
             }
-            write!(content_sink, "{content}")?;
+            content_sink.write_all(content.as_bytes()).await?;
             // Only the live stdout display needs each delta pushed out
             // immediately; a `-o` file's `BufWriter` batches until the final
             // flush below instead of paying a syscall per delta.
             if reasoning_inline {
-                content_sink.flush()?;
+                content_sink.flush().await?;
             }
             wrote_content = true;
             content_text.push_str(content);
@@ -579,8 +584,8 @@ pub(crate) async fn stream_response(
     if !reasoning_inline && wrote_reasoning {
         eprintln!();
     }
-    writeln!(content_sink)?;
-    content_sink.flush()?;
+    content_sink.write_all(b"\n").await?;
+    content_sink.flush().await?;
     Ok(StreamOutcome {
         content: content_text,
         usage: last_usage,
