@@ -1,9 +1,6 @@
 mod support;
 
-use support::{
-    JsonSchemaFile, MockServer, run_lait, run_lait_with_json_schema, run_lait_with_request_options,
-    run_lait_with_sampling_options, without_json_whitespace,
-};
+use support::{JsonSchemaFile, LaitCommand, MockServer, run_lait, without_json_whitespace};
 
 #[test]
 fn sends_prompt_to_openai_compatible_chat_completions() {
@@ -58,13 +55,13 @@ fn sends_strict_json_schema_response_format() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"mock response\"}"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_json_schema(
-        Some(&server.base_url),
-        None,
-        "hello",
-        &schema.path,
-        Some("answer_schema"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .arg("--json-schema")
+        .arg(&schema.path)
+        .opt_arg("--schema-name", Some("answer_schema"))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -95,14 +92,12 @@ fn cli_reasoning_effort_overrides_environment() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_request_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        false,
-        Some("high"),
-        Some("none"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_arg("--reasoning-effort", Some("high"))
+        .env("LLM_REASONING_EFFORT", "none")
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -120,14 +115,11 @@ fn sends_none_reasoning_effort_when_explicitly_requested() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_request_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        false,
-        Some("none"),
-        None,
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_arg("--reasoning-effort", Some("none"))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -145,14 +137,11 @@ fn sends_reasoning_effort_from_environment() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_request_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        false,
-        None,
-        Some("minimal"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .env("LLM_REASONING_EFFORT", "minimal")
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -170,14 +159,13 @@ fn sends_temperature_top_p_and_max_tokens_when_set() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_sampling_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        Some("0.7"),
-        Some("0.9"),
-        Some("256"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_arg("--temperature", Some("0.7"))
+        .opt_arg("--top-p", Some("0.9"))
+        .opt_arg("--max-tokens", Some("256"))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -200,8 +188,10 @@ fn omits_temperature_top_p_and_max_tokens_when_unset() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output =
-        run_lait_with_sampling_options(Some(&server.base_url), None, "hello", None, None, None);
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 

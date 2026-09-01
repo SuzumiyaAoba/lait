@@ -423,170 +423,122 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// Builds a `lait` single-shot chat invocation for tests: `--model
+/// test-model` and a cleared `LLM_REASONING_EFFORT` are the fixed baseline
+/// every caller wants, and `.run()`/`.spawn_with_stdin(..)` execute it.
+/// Replaces what used to be seven near-duplicate `run_lait_with_*`
+/// functions (one per flag combination a test needed), each repeating the
+/// same base-url/api-key/prompt plumbing around one or two extra flags.
+pub(crate) struct LaitCommand {
+    command: Command,
+    prompt: Option<String>,
+}
+
+impl LaitCommand {
+    pub(crate) fn new() -> Self {
+        let mut command = test_command();
+        command.args(["--model", "test-model"]);
+        command.env_remove("LLM_REASONING_EFFORT");
+        Self {
+            command,
+            prompt: None,
+        }
+    }
+
+    pub(crate) fn base_url(mut self, base_url: Option<&str>) -> Self {
+        if let Some(base_url) = base_url {
+            self.command.args(["--base-url", base_url]);
+        }
+        self
+    }
+
+    pub(crate) fn api_key(mut self, api_key: Option<&str>) -> Self {
+        if let Some(api_key) = api_key {
+            self.command.args(["--api-key", api_key]);
+        }
+        self
+    }
+
+    pub(crate) fn arg(mut self, arg: impl AsRef<std::ffi::OsStr>) -> Self {
+        self.command.arg(arg);
+        self
+    }
+
+    /// Only adds the flag when `value` is `Some` — the common shape for an
+    /// optional CLI override (`--show-reasoning`/`--reasoning-effort`/
+    /// `--temperature`/... in these tests).
+    pub(crate) fn opt_arg(mut self, flag: &str, value: Option<&str>) -> Self {
+        if let Some(value) = value {
+            self.command.args([flag, value]);
+        }
+        self
+    }
+
+    pub(crate) fn flag_if(mut self, flag: &str, enabled: bool) -> Self {
+        if enabled {
+            self.command.arg(flag);
+        }
+        self
+    }
+
+    pub(crate) fn env(mut self, key: &str, value: &str) -> Self {
+        self.command.env(key, value);
+        self
+    }
+
+    /// Sets PROMPT, appended last so flag order in the tests reads naturally
+    /// without callers needing to remember PROMPT must come after flags.
+    pub(crate) fn prompt(mut self, prompt: &str) -> Self {
+        self.prompt = Some(prompt.to_owned());
+        self
+    }
+
+    /// Like `.prompt(..)`, but leaves PROMPT unset for `None` — for the
+    /// piped-stdin tests, where "no PROMPT argument" is itself the case
+    /// under test.
+    pub(crate) fn opt_prompt(self, prompt: Option<&str>) -> Self {
+        match prompt {
+            Some(prompt) => self.prompt(prompt),
+            None => self,
+        }
+    }
+
+    pub(crate) fn run(mut self) -> Output {
+        if let Some(prompt) = &self.prompt {
+            self.command.arg(prompt);
+        }
+        self.command.output().expect("failed to execute lait")
+    }
+
+    /// Like `.run()`, but pipes `stdin_text` into the child's stdin instead
+    /// of inheriting the test process's — for the piped-input rules (stdin
+    /// as the whole prompt, or appended to a PROMPT argument as context).
+    pub(crate) fn spawn_with_stdin(mut self, stdin_text: &str) -> Output {
+        if let Some(prompt) = &self.prompt {
+            self.command.arg(prompt);
+        }
+        self.command.stdin(std::process::Stdio::piped());
+        self.command.stdout(std::process::Stdio::piped());
+        self.command.stderr(std::process::Stdio::piped());
+        let mut child = self.command.spawn().expect("failed to spawn lait");
+        child
+            .stdin
+            .take()
+            .expect("child stdin should be piped")
+            .write_all(stdin_text.as_bytes())
+            .expect("failed to write to lait's stdin");
+        child
+            .wait_with_output()
+            .expect("failed to wait for lait to finish")
+    }
+}
+
 pub(crate) fn run_lait(base_url: Option<&str>, api_key: Option<&str>, prompt: &str) -> Output {
-    run_lait_with_request_options(base_url, api_key, prompt, false, None, None)
-}
-
-pub(crate) fn run_lait_with_options(
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    prompt: &str,
-    show_reasoning: bool,
-) -> Output {
-    run_lait_with_request_options(base_url, api_key, prompt, show_reasoning, None, None)
-}
-
-pub(crate) fn run_lait_with_json(
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    prompt: &str,
-) -> Output {
-    let mut command = test_command();
-    command.args(["--model", "test-model", "--json"]);
-    command.env_remove("LLM_REASONING_EFFORT");
-    if let Some(base_url) = base_url {
-        command.args(["--base-url", base_url]);
-    }
-    if let Some(api_key) = api_key {
-        command.args(["--api-key", api_key]);
-    }
-    command.arg(prompt);
-    command.output().expect("failed to execute lait")
-}
-
-pub(crate) fn run_lait_with_json_schema(
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    prompt: &str,
-    schema_path: &Path,
-    schema_name: Option<&str>,
-) -> Output {
-    let mut command = test_command();
-    command.args(["--model", "test-model"]);
-    command.env_remove("LLM_REASONING_EFFORT");
-    if let Some(base_url) = base_url {
-        command.args(["--base-url", base_url]);
-    }
-    if let Some(api_key) = api_key {
-        command.args(["--api-key", api_key]);
-    }
-    command.arg("--json-schema").arg(schema_path);
-    if let Some(schema_name) = schema_name {
-        command.args(["--schema-name", schema_name]);
-    }
-    command.arg(prompt);
-    command.output().expect("failed to execute lait")
-}
-
-pub(crate) fn run_lait_with_request_options(
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    prompt: &str,
-    show_reasoning: bool,
-    cli_reasoning_effort: Option<&str>,
-    env_reasoning_effort: Option<&str>,
-) -> Output {
-    let mut command = test_command();
-    command.args(["--model", "test-model"]);
-    command.env_remove("LLM_REASONING_EFFORT");
-    if let Some(base_url) = base_url {
-        command.args(["--base-url", base_url]);
-    }
-    if let Some(api_key) = api_key {
-        command.args(["--api-key", api_key]);
-    }
-    if show_reasoning {
-        command.arg("--show-reasoning");
-    }
-    if let Some(reasoning_effort) = cli_reasoning_effort {
-        command.args(["--reasoning-effort", reasoning_effort]);
-    }
-    if let Some(reasoning_effort) = env_reasoning_effort {
-        command.env("LLM_REASONING_EFFORT", reasoning_effort);
-    }
-    command.arg(prompt);
-    command.output().expect("failed to execute lait")
-}
-
-pub(crate) fn run_lait_with_sampling_options(
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    prompt: &str,
-    temperature: Option<&str>,
-    top_p: Option<&str>,
-    max_tokens: Option<&str>,
-) -> Output {
-    let mut command = test_command();
-    command.args(["--model", "test-model"]);
-    command.env_remove("LLM_REASONING_EFFORT");
-    if let Some(base_url) = base_url {
-        command.args(["--base-url", base_url]);
-    }
-    if let Some(api_key) = api_key {
-        command.args(["--api-key", api_key]);
-    }
-    if let Some(temperature) = temperature {
-        command.args(["--temperature", temperature]);
-    }
-    if let Some(top_p) = top_p {
-        command.args(["--top-p", top_p]);
-    }
-    if let Some(max_tokens) = max_tokens {
-        command.args(["--max-tokens", max_tokens]);
-    }
-    command.arg(prompt);
-    command.output().expect("failed to execute lait")
-}
-
-pub(crate) fn run_lait_with_stream(
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    prompt: &str,
-    show_reasoning: bool,
-) -> Output {
-    let mut command = test_command();
-    command.args(["--model", "test-model", "--stream"]);
-    command.env_remove("LLM_REASONING_EFFORT");
-    if let Some(base_url) = base_url {
-        command.args(["--base-url", base_url]);
-    }
-    if let Some(api_key) = api_key {
-        command.args(["--api-key", api_key]);
-    }
-    if show_reasoning {
-        command.arg("--show-reasoning");
-    }
-    command.arg(prompt);
-    command.output().expect("failed to execute lait")
-}
-
-/// Runs `lait` with `stdin_text` piped into its stdin, plus an optional
-/// PROMPT argument, so tests can exercise the piped-input rules (stdin as
-/// the whole prompt, or appended to an argument as context).
-pub(crate) fn run_lait_with_stdin(
-    base_url: &str,
-    prompt: Option<&str>,
-    stdin_text: &str,
-) -> Output {
-    let mut command = test_command();
-    command.args(["--model", "test-model", "--base-url", base_url]);
-    command.env_remove("LLM_REASONING_EFFORT");
-    if let Some(prompt) = prompt {
-        command.arg(prompt);
-    }
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().expect("failed to spawn lait");
-    child
-        .stdin
-        .take()
-        .expect("child stdin should be piped")
-        .write_all(stdin_text.as_bytes())
-        .expect("failed to write to lait's stdin");
-    child
-        .wait_with_output()
-        .expect("failed to wait for lait to finish")
+    LaitCommand::new()
+        .base_url(base_url)
+        .api_key(api_key)
+        .prompt(prompt)
+        .run()
 }
 
 pub(crate) fn run_lait_workflow(workflow_path: &Path, prompt: &str) -> Output {
