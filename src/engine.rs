@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 
 use crate::{
     agent::AgentFile,
+    async_io,
     cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
     llm, mcp, nesting, response, schema, skill, subagent, template, usage, workflow,
@@ -504,10 +505,26 @@ impl RequestSettings {
 /// obliged. `output_path` redirects the content to a file (`-o`): the file
 /// then holds the body alone, so reasoning deltas — normally written ahead of
 /// the content on stdout — go to stderr instead.
+///
+/// `cancellation` is raced against each chunk (via `async_io::
+/// await_cancellation`, the same primitive `llm::complete`'s own
+/// cancellation wraps), so a stream stuck waiting on the next chunk can be
+/// abandoned instead of hanging until the server closes the connection —
+/// previously nothing watched cancellation once the stream was established
+/// (see `AppContext::cancel`'s doc comment: today's only live source is a
+/// workflow step's own `timeout`, since nothing yet wires up a process-wide
+/// source like Ctrl-C). On cancellation, a `-o` file is explicitly flushed
+/// before returning the error, so it holds whatever content arrived before
+/// the cancellation rather than being left empty by `BufWriter`'s buffering
+/// (deltas to a file are batched, not flushed per-delta, unlike stdout's —
+/// see below). A stream ending in some other error (a malformed chunk, a
+/// dropped connection) does not get this treatment and can still leave an
+/// empty `-o` file — a pre-existing gap this change doesn't address.
 pub(crate) async fn stream_response(
     mut stream: llm::CompletionStream,
     show_reasoning: bool,
     output_path: Option<&Path>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<StreamOutcome> {
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -541,8 +558,15 @@ pub(crate) async fn stream_response(
     let mut last_usage = None;
     let mut content_text = String::new();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    loop {
+        let chunk = match async_io::await_cancellation(stream.next(), cancellation.clone()).await {
+            async_io::CancellationResult::Cancelled => {
+                content_sink.flush().await?;
+                bail!("streamed completion was cancelled");
+            }
+            async_io::CancellationResult::Completed(None) => break,
+            async_io::CancellationResult::Completed(Some(chunk)) => chunk?,
+        };
         if let Some(usage) = chunk.usage {
             last_usage = Some(usage);
         }
@@ -598,6 +622,7 @@ pub(crate) async fn stream_response(
 /// complete text after the stream ends even though it was already written
 /// out incrementally — recording a `--session` turn or a `lait history`
 /// entry, neither of which can work from deltas alone.
+#[derive(Debug)]
 pub(crate) struct StreamOutcome {
     pub(crate) content: String,
     pub(crate) usage: Option<response::Usage>,
@@ -967,4 +992,38 @@ pub(crate) fn agent_file_settings(
         &ModelMap::default(),
         file_config,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stream_response;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// A regression test for the bug `stream_response`'s cancellation
+    /// parameter fixes: before this, a stream that never produced another
+    /// chunk (a server that accepted the connection but stopped responding
+    /// mid-stream) had no way to be interrupted short of the server's own
+    /// connection eventually dropping — nothing polled cancellation once
+    /// `stream.next()` was already being awaited.
+    #[tokio::test]
+    async fn is_cancelled_promptly_instead_of_hanging_on_a_stream_that_never_completes() {
+        let stream: crate::llm::CompletionStream = Box::pin(futures_util::stream::pending());
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_response(stream, false, None, Some(cancellation)),
+        )
+        .await
+        .expect("stream_response should return promptly once cancelled, not hang");
+
+        let error = result.expect_err("a cancelled stream should be reported as an error");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
 }

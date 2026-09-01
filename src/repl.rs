@@ -194,7 +194,7 @@ async fn run_turn(
         let stream = settings
             .complete_stream(&env.skill_cache, turn, None, show_usage)
             .await?;
-        let outcome = stream_response(stream, show_reasoning, None).await?;
+        let outcome = stream_response(stream, show_reasoning, None, env.cancel.clone()).await?;
         if show_usage && let Some(usage) = outcome.usage {
             env.usage.record(&settings.usage_label, usage);
         }

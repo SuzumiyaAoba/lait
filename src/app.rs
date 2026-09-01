@@ -344,7 +344,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, config_source: ConfigSource) -
                 let stream = settings
                     .complete_stream(&env.skill_cache, turn, response_format, show_usage)
                     .await?;
-                stream_response(stream, show_reasoning, output_path).await
+                stream_response(stream, show_reasoning, output_path, env.cancel.clone()).await
             })
             .await?;
         // Streamed usage arrives on the final chunk rather than through
