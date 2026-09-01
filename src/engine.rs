@@ -9,6 +9,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,12 +41,17 @@ const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
 /// `call_agent`/`RequestSettings::complete`, through a subagent call's own
 /// recursive completion too — see `call_subagent_tool`). Bundled into one
 /// struct (rather than five parameters) purely to keep those functions'
-/// argument counts under clippy's `too_many_arguments` threshold.
-pub(crate) struct AppContext<'a> {
-    pub(crate) file_config: &'a ConfigFile,
-    pub(crate) registry: mcp::McpRegistry<'a>,
-    pub(crate) skill_cache: skill::SkillCache<'a>,
-    pub(crate) agent_registry: subagent::AgentRegistry<'a>,
+/// argument counts under clippy's `too_many_arguments` threshold. Owns
+/// everything (an `Arc<ConfigFile>`, not a borrow) rather than borrowing
+/// `file_config` for a lifetime, so an `Arc<AppContext>` clone can move into
+/// a `tokio::spawn`ed task for `parallel`/concurrent `for_each` (see
+/// `workflow::exec::run_steps`) without that task's future needing to
+/// outlive a borrow.
+pub(crate) struct AppContext {
+    pub(crate) file_config: Arc<ConfigFile>,
+    pub(crate) registry: mcp::McpRegistry,
+    pub(crate) skill_cache: skill::SkillCache,
+    pub(crate) agent_registry: subagent::AgentRegistry,
     /// Every completion request's server-reported token usage, recorded by
     /// `RequestSettings::complete` and summarized when `--show-usage` asks
     /// for it.
@@ -61,16 +67,18 @@ pub(crate) struct AppContext<'a> {
     pub(crate) cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
-impl<'a> AppContext<'a> {
+impl AppContext {
     /// Builds the registries/cache over `file_config`'s named entries. Cheap:
-    /// each one only borrows its config map — MCP connections, skill files,
-    /// and agent files are all loaded lazily on first use.
-    pub(crate) fn new(file_config: &'a ConfigFile) -> Self {
+    /// each registry gets its own `Arc` clone of just the map it needs (MCP
+    /// connections, skill files, and agent files are all loaded lazily on
+    /// first use, so cloning the (typically small) name/path maps up front
+    /// costs far less than any of that).
+    pub(crate) fn new(file_config: Arc<ConfigFile>) -> Self {
         Self {
+            registry: mcp::McpRegistry::new(Arc::new(file_config.mcp_servers.clone())),
+            skill_cache: skill::SkillCache::new(Arc::new(file_config.skills.clone())),
+            agent_registry: subagent::AgentRegistry::new(Arc::new(file_config.agents.clone())),
             file_config,
-            registry: mcp::McpRegistry::new(&file_config.mcp_servers),
-            skill_cache: skill::SkillCache::new(&file_config.skills),
-            agent_registry: subagent::AgentRegistry::new(&file_config.agents),
             usage: usage::UsageTally::default(),
             cancel: None,
         }
@@ -291,7 +299,7 @@ impl RequestSettings {
     /// feature existed — see `llm::initial_messages`.
     pub(crate) async fn complete(
         &self,
-        env: &AppContext<'_>,
+        env: &AppContext,
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
@@ -410,7 +418,7 @@ impl RequestSettings {
     /// and skew `--show-usage`.
     async fn complete_recorded(
         &self,
-        env: &AppContext<'_>,
+        env: &AppContext,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
@@ -436,7 +444,7 @@ impl RequestSettings {
     /// `turn.image_urls` behave exactly as in `complete` — see its doc comment.
     pub(crate) async fn complete_stream(
         &self,
-        skill_cache: &skill::SkillCache<'_>,
+        skill_cache: &skill::SkillCache,
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
         include_usage: bool,
@@ -471,7 +479,7 @@ impl RequestSettings {
     /// `with_skills`.
     async fn system_prompt_with_skills<'a>(
         &self,
-        skill_cache: &skill::SkillCache<'_>,
+        skill_cache: &skill::SkillCache,
         system_prompt: Option<&'a str>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Option<Cow<'a, str>>> {
@@ -621,7 +629,7 @@ impl<'a> AgentTurn<'a> {
 pub(crate) async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
-    env: &AppContext<'_>,
+    env: &AppContext,
     turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
@@ -747,7 +755,7 @@ fn subagent_tool_input(
 pub(crate) fn call_subagent_tool<'a>(
     name: &'a str,
     arguments_json: &'a str,
-    env: &'a AppContext<'a>,
+    env: &'a AppContext,
     active_paths: &'a [PathBuf],
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
@@ -780,7 +788,7 @@ pub(crate) fn call_subagent_tool<'a>(
             subagent_tool_input(&loaded.file, arguments_json).with_context(context)?;
         loaded.validate_input(&input).with_context(context)?;
 
-        let settings = agent_file_settings(&loaded.file, env.file_config, Some(name))
+        let settings = agent_file_settings(&loaded.file, &env.file_config, Some(name))
             .with_context(context)?
             .with_usage_label(format!("subagent '{name}'"));
 

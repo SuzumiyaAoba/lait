@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::ChatCompletionRequestMessage;
 
@@ -279,7 +281,7 @@ pub(crate) fn load_session_history(
 /// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
 /// CLI argument and/or piped stdin).
 async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()> {
-    let file_config = config::load_config(no_config)?;
+    let file_config = Arc::new(config::load_config(no_config)?);
 
     // `-p`/`--prompt-name` renders a named `prompts:` template against
     // `prompt` (which, for this path, is really the template's `{{ input }}`
@@ -307,7 +309,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
     let system_prompt = resolve_system_prompt(&chat.shared, &file_config)?;
     let image_urls = attachment::resolve_image_urls(&chat.images).await?;
     let session_history = load_session_history(chat.shared.session.as_deref())?;
-    let env = AppContext::new(&file_config);
+    let env = AppContext::new(Arc::clone(&file_config));
 
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
@@ -403,7 +405,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
 /// the main chat invocation (no `--model`/`--stream`/`-o`/... overrides —
 /// see `docs/usage/ja/prompts.md`); reach for `-p` when those are needed.
 async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
-    let file_config = config::load_config(no_config)?;
+    let file_config = Arc::new(config::load_config(no_config)?);
     if args.name == "list" {
         return prompt::list(&file_config);
     }
@@ -435,7 +437,7 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
     )?
     .with_usage_label(format!("prompt '{}'", args.name));
 
-    let env = AppContext::new(&file_config);
+    let env = AppContext::new(Arc::clone(&file_config));
     let response = env
         .finish(settings.complete(
             &env,
@@ -471,7 +473,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
             args.file.display()
         )
     })?;
-    let file_config = config::load_config(no_config)?;
+    let file_config = Arc::new(config::load_config(no_config)?);
 
     announce_named_file(
         "==>",
@@ -491,7 +493,7 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
     let settings =
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
-    let env = AppContext::new(&file_config);
+    let env = AppContext::new(Arc::clone(&file_config));
     let output = env
         .finish(call_agent(
             &agent_file,
@@ -523,12 +525,12 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
     let prompt = resolve_input_with_stdin(run_args.prompt.clone())?
         .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
     let mut wf = workflow::load_workflow(&run_args.file)?;
-    let file_config = config::load_config(no_config)?;
+    let file_config = Arc::new(config::load_config(no_config)?);
 
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
-    let env = AppContext::new(&file_config);
+    let env = AppContext::new(Arc::clone(&file_config));
     let initial_prompt = prompt.clone();
     let StepsOutcome {
         output: current_input,

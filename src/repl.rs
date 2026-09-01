@@ -4,7 +4,10 @@
 //! `load_session_history`/`finish_chat_turn`) stays in `app`, shared with
 //! `run_chat`'s single-shot path.
 
-use std::io::{BufRead, Write};
+use std::{
+    io::{BufRead, Write},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use async_openai::types::chat::ChatCompletionRequestMessage;
@@ -61,10 +64,10 @@ pub(crate) fn parse_meta_command(line: &str) -> Option<MetaCommand<'_>> {
 /// stdin-is-a-terminal bare `lait` invocation — see `app::run_chat_or_repl`.
 pub(crate) async fn run(args: ChatReplArgs, no_config: bool) -> Result<()> {
     let mut shared = args.shared;
-    let file_config = config::load_config(no_config)?;
+    let file_config = Arc::new(config::load_config(no_config)?);
     let mut history = app::load_session_history(shared.session.as_deref())?;
     let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
-    let env = AppContext::new(&file_config);
+    let env = AppContext::new(Arc::clone(&file_config));
 
     eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
 
@@ -173,7 +176,7 @@ pub(crate) async fn run(args: ChatReplArgs, no_config: bool) -> Result<()> {
 /// history` wants each entry's own usage, not the cumulative session total).
 async fn run_turn(
     settings: &RequestSettings,
-    env: &AppContext<'_>,
+    env: &AppContext,
     system_prompt: &Option<String>,
     history: &[ChatCompletionRequestMessage],
     prompt: &str,

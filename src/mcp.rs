@@ -414,8 +414,8 @@ type ToolListCell = Arc<tokio::sync::OnceCell<Arc<Vec<Tool>>>>;
 /// completion request it makes — including concurrent ones (`parallel`/
 /// `for_each` branches), which is why connections are cached behind a
 /// `tokio::sync::Mutex`.
-pub(crate) struct McpRegistry<'a> {
-    servers: &'a config::McpServerMap,
+pub(crate) struct McpRegistry {
+    servers: Arc<config::McpServerMap>,
     connections: tokio::sync::Mutex<HashMap<String, ConnectionCellRef>>,
     /// Each server's `tools/list` result, cached for the registry's lifetime:
     /// a server's tool list doesn't change over the course of one `lait run`/
@@ -448,8 +448,8 @@ impl ToolSet {
     }
 }
 
-impl<'a> McpRegistry<'a> {
-    pub(crate) fn new(servers: &'a config::McpServerMap) -> Self {
+impl McpRegistry {
+    pub(crate) fn new(servers: Arc<config::McpServerMap>) -> Self {
         Self {
             servers,
             connections: tokio::sync::Mutex::new(HashMap::new()),
@@ -1412,7 +1412,7 @@ async fn connect(
     }
 }
 
-impl<'a> McpRegistry<'a> {
+impl McpRegistry {
     /// Cancels `connection`, waits for the rmcp service and its transport to
     /// finish cleanup, and only then removes it from the cache. Pointer
     /// identity matters: another task may already have installed a fresh

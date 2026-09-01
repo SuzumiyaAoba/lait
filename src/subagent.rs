@@ -1,12 +1,12 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
+use tokio::sync::OnceCell;
 
 use crate::{
     agent::{self, AgentFile},
@@ -56,15 +56,16 @@ impl LoadedAgent {
 /// for the registry's lifetime, since an agent file's content doesn't change
 /// over the course of one invocation — without this, a `for_each`/`loop`
 /// node with `agent:` set would re-read and re-parse the same file (and its
-/// `file_path:` input schema) on every iteration. Uses `RefCell`/`Rc`
-/// rather than `tokio::sync::Mutex`/`Arc` like `mcp::McpRegistry`, for the
-/// same reason as `SkillCache`: loading a file is synchronous, so there is no
-/// `.await` to interleave across when `parallel:`/`for_each:` branches (or
-/// concurrent tool calls within one round — see
-/// `engine::RequestSettings::complete`) race on the same path.
-pub(crate) struct AgentRegistry<'a> {
-    agents_map: &'a config::AgentMap,
-    loaded: RefCell<HashMap<PathBuf, Rc<LoadedAgent>>>,
+/// `file_path:` input schema) on every iteration. Each path gets its own
+/// `OnceCell`, the same per-entry scheme `SkillCache` uses (see its doc
+/// comment): the outer `Mutex` is only ever held long enough to fetch or
+/// insert a cell, and the cell's `get_or_try_init` is what makes two
+/// concurrent `parallel:`/`for_each:` branches (or concurrent tool calls
+/// within one round — see `engine::RequestSettings::complete`) racing on the
+/// same path share one load instead of two.
+pub(crate) struct AgentRegistry {
+    agents_map: Arc<config::AgentMap>,
+    loaded: Mutex<HashMap<PathBuf, Arc<OnceCell<Arc<LoadedAgent>>>>>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request's
@@ -95,11 +96,11 @@ impl ToolSet {
     }
 }
 
-impl<'a> AgentRegistry<'a> {
-    pub(crate) fn new(agents_map: &'a config::AgentMap) -> Self {
+impl AgentRegistry {
+    pub(crate) fn new(agents_map: Arc<config::AgentMap>) -> Self {
         Self {
             agents_map,
-            loaded: RefCell::new(HashMap::new()),
+            loaded: Mutex::new(HashMap::new()),
         }
     }
 
@@ -111,7 +112,7 @@ impl<'a> AgentRegistry<'a> {
         &self,
         name: &str,
         cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<Rc<LoadedAgent>> {
+    ) -> Result<Arc<LoadedAgent>> {
         let path = self.agents_map.get(name).ok_or_else(|| {
             anyhow!(
                 "unknown subagent '{name}'; define it under 'agents:' in {}",
@@ -132,48 +133,55 @@ impl<'a> AgentRegistry<'a> {
     /// subagent's own structured input; an agent with no `input_schema` gets
     /// a generic single-field `{ "input": ... }` schema instead — see
     /// `engine::subagent_tool_input`, the matching unwrap logic on the call
-    /// side. The cache is checked before any await.
+    /// side.
     pub(crate) async fn load_path_cancellable(
         &self,
         path: &Path,
         cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<Rc<LoadedAgent>> {
-        if let Some(cached) = self.loaded.borrow().get(path) {
-            return Ok(Rc::clone(cached));
-        }
-        let (file, canonical_path) = tokio::try_join!(
-            agent::load_agent_cancellable(path, cancellation.clone()),
-            async {
-                async_io::canonicalize(path, cancellation.clone())
-                    .await
-                    .with_context(|| {
-                        format!("failed to resolve agent file path '{}'", path.display())
-                    })
-            },
-        )?;
-        let tool_parameters = match &file.input_schema {
-            Some(entry) => schema::load_schema_value_cancellable(entry, cancellation).await?,
-            None => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "description": "The task or input to pass to the subagent. A string \
-                            for a plain-text task, or a JSON object/array if the subagent \
-                            expects structured input."
+    ) -> Result<Arc<LoadedAgent>> {
+        let cell = Arc::clone(
+            self.loaded
+                .lock()
+                .expect("agent registry lock should not be poisoned")
+                .entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        );
+        let loaded = cell
+            .get_or_try_init(|| async {
+                let (file, canonical_path) = tokio::try_join!(
+                    agent::load_agent_cancellable(path, cancellation.clone()),
+                    async {
+                        async_io::canonicalize(path, cancellation.clone())
+                            .await
+                            .with_context(|| {
+                                format!("failed to resolve agent file path '{}'", path.display())
+                            })
+                    },
+                )?;
+                let tool_parameters = match &file.input_schema {
+                    Some(entry) => {
+                        schema::load_schema_value_cancellable(entry, cancellation).await?
                     }
-                },
-                "required": ["input"],
-            }),
-        };
-        let loaded = Rc::new(LoadedAgent {
-            file,
-            canonical_path,
-            tool_parameters,
-        });
-        self.loaded
-            .borrow_mut()
-            .insert(path.to_path_buf(), Rc::clone(&loaded));
-        Ok(loaded)
+                    None => serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "description": "The task or input to pass to the subagent. A string \
+                                    for a plain-text task, or a JSON object/array if the subagent \
+                                    expects structured input."
+                            }
+                        },
+                        "required": ["input"],
+                    }),
+                };
+                Ok::<_, anyhow::Error>(Arc::new(LoadedAgent {
+                    file,
+                    canonical_path,
+                    tool_parameters,
+                }))
+            })
+            .await?;
+        Ok(Arc::clone(loaded))
     }
 
     /// Builds the OpenAI-shaped tool definitions for `names` (a resolved
@@ -226,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn errors_on_an_unknown_subagent_name() {
         let agents_map: config::AgentMap = StdHashMap::new();
-        let registry = AgentRegistry::new(&agents_map);
+        let registry = AgentRegistry::new(Arc::new(agents_map));
         let error = registry
             .load_cancellable("missing", None)
             .await

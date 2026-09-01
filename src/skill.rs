@@ -1,12 +1,12 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 
 use crate::{async_io, config, frontmatter};
 
@@ -113,25 +113,26 @@ fn format_skill(skill: &SkillFile) -> String {
 /// course of one `lait run`/`lait agent run`/chat invocation, so every
 /// `render()` call after the first for a given name reuses this instead of
 /// re-reading and re-parsing the file (which a `for_each`/`loop` node with
-/// `skills:` set would otherwise do on every iteration). The first miss now
-/// awaits a cancellable async_io worker. Cache borrows are copied into an
-/// `Option` before that await, and insertion happens only afterward, so a
-/// plain `RefCell` remains safe when `parallel:`/`for_each:` branches race
-/// within the same task. Two simultaneous misses may both read the same file,
-/// but neither can observe a borrow across an await; the later result simply
-/// replaces the equivalent cached section. The cached value is an `Rc<String>`
-/// rather than a bare `String` so a cache hit is a refcount bump, not a clone of
-/// the skill's Markdown body.
-pub(crate) struct SkillCache<'a> {
-    skills_map: &'a config::SkillMap,
-    sections: RefCell<HashMap<String, Rc<String>>>,
+/// `skills:` set would otherwise do on every iteration). Each name gets its
+/// own `OnceCell`: the outer `Mutex` is only ever held long enough to fetch
+/// or insert that cell (never across an await), and the cell's own
+/// `get_or_try_init` — not a check-then-insert on the map — is what makes
+/// concurrent `parallel:`/`for_each:` branches requesting the same name for
+/// the first time share one load instead of two racing ones. The cached
+/// value is an `Arc<String>` rather than a bare `String` so a cache hit is a
+/// refcount bump, not a clone of the skill's Markdown body; `Arc` (not `Rc`)
+/// because a `SkillCache` is shared across `tokio::spawn`ed tasks (`parallel`/
+/// concurrent `for_each` — see `engine::AppContext`), which requires `Send`.
+pub(crate) struct SkillCache {
+    skills_map: Arc<config::SkillMap>,
+    sections: Mutex<HashMap<String, Arc<OnceCell<Arc<String>>>>>,
 }
 
-impl<'a> SkillCache<'a> {
-    pub(crate) fn new(skills_map: &'a config::SkillMap) -> Self {
+impl SkillCache {
+    pub(crate) fn new(skills_map: Arc<config::SkillMap>) -> Self {
         Self {
             skills_map,
-            sections: RefCell::new(HashMap::new()),
+            sections: Mutex::new(HashMap::new()),
         }
     }
 
@@ -182,43 +183,47 @@ impl<'a> SkillCache<'a> {
         &self,
         name: &str,
         cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<Rc<String>> {
+    ) -> Result<Arc<String>> {
         if cancellation
             .as_ref()
             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
             anyhow::bail!("skill rendering was cancelled");
         }
-        let cached = self.sections.borrow().get(name).cloned();
-        if let Some(cached) = cached {
-            return Ok(cached);
-        }
-        let configured_path = self.skills_map.get(name).ok_or_else(|| {
-            anyhow!(
-                "unknown skill '{name}'; define it under 'skills:' in {}",
-                config::CONFIG_FILE_NAME
-            )
-        })?;
-        let read_cancellation = cancellation.clone();
-        let skill = load_skill(name, configured_path, cancellation).await?;
-        if read_cancellation
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-        {
-            anyhow::bail!("skill rendering was cancelled");
-        }
-        let section = Rc::new(format_skill(&skill));
-        self.sections
-            .borrow_mut()
-            .insert(name.to_owned(), Rc::clone(&section));
-        Ok(section)
+        let cell = Arc::clone(
+            self.sections
+                .lock()
+                .expect("skill cache lock should not be poisoned")
+                .entry(name.to_owned())
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        );
+        let section = cell
+            .get_or_try_init(|| async {
+                let configured_path = self.skills_map.get(name).ok_or_else(|| {
+                    anyhow!(
+                        "unknown skill '{name}'; define it under 'skills:' in {}",
+                        config::CONFIG_FILE_NAME
+                    )
+                })?;
+                let read_cancellation = cancellation.clone();
+                let skill = load_skill(name, configured_path, cancellation).await?;
+                if read_cancellation
+                    .as_ref()
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                {
+                    anyhow::bail!("skill rendering was cancelled");
+                }
+                Ok::<_, anyhow::Error>(Arc::new(format_skill(&skill)))
+            })
+            .await?;
+        Ok(Arc::clone(section))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{SkillCache, parse_skill};
-    use std::{collections::HashMap, fs, time::Duration};
+    use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
     #[test]
     fn parses_frontmatter_and_body() {
@@ -251,14 +256,14 @@ mod tests {
     #[tokio::test]
     async fn render_returns_none_for_an_empty_name_list() {
         let skills_map = HashMap::new();
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
         assert!(cache.render(&[], None).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn render_errors_on_an_unknown_skill_name() {
         let skills_map = HashMap::new();
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
         let error = cache
             .render(&["missing".to_owned()], None)
             .await
@@ -274,7 +279,7 @@ mod tests {
         fs::write(&path, contents).unwrap();
         let mut skills_map = HashMap::new();
         skills_map.insert("large".to_owned(), path.clone());
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
 
         let error = cache.render(&["large".to_owned()], None).await.unwrap_err();
         assert!(
@@ -295,7 +300,7 @@ mod tests {
         assert!(status.success());
         let mut skills_map = HashMap::new();
         skills_map.insert("blocked".to_owned(), path.clone());
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
         let names = ["blocked".to_owned()];
         let token = tokio_util::sync::CancellationToken::new();
         let mut render = Box::pin(cache.render(&names, Some(token.clone())));

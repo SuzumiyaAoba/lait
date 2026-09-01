@@ -98,7 +98,7 @@ fn check_workflow_cancellation(
 /// node's own `step_cancel`.
 pub(crate) struct RunStepsFrame<'a> {
     pub(crate) scope: &'a WorkflowScope,
-    pub(crate) env: &'a AppContext<'a>,
+    pub(crate) env: &'a AppContext,
     pub(crate) start_counter: usize,
     pub(crate) progress_prefix: &'a str,
     pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
@@ -709,7 +709,7 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
 async fn execute_step_with_retry(
     node: &workflow::NodeDefinition,
     current_input: &str,
-    context: StepContext<'_, '_>,
+    context: StepContext<'_>,
 ) -> Result<String> {
     let StepContext {
         scope,
@@ -861,9 +861,9 @@ async fn wait_retry_delay(
 /// here rather than on `AppContext`: it changes across attempts and nesting
 /// depths, unlike everything on `AppContext`, which does not.
 #[derive(Clone)]
-struct StepContext<'a, 'env> {
+struct StepContext<'a> {
     scope: &'a WorkflowScope,
-    env: &'a AppContext<'env>,
+    env: &'a AppContext,
     label: &'a str,
     progress_prefix: &'a str,
     steps_outputs: &'a workflow::StepOutputs,
@@ -997,7 +997,7 @@ async fn resolve_attachments<'a>(
 async fn execute_step(
     node: &workflow::NodeDefinition,
     current_input: &str,
-    context: StepContext<'_, '_>,
+    context: StepContext<'_>,
 ) -> Result<String> {
     let StepContext {
         scope,
@@ -1038,7 +1038,7 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?;
 
         let settings =
-            resolve_step_settings(node, scope, env.file_config, Some(agent_file), label)?
+            resolve_step_settings(node, scope, &env.file_config, Some(agent_file), label)?
                 .with_usage_label(label);
 
         let (prompt, image_urls) =
@@ -1060,7 +1060,7 @@ async fn execute_step(
         .await
         .with_context(|| format!("step '{label}'"))?
     } else if node.sends_prompt() {
-        let settings = resolve_step_settings(node, scope, env.file_config, None, label)?
+        let settings = resolve_step_settings(node, scope, &env.file_config, None, label)?
             .with_usage_label(label);
 
         let response_format = match node.output_schema.as_deref() {
@@ -1265,8 +1265,8 @@ steps:
         .expect("router workflow fixture should be writable");
         let mut workflow = crate::workflow::load_workflow(&path).unwrap();
         let scope = WorkflowScope::top_level(&mut workflow, &path).unwrap();
-        let config = crate::config::ConfigFile::default();
-        let env = AppContext::new(&config);
+        let config = std::sync::Arc::new(crate::config::ConfigFile::default());
+        let env = AppContext::new(config);
         let token = CancellationToken::new();
         let started = std::time::Instant::now();
         let execution = run_steps(
