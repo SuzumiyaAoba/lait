@@ -13,7 +13,7 @@ use crate::{
         AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
         agent_file_settings, call_agent, resolve_request_settings, stream_response,
     },
-    history, lint, prompt, render, repl, response, schema, session, template, usage,
+    history, lint, prompt, repl, report, response, schema, session, template, usage,
     workflow::{
         self, WorkflowScope,
         exec::{RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
@@ -60,28 +60,6 @@ fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>
     })
 }
 
-/// Records a completed chat/agent/workflow/prompt run in `lait history`,
-/// unless `no_history` (the caller's own `--no-history`) or
-/// `default.history: false` opts out — the one gate every `run_*` entry
-/// point goes through before ever calling `history::record`, so recording
-/// can never happen from a place that forgot to check the opt-out. Called
-/// only after a run has actually succeeded (every call site is on the
-/// success path), matching `history::record`'s own contract.
-fn record_history(
-    no_history: bool,
-    file_config: &ConfigFile,
-    kind: &str,
-    model: Option<&str>,
-    prompt: &str,
-    response: &str,
-    usage: Option<response::Usage>,
-) -> Result<()> {
-    if no_history || !file_config.default.history.unwrap_or(true) {
-        return Ok(());
-    }
-    history::record(kind, model, prompt, response, usage)
-}
-
 /// Records one finished chat turn: appends it to `--session`'s log (when
 /// set) and to `lait history` (unless suppressed) — the shared tail of
 /// `run_chat`'s streamed and non-streamed paths and `repl::run`'s per-turn
@@ -98,7 +76,7 @@ pub(crate) fn finish_chat_turn(
     if let Some(name) = session_name {
         session::append_turn(name, prompt, response)?;
     }
-    record_history(
+    report::record_history(
         no_history,
         file_config,
         "chat",
@@ -445,10 +423,8 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
             if show_reasoning && let Some(reasoning) = response::response_reasoning(&response) {
                 eprintln!("Reasoning:\n{reasoning}\n");
             }
-            let mut body = response::render_response(&response, chat.json, false)?;
-            body.push('\n');
-            std::fs::write(path, body)
-                .with_context(|| format!("failed to write the response to '{}'", path.display()))?;
+            let body = response::render_response(&response, chat.json, false)?;
+            report::emit_output(&body, Some(path), false)?;
         }
         None => {
             let output = response::render_response(&response, chat.json, show_reasoning)?;
@@ -456,12 +432,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, no_config: bool) -> Result<()>
             // Markdown; `chat.stream`'s branch above already returned before
             // reaching here, so `--render` never has to reckon with a
             // partial streamed response either — see `render::maybe_render`.
-            let output = if chat.json {
-                output
-            } else {
-                render::maybe_render(&output, render_enabled)
-            };
-            println!("{output}");
+            report::emit_output(&output, None, !chat.json && render_enabled)?;
         }
     }
     let content = response::content_text(&response);
@@ -531,20 +502,19 @@ async fn run_prompt(args: PromptArgs, no_config: bool) -> Result<()> {
         ))
         .await?;
     let output = response::render_response(&response, false, false)?;
-    println!("{output}");
-    record_history(
+    report::emit_output(&output, None, false)?;
+    report::finish_run(
+        report::RunRecord {
+            kind: "prompt",
+            model: Some(&settings.resolved_model.model_id),
+            prompt: &prompt_text,
+            response: &output,
+        },
         args.no_history,
         &file_config,
-        "prompt",
-        Some(&settings.resolved_model.model_id),
-        &prompt_text,
-        &output,
-        env.usage.total(),
-    )?;
-    if args.show_usage {
-        usage::print_usage_summary(&env.usage);
-    }
-    Ok(())
+        &env.usage,
+        args.show_usage,
+    )
 }
 
 async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
@@ -590,20 +560,19 @@ async fn run_agent(args: AgentRunArgs, no_config: bool) -> Result<()> {
         ))
         .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;
-    println!("{output}");
-    record_history(
+    report::emit_output(&output, None, false)?;
+    report::finish_run(
+        report::RunRecord {
+            kind: "agent",
+            model: Some(&settings.resolved_model.model_id),
+            prompt: &raw_input,
+            response: &output,
+        },
         args.no_history,
         &file_config,
-        "agent",
-        Some(&settings.resolved_model.model_id),
-        &raw_input,
-        &output,
-        env.usage.total(),
-    )?;
-    if args.show_usage {
-        usage::print_usage_summary(&env.usage);
-    }
-    Ok(())
+        &env.usage,
+        args.show_usage,
+    )
 }
 
 async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
@@ -634,20 +603,19 @@ async fn run_workflow(run_args: RunArgs, no_config: bool) -> Result<()> {
             },
         ))
         .await?;
-    println!("{current_input}");
-    // A workflow can touch several models across its steps, so no single
-    // `model` is recorded here — see `history::HistoryEntry::model`.
-    record_history(
+    report::emit_output(&current_input, None, false)?;
+    report::finish_run(
+        // A workflow can touch several models across its steps, so no
+        // single `model` is recorded here — see `history::HistoryEntry::model`.
+        report::RunRecord {
+            kind: "workflow",
+            model: None,
+            prompt: &initial_prompt,
+            response: &current_input,
+        },
         run_args.no_history,
         &file_config,
-        "workflow",
-        None,
-        &initial_prompt,
-        &current_input,
-        env.usage.total(),
-    )?;
-    if run_args.show_usage {
-        usage::print_usage_summary(&env.usage);
-    }
-    Ok(())
+        &env.usage,
+        run_args.show_usage,
+    )
 }

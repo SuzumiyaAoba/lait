@@ -23,6 +23,7 @@ mod process;
 mod prompt;
 mod render;
 mod repl;
+mod report;
 mod response;
 mod schema;
 mod session;
