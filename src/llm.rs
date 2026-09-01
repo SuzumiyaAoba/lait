@@ -54,7 +54,7 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) response_format: Option<ResponseFormat>,
     /// The full message history for this request: for a single-shot call
     /// this is just `initial_messages(system_prompt, prompt)`, but a tool
-    /// loop (`app::RequestSettings::complete`) grows it across rounds with
+    /// loop (`engine::RequestSettings::complete`) grows it across rounds with
     /// the assistant's `tool_calls` message and each tool's `tool`-role
     /// result. Owned (not built from `system_prompt`/`prompt` here) so the
     /// caller can reuse/extend the same history across rounds without lait
@@ -155,7 +155,7 @@ pub(crate) fn assistant_message(content: &str) -> Result<ChatCompletionRequestMe
 
 /// Builds the assistant-role message recording a model turn's `tool_calls`
 /// (and any `content` it produced alongside them), the shape a tool loop
-/// (`app::RequestSettings::complete`) appends to its message history right
+/// (`engine::RequestSettings::complete`) appends to its message history right
 /// before running the calls themselves.
 pub(crate) fn assistant_tool_call_message(
     tool_calls: &[ToolCall],
@@ -203,7 +203,7 @@ pub(crate) fn tool_result_message(
 /// from (CLI/env, a `models:` alias, `default:`, or a step/agent override).
 /// Called both eagerly at workflow parse time (`workflow::validate`, so a bad
 /// value fails before any step runs) and again once every fallback layer has
-/// been resolved (`app::resolve_request_settings`, which also covers values
+/// been resolved (`engine::resolve_request_settings`, which also covers values
 /// that only workflow parsing can't see, like a config file's `models:`).
 pub(crate) fn validate_sampling_params(
     temperature: Option<f64>,
@@ -232,7 +232,7 @@ pub(crate) fn validate_sampling_params(
 /// least 1, the same "validate eagerly everywhere, then again once resolved"
 /// pattern as [`validate_sampling_params`]. Called from `agent::parse_agent`,
 /// `workflow::validate::validate_node`/`validate_workflow_defaults`, and
-/// `app::resolve_request_settings`.
+/// `engine::resolve_request_settings`.
 pub(crate) fn validate_max_tool_rounds(
     max_tool_rounds: Option<usize>,
     description: &str,

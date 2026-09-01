@@ -8,7 +8,7 @@ use crate::response;
 /// Accumulates every completion request's usage over one `lait` run, by the
 /// label of whatever drove it (a workflow step, an agent, "chat"), so
 /// `--show-usage` can print a per-label and total summary once a run
-/// finishes. Lives in `app::AppContext`, so recording must tolerate concurrent
+/// finishes. Lives in `engine::AppContext`, so recording must tolerate concurrent
 /// callers (`parallel`/concurrent `for_each` steps record from concurrently
 /// running tasks).
 #[derive(Default)]

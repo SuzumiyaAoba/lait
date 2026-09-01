@@ -137,7 +137,7 @@ impl<'a> SkillCache<'a> {
 
     /// Renders `names` (a resolved `skills:` list, already merged through
     /// every fallback layer) into the block of text appended to a completion
-    /// request's system prompt — see `app::with_skills`. Returns `None` when
+    /// request's system prompt — see `engine::with_skills`. Returns `None` when
     /// `names` is empty, so a request that never turns on skills pays no
     /// cost. Each name is resolved against `skills_map` (`lait.config.yml`'s
     /// top-level `skills:`) here, at request time, not at workflow/agent-file

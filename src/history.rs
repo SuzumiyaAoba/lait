@@ -31,7 +31,7 @@ pub(crate) struct HistoryEntry {
     pub(crate) prompt: String,
     pub(crate) response: String,
     /// The server-reported token usage accumulated over the run, when known
-    /// — see `app::UsageTally::total`. `None` covers both "the server never
+    /// — see `usage::UsageTally::total`. `None` covers both "the server never
     /// reports usage" and "a streamed chat turn that didn't request the
     /// usage chunk" (see `app::run_chat`), not just "usage is zero".
     pub(crate) usage: Option<Usage>,

@@ -19,7 +19,7 @@ use crate::{
 /// a recursive subagent call (a subagent whose own `subagents:` names
 /// another) needs it to detect a cycle or excessive nesting the same way
 /// `WorkflowScope`/`check_workflow_nesting` do for `workflow:` nodes — see
-/// `app::call_subagent_tool`. `tool_parameters` is resolved once here too
+/// `engine::call_subagent_tool`. `tool_parameters` is resolved once here too
 /// (not rebuilt by `AgentRegistry::tools` on every call): it resolves
 /// `file.input_schema`, which for a `file_path:` entry means reading and
 /// parsing a JSON file — real I/O that a `for_each`/`loop` workflow node
@@ -61,7 +61,7 @@ impl LoadedAgent {
 /// same reason as `SkillCache`: loading a file is synchronous, so there is no
 /// `.await` to interleave across when `parallel:`/`for_each:` branches (or
 /// concurrent tool calls within one round — see
-/// `app::RequestSettings::complete`) race on the same path.
+/// `engine::RequestSettings::complete`) race on the same path.
 pub(crate) struct AgentRegistry<'a> {
     agents_map: &'a config::AgentMap,
     loaded: RefCell<HashMap<PathBuf, Rc<LoadedAgent>>>,
@@ -88,7 +88,7 @@ impl ToolSet {
 
     /// Every qualified tool name this set defines, used only to check for a
     /// collision against another tool source (see
-    /// `app::RequestSettings::complete`, which combines this with
+    /// `engine::RequestSettings::complete`, which combines this with
     /// `mcp::ToolSet`).
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.index.keys().map(String::as_str)
@@ -131,7 +131,7 @@ impl<'a> AgentRegistry<'a> {
     /// verbatim, so the model's arguments pass straight through as the
     /// subagent's own structured input; an agent with no `input_schema` gets
     /// a generic single-field `{ "input": ... }` schema instead — see
-    /// `app::subagent_tool_input`, the matching unwrap logic on the call
+    /// `engine::subagent_tool_input`, the matching unwrap logic on the call
     /// side. The cache is checked before any await.
     pub(crate) async fn load_path_cancellable(
         &self,

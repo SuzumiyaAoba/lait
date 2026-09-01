@@ -441,7 +441,7 @@ pub(crate) struct ToolSet {
 
 impl ToolSet {
     /// Whether `qualified_name` (as returned in `tools`) names a tool in this
-    /// set, used by `app::RequestSettings::complete` to route a model's tool
+    /// set, used by `engine::RequestSettings::complete` to route a model's tool
     /// call between this set and `subagent::ToolSet` when both are in play.
     pub(crate) fn contains(&self, qualified_name: &str) -> bool {
         self.index.contains_key(qualified_name)

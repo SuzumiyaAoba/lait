@@ -7,10 +7,13 @@ use crate::jq;
 #[cfg(test)]
 use crate::template;
 
+pub(crate) mod exec;
 mod model;
+pub(crate) mod scope;
 mod validate;
 
 pub(crate) use model::*;
+pub(crate) use scope::WorkflowScope;
 
 #[cfg(test)]
 mod tests;
