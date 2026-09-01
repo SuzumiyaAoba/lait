@@ -164,7 +164,10 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
 
         // `router_count` above guarantees at most one of these is set, so
         // `step.router()` (which just checks them in a fixed order) can't
-        // silently prefer one over another here.
+        // silently prefer one over another here. Matched exhaustively (no
+        // `_` arm), like `run_steps`' and `lint::walk_steps`' own matches on
+        // this same enum, so a new router kind fails to compile here until
+        // this function's nesting-context handling is updated for it too.
         match step.router() {
             Some(Router::Switch(switch)) => {
                 reject_router_incompatible_fields(step, "switch", &label)?;

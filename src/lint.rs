@@ -262,6 +262,10 @@ fn walk_steps<'a>(
             walk_steps(&on_error.steps, used, issues);
         }
 
+        // Matched exhaustively (no `_` arm), like `validate_steps`' and
+        // `run_steps`' own matches on this same enum, so a new router kind
+        // fails to compile here until this function's traversal is updated
+        // for it too.
         match step.router() {
             Some(workflow::Router::Switch(switch)) => {
                 for case in &switch.cases {
