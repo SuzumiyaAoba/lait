@@ -66,6 +66,11 @@ pub(crate) struct AppContext {
     /// means a future one only has to change `new`'s caller, not every
     /// `run_steps`/`complete` call site.
     pub(crate) cancel: Option<tokio_util::sync::CancellationToken>,
+    /// `lait run --var KEY=VALUE` overrides (see `cli::VarArgs`), exposed to
+    /// workflow templates as `{{ vars.<key> }}` and to jq filters as
+    /// `$vars.<key>`. Empty for every caller but `app::run_workflow` — see
+    /// `with_vars`.
+    pub(crate) vars: serde_json::Map<String, serde_json::Value>,
 }
 
 impl AppContext {
@@ -82,7 +87,15 @@ impl AppContext {
             file_config,
             usage: usage::UsageTally::default(),
             cancel: None,
+            vars: serde_json::Map::new(),
         }
+    }
+
+    /// Sets this context's `vars` (see the field doc), returning `self` for
+    /// use in a builder chain at the call site (`app::run_workflow`).
+    pub(crate) fn with_vars(mut self, vars: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.vars = vars;
+        self
     }
 
     /// Drives `fut` to completion, then unconditionally shuts down the MCP
@@ -669,7 +682,7 @@ pub(crate) async fn call_agent(
         &agent_file.system_prompt_template,
         turn.input,
         steps_outputs,
-        &serde_json::Map::new(),
+        &env.vars,
     )?;
     let response_format = if agent_file.structured_output {
         Some(

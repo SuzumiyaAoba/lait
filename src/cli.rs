@@ -135,15 +135,18 @@ pub(crate) struct PromptRunArgs {
     pub(crate) output: OutputArgs,
 }
 
-/// `--var KEY=VALUE`, shared by `lait prompt run <NAME>` and `-p`/
-/// `--prompt-name` on single-shot chat — the two entry points that render a
-/// named prompt's `vars:` template.
+/// `--var KEY=VALUE`, shared by `lait prompt run <NAME>`, `-p`/
+/// `--prompt-name` on single-shot chat, and `lait run` — every entry point
+/// that renders a `{{ vars.<key> }}` template placeholder.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct VarArgs {
-    /// Override a named prompt's `vars:` default: `--var KEY=VALUE`.
-    /// Repeatable; a later `--var` for the same key wins. Only meaningful
-    /// when running a named prompt (`lait prompt run <NAME>` or
-    /// `-p`/`--prompt-name`).
+    /// Set a template variable: `--var KEY=VALUE`. Repeatable; a later
+    /// `--var` for the same key wins. For a named prompt (`lait prompt run
+    /// <NAME>` or `-p`/`--prompt-name`), overrides that prompt's `vars:`
+    /// default. For `lait run`, VALUE is parsed as JSON when possible
+    /// (`--var items='["a","b"]'`), otherwise used as a plain string;
+    /// exposed to step templates as `{{ vars.KEY }}` and to jq filters as
+    /// `$vars.KEY`.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub(crate) var: Vec<String>,
 }
@@ -289,6 +292,9 @@ pub(crate) struct RunArgs {
     /// input; when both are given, the piped text is appended to PROMPT).
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+
+    #[command(flatten)]
+    pub(crate) var: VarArgs,
 
     #[command(flatten)]
     pub(crate) reporting: ReportingArgs,

@@ -606,6 +606,43 @@ steps:
   branch が同じ `id` を記録した場合に「どちらが正か」を決められないからです）。branch の結果を
   外へ出す方法は、これまでどおり `parallel` の `join` です。
 
+## 追加パラメータの受け渡し（`lait run --var` / `{{ vars.<key> }}` / `$vars`）
+
+ワークフローへの入力は `<PROMPT>`（最初のステップの `{{ input }}`）だけでは表現しきれない
+ことがあります。`lait run` に `--var KEY=VALUE` を渡すと、`<PROMPT>` とは別に、ワークフロー
+全体からいつでも参照できる名前付きの値を渡せます。
+
+```yaml
+# workflow.yml
+nodes:
+  translate:
+    type: prompt
+    prompt: "次の文章を {{ vars.lang }} に翻訳してください。\n{{ input }}"
+steps:
+  - use: translate
+```
+
+```sh
+lait run workflow.yml "本文" --var lang=フランス語
+```
+
+- `--var` は繰り返し指定できます（`--var lang=ja --var style=formal`）。同じキーを複数回
+  指定した場合は、あとに指定した `--var` が勝ちます。
+- `prompt` テンプレートからは `{{ vars.<key> }}` / `{{ json vars.<key> }}` で参照します
+  （`{{ input }}`/`{{ steps.<id> }} と同じ handlebars の strict mode に従うため、渡していない
+  `key` を参照するとエラーになります）。
+- `jq` フィルター（`when`、`switch` の `when`、`loop` の `while`/`until`、`for_each` の
+  `items`、すべての `join`、ノードの `jq` 自身）からは `$vars.<key>` という jq のグローバル
+  変数として参照します。`$steps` と同様、渡していない `key` を参照してもエラーにはならず
+  `null` になります。
+- `VALUE` は JSON として解釈できる場合は構造化された値として扱われます
+  （`--var items='["a","b"]'` は配列になり、`{{ json vars.items }}` や `$vars.items | length`
+  で扱えます）。JSON として解釈できない値はそのまま文字列になります（`--var lang=ja` は
+  文字列 `"ja"`）。
+- `lait lint` は `vars.`/`$vars` の参照が未定義かどうかまではチェックしません（`--var` は
+  実行時に渡すパラメータであり、lint の時点ではどんな値が渡されるか分からないため）。
+  テンプレート/jq フィルターの構文チェックは、これまでどおり行われます。
+
 ## エラー処理（`retry` / `timeout` / `on_error`）
 
 ノードには `retry:`（再試行）、`timeout:`（1回の試行あたりの時間制限）を指定できます。

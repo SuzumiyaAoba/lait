@@ -185,6 +185,7 @@ pub(crate) fn run_steps<'a>(
                             &case.when,
                             &current_input,
                             &steps_outputs,
+                            &env.vars,
                             cancellation.clone(),
                         )
                         .await
@@ -317,6 +318,7 @@ pub(crate) fn run_steps<'a>(
                             filter,
                             &joined_json,
                             &steps_outputs,
+                            &env.vars,
                             cancellation.clone(),
                         )
                         .await
@@ -355,6 +357,7 @@ pub(crate) fn run_steps<'a>(
                                 while_cond,
                                 &iteration_input,
                                 &steps_outputs,
+                                &env.vars,
                                 cancellation.clone(),
                             )
                             .await
@@ -407,6 +410,7 @@ pub(crate) fn run_steps<'a>(
                                 until_cond,
                                 &iteration_input,
                                 &steps_outputs,
+                                &env.vars,
                                 cancellation.clone(),
                             )
                             .await
@@ -437,6 +441,7 @@ pub(crate) fn run_steps<'a>(
                         &for_each.items,
                         &current_input,
                         &steps_outputs,
+                        &env.vars,
                         cancellation.clone(),
                     )
                     .await
@@ -581,6 +586,7 @@ pub(crate) fn run_steps<'a>(
                             filter,
                             &results_json,
                             &steps_outputs,
+                            &env.vars,
                             cancellation.clone(),
                         )
                         .await
@@ -599,6 +605,7 @@ pub(crate) fn run_steps<'a>(
                     when,
                     &current_input,
                     &steps_outputs,
+                    &env.vars,
                     cancellation.clone(),
                 )
                 .await
@@ -1091,13 +1098,8 @@ async fn execute_step(
             // without going through `template::render`.
             let prompt: Cow<'_, str> = match &prompt_node.prompt {
                 Some(prompt_template) => Cow::Owned(
-                    template::render(
-                        prompt_template,
-                        &input,
-                        steps_outputs,
-                        &serde_json::Map::new(),
-                    )
-                    .with_context(|| format!("step '{label}'"))?,
+                    template::render(prompt_template, &input, steps_outputs, &env.vars)
+                        .with_context(|| format!("step '{label}'"))?,
                 ),
                 None => Cow::Borrowed(current_input),
             };
@@ -1114,12 +1116,7 @@ async fn execute_step(
                 .as_deref()
                 .or(scope.defaults.system_prompt.as_deref())
                 .map(|system_prompt_template| {
-                    template::render(
-                        system_prompt_template,
-                        &input,
-                        steps_outputs,
-                        &serde_json::Map::new(),
-                    )
+                    template::render(system_prompt_template, &input, steps_outputs, &env.vars)
                 })
                 .transpose()
                 .with_context(|| format!("step '{label}'"))?;
@@ -1228,7 +1225,7 @@ async fn execute_step(
             let rendered_argv: Vec<String> = command_node
                 .command
                 .iter()
-                .map(|arg| template::render(arg, &input, steps_outputs, &serde_json::Map::new()))
+                .map(|arg| template::render(arg, &input, steps_outputs, &env.vars))
                 .collect::<Result<_>>()
                 .with_context(|| format!("step '{label}'"))?;
             crate::process::run_command(&rendered_argv, current_input, step_cancel.clone())
@@ -1239,9 +1236,15 @@ async fn execute_step(
     };
 
     if let Some(filter) = node.jq() {
-        step_output = apply_jq(filter, &step_output, steps_outputs, step_cancel.as_ref())
-            .await
-            .with_context(|| format!("step '{label}'"))?;
+        step_output = apply_jq(
+            filter,
+            &step_output,
+            steps_outputs,
+            &env.vars,
+            step_cancel.as_ref(),
+        )
+        .await
+        .with_context(|| format!("step '{label}'"))?;
     }
 
     if let Some(path) = node.write_file() {
@@ -1263,13 +1266,14 @@ async fn apply_jq(
     filter: &str,
     input: &str,
     steps_outputs: &workflow::StepOutputs,
+    vars: &workflow::StepOutputs,
     step_cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     let cancellation = step_cancel.cloned();
     // Input normalization is deliberately performed inside the bounded jq
     // worker. A large plain-text model/command result must not be parsed and
     // re-serialized on a Tokio executor thread before cancellation can win.
-    jq::apply_cancellable_async(filter, input, steps_outputs, cancellation).await
+    jq::apply_cancellable_async(filter, input, steps_outputs, vars, cancellation).await
 }
 
 #[cfg(test)]
@@ -1282,12 +1286,13 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
         let steps = crate::workflow::StepOutputs::new();
+        let vars = crate::workflow::StepOutputs::new();
         let started = std::time::Instant::now();
 
         // The filter is intentionally expensive if it is allowed to run. A
         // pre-set step cancellation must be observed immediately, before a
         // caller can mistake a value from the worker for a successful step.
-        let result = apply_jq("range(0; 1000000000)", "null", &steps, Some(&token)).await;
+        let result = apply_jq("range(0; 1000000000)", "null", &steps, &vars, Some(&token)).await;
 
         assert!(result.is_err());
         assert!(

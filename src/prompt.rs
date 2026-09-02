@@ -14,8 +14,10 @@ use crate::{
     template,
 };
 
-/// Parses one `--var KEY=VALUE` argument into its `(key, value)` pair.
-fn parse_var(raw: &str) -> Result<(String, String)> {
+/// Parses one `--var KEY=VALUE` argument into its `(key, value)` pair. Shared
+/// with `workflow::build_vars` (`lait run --var`), which differs only in how
+/// it interprets `value` (JSON-coerced there, kept as a plain string here).
+pub(crate) fn parse_var(raw: &str) -> Result<(String, String)> {
     let (key, value) = raw
         .split_once('=')
         .ok_or_else(|| anyhow!("invalid '--var {raw}'; expected KEY=VALUE"))?;

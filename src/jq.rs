@@ -39,6 +39,8 @@ const MAX_VALUE_DEPTH: usize = 1024;
 
 /// Named step outputs recorded by `id` (see `workflow::StepOutputs`), exposed
 /// to jq filters as the `$steps` global variable (e.g. `$steps.extract.city`).
+/// The same type also holds `--var KEY=VALUE` overrides exposed as `$vars`
+/// (e.g. `$vars.lang`) — both are flat JSON objects keyed by name.
 pub(crate) type Steps = serde_json::Map<String, serde_json::Value>;
 
 /// Runs a jq filter against a single JSON input, rendering each output value as
@@ -46,8 +48,19 @@ pub(crate) type Steps = serde_json::Map<String, serde_json::Value>;
 /// line). A string output is rendered raw/unquoted, like `jq -r`; every other
 /// value is rendered as compact JSON.
 #[cfg(test)]
-pub(crate) fn apply(filter_source: &str, input_json: &str, steps: &Steps) -> Result<String> {
-    apply_cancellable(filter_source, input_json, steps, &AtomicBool::new(false))
+pub(crate) fn apply(
+    filter_source: &str,
+    input_json: &str,
+    steps: &Steps,
+    vars: &Steps,
+) -> Result<String> {
+    apply_cancellable(
+        filter_source,
+        input_json,
+        steps,
+        vars,
+        &AtomicBool::new(false),
+    )
 }
 
 /// Runs a jq filter while allowing a caller that owns the evaluation worker
@@ -60,18 +73,24 @@ pub(crate) fn apply_cancellable(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,
+    vars: &Steps,
     cancelled: &AtomicBool,
 ) -> Result<String> {
     check_cancelled(cancelled)?;
     let mut output = OutputWriter::new(Some(cancelled));
-    run_filter_with(filter_source, input_json, steps, Some(cancelled), |value| {
-        output.render(filter_source, &value)
-    })?;
+    run_filter_with(
+        filter_source,
+        input_json,
+        steps,
+        vars,
+        Some(cancelled),
+        |value| output.render(filter_source, &value),
+    )?;
     output.finish(filter_source)
 }
 
 /// Shared scaffolding for the three `*_cancellable_async` entry points below:
-/// owns the input/steps so the operation can run on a dedicated blocking
+/// owns the input/steps/vars so the operation can run on a dedicated blocking
 /// worker, normalizes the input once inside that worker (so parsing a large
 /// plain-text input cannot monopolize a Tokio executor thread before the
 /// worker gets a chance to observe cancellation), then delegates to the
@@ -80,20 +99,22 @@ async fn run_cancellable_async<T, F>(
     filter_source: &str,
     input: &str,
     steps: &Steps,
+    vars: &Steps,
     cancellation: Option<tokio_util::sync::CancellationToken>,
     op: F,
 ) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&str, &str, &Steps, &AtomicBool) -> Result<T> + Send + 'static,
+    F: FnOnce(&str, &str, &Steps, &Steps, &AtomicBool) -> Result<T> + Send + 'static,
 {
     let filter_source = filter_source.to_owned();
     let input = input.to_owned();
     let steps = steps.clone();
+    let vars = vars.clone();
     async_io::run_blocking(
         move |cancelled| {
             let input_json = normalize_input(&input)?;
-            op(&filter_source, &input_json, &steps, cancelled)
+            op(&filter_source, &input_json, &steps, &vars, cancelled)
         },
         cancellation,
     )
@@ -108,9 +129,18 @@ pub(crate) async fn apply_cancellable_async(
     filter_source: &str,
     input: &str,
     steps: &Steps,
+    vars: &Steps,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
-    run_cancellable_async(filter_source, input, steps, cancellation, apply_cancellable).await
+    run_cancellable_async(
+        filter_source,
+        input,
+        steps,
+        vars,
+        cancellation,
+        apply_cancellable,
+    )
+    .await
 }
 
 /// Runs a jq filter as a boolean condition on a bounded blocking worker.
@@ -118,12 +148,14 @@ pub(crate) async fn apply_bool_cancellable_async(
     filter_source: &str,
     input: &str,
     steps: &Steps,
+    vars: &Steps,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<bool> {
     run_cancellable_async(
         filter_source,
         input,
         steps,
+        vars,
         cancellation,
         apply_bool_cancellable,
     )
@@ -137,12 +169,14 @@ pub(crate) async fn apply_one_cancellable_async(
     filter_source: &str,
     input: &str,
     steps: &Steps,
+    vars: &Steps,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     run_cancellable_async(
         filter_source,
         input,
         steps,
+        vars,
         cancellation,
         apply_one_cancellable,
     )
@@ -153,8 +187,13 @@ pub(crate) async fn apply_one_cancellable_async(
 /// The filter must produce exactly one output value; that value is falsy iff
 /// it is JSON `false` or `null` (jq's own truthiness rules), truthy otherwise.
 #[cfg(test)]
-pub(crate) fn apply_bool(filter_source: &str, input_json: &str, steps: &Steps) -> Result<bool> {
-    apply_bool_inner(filter_source, input_json, steps, None)
+pub(crate) fn apply_bool(
+    filter_source: &str,
+    input_json: &str,
+    steps: &Steps,
+    vars: &Steps,
+) -> Result<bool> {
+    apply_bool_inner(filter_source, input_json, steps, vars, None)
 }
 
 /// Runs a jq filter that must produce exactly one JSON value (used by
@@ -162,8 +201,13 @@ pub(crate) fn apply_bool(filter_source: &str, input_json: &str, steps: &Steps) -
 /// rendered as proper JSON text even for a string output (no `jq -r`-style
 /// unquoting), and multiple outputs are rejected instead of newline-joined.
 #[cfg(test)]
-pub(crate) fn apply_one(filter_source: &str, input_json: &str, steps: &Steps) -> Result<String> {
-    apply_one_inner(filter_source, input_json, steps, None)
+pub(crate) fn apply_one(
+    filter_source: &str,
+    input_json: &str,
+    steps: &Steps,
+    vars: &Steps,
+) -> Result<String> {
+    apply_one_inner(filter_source, input_json, steps, vars, None)
 }
 
 /// Parses and compiles `filter_source` without running it against any input,
@@ -198,7 +242,7 @@ pub(crate) fn check_syntax(filter_source: &str) -> Result<()> {
         .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
     Compiler::default()
         .with_funs(funs)
-        .with_global_vars(["$steps"])
+        .with_global_vars(["$steps", "$vars"])
         .compile(modules)
         .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
     Ok(())
@@ -208,24 +252,27 @@ fn apply_bool_cancellable(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,
+    vars: &Steps,
     cancelled: &AtomicBool,
 ) -> Result<bool> {
-    apply_bool_inner(filter_source, input_json, steps, Some(cancelled))
+    apply_bool_inner(filter_source, input_json, steps, vars, Some(cancelled))
 }
 
 fn apply_one_cancellable(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,
+    vars: &Steps,
     cancelled: &AtomicBool,
 ) -> Result<String> {
-    apply_one_inner(filter_source, input_json, steps, Some(cancelled))
+    apply_one_inner(filter_source, input_json, steps, vars, Some(cancelled))
 }
 
 fn apply_bool_inner(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,
+    vars: &Steps,
     cancelled: Option<&AtomicBool>,
 ) -> Result<bool> {
     // Conditions do not return their value to the caller, but they still
@@ -236,6 +283,7 @@ fn apply_bool_inner(
         filter_source,
         input_json,
         steps,
+        vars,
         cancelled,
         "condition",
         |value, _| Ok(!matches!(value, Val::Null | Val::Bool(false))),
@@ -246,12 +294,14 @@ fn apply_one_inner(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,
+    vars: &Steps,
     cancelled: Option<&AtomicBool>,
 ) -> Result<String> {
     run_single_value(
         filter_source,
         input_json,
         steps,
+        vars,
         cancelled,
         "filter",
         |_, rendered| String::from_utf8(rendered).context("jq rendered output was not valid UTF-8"),
@@ -269,13 +319,14 @@ fn run_single_value<T>(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,
+    vars: &Steps,
     cancelled: Option<&AtomicBool>,
     label: &str,
     mut extract: impl FnMut(Val, Vec<u8>) -> Result<T>,
 ) -> Result<T> {
     let mut result = None;
     let mut count = 0usize;
-    run_filter_with(filter_source, input_json, steps, cancelled, |value| {
+    run_filter_with(filter_source, input_json, steps, vars, cancelled, |value| {
         count += 1;
         if count > 1 {
             bail!(
@@ -305,6 +356,7 @@ fn run_filter_with<F>(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,
+    vars: &Steps,
     cancelled: Option<&AtomicBool>,
     mut on_value: F,
 ) -> Result<()>
@@ -324,18 +376,9 @@ where
     validate_value_structure(&input)
         .context("jq input structure exceeds the configured memory limit")?;
     check_cancelled_opt(cancelled)?;
-    let steps_json = serde_json::to_string(steps)
-        .map_err(|error| anyhow!("failed to serialize named step outputs for '$steps': {error}"))?;
-    if steps_json.len() > MAX_INPUT_BYTES {
-        bail!(
-            "jq '$steps' data exceeds the configured limit of {} bytes",
-            MAX_INPUT_BYTES
-        );
-    }
-    let steps_val = read::parse_single(steps_json.as_bytes())
-        .map_err(|error| anyhow!("failed to parse named step outputs as JSON: {error}"))?;
-    validate_value_structure(&steps_val)
-        .context("jq '$steps' structure exceeds the configured memory limit")?;
+    let steps_val = parse_global_var(steps, "$steps")?;
+    check_cancelled_opt(cancelled)?;
+    let vars_val = parse_global_var(vars, "$vars")?;
     check_cancelled_opt(cancelled)?;
 
     let program = File {
@@ -357,12 +400,12 @@ where
     check_cancelled_opt(cancelled)?;
     let filter = Compiler::default()
         .with_funs(funs)
-        .with_global_vars(["$steps"])
+        .with_global_vars(["$steps", "$vars"])
         .compile(modules)
         .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
     check_cancelled_opt(cancelled)?;
 
-    let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([steps_val]));
+    let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([steps_val, vars_val]));
     for (output_count, result) in filter.id.run((ctx, input)).map(unwrap_valr).enumerate() {
         check_cancelled_opt(cancelled)?;
         if output_count >= MAX_OUTPUT_VALUES {
@@ -380,6 +423,26 @@ where
     }
     check_cancelled_opt(cancelled)?;
     Ok(())
+}
+
+/// Serializes a `Steps`-shaped global (`$steps` or `$vars`) and re-parses it
+/// as a jaq `Val`, bounding its size/structure the same way the jq input
+/// itself is bounded. `label` (`"$steps"`/`"$vars"`) names the global in the
+/// error text.
+fn parse_global_var(value: &Steps, label: &str) -> Result<Val> {
+    let json = serde_json::to_string(value)
+        .map_err(|error| anyhow!("failed to serialize {label} data: {error}"))?;
+    if json.len() > MAX_INPUT_BYTES {
+        bail!(
+            "jq '{label}' data exceeds the configured limit of {} bytes",
+            MAX_INPUT_BYTES
+        );
+    }
+    let parsed = read::parse_single(json.as_bytes())
+        .map_err(|error| anyhow!("failed to parse {label} data as JSON: {error}"))?;
+    validate_value_structure(&parsed)
+        .with_context(|| format!("jq '{label}' structure exceeds the configured memory limit"))?;
+    Ok(parsed)
 }
 
 fn validate_filter_source(filter_source: &str) -> Result<()> {
@@ -791,29 +854,42 @@ mod tests {
         Steps::new()
     }
 
+    fn no_vars() -> Steps {
+        Steps::new()
+    }
+
     fn steps_with(id: &str, value: serde_json::Value) -> Steps {
         let mut steps = Steps::new();
         steps.insert(id.to_owned(), value);
         steps
     }
 
+    fn vars_with(key: &str, value: serde_json::Value) -> Steps {
+        let mut vars = Steps::new();
+        vars.insert(key.to_owned(), value);
+        vars
+    }
+
     #[test]
     fn extracts_a_string_field_raw() {
         assert_eq!(
-            apply(".name", r#"{"name":"Alice"}"#, &no_steps()).unwrap(),
+            apply(".name", r#"{"name":"Alice"}"#, &no_steps(), &no_vars()).unwrap(),
             "Alice"
         );
     }
 
     #[test]
     fn extracts_a_number_field_as_json() {
-        assert_eq!(apply(".age", r#"{"age":30}"#, &no_steps()).unwrap(), "30");
+        assert_eq!(
+            apply(".age", r#"{"age":30}"#, &no_steps(), &no_vars()).unwrap(),
+            "30"
+        );
     }
 
     #[test]
     fn joins_multiple_outputs_with_newlines() {
         assert_eq!(
-            apply(".[]", r#"["a","b","c"]"#, &no_steps()).unwrap(),
+            apply(".[]", r#"["a","b","c"]"#, &no_steps(), &no_vars()).unwrap(),
             "a\nb\nc"
         );
     }
@@ -821,53 +897,53 @@ mod tests {
     #[test]
     fn renders_objects_and_arrays_as_compact_json() {
         assert_eq!(
-            apply("{n: .name}", r#"{"name":"Alice"}"#, &no_steps()).unwrap(),
+            apply("{n: .name}", r#"{"name":"Alice"}"#, &no_steps(), &no_vars()).unwrap(),
             r#"{"n":"Alice"}"#
         );
     }
 
     #[test]
     fn rejects_invalid_json_input() {
-        assert!(apply(".", "not json", &no_steps()).is_err());
+        assert!(apply(".", "not json", &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn rejects_invalid_filter_syntax() {
-        assert!(apply(".[", "{}", &no_steps()).is_err());
+        assert!(apply(".[", "{}", &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn reports_a_runtime_error_from_the_filter() {
-        assert!(apply(".foo.bar", "1", &no_steps()).is_err());
+        assert!(apply(".foo.bar", "1", &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn apply_bool_treats_false_and_null_as_falsy() {
-        assert!(!apply_bool(".flag", r#"{"flag":false}"#, &no_steps()).unwrap());
-        assert!(!apply_bool(".missing", "{}", &no_steps()).unwrap());
+        assert!(!apply_bool(".flag", r#"{"flag":false}"#, &no_steps(), &no_vars()).unwrap());
+        assert!(!apply_bool(".missing", "{}", &no_steps(), &no_vars()).unwrap());
     }
 
     #[test]
     fn apply_bool_treats_everything_else_as_truthy() {
-        assert!(apply_bool(".flag", r#"{"flag":true}"#, &no_steps()).unwrap());
-        assert!(apply_bool(".n", r#"{"n":0}"#, &no_steps()).unwrap());
-        assert!(apply_bool(".s", r#"{"s":""}"#, &no_steps()).unwrap());
+        assert!(apply_bool(".flag", r#"{"flag":true}"#, &no_steps(), &no_vars()).unwrap());
+        assert!(apply_bool(".n", r#"{"n":0}"#, &no_steps(), &no_vars()).unwrap());
+        assert!(apply_bool(".s", r#"{"s":""}"#, &no_steps(), &no_vars()).unwrap());
     }
 
     #[test]
     fn apply_bool_rejects_zero_outputs() {
-        assert!(apply_bool(".[]", "[]", &no_steps()).is_err());
+        assert!(apply_bool(".[]", "[]", &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn apply_bool_rejects_multiple_outputs() {
-        assert!(apply_bool(".[]", "[true, false]", &no_steps()).is_err());
+        assert!(apply_bool(".[]", "[true, false]", &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn apply_one_renders_a_string_output_as_quoted_json() {
         assert_eq!(
-            apply_one(".name", r#"{"name":"Alice"}"#, &no_steps()).unwrap(),
+            apply_one(".name", r#"{"name":"Alice"}"#, &no_steps(), &no_vars()).unwrap(),
             r#""Alice""#
         );
     }
@@ -875,30 +951,31 @@ mod tests {
     #[test]
     fn apply_one_renders_an_array_output_as_compact_json() {
         assert_eq!(
-            apply_one(".items", r#"{"items":[1,2,3]}"#, &no_steps()).unwrap(),
+            apply_one(".items", r#"{"items":[1,2,3]}"#, &no_steps(), &no_vars()).unwrap(),
             "[1,2,3]"
         );
     }
 
     #[test]
     fn apply_one_rejects_zero_outputs() {
-        assert!(apply_one(".[]", "[]", &no_steps()).is_err());
+        assert!(apply_one(".[]", "[]", &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn apply_one_rejects_multiple_outputs() {
-        assert!(apply_one(".[]", "[1, 2]", &no_steps()).is_err());
+        assert!(apply_one(".[]", "[1, 2]", &no_steps(), &no_vars()).is_err());
     }
 
     #[test]
     fn rejects_an_unbounded_number_of_outputs() {
-        let error = apply("range(0; 100001)", "null", &no_steps()).unwrap_err();
+        let error = apply("range(0; 100001)", "null", &no_steps(), &no_vars()).unwrap_err();
         assert!(error.to_string().contains("configured limit"));
     }
 
     #[test]
     fn apply_bool_rejects_a_stream_after_the_second_value() {
-        let error = apply_bool("range(0; 1000000000)", "null", &no_steps()).unwrap_err();
+        let error =
+            apply_bool("range(0; 1000000000)", "null", &no_steps(), &no_vars()).unwrap_err();
         assert!(
             error.to_string().contains("produced 2 outputs"),
             "unexpected jq error: {error:#}"
@@ -907,7 +984,7 @@ mod tests {
 
     #[test]
     fn apply_one_rejects_a_stream_after_the_second_value() {
-        let error = apply_one("range(0; 1000000000)", "null", &no_steps()).unwrap_err();
+        let error = apply_one("range(0; 1000000000)", "null", &no_steps(), &no_vars()).unwrap_err();
         assert!(
             error.to_string().contains("produced 2 outputs"),
             "unexpected jq error: {error:#}"
@@ -917,7 +994,7 @@ mod tests {
     #[test]
     fn rejects_rendered_output_larger_than_the_evaluation_limit() {
         let filter = format!("\"x\" * {}", super::MAX_RENDERED_BYTES + 1);
-        let error = apply(&filter, "null", &no_steps()).unwrap_err();
+        let error = apply(&filter, "null", &no_steps(), &no_vars()).unwrap_err();
         assert!(
             format!("{error:#}").contains("rendered output exceeds"),
             "unexpected jq error: {error:#}"
@@ -927,7 +1004,7 @@ mod tests {
     #[test]
     fn apply_one_rejects_rendered_output_larger_than_the_evaluation_limit() {
         let filter = format!("\"x\" * {}", super::MAX_RENDERED_BYTES + 1);
-        let error = apply_one(&filter, "null", &no_steps()).unwrap_err();
+        let error = apply_one(&filter, "null", &no_steps(), &no_vars()).unwrap_err();
         assert!(
             format!("{error:#}").contains("rendered output exceeds"),
             "unexpected jq error: {error:#}"
@@ -938,7 +1015,7 @@ mod tests {
     fn rejects_an_output_with_excessive_nesting() {
         let filter =
             (0..=super::MAX_VALUE_DEPTH).fold("null".to_owned(), |value, _| format!("[{value}]"));
-        let error = apply(&filter, "null", &no_steps()).unwrap_err();
+        let error = apply(&filter, "null", &no_steps(), &no_vars()).unwrap_err();
         assert!(
             error.to_string().contains("nesting limit"),
             "unexpected jq error: {error:#}"
@@ -948,7 +1025,7 @@ mod tests {
     #[test]
     fn rejects_input_larger_than_the_evaluation_limit() {
         let input = format!("\"{}\"", "x".repeat(super::MAX_INPUT_BYTES));
-        let error = apply(".", &input, &no_steps()).unwrap_err();
+        let error = apply(".", &input, &no_steps(), &no_vars()).unwrap_err();
         assert!(error.to_string().contains("input exceeds"));
     }
 
@@ -956,7 +1033,7 @@ mod tests {
     fn apply_can_reference_a_named_step_output_via_dollar_steps() {
         let steps = steps_with("extract", serde_json::json!({"city": "Tokyo"}));
         assert_eq!(
-            apply("$steps.extract.city", "null", &steps).unwrap(),
+            apply("$steps.extract.city", "null", &steps, &no_vars()).unwrap(),
             "Tokyo"
         );
     }
@@ -964,12 +1041,32 @@ mod tests {
     #[test]
     fn apply_bool_can_reference_a_named_step_output_via_dollar_steps() {
         let steps = steps_with("check", serde_json::json!({"ok": true}));
-        assert!(apply_bool("$steps.check.ok", "null", &steps).unwrap());
+        assert!(apply_bool("$steps.check.ok", "null", &steps, &no_vars()).unwrap());
     }
 
     #[test]
     fn dollar_steps_is_an_empty_object_when_no_step_output_is_recorded() {
-        assert_eq!(apply("$steps", "null", &no_steps()).unwrap(), "{}");
+        assert_eq!(
+            apply("$steps", "null", &no_steps(), &no_vars()).unwrap(),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn apply_can_reference_a_var_via_dollar_vars() {
+        let vars = vars_with("lang", serde_json::json!("英語"));
+        assert_eq!(
+            apply("$vars.lang", "null", &no_steps(), &vars).unwrap(),
+            "英語"
+        );
+    }
+
+    #[test]
+    fn dollar_vars_is_an_empty_object_when_no_var_is_set() {
+        assert_eq!(
+            apply("$vars", "null", &no_steps(), &no_vars()).unwrap(),
+            "{}"
+        );
     }
 
     #[test]
@@ -980,6 +1077,11 @@ mod tests {
     #[test]
     fn check_syntax_accepts_a_filter_that_references_dollar_steps() {
         assert!(super::check_syntax("$steps.extract.city").is_ok());
+    }
+
+    #[test]
+    fn check_syntax_accepts_a_filter_that_references_dollar_vars() {
+        assert!(super::check_syntax("$vars.lang").is_ok());
     }
 
     #[test]

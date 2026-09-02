@@ -546,7 +546,8 @@ async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
-    let env = AppContext::new(Arc::clone(&file_config));
+    let vars = workflow::build_vars(&run_args.var.var)?;
+    let env = AppContext::new(Arc::clone(&file_config)).with_vars(vars);
     let initial_prompt = prompt.clone();
     let StepsOutcome {
         output: current_input,

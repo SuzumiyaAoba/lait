@@ -65,6 +65,25 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
     Ok(workflow)
 }
 
+/// Builds the `vars` object a `lait run --var KEY=VALUE` invocation exposes
+/// to step templates as `{{ vars.<key> }}` and to jq filters as
+/// `$vars.<key>` (see `engine::AppContext::vars`). Unlike a named prompt's
+/// `--var` (`prompt::build_vars`, always a string), each VALUE is parsed as
+/// JSON when possible — `--var items='["a","b"]'` becomes a structured
+/// array/object rather than its literal text — falling back to a plain JSON
+/// string otherwise, so `--var lang=ja` still renders as `ja`. A later
+/// `--var` for the same key wins.
+pub(crate) fn build_vars(
+    cli_vars: &[String],
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut vars = serde_json::Map::new();
+    for raw in cli_vars {
+        let (key, value) = crate::prompt::parse_var(raw)?;
+        vars.insert(key, crate::template::parse_input(&value));
+    }
+    Ok(vars)
+}
+
 /// Named step outputs recorded by `id` while a workflow runs, exposed to
 /// prompts as `{{ steps.<id> }}` and to jq filters (`when`/`jq`/`switch`
 /// cases/`loop` conditions/`for_each.items`/every `join`) as the `$steps`
@@ -77,14 +96,16 @@ pub(crate) type StepOutputs = jq::Steps;
 /// bounded blocking worker. Input coercion/serialization is performed by the
 /// worker as well, so a very large plain-text input cannot block a Tokio
 /// executor thread before jq starts evaluating it. `steps` is exposed to the
-/// filter as `$steps` (see `StepOutputs`).
+/// filter as `$steps` (see `StepOutputs`), `vars` as `$vars` (see
+/// `engine::AppContext::vars`).
 pub(crate) async fn eval_when_async(
     filter: &str,
     current_input: &str,
     steps: &StepOutputs,
+    vars: &StepOutputs,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<bool> {
-    jq::apply_bool_cancellable_async(filter, current_input, steps, cancellation)
+    jq::apply_bool_cancellable_async(filter, current_input, steps, vars, cancellation)
         .await
         .context("failed to evaluate 'when' condition")
 }
@@ -96,5 +117,6 @@ pub(crate) fn eval_when(filter: &str, current_input: &str, steps: &StepOutputs) 
     let value = template::parse_input(current_input);
     let input_json = serde_json::to_string(&value)
         .context("failed to serialize the current input for a 'when' condition")?;
-    jq::apply_bool(filter, &input_json, steps).context("failed to evaluate 'when' condition")
+    jq::apply_bool(filter, &input_json, steps, &StepOutputs::new())
+        .context("failed to evaluate 'when' condition")
 }
