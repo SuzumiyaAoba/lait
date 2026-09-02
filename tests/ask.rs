@@ -114,7 +114,10 @@ steps:
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("choices"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("which is not one of its 'choices'"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

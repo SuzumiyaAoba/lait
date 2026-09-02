@@ -82,7 +82,9 @@ fn reject_step_id_node_collision(step: &FlowStep, nodes: &NodeMap, label: &str) 
 /// branch boundary (concurrently running branches can't share a single loop's
 /// break target, so entering a branch resets it). `in_parallel_branch` marks
 /// any depth inside a `parallel` branch, since there is no well-defined "the
-/// workflow" to `stop` while sibling branches may still be running.
+/// workflow" to `stop` while sibling branches may still be running; it also
+/// gates `type: ask`, since concurrently running branches reading the same
+/// stdin cannot be told apart.
 /// `in_concurrent_for_each` marks depth inside a `for_each` body whose
 /// `max_concurrency` is above 1: unlike a `parallel` branch (a distinct,
 /// separately-authored step list per branch), every concurrently running item
