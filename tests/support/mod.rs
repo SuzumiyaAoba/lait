@@ -229,6 +229,16 @@ impl MockServer {
     /// body)` pair) and recording every request it received. Used to test
     /// retry: e.g. `&[("500 Internal Server Error", "..."), ("200 OK", "...")]`
     /// simulates one transient failure followed by a success.
+    ///
+    /// Tolerates *more* connections than `responses.len()` — an HTTP-level
+    /// retry (see `llm::complete_with_retry`) attempting again after the
+    /// last configured response, most notably — by repeating the last
+    /// response for each one, on a background thread `finish()` never joins
+    /// (so a test that never sends an extra connection isn't slowed down
+    /// waiting for one that never arrives). A test that wants to assert on
+    /// the exact number of connections still can, by calling
+    /// `receive_request()` exactly `responses.len()` times: extras are
+    /// still recorded on the same channel, just never required.
     pub(crate) fn start_sequence(responses: &[(&str, &str)]) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
         let address = listener
@@ -239,21 +249,28 @@ impl MockServer {
             .iter()
             .map(|(status, body)| ((*status).to_owned(), (*body).to_owned()))
             .collect();
+        let last_response = responses.last().cloned();
 
         let thread = thread::spawn(move || {
-            for (status, response_body) in responses {
+            for (status, response_body) in &responses {
                 let (mut stream, _) = listener.accept()?;
                 let request = read_request(&mut stream)?;
                 request_sender
                     .send(request)
                     .map_err(|_| io::Error::other("test receiver was dropped"))?;
+                write_response(&mut stream, status, response_body)?;
+            }
 
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                    response_body.len(),
-                );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+            if let Some((status, response_body)) = last_response {
+                thread::spawn(move || {
+                    while let Ok((mut stream, _)) = listener.accept() {
+                        let Ok(request) = read_request(&mut stream) else {
+                            continue;
+                        };
+                        let _ = request_sender.send(request);
+                        let _ = write_response(&mut stream, &status, &response_body);
+                    }
+                });
             }
             Ok(())
         });
@@ -359,6 +376,18 @@ impl MockServer {
             .expect("mock server thread panicked")
             .expect("mock server failed");
     }
+}
+
+/// Writes a canned `status`/`response_body` HTTP response to `stream`,
+/// shared by every `MockServer` constructor that replies with a fixed JSON
+/// body.
+fn write_response(stream: &mut TcpStream, status: &str, response_body: &str) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+        response_body.len(),
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
 }
 
 pub(crate) fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
