@@ -3866,6 +3866,11 @@ steps:
         "request body: {}",
         request.body
     );
+    assert!(
+        !request.body.contains("\"ja\""),
+        "request body: {}",
+        request.body
+    );
 }
 
 #[test]

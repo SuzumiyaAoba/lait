@@ -160,5 +160,9 @@ frontmatter → ワークフローの `default:` の順に、それぞれ独立�
 さらに、ワークフロー内で `id` を持つ他のステップの出力は、エージェントのシステムプロンプトから
 も `{{ steps.<id> }}` として参照できます（詳細は
 [ワークフロー（workflow.yml）](./workflow.md#ステップ間の値の受け渡し-stepsid---steps) を参照）。
+同様に `lait run --var KEY=VALUE` で渡した値も `{{ vars.<key> }}` として参照できます（詳細は
+[ワークフロー（workflow.yml）](./workflow.md#追加パラメータの受け渡し-lait-run---var--vars-key---vars) を参照）。
+これはワークフローのステップとして呼び出された場合に限ります（`lait agent run` から直接
+実行したときや、サブエージェントとして呼び出されたときは `vars` は空です）。
 
 関連: [ワークフロー（workflow.yml）](./workflow.md)、[サブエージェントを使う](./subagents.md)
