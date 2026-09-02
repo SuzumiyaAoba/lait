@@ -83,7 +83,7 @@ nodes:
 steps:
   - switch:
       cases:
-        - id: yes
+        - id: flagged
           when: ".flag"
           steps:
             - use: a
@@ -103,7 +103,7 @@ steps:
     assert!(output.status.success(), "lait graph failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("switch"), "stdout: {stdout}");
-    assert!(stdout.contains("yes: .flag"), "stdout: {stdout}");
+    assert!(stdout.contains("flagged: .flag"), "stdout: {stdout}");
     assert!(stdout.contains("else"), "stdout: {stdout}");
 }
 
@@ -136,7 +136,9 @@ steps:
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("loop: while .continue"), "stdout: {stdout}");
     assert!(stdout.contains("max_iterations: 5"), "stdout: {stdout}");
-    assert!(stdout.contains("subgraph"), "stdout: {stdout}");
+    // Mermaid's subgraph grammar is `subgraph id[title]` — a bare quoted
+    // title with no id is only accepted by some renderers.
+    assert!(stdout.contains("subgraph sg0["), "stdout: {stdout}");
     assert!(stdout.contains("loop body"), "stdout: {stdout}");
 }
 

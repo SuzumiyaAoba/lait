@@ -358,9 +358,13 @@ fn render_mermaid(model: &GraphModel) -> String {
         };
         out.push_str(&rendered);
     }
-    for subgraph in &model.subgraphs {
+    for (index, subgraph) in model.subgraphs.iter().enumerate() {
+        // Mermaid's subgraph grammar is `subgraph id [title]` — a bare
+        // quoted title with no id is accepted by some renderers and not
+        // others, so give every subgraph its own synthetic id the same way
+        // every node gets one.
         out.push_str(&format!(
-            "    subgraph \"{}\"\n",
+            "    subgraph sg{index}[\"{}\"]\n",
             mermaid_escape(&subgraph.title)
         ));
         for id in &subgraph.node_ids {
