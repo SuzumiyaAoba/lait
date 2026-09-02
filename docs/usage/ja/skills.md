@@ -94,6 +94,7 @@ skills: [code-review]
 # workflow.yml
 nodes:
   review:
+    type: prompt
     prompt: "{{ input }} をレビューしてください。"
     skills: [code-review, style-guide]
 ```

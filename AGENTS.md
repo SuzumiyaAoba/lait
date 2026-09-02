@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-This repository is primarily a Rust 2024 CLI (Rust 1.88, stable). `src/main.rs` is the module root; feature modules live in `src/`, with workflow parsing and validation under `src/workflow/`. Rust integration tests are in `tests/`, and `tests/support/` provides temporary-file fixtures and mock OpenAI-compatible servers. Japanese user documentation is in `docs/usage/ja/`. The `website/` directory is an Astro/Starlight TypeScript site; follow its existing `website/AGENTS.md` instructions for any work there. Configuration and development metadata are in `Cargo.toml`, `Makefile.toml`, `rust-toolchain.toml`, `lait.config.yml`, and `scripts/`.
+This repository is primarily a Rust 2024 CLI (Rust 1.88, stable). `src/main.rs` is the module root; feature modules live in `src/`, with workflow parsing and validation under `src/workflow/`. Rust integration tests are in `tests/`, and `tests/support/` provides temporary-file fixtures and mock OpenAI-compatible servers. Japanese user documentation is in `docs/usage/ja/` — this is the single source of truth; edit it, never the generated copy. The `website/` directory is an Astro/Starlight TypeScript site whose doc pages are generated from `docs/usage/ja/` by `website/scripts/sync-docs.mjs` (run `pnpm sync-docs` after editing docs, or just `pnpm build`/`pnpm dev`, which run it automatically); follow its existing `website/AGENTS.md` instructions for any other work there. Configuration and development metadata are in `Cargo.toml`, `Makefile.toml`, `rust-toolchain.toml`, `lait.config.yml`, and `scripts/`.
 
 ## Build, Test, and Development Commands
 
@@ -11,10 +11,10 @@ Run these from the repository root:
 ```sh
 cargo run -- --help
 cargo check --locked
-cargo test --all-features --locked
+cargo test --locked
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo build --release --all-features --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
 ```
 
 `makers run|check|test|fmt-check|clippy|build` provides the corresponding cargo-make tasks; its wrapper configures Apple Clang and the macOS SDK when needed. For the documentation site, use `cd website && pnpm dev`, `pnpm build`, `pnpm preview`, or `pnpm types:check`.
@@ -33,4 +33,4 @@ Use the history’s Conventional Commit-style prefixes (`feat:`, `fix:`, `refact
 
 ## Security and Configuration
 
-Keep API keys in environment variables or an untracked `.env`; the root `.gitignore` does not ignore `.env`, so never commit secrets. Config files support `${VAR_NAME}` expansion, and `--no-env`/`--no-config` can disable local loading. Treat `mcp_servers` entries as trusted code: they may launch child processes or connect to remote URLs, and credentials must not be hard-coded.
+Keep API keys in environment variables or an untracked `.env`; the root `.gitignore` already ignores `.env`/`.env.*`, but double-check before committing config files that embed secrets directly. `lait.config.yml`'s top-level `base_url`/`api_key`, `models[].provider.*`, and `mcp_servers[]` (`command`/`args`/`env`/`cwd`/`url`/`headers`) support `${VAR_NAME}` expansion — other fields (prompt templates, `default.system`, workflow `prompt:`/`system_prompt:`) do not. `--no-env`/`--no-config` can disable local loading. Treat `mcp_servers` entries as trusted code: they may launch child processes or connect to remote URLs, and credentials must not be hard-coded.

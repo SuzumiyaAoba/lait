@@ -1,8 +1,6 @@
 mod support;
 
-use support::{
-    ConfigDirectory, MockServer, run_lait_with_stream, test_command, without_json_whitespace,
-};
+use support::{ConfigDirectory, LaitCommand, MockServer, test_command, without_json_whitespace};
 
 #[test]
 fn streams_content_deltas_to_stdout() {
@@ -12,7 +10,12 @@ fn streams_content_deltas_to_stdout() {
         r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"content":"world!"},"finish_reason":null}]}"#,
         r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
     ]);
-    let output = run_lait_with_stream(Some(&server.base_url), Some("test-key"), "hello", false);
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .api_key(Some("test-key"))
+        .arg("--stream")
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -33,7 +36,11 @@ fn streams_reasoning_before_content_only_when_show_reasoning_is_set() {
     ];
 
     let server = MockServer::start_stream(&events);
-    let output = run_lait_with_stream(Some(&server.base_url), None, "hello", false);
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .arg("--stream")
+        .prompt("hello")
+        .run();
     server.receive_request();
     server.finish();
 
@@ -41,7 +48,12 @@ fn streams_reasoning_before_content_only_when_show_reasoning_is_set() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "answer");
 
     let server = MockServer::start_stream(&events);
-    let output = run_lait_with_stream(Some(&server.base_url), None, "hello", true);
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .arg("--stream")
+        .flag_if("--show-reasoning", true)
+        .prompt("hello")
+        .run();
     server.receive_request();
     server.finish();
 
@@ -57,7 +69,11 @@ fn fails_when_the_stream_never_produces_content() {
     let server = MockServer::start_stream(&[
         r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
     ]);
-    let output = run_lait_with_stream(Some(&server.base_url), None, "hello", false);
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .arg("--stream")
+        .prompt("hello")
+        .run();
     server.receive_request();
     server.finish();
 

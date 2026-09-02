@@ -1,12 +1,12 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 
 use crate::{async_io, config, frontmatter};
 
@@ -43,7 +43,7 @@ fn resolve_skill_file_path(configured_path: &Path) -> PathBuf {
 async fn load_skill(
     name: &str,
     configured_path: &Path,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<SkillFile> {
     let configured_path = configured_path.to_owned();
     let name = name.to_owned();
@@ -113,31 +113,32 @@ fn format_skill(skill: &SkillFile) -> String {
 /// course of one `lait run`/`lait agent run`/chat invocation, so every
 /// `render()` call after the first for a given name reuses this instead of
 /// re-reading and re-parsing the file (which a `for_each`/`loop` node with
-/// `skills:` set would otherwise do on every iteration). The first miss now
-/// awaits a cancellable async_io worker. Cache borrows are copied into an
-/// `Option` before that await, and insertion happens only afterward, so a
-/// plain `RefCell` remains safe when `parallel:`/`for_each:` branches race
-/// within the same task. Two simultaneous misses may both read the same file,
-/// but neither can observe a borrow across an await; the later result simply
-/// replaces the equivalent cached section. The cached value is an `Rc<String>`
-/// rather than a bare `String` so a cache hit is a refcount bump, not a clone of
-/// the skill's Markdown body.
-pub(crate) struct SkillCache<'a> {
-    skills_map: &'a config::SkillMap,
-    sections: RefCell<HashMap<String, Rc<String>>>,
+/// `skills:` set would otherwise do on every iteration). Each name gets its
+/// own `OnceCell`: the outer `Mutex` is only ever held long enough to fetch
+/// or insert that cell (never across an await), and the cell's own
+/// `get_or_try_init` — not a check-then-insert on the map — is what makes
+/// concurrent `parallel:`/`for_each:` branches requesting the same name for
+/// the first time share one load instead of two racing ones. The cached
+/// value is an `Arc<String>` rather than a bare `String` so a cache hit is a
+/// refcount bump, not a clone of the skill's Markdown body; `Arc` (not `Rc`)
+/// because a `SkillCache` is shared across `tokio::spawn`ed tasks (`parallel`/
+/// concurrent `for_each` — see `engine::AppContext`), which requires `Send`.
+pub(crate) struct SkillCache {
+    skills_map: Arc<config::SkillMap>,
+    sections: Mutex<HashMap<String, Arc<OnceCell<Arc<String>>>>>,
 }
 
-impl<'a> SkillCache<'a> {
-    pub(crate) fn new(skills_map: &'a config::SkillMap) -> Self {
+impl SkillCache {
+    pub(crate) fn new(skills_map: Arc<config::SkillMap>) -> Self {
         Self {
             skills_map,
-            sections: RefCell::new(HashMap::new()),
+            sections: Mutex::new(HashMap::new()),
         }
     }
 
     /// Renders `names` (a resolved `skills:` list, already merged through
     /// every fallback layer) into the block of text appended to a completion
-    /// request's system prompt — see `app::with_skills`. Returns `None` when
+    /// request's system prompt — see `engine::with_skills`. Returns `None` when
     /// `names` is empty, so a request that never turns on skills pays no
     /// cost. Each name is resolved against `skills_map` (`lait.config.yml`'s
     /// top-level `skills:`) here, at request time, not at workflow/agent-file
@@ -153,14 +154,14 @@ impl<'a> SkillCache<'a> {
     pub(crate) async fn render(
         &self,
         names: &[String],
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Option<String>> {
         if names.is_empty() {
             return Ok(None);
         }
         if cancellation
             .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
             anyhow::bail!("skill rendering was cancelled");
         }
@@ -181,44 +182,60 @@ impl<'a> SkillCache<'a> {
     async fn section(
         &self,
         name: &str,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Rc<String>> {
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Arc<String>> {
         if cancellation
             .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
             anyhow::bail!("skill rendering was cancelled");
         }
-        let cached = self.sections.borrow().get(name).cloned();
-        if let Some(cached) = cached {
-            return Ok(cached);
-        }
-        let configured_path = self.skills_map.get(name).ok_or_else(|| {
-            anyhow!(
-                "unknown skill '{name}'; define it under 'skills:' in {}",
-                config::CONFIG_FILE_NAME
-            )
-        })?;
-        let read_cancellation = cancellation.clone();
-        let skill = load_skill(name, configured_path, cancellation).await?;
-        if read_cancellation
-            .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
-        {
-            anyhow::bail!("skill rendering was cancelled");
-        }
-        let section = Rc::new(format_skill(&skill));
-        self.sections
-            .borrow_mut()
-            .insert(name.to_owned(), Rc::clone(&section));
-        Ok(section)
+        let cell = Arc::clone(
+            self.sections
+                .lock()
+                .expect("skill cache lock should not be poisoned")
+                .entry(name.to_owned())
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        );
+        // Only the caller that actually wins the race to initialize `cell`
+        // runs this closure — every other concurrent caller for the same
+        // name just awaits its result, never reaching its own cancellation
+        // checks below. Race the whole `get_or_try_init` against this call's
+        // own `cancellation` too, so a losing (non-initializing) caller can
+        // still bail out promptly on its own token instead of being stuck
+        // waiting on a load it isn't driving.
+        let init_cancellation = cancellation.clone();
+        let init = cell.get_or_try_init(|| async {
+            let configured_path = self.skills_map.get(name).ok_or_else(|| {
+                anyhow!(
+                    "unknown skill '{name}'; define it under 'skills:' in {}",
+                    config::CONFIG_FILE_NAME
+                )
+            })?;
+            let read_cancellation = init_cancellation.clone();
+            let skill = load_skill(name, configured_path, init_cancellation).await?;
+            if read_cancellation
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                anyhow::bail!("skill rendering was cancelled");
+            }
+            Ok::<_, anyhow::Error>(Arc::new(format_skill(&skill)))
+        });
+        let section = match async_io::await_cancellation(init, cancellation).await {
+            async_io::CancellationResult::Completed(result) => result?,
+            async_io::CancellationResult::Cancelled => {
+                anyhow::bail!("skill rendering was cancelled");
+            }
+        };
+        Ok(Arc::clone(section))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{SkillCache, parse_skill};
-    use std::{collections::HashMap, fs, time::Duration};
+    use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
     #[test]
     fn parses_frontmatter_and_body() {
@@ -251,14 +268,14 @@ mod tests {
     #[tokio::test]
     async fn render_returns_none_for_an_empty_name_list() {
         let skills_map = HashMap::new();
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
         assert!(cache.render(&[], None).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn render_errors_on_an_unknown_skill_name() {
         let skills_map = HashMap::new();
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
         let error = cache
             .render(&["missing".to_owned()], None)
             .await
@@ -274,7 +291,7 @@ mod tests {
         fs::write(&path, contents).unwrap();
         let mut skills_map = HashMap::new();
         skills_map.insert("large".to_owned(), path.clone());
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
 
         let error = cache.render(&["large".to_owned()], None).await.unwrap_err();
         assert!(
@@ -295,15 +312,15 @@ mod tests {
         assert!(status.success());
         let mut skills_map = HashMap::new();
         skills_map.insert("blocked".to_owned(), path.clone());
-        let cache = SkillCache::new(&skills_map);
+        let cache = SkillCache::new(Arc::new(skills_map));
         let names = ["blocked".to_owned()];
-        let (sender, receiver) = tokio::sync::watch::channel(false);
-        let mut render = Box::pin(cache.render(&names, Some(receiver)));
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut render = Box::pin(cache.render(&names, Some(token.clone())));
 
         tokio::select! {
             result = &mut render => panic!("FIFO skill unexpectedly returned: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                sender.send(true).unwrap();
+                token.cancel();
             }
         }
         let result = tokio::time::timeout(Duration::from_secs(1), render)
@@ -311,6 +328,56 @@ mod tests {
             .expect("FIFO skill cancellation should finish promptly")
             .unwrap_err();
         assert!(result.to_string().contains("cancel"), "error: {result}");
+        let _ = fs::remove_file(path);
+    }
+
+    /// Regression test for the `OnceCell`-per-name cache (see `SkillCache`'s
+    /// doc comment): only the first caller for a given name actually runs
+    /// the load and its own cancellation checks — every other concurrent
+    /// caller just awaits that result. Confirms a losing (non-initializing)
+    /// caller still returns promptly on *its own* cancellation rather than
+    /// being stuck until the winning caller's load finishes (which, here,
+    /// never happens — the FIFO is never written to).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_waiter_can_cancel_while_the_first_is_still_loading() {
+        let path = crate::test_support::unique_temp_path("lait-test-skill-fifo-2", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut skills_map = HashMap::new();
+        skills_map.insert("blocked".to_owned(), path.clone());
+        let cache = SkillCache::new(Arc::new(skills_map));
+        let names = ["blocked".to_owned()];
+
+        // A token of its own that's never cancelled: this caller becomes the
+        // cell's initializer and blocks on the FIFO for the rest of the test
+        // (passing `None` here would skip `load_skill`'s wait-for-a-writer
+        // path entirely and return immediately instead).
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let mut first = Box::pin(cache.render(&names, Some(first_token)));
+        tokio::select! {
+            result = &mut first => panic!("first render unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut second = Box::pin(cache.render(&names, Some(token.clone())));
+        tokio::select! {
+            result = &mut second => panic!("second render unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                token.cancel();
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("a losing waiter's own cancellation should finish promptly")
+            .unwrap_err();
+        assert!(result.to_string().contains("cancel"), "error: {result}");
+
+        drop(first);
         let _ = fs::remove_file(path);
     }
 

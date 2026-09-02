@@ -8,9 +8,11 @@ use anyhow::{Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
-    app::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
-    config::{self, ConfigFile},
-    jq, schema, template, workflow,
+    cli::LintArgs,
+    config::{self, ConfigFile, ConfigSource},
+    jq,
+    nesting::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
+    schema, template, workflow,
 };
 
 /// How serious a `LintIssue` is. An `Error` names something that would fail
@@ -91,6 +93,62 @@ pub(crate) fn lint_file(path: &Path, config: Option<&ConfigFile>) -> Result<Lint
             path.display()
         ),
     }
+}
+
+/// Runs `lait lint <FILES>...`: statically checks every file in
+/// `lint_args.files` (see [`lint_file`]) and prints a per-file report to
+/// stdout. Synchronous, like `history::run`/`session::run` — every check is
+/// a local file read/parse, none of it needs the async runtime `app::run`
+/// otherwise sets up for a model request (see `app::needs_async_runtime`).
+/// Unlike `run_workflow`/`run_agent`, one bad file doesn't stop the rest:
+/// every file is linted and reported before this returns `Err` (which only
+/// happens if at least one file has an `Error`-level issue, so CI can rely
+/// on the exit code).
+pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
+    // Unlike `config::load_config`, which returns an empty `ConfigFile` both
+    // when `lait.config.yml` is absent/not found and when `--no-config` was
+    // passed, the linter needs to tell "absent/skipped" apart from "present
+    // but empty" so it can skip `mcp:`/`skills:` name checks (and say why)
+    // instead of reporting every referenced name as unknown.
+    let config_present = config::resolve_config_path(&config_source)?.is_some();
+    let file_config = config::load_config(&config_source)?;
+    let config = config_present.then_some(&file_config);
+
+    let mut failed_files = 0usize;
+    for file in &lint_args.files {
+        // `lint_file` only ever returns `Err` for a file whose type it can't
+        // determine (an unrecognized extension) — treated here as one more
+        // failure to report, not a reason to stop linting the rest of
+        // `lint_args.files`.
+        let report = match lint_file(file, config) {
+            Ok(report) => report,
+            Err(error) => {
+                println!("{}:", file.display());
+                println!("  error: {error:#}");
+                failed_files += 1;
+                continue;
+            }
+        };
+        if report.issues.is_empty() {
+            println!("{}: OK", report.file.display());
+            continue;
+        }
+        println!("{}:", report.file.display());
+        for issue in &report.issues {
+            println!("  {}: {}", issue.severity, issue.message);
+        }
+        if report.has_errors() {
+            failed_files += 1;
+        }
+    }
+
+    if failed_files > 0 {
+        bail!(
+            "{failed_files} of {} file(s) had errors",
+            lint_args.files.len()
+        );
+    }
+    Ok(())
 }
 
 /// Threaded through every check in one `lint_file` call: `config` is looked
@@ -261,6 +319,10 @@ fn walk_steps<'a>(
             walk_steps(&on_error.steps, used, issues);
         }
 
+        // Matched exhaustively (no `_` arm), like `validate_steps`' and
+        // `run_steps`' own matches on this same enum, so a new router kind
+        // fails to compile here until this function's traversal is updated
+        // for it too.
         match step.router() {
             Some(workflow::Router::Switch(switch)) => {
                 for case in &switch.cases {
@@ -320,84 +382,100 @@ fn lint_node(
 ) {
     let node_context = format!("node '{node_id}'");
 
-    if let Some(filter) = &node.jq {
+    if let Some(filter) = node.jq() {
         check_jq(filter, &format!("{node_context}: 'jq'"), issues);
     }
-    if let Some(prompt) = &node.prompt {
-        check_prompt_template(&node_context, "'prompt' template", prompt, issues);
-    }
-    if let Some(system_prompt) = &node.system_prompt {
-        check_prompt_template(
-            &node_context,
-            "'system_prompt' template",
-            system_prompt,
-            issues,
-        );
-    }
-    if let Some(argv) = &node.command {
-        if argv
-            .first()
-            .is_some_and(|program| program.trim().is_empty())
-        {
-            issues.push(LintIssue::error(format!(
-                "{node_context} has an empty 'command[0]' program; it must name an executable"
-            )));
-        }
-        for arg in argv {
-            check_prompt_template(&node_context, "'command' argument template", arg, issues);
-        }
-    }
-    if let Some(name_or_path) = &node.input_schema
-        && let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path)
-    {
-        issues.push(LintIssue::error(format!(
-            "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
-        )));
-    }
-    if let Some(name_or_path) = &node.output_schema {
-        if let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path) {
-            issues.push(LintIssue::error(format!(
-                "node '{node_id}' has an unresolvable 'output_schema': {error:#}"
-            )));
-        }
-        // `output_schema` implies a `schema_name` (the node's own, or the
-        // "structured_output" default) is sent as the Structured Outputs
-        // request's schema name — validated only at request time otherwise
-        // (see `schema::build_json_schema`).
-        let schema_name = node.schema_name.as_deref().unwrap_or("structured_output");
-        if let Err(error) = schema::validate_schema_name(schema_name) {
-            issues.push(LintIssue::error(format!(
-                "node '{node_id}' has an invalid 'schema_name': {error:#}"
-            )));
-        }
-    }
+    check_mcp_names(&node_context, node.mcp(), ctx, issues);
+    check_skill_names(&node_context, node.skills(), ctx, issues);
+    check_subagent_names(&node_context, node.subagents(), ctx, issues);
 
-    check_mcp_names(&node_context, node.mcp.as_deref(), ctx, issues);
-    check_skill_names(&node_context, node.skills.as_deref(), ctx, issues);
-    check_subagent_names(&node_context, node.subagents.as_deref(), ctx, issues);
-
-    if let Some(agent_path) = &node.agent {
-        // Matches `execute_step`: `agent:` is loaded as given, relative to
-        // the current working directory (unlike `workflow:`, which resolves
-        // against the workflow file's own directory) — see
-        // `NodeDefinition::agent`'s doc comment.
-        match agent::load_agent(agent_path) {
-            Ok(agent_file) => lint_agent_contents(
-                &format!("node '{node_id}''s agent"),
-                &agent_file,
+    match node {
+        workflow::NodeDefinition::Prompt(prompt) => {
+            if let Some(template) = &prompt.prompt {
+                check_prompt_template(&node_context, "'prompt' template", template, issues);
+            }
+            if let Some(system_prompt) = &prompt.system_prompt {
+                check_prompt_template(
+                    &node_context,
+                    "'system_prompt' template",
+                    system_prompt,
+                    issues,
+                );
+            }
+            if let Some(name_or_path) = &prompt.input_schema {
+                match schema::resolve_named_schema_value(json_schemas, name_or_path) {
+                    Ok(resolved) => check_unrecognized_schema_types(
+                        &format!("node '{node_id}''s 'input_schema'"),
+                        &resolved,
+                        issues,
+                    ),
+                    Err(error) => issues.push(LintIssue::error(format!(
+                        "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
+                    ))),
+                }
+            }
+            if let Some(name_or_path) = &prompt.output_schema {
+                if let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path) {
+                    issues.push(LintIssue::error(format!(
+                        "node '{node_id}' has an unresolvable 'output_schema': {error:#}"
+                    )));
+                }
+                // `output_schema` implies a `schema_name` (the node's own, or
+                // the "structured_output" default) is sent as the Structured
+                // Outputs request's schema name — validated only at request
+                // time otherwise (see `schema::build_json_schema`).
+                let schema_name = prompt.schema_name.as_deref().unwrap_or("structured_output");
+                if let Err(error) = schema::validate_schema_name(schema_name) {
+                    issues.push(LintIssue::error(format!(
+                        "node '{node_id}' has an invalid 'schema_name': {error:#}"
+                    )));
+                }
+            }
+        }
+        workflow::NodeDefinition::Agent(agent_node) => {
+            // Matches `execute_step`: `agent:` is loaded as given, relative
+            // to the current working directory (unlike `workflow:`, which
+            // resolves against the workflow file's own directory) — see
+            // `AgentNode::agent`'s doc comment.
+            match agent::load_agent(&agent_node.agent) {
+                Ok(agent_file) => lint_agent_contents(
+                    &format!("node '{node_id}''s agent"),
+                    &agent_file,
+                    ctx,
+                    issues,
+                ),
+                Err(error) => issues.push(LintIssue::error(format!(
+                    "node '{node_id}' has 'agent: {}' (resolved relative to the current working \
+                     directory, not this workflow file), which failed to load: {error:#}",
+                    agent_node.agent.display()
+                ))),
+            }
+        }
+        workflow::NodeDefinition::Workflow(workflow_node) => {
+            lint_sub_workflow(
+                node_id,
+                &workflow_node.workflow,
+                base_dir,
                 ctx,
                 issues,
-            ),
-            Err(error) => issues.push(LintIssue::error(format!(
-                "node '{node_id}' has 'agent: {}' (resolved relative to the current working \
-                 directory, not this workflow file), which failed to load: {error:#}",
-                agent_path.display()
-            ))),
+                visited,
+            );
         }
-    }
-
-    if let Some(sub_workflow_path) = &node.workflow {
-        lint_sub_workflow(node_id, sub_workflow_path, base_dir, ctx, issues, visited);
+        workflow::NodeDefinition::Command(command) => {
+            if command
+                .command
+                .first()
+                .is_some_and(|program| program.trim().is_empty())
+            {
+                issues.push(LintIssue::error(format!(
+                    "{node_context} has an empty 'command[0]' program; it must name an executable"
+                )));
+            }
+            for arg in &command.command {
+                check_prompt_template(&node_context, "'command' argument template", arg, issues);
+            }
+        }
+        workflow::NodeDefinition::Transform(_) => {}
     }
 }
 
@@ -430,9 +508,36 @@ fn check_schema_entry(
     issues: &mut Vec<LintIssue>,
 ) {
     let Some(entry) = entry else { return };
-    if let Err(error) = schema::load_schema_value(entry) {
-        issues.push(LintIssue::error(format!(
+    match schema::load_schema_value(entry) {
+        // Only `input_schema` is actually checked against the runtime input
+        // locally (`schema::validate_input_against_schema`) — `output_schema`
+        // is sent to the model as-is for Structured Outputs, so an
+        // unrecognized `type` there is the server's problem, not lait's.
+        Ok(resolved) if field == "input_schema" => {
+            check_unrecognized_schema_types(&format!("{context}'s '{field}'"), &resolved, issues);
+        }
+        Ok(_) => {}
+        Err(error) => issues.push(LintIssue::error(format!(
             "{context}'s '{field}' is invalid: {error:#}"
+        ))),
+    }
+}
+
+/// Warns about every `type` keyword value in `schema` that isn't one of
+/// JSON Schema's recognized primitive type names (`schema::
+/// unrecognized_type_names`) — `validate_input_against_schema` silently
+/// treats an unrecognized name as matching any value, so a typo like
+/// `type: sting` would otherwise leave that field completely unchecked
+/// without any indication why.
+fn check_unrecognized_schema_types(
+    context: &str,
+    schema: &serde_json::Value,
+    issues: &mut Vec<LintIssue>,
+) {
+    for type_name in schema::unrecognized_type_names(schema) {
+        issues.push(LintIssue::warning(format!(
+            "{context} uses 'type: {type_name}', which is not a JSON Schema type lait recognizes; \
+             it will not be enforced (treated as matching any value)"
         )));
     }
 }
@@ -573,6 +678,37 @@ fn check_mcp_names(
         ctx,
         issues,
     );
+    check_mcp_allowed_tools_not_empty(context, names, ctx, issues);
+}
+
+/// Warns when a node/agent references an MCP server whose `allowed_tools`
+/// (see `McpRegistry::call`) is an explicit empty list — every tool call to
+/// it is unconditionally rejected at runtime, so referencing such a server
+/// at all is almost certainly a mistake. Distinct from
+/// `check_capability_names`'s unknown-name check above: this only fires for
+/// servers that *do* exist, and is a warning (not an error) since lait
+/// cannot know in advance which tool, if any, the model will actually try
+/// to call — an `allowed_tools` list that is merely non-empty could still
+/// reject some calls at runtime with no way to tell in advance.
+fn check_mcp_allowed_tools_not_empty(
+    context: &str,
+    names: Option<&[String]>,
+    ctx: &LintCtx,
+    issues: &mut Vec<LintIssue>,
+) {
+    let Some(names) = names else { return };
+    let Some(config) = ctx.config else { return };
+    for name in names {
+        if let Some(server) = config.mcp_servers.get(name)
+            && let Some(allowed_tools) = &server.allowed_tools
+            && allowed_tools.is_empty()
+        {
+            issues.push(LintIssue::warning(format!(
+                "{context} references MCP server '{name}', whose 'allowed_tools' in {} is an empty list; every tool call to it will be rejected at runtime",
+                config::CONFIG_FILE_NAME
+            )));
+        }
+    }
 }
 
 fn check_skill_names(
@@ -666,7 +802,7 @@ mod tests {
     #[test]
     fn warns_about_a_node_defined_but_never_used() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  used:\n    prompt: hi\n  unused:\n    prompt: hi\nsteps:\n  - use: used\n",
+            "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -683,7 +819,9 @@ mod tests {
 
     #[test]
     fn does_not_warn_when_every_node_is_used() {
-        let wf = parse_workflow_fixture("nodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n");
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
+        );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(issues.is_empty(), "{issues:?}");
     }
@@ -691,7 +829,7 @@ mod tests {
     #[test]
     fn counts_a_node_used_only_inside_a_switch_case_as_used() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\nsteps:\n  - switch:\n      cases:\n        - when: \".x\"\n          steps:\n            - use: a\n      else:\n        - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - switch:\n      cases:\n        - when: \".x\"\n          steps:\n            - use: a\n      else:\n        - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -705,7 +843,7 @@ mod tests {
     #[test]
     fn flags_an_invalid_jq_when_filter() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -719,7 +857,7 @@ mod tests {
     #[test]
     fn flags_an_invalid_jq_for_each_items_filter() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\nsteps:\n  - for_each:\n      items: \".[\"\n      steps:\n        - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - for_each:\n      items: \".[\"\n      steps:\n        - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -730,8 +868,9 @@ mod tests {
 
     #[test]
     fn flags_an_invalid_prompt_template() {
-        let wf =
-            parse_workflow_fixture("nodes:\n  a:\n    prompt: \"{{ input\"\nsteps:\n  - use: a\n");
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input\"\nsteps:\n  - use: a\n",
+        );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
             issues.iter().any(|issue| issue.severity == Severity::Error
@@ -743,7 +882,7 @@ mod tests {
     #[test]
     fn flags_an_invalid_command_argument_template() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    command: [\"echo\", \"{{ input\"]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: command\n    command: [\"echo\", \"{{ input\"]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -761,7 +900,7 @@ mod tests {
         // will be an object/array — see `template::check_syntax`'s doc
         // comment.
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: \"{{ input }}\"\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(issues.is_empty(), "{issues:?}");
@@ -770,7 +909,7 @@ mod tests {
     #[test]
     fn flags_an_unknown_mcp_server_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -793,10 +932,11 @@ mod tests {
                 cwd: None,
                 url: None,
                 headers: HashMap::new(),
+                allowed_tools: None,
             },
         );
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&config));
         assert!(
@@ -806,9 +946,38 @@ mod tests {
     }
 
     #[test]
+    fn flags_a_referenced_mcp_server_whose_allowed_tools_is_empty() {
+        let mut config = empty_config();
+        config.mcp_servers.insert(
+            "locked-down".to_owned(),
+            config::McpServerConfig {
+                command: Some("true".to_owned()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                url: None,
+                headers: HashMap::new(),
+                allowed_tools: Some(Vec::new()),
+            },
+        );
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [locked-down]\nsteps:\n  - use: a\n",
+        );
+        let issues = lint_fixture(&wf, Some(&config));
+        assert!(
+            issues.iter().any(|issue| {
+                issue.severity == Severity::Warning
+                    && issue.message.contains("locked-down")
+                    && issue.message.contains("allowed_tools")
+            }),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
     fn flags_an_unknown_skill_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    skills: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    skills: [nope]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -822,7 +991,7 @@ mod tests {
     #[test]
     fn flags_an_unknown_subagent_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    subagents: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [nope]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -840,7 +1009,7 @@ mod tests {
             .agents
             .insert("known".to_owned(), PathBuf::from("agents/known.md"));
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&config));
         assert!(
@@ -854,7 +1023,7 @@ mod tests {
     #[test]
     fn skips_mcp_and_skill_checks_and_notes_it_when_there_is_no_config() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
         );
         let mut ctx = LintCtx::new(None);
         let mut issues = Vec::new();
@@ -877,7 +1046,7 @@ mod tests {
     #[test]
     fn flags_an_unresolvable_output_schema_name() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    prompt: hi\n    output_schema: nonexistent.json\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: nonexistent.json\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -891,7 +1060,7 @@ mod tests {
     #[test]
     fn accepts_an_output_schema_name_defined_in_json_schemas() {
         let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
+            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -909,7 +1078,7 @@ mod tests {
         // trigger this — the invalid character has to actually be spelled
         // out in `schema_name`.
         let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    prompt: hi\n    output_schema: city\n    schema_name: \"bad name!\"\nsteps:\n  - use: a\n",
+            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\n    schema_name: \"bad name!\"\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -923,7 +1092,7 @@ mod tests {
     #[test]
     fn accepts_the_default_schema_name_when_none_is_set() {
         let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
+            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(
@@ -937,7 +1106,7 @@ mod tests {
     #[test]
     fn flags_a_missing_agent_file() {
         let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    agent: /nonexistent/agent-does-not-exist.md\nsteps:\n  - use: a\n",
+            "nodes:\n  a:\n    type: agent\n    agent: /nonexistent/agent-does-not-exist.md\nsteps:\n  - use: a\n",
         );
         let issues = lint_fixture(&wf, Some(&empty_config()));
         assert!(

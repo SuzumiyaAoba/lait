@@ -1,11 +1,75 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::cli::ReasoningEffort;
+use crate::cli::{Cli, ReasoningEffort};
 
 pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
+
+/// Where `load_config` should look for `lait.config.yml`, resolved once from
+/// `Cli`'s two mutually exclusive flags (`--config`/`--no-config`, enforced
+/// at the clap level via `conflicts_with`) rather than re-read from `Cli` at
+/// every one of the ten call sites that used to take a bare `no_config: bool`.
+#[derive(Clone, Debug)]
+pub(crate) enum ConfigSource {
+    /// Neither flag was given: search `CONFIG_FILE_NAME` starting at the
+    /// current directory and walking up through its ancestors (like git
+    /// looks for `.git`), falling back to [`ConfigFile::default`] if none is
+    /// found anywhere.
+    Search,
+    /// `--config PATH`: read exactly this file. Unlike `Search`, a missing
+    /// file here is an error — the user named a specific path, so silently
+    /// falling back to defaults would hide a typo.
+    Explicit(PathBuf),
+    /// `--no-config`: always [`ConfigFile::default`], no filesystem access.
+    Disabled,
+}
+
+impl From<&Cli> for ConfigSource {
+    fn from(cli: &Cli) -> Self {
+        if cli.no_config {
+            Self::Disabled
+        } else if let Some(path) = &cli.config {
+            Self::Explicit(path.clone())
+        } else {
+            Self::Search
+        }
+    }
+}
+
+/// Walks from `start` up through its ancestors (inclusive), returning the
+/// first directory that contains `CONFIG_FILE_NAME` — the same shape a `.git`
+/// search uses, so `lait` works from a project subdirectory the way `git`
+/// does. Ancestors are compared to the walk's own directories, never
+/// symlink-resolved, matching `Path::ancestors`'s usual (lexical) behavior.
+fn find_config_upward(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| dir.join(CONFIG_FILE_NAME))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Resolves `source` to a concrete file path to read, or `None` when there is
+/// none (`Disabled`, or `Search` that found nothing) — the information
+/// `lint::run` needs to tell "no config anywhere" from "found one" apart from
+/// [`load_config`]'s own `ConfigFile::default()` fallback, which looks the
+/// same in both cases.
+pub(crate) fn resolve_config_path(source: &ConfigSource) -> Result<Option<PathBuf>> {
+    match source {
+        ConfigSource::Disabled => Ok(None),
+        ConfigSource::Explicit(path) => Ok(Some(path.clone())),
+        ConfigSource::Search => {
+            let cwd = std::env::current_dir()
+                .context("failed to determine the current directory for configuration")?;
+            Ok(find_config_upward(&cwd))
+        }
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +164,15 @@ pub(crate) struct McpServerConfig {
     pub(crate) url: Option<String>,
     #[serde(default)]
     pub(crate) headers: HashMap<String, String>,
+    /// Restricts which of this server's tools the model may call. `None`
+    /// (the field omitted) means unrestricted — every tool the server
+    /// advertises is callable, matching lait's behavior before this field
+    /// existed. `Some(vec![])` (an explicit empty list) means the opposite:
+    /// no tool on this server may be called at all. These two are
+    /// deliberately distinguishable (hence `Option<Vec<_>>` rather than a
+    /// bare `Vec` defaulting to empty) — see `McpRegistry::call`, which
+    /// enforces this before ever opening a connection to the server.
+    pub(crate) allowed_tools: Option<Vec<String>>,
 }
 
 /// The transport settings for one MCP server, after resolving `${VAR}`
@@ -298,6 +371,48 @@ pub(crate) fn expand_env_placeholders(value: &str) -> Result<String> {
     expand_with(value, |name| std::env::var(name).ok())
 }
 
+pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+
+/// Resolves the endpoint a request goes to from the three layers every
+/// caller shares — explicit override > model-definition value > config
+/// top-level — falling back to `DEFAULT_BASE_URL`, normalizing the trailing
+/// slash, and rejecting an empty base URL. `${VAR}` placeholders are only
+/// expanded in the config-sourced layers (see `expand_env_placeholders`),
+/// never in an override, which the shell already expands on its own. The API
+/// key comes back as `None` when no layer sets one — `resolve_request_settings`
+/// substitutes its dummy key, `lait models --remote` sends no Authorization
+/// header at all.
+pub(crate) fn resolve_endpoint(
+    base_url_override: Option<String>,
+    api_key_override: Option<String>,
+    model_base_url: Option<&str>,
+    model_api_key: Option<&str>,
+    file_config: &ConfigFile,
+) -> Result<(String, Option<String>)> {
+    let model_base_url = model_base_url.map(expand_env_placeholders).transpose()?;
+    let config_base_url = file_config
+        .base_url
+        .as_deref()
+        .map(expand_env_placeholders)
+        .transpose()?;
+    let base_url = base_url_override
+        .or(model_base_url)
+        .or(config_base_url)
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let base_url = base_url.trim_end_matches('/').to_owned();
+    if base_url.is_empty() {
+        return Err(anyhow!("base URL must not be empty"));
+    }
+    let model_api_key = model_api_key.map(expand_env_placeholders).transpose()?;
+    let config_api_key = file_config
+        .api_key
+        .as_deref()
+        .map(expand_env_placeholders)
+        .transpose()?;
+    let api_key = api_key_override.or(model_api_key).or(config_api_key);
+    Ok((base_url, api_key))
+}
+
 /// The parsing logic behind `expand_env_placeholders`, taking a `lookup`
 /// function instead of reading `std::env` directly so it can be unit tested
 /// without touching real process environment variables (mutating those from
@@ -331,17 +446,22 @@ fn expand_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<S
     Ok(result)
 }
 
-pub(crate) fn load_config(no_config: bool) -> Result<ConfigFile> {
-    if no_config {
+pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
+    let Some(path) = resolve_config_path(source)? else {
         return Ok(ConfigFile::default());
-    }
+    };
 
-    let path = std::env::current_dir()
-        .context("failed to determine the current directory for configuration")?
-        .join(CONFIG_FILE_NAME);
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // `Search` found nothing and falls back to defaults (unchanged
+        // behavior); `Explicit` named this exact path, so a missing file
+        // here falls through to the `with_context` error below instead —
+        // the user asked for it by name, so silently using defaults would
+        // hide a typo.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !matches!(source, ConfigSource::Explicit(_)) =>
+        {
             return Ok(ConfigFile::default());
         }
         Err(error) => {
@@ -459,6 +579,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: HashMap::new(),
+            allowed_tools: None,
         }
     }
 
@@ -470,6 +591,7 @@ mod tests {
             cwd: None,
             url: Some(url.to_owned()),
             headers: HashMap::new(),
+            allowed_tools: None,
         }
     }
 
@@ -502,6 +624,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: HashMap::new(),
+            allowed_tools: None,
         };
         let error = config.resolve_transport("test").unwrap_err();
         assert!(error.to_string().contains("neither"));

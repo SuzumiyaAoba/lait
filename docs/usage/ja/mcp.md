@@ -56,6 +56,33 @@ mcp_servers:
 実際に `mcp:` で参照されたサーバーだけがその場で接続されます。未登録の名前を `mcp:` に書くと、
 `lait.config.yml` の `mcp_servers:` を案内するエラーになります。
 
+## 呼び出せるツールを制限する（`allowed_tools`）
+
+`mcp_servers:` の各サーバーは `mcp_servers.<name>.allowed_tools` の設定を持てます。省略時は
+無制限（そのサーバーが持つ全ツールをモデルが呼び出せる、この設定が存在する前と同じ挙動）です。
+一方、空リスト `[]` を明示すると「そのサーバーの全ツールを禁止」という意味になり、`null`/省略とは
+区別されます。
+
+```yaml
+mcp_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    allowed_tools: [read_file, list_directory]   # write_file 等はモデルから呼び出せない
+```
+
+この制限はツール一覧（`tools/list`）ではなく実行前（`tools/call` の直前）で強制されます。つまり
+`allowed_tools` に含まれないツールもモデルには見えたままですが、実際に呼び出そうとするとサーバー
+へ接続する前にエラーになり、そのモデルからの呼び出しは拒否されます。`lait.config.yml` の
+`mcp_servers` は AGENTS.md が言うとおり「信頼されたコード」として扱われますが、実際にどのツール
+を実行するかはモデルが選ぶため、`allowed_tools` はその選択に対するユーザー側のガードレールです。
+
+`lait lint` は、あるノード/エージェントファイルが `mcp:` で参照しているサーバーの
+`allowed_tools` が空リストの場合、警告を出します（そのサーバーへのツール呼び出しは実行前に
+必ず拒否されるため、参照していること自体がほぼ設定ミスだからです）。`allowed_tools` が空でない
+リストの場合は、モデルが実際にどのツールを呼び出すかを事前には知りようがないため、警告は出ません
+（実行時にそのつど拒否されるだけです）。
+
 ## 各経路での指定方法
 
 `mcp:`（使うサーバー名のリスト）と `max_tool_rounds:`（そのツール周回の上限回数、既定 8）は、
@@ -85,6 +112,7 @@ max_tool_rounds: 8
 # workflow.yml
 nodes:
   research:
+    type: prompt
     prompt: "{{ input }} について調べてください。"
     mcp: [filesystem, remote-search]
 ```

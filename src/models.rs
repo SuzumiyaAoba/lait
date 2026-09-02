@@ -8,12 +8,12 @@ use serde::Deserialize;
 
 use crate::{
     cli::ModelsArgs,
-    config::{self, ConfigFile, ResolvedModel},
+    config::{self, ConfigFile, ConfigSource, ResolvedModel},
     llm,
 };
 
-pub(crate) async fn run(args: ModelsArgs, no_config: bool) -> Result<()> {
-    let file_config = config::load_config(no_config)?;
+pub(crate) async fn run(args: ModelsArgs, config_source: ConfigSource) -> Result<()> {
+    let file_config = config::load_config(&config_source)?;
     if args.remote {
         list_remote(&args, &file_config).await
     } else {
@@ -23,8 +23,8 @@ pub(crate) async fn run(args: ModelsArgs, no_config: bool) -> Result<()> {
 
 /// The `--remote`-less path, callable without an async runtime — see
 /// `app::run_blocking`.
-pub(crate) fn run_local(args: ModelsArgs, no_config: bool) -> Result<()> {
-    let file_config = config::load_config(no_config)?;
+pub(crate) fn run_local(args: ModelsArgs, config_source: ConfigSource) -> Result<()> {
+    let file_config = config::load_config(&config_source)?;
     list_local(&args, &file_config)
 }
 
@@ -202,9 +202,9 @@ async fn list_remote(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> 
     // config), except model aliases play no part: `--remote` asks one
     // concrete server, and no API key means no Authorization header rather
     // than the completion path's dummy key.
-    let (base_url, api_key) = crate::app::resolve_endpoint(
-        args.base_url.clone(),
-        args.api_key.clone(),
+    let (base_url, api_key) = crate::config::resolve_endpoint(
+        args.endpoint.base_url.clone(),
+        args.endpoint.api_key.clone(),
         None,
         None,
         file_config,

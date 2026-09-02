@@ -46,7 +46,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::config;
+use crate::{
+    async_io::{CancellationResult, await_cancellation},
+    config,
+};
 
 /// Finite safety net for MCP handshakes, pagination requests, and tool calls.
 /// Workflow nodes may still impose a shorter existing `timeout:`; this keeps
@@ -80,56 +83,13 @@ const MAX_TOOL_METADATA_BYTES: usize = 16 * 1024 * 1024;
 /// distinct cursors.
 const MAX_TOOL_LIST_PAGES: usize = 128;
 
-type CancellationReceiver = tokio::sync::watch::Receiver<bool>;
-
-/// The outer workflow timeout may race an MCP future.  Keep cancellation as
-/// an explicit outcome so the caller can evict the exact cached connection
-/// before returning; simply dropping `RunningService::call_tool` leaves the
-/// server-side request in flight and makes a retry capable of duplicating a
-/// side effect.
-enum CancellationResult<T> {
-    Completed(T),
-    Cancelled,
-}
-
-async fn await_cancellation<F, T>(
-    future: F,
-    cancellation: Option<CancellationReceiver>,
-) -> CancellationResult<T>
-where
-    F: Future<Output = T>,
-{
-    let Some(mut cancellation) = cancellation else {
-        return CancellationResult::Completed(future.await);
-    };
-
-    let mut future = Box::pin(future);
-    loop {
-        if *cancellation.borrow() {
-            return CancellationResult::Cancelled;
-        }
-        tokio::select! {
-            biased;
-            result = &mut future => {
-                // Prefer cancellation even when the operation and the
-                // sender become ready in the same turn.  A timeout handler
-                // may already have started a cleanup/retry sequence by the
-                // time this branch is polled; returning the result would
-                // retain a connection whose request was part of that timed
-                // out attempt.
-                if *cancellation.borrow() {
-                    return CancellationResult::Cancelled;
-                }
-                return CancellationResult::Completed(result);
-            },
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    return CancellationResult::Cancelled;
-                }
-            }
-        }
-    }
-}
+/// The app-level "this run was cancelled" signal threaded down from
+/// `app.rs`, distinct from this module's own [`CancellationToken`] uses
+/// below (each of those represents one MCP I/O operation's own timeout, not
+/// the run as a whole). Kept as its own alias — rather than writing
+/// `CancellationToken` at each of these call sites — precisely so that
+/// distinction stays visible at a glance.
+type CancellationReceiver = CancellationToken;
 
 /// Completion state for a cleanup operation that is performed by another
 /// task.  `Notify` is paired with the atomic flag so a waiter cannot miss a
@@ -454,8 +414,8 @@ type ToolListCell = Arc<tokio::sync::OnceCell<Arc<Vec<Tool>>>>;
 /// completion request it makes — including concurrent ones (`parallel`/
 /// `for_each` branches), which is why connections are cached behind a
 /// `tokio::sync::Mutex`.
-pub(crate) struct McpRegistry<'a> {
-    servers: &'a config::McpServerMap,
+pub(crate) struct McpRegistry {
+    servers: Arc<config::McpServerMap>,
     connections: tokio::sync::Mutex<HashMap<String, ConnectionCellRef>>,
     /// Each server's `tools/list` result, cached for the registry's lifetime:
     /// a server's tool list doesn't change over the course of one `lait run`/
@@ -481,15 +441,15 @@ pub(crate) struct ToolSet {
 
 impl ToolSet {
     /// Whether `qualified_name` (as returned in `tools`) names a tool in this
-    /// set, used by `app::RequestSettings::complete` to route a model's tool
+    /// set, used by `engine::RequestSettings::complete` to route a model's tool
     /// call between this set and `subagent::ToolSet` when both are in play.
     pub(crate) fn contains(&self, qualified_name: &str) -> bool {
         self.index.contains_key(qualified_name)
     }
 }
 
-impl<'a> McpRegistry<'a> {
-    pub(crate) fn new(servers: &'a config::McpServerMap) -> Self {
+impl McpRegistry {
+    pub(crate) fn new(servers: Arc<config::McpServerMap>) -> Self {
         Self {
             servers,
             connections: tokio::sync::Mutex::new(HashMap::new()),
@@ -639,7 +599,7 @@ impl<'a> McpRegistry<'a> {
         if result.is_err()
             && cancellation
                 .as_ref()
-                .is_some_and(|receiver| *receiver.borrow())
+                .is_some_and(CancellationToken::is_cancelled)
         {
             self.remove_tool_list_cell(name, &tool_list_cell).await;
         }
@@ -661,6 +621,7 @@ impl<'a> McpRegistry<'a> {
             .index
             .get(qualified_name)
             .ok_or_else(|| anyhow!("model called unknown tool '{qualified_name}'"))?;
+        self.check_tool_is_allowed(server_name, tool_name)?;
         let connection = self.connection(server_name, cancellation.clone()).await?;
 
         let arguments = if arguments_json.trim().is_empty() {
@@ -728,6 +689,33 @@ impl<'a> McpRegistry<'a> {
         Ok(render_tool_result(result))
     }
 
+    /// Enforces `mcp_servers.<name>.allowed_tools`, if the server's config
+    /// sets it: the field is absent by default (unrestricted, matching
+    /// lait's behavior before this gate existed), but a present list —
+    /// including an empty one, which denies every tool on the server —
+    /// restricts which of the server's tools the model may call. Checked in
+    /// `call` before opening a connection, so a disallowed call never
+    /// reaches the server at all (unlike `tools()`, filtering the
+    /// advertised list there would be bypassable by a model naming a tool
+    /// it was never offered).
+    fn check_tool_is_allowed(&self, server_name: &str, tool_name: &str) -> Result<()> {
+        let Some(server) = self.servers.get(server_name) else {
+            return Ok(());
+        };
+        let Some(allowed_tools) = &server.allowed_tools else {
+            return Ok(());
+        };
+        if allowed_tools.iter().any(|allowed| allowed == tool_name) {
+            return Ok(());
+        }
+        bail!(
+            "MCP server '{server_name}' does not allow calling tool '{tool_name}' \
+             (not listed in its 'allowed_tools' in {}); add it there if this call \
+             should be permitted",
+            config::CONFIG_FILE_NAME
+        );
+    }
+
     /// Returns the running connection for `name`, connecting lazily (and
     /// caching the result) on first use. The lock is only ever held to
     /// fetch-or-insert the `OnceCell` for `name`, never across the connect
@@ -745,7 +733,7 @@ impl<'a> McpRegistry<'a> {
     ) -> Result<Arc<McpConnection>> {
         if cancellation
             .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+            .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(anyhow!("MCP operation was cancelled"));
         }
@@ -764,19 +752,11 @@ impl<'a> McpRegistry<'a> {
             // turns a caller's cancellation into cancellation of that shared
             // attempt; the initializer then remains alive long enough for
             // `connect` to close/reap its transport before this future ends.
-            let monitor = cancellation.clone().map(|mut receiver| {
+            let monitor = cancellation.clone().map(|cancellation| {
                 let initializer_cancellation = initializer_cancellation.clone();
                 tokio::spawn(async move {
-                    if *receiver.borrow() {
-                        initializer_cancellation.cancel();
-                        return;
-                    }
-                    while receiver.changed().await.is_ok() {
-                        if *receiver.borrow() {
-                            initializer_cancellation.cancel();
-                            return;
-                        }
-                    }
+                    cancellation.cancelled().await;
+                    initializer_cancellation.cancel();
                 })
             });
             let result = cell
@@ -804,7 +784,7 @@ impl<'a> McpRegistry<'a> {
                     let cancelled = initializer_cancellation.is_cancelled()
                         || cancellation
                             .as_ref()
-                            .is_some_and(|receiver| *receiver.borrow());
+                            .is_some_and(CancellationToken::is_cancelled);
                     if cancelled {
                         connection.shutdown().await;
                         self.remove_connection_cell(name, &cell).await;
@@ -1460,7 +1440,7 @@ async fn connect(
     }
 }
 
-impl<'a> McpRegistry<'a> {
+impl McpRegistry {
     /// Cancels `connection`, waits for the rmcp service and its transport to
     /// finish cleanup, and only then removes it from the cache. Pointer
     /// identity matters: another task may already have installed a fresh
@@ -1734,10 +1714,61 @@ fn render_tool_result(result: rmcp::model::CallToolResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameLimitedReader, qualify_tool_name, render_tool_result, serialized_json_bytes};
+    use super::{
+        FrameLimitedReader, McpRegistry, qualify_tool_name, render_tool_result,
+        serialized_json_bytes,
+    };
+    use crate::config::McpServerConfig;
     use rmcp::model::CallToolResult;
     use serde_json::json;
+    use std::{collections::HashMap, sync::Arc};
     use tokio::io::AsyncReadExt;
+
+    fn server_with_allowed_tools(allowed_tools: Option<Vec<String>>) -> McpRegistry {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "fs".to_owned(),
+            McpServerConfig {
+                command: Some("true".to_owned()),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+                url: None,
+                headers: HashMap::new(),
+                allowed_tools,
+            },
+        );
+        McpRegistry::new(Arc::new(servers))
+    }
+
+    #[test]
+    fn allows_any_tool_when_allowed_tools_is_unset() {
+        let registry = server_with_allowed_tools(None);
+        assert!(registry.check_tool_is_allowed("fs", "read_file").is_ok());
+        assert!(registry.check_tool_is_allowed("fs", "write_file").is_ok());
+    }
+
+    #[test]
+    fn allows_a_tool_named_in_the_allowlist() {
+        let registry = server_with_allowed_tools(Some(vec!["read_file".to_owned()]));
+        assert!(registry.check_tool_is_allowed("fs", "read_file").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_tool_not_named_in_the_allowlist() {
+        let registry = server_with_allowed_tools(Some(vec!["read_file".to_owned()]));
+        let error = registry
+            .check_tool_is_allowed("fs", "write_file")
+            .unwrap_err();
+        assert!(error.to_string().contains("write_file"));
+        assert!(error.to_string().contains("allowed_tools"));
+    }
+
+    #[test]
+    fn an_empty_allowlist_denies_every_tool() {
+        let registry = server_with_allowed_tools(Some(vec![]));
+        assert!(registry.check_tool_is_allowed("fs", "read_file").is_err());
+    }
 
     #[test]
     fn qualifies_a_tool_name_with_its_server() {

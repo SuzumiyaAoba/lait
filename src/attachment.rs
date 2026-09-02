@@ -40,7 +40,7 @@ pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<St
 /// filesystem even before the first model request is made.
 pub(crate) async fn read_file_attachments_cancellable(
     files: &[PathBuf],
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Option<String>> {
     if files.is_empty() {
         return Ok(None);
@@ -61,7 +61,7 @@ pub(crate) async fn read_file_attachments_cancellable(
 /// leaving it running in the runtime's blocking pool.
 async fn read_all(
     files: &[PathBuf],
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Vec<String>> {
     let budget = async_io::ReadBudget::new(MAX_TOTAL_ATTACHMENT_BYTES as usize);
     // Preserve the historical `fs::read` behavior for all callers: a FIFO
@@ -82,7 +82,7 @@ async fn read_all(
 
 async fn read_text_file_cancellable(
     path: PathBuf,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
     budget: async_io::ReadBudget,
     wait_for_fifo_writer: bool,
 ) -> Result<String> {
@@ -127,7 +127,7 @@ pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<String>>
 /// pass through without touching the filesystem.
 pub(crate) async fn resolve_image_urls_cancellable(
     images: &[String],
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Vec<String>> {
     match images {
         [] => Ok(Vec::new()),
@@ -152,7 +152,7 @@ pub(crate) async fn resolve_image_urls_cancellable(
 
 async fn resolve_one_cancellable(
     image: String,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
     budget: async_io::ReadBudget,
     wait_for_fifo_writer: bool,
 ) -> Result<String> {
@@ -438,11 +438,14 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let token = tokio_util::sync::CancellationToken::new();
         let read_path = path.clone();
-        let read_task = tokio::spawn(async move {
-            read_file_attachments_cancellable(std::slice::from_ref(&read_path), Some(receiver))
-                .await
+        let read_task = tokio::spawn({
+            let token = token.clone();
+            async move {
+                read_file_attachments_cancellable(std::slice::from_ref(&read_path), Some(token))
+                    .await
+            }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -450,7 +453,7 @@ mod tests {
             "a FIFO attachment should wait for a writer before cancellation"
         );
 
-        sender.send(true).unwrap();
+        token.cancel();
         let result = tokio::time::timeout(Duration::from_secs(1), read_task)
             .await
             .expect("cancelling a FIFO wait must finish promptly")

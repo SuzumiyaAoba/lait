@@ -14,9 +14,17 @@ pub(crate) struct Cli {
     #[command(flatten)]
     pub(crate) chat: ChatArgs,
 
-    /// Do not read lait.config.yml from the current directory.
-    #[arg(long, global = true)]
+    /// Do not read lait.config.yml from the current directory or any of its
+    /// ancestors.
+    #[arg(long, global = true, conflicts_with = "config")]
     pub(crate) no_config: bool,
+
+    /// Read configuration from PATH instead of searching for
+    /// lait.config.yml starting at the current directory and walking up
+    /// through its ancestors (like git looks for `.git`). Unlike the
+    /// default search, a missing PATH is an error.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
 
     /// Do not read a `.env` file from the current directory. (Acted on
     /// before argument parsing — see `main` — so this declaration only
@@ -51,9 +59,10 @@ pub(crate) enum Command {
     Sessions(SessionsCommand),
     /// Start an interactive, multi-turn chat REPL (see docs/usage/ja/chat.md).
     Chat(ChatReplArgs),
-    /// Run a named prompt template from `prompts:` in lait.config.yml, or
-    /// `lait prompt list` to show every configured prompt.
-    Prompt(PromptArgs),
+    /// Run a named prompt template from `prompts:` in lait.config.yml
+    /// (`lait prompt run <NAME>`), or list every configured prompt
+    /// (`lait prompt list`).
+    Prompt(PromptCommand),
     /// List, show, or search recorded chat/agent/workflow/prompt runs (see
     /// docs/usage/ja/history.md).
     History(HistoryArgs),
@@ -92,9 +101,22 @@ pub(crate) struct HistorySearchArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct PromptArgs {
-    /// Name of a `prompts:` entry in lait.config.yml, or the literal `list`
-    /// to print every configured prompt instead of running one.
+pub(crate) struct PromptCommand {
+    #[command(subcommand)]
+    pub(crate) action: PromptAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PromptAction {
+    /// List every `prompts:` entry configured in lait.config.yml.
+    List,
+    /// Run a named prompt template from `prompts:` in lait.config.yml.
+    Run(PromptRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PromptRunArgs {
+    /// Name of a `prompts:` entry in lait.config.yml.
     #[arg(value_name = "NAME")]
     pub(crate) name: String,
 
@@ -103,18 +125,85 @@ pub(crate) struct PromptArgs {
     #[arg(value_name = "INPUT")]
     pub(crate) input: Option<String>,
 
-    /// Override a `vars:` default declared on the prompt: `--var
-    /// KEY=VALUE`. Repeatable; a later `--var` for the same key wins.
+    #[command(flatten)]
+    pub(crate) var: VarArgs,
+
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
+
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
+}
+
+/// `--var KEY=VALUE`, shared by `lait prompt run <NAME>` and `-p`/
+/// `--prompt-name` on single-shot chat — the two entry points that render a
+/// named prompt's `vars:` template.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct VarArgs {
+    /// Override a named prompt's `vars:` default: `--var KEY=VALUE`.
+    /// Repeatable; a later `--var` for the same key wins. Only meaningful
+    /// when running a named prompt (`lait prompt run <NAME>` or
+    /// `-p`/`--prompt-name`).
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub(crate) var: Vec<String>,
+}
 
-    /// Print a token usage summary to stderr when the prompt finishes.
+/// `--show-usage`/`--no-history`, shared by every `run_*` entry point that
+/// records a `lait history` entry and can print a token usage summary.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReportingArgs {
+    /// Print a token usage summary to stderr when the run finishes (for
+    /// servers that report usage).
     #[arg(long)]
     pub(crate) show_usage: bool,
 
     /// Do not record this run in `lait history`.
     #[arg(long)]
     pub(crate) no_history: bool,
+}
+
+/// `--base-url`/`--api-key`, shared by every command that talks to an
+/// OpenAI-compatible endpoint directly.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct EndpointArgs {
+    /// The OpenAI-compatible API base URL.
+    #[arg(long, env = "OPENAI_BASE_URL")]
+    pub(crate) base_url: Option<String>,
+
+    /// The API key. LM Studio does not require one.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    pub(crate) api_key: Option<String>,
+}
+
+/// `-o`/`--render`/`--json`, shared by every subcommand that produces a
+/// single finished response body: single-shot chat, `lait run`, `lait agent
+/// run`, and `lait prompt run <NAME>`. Previously only `ChatArgs` had these (see
+/// the design plan's B-2) — `--session` is deliberately not part of this
+/// bundle, since a workflow/agent run has no single conversation turn to
+/// append a session entry for.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct OutputArgs {
+    /// Write the response body to PATH instead of stdout (`-o -` writes to
+    /// stdout explicitly). With `--json`, the JSON object goes to the file.
+    /// Without `--stream` (single-shot chat only), the file is only written
+    /// after the request succeeds, so a failed run leaves no empty file
+    /// behind.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub(crate) output: Option<PathBuf>,
+
+    /// Print the response as JSON (`{"content", "reasoning", "usage"}`;
+    /// `reasoning` is always `null` outside single-shot chat).
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// Render the response as Markdown for terminal display (headings,
+    /// lists, emphasis, code blocks, tables, ...) instead of printing it as
+    /// raw text. Falls back to raw text automatically when stdout isn't a
+    /// terminal, or when combined with `--stream` (single-shot chat only).
+    /// Ignored with `--json`. Falls back to `default.render` in
+    /// lait.config.yml when this is unset.
+    #[arg(long)]
+    pub(crate) render: bool,
 }
 
 #[derive(Debug, Args)]
@@ -185,13 +274,8 @@ pub(crate) struct ModelsArgs {
     #[arg(long)]
     pub(crate) json: bool,
 
-    /// The OpenAI-compatible API base URL to query with `--remote`.
-    #[arg(long, env = "OPENAI_BASE_URL")]
-    pub(crate) base_url: Option<String>,
-
-    /// The API key sent with `--remote`. LM Studio does not require one.
-    #[arg(long, env = "OPENAI_API_KEY")]
-    pub(crate) api_key: Option<String>,
+    #[command(flatten)]
+    pub(crate) endpoint: EndpointArgs,
 }
 
 #[derive(Debug, Args)]
@@ -206,14 +290,11 @@ pub(crate) struct RunArgs {
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
 
-    /// Print a per-step and total token usage summary to stderr when the
-    /// workflow finishes (for servers that report usage).
-    #[arg(long)]
-    pub(crate) show_usage: bool,
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
 
-    /// Do not record this run in `lait history`.
-    #[arg(long)]
-    pub(crate) no_history: bool,
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -242,14 +323,11 @@ pub(crate) struct AgentRunArgs {
     #[arg(value_name = "INPUT")]
     pub(crate) input: Option<String>,
 
-    /// Print a token usage summary to stderr when the agent finishes (for
-    /// servers that report usage).
-    #[arg(long)]
-    pub(crate) show_usage: bool,
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
 
-    /// Do not record this run in `lait history`.
-    #[arg(long)]
-    pub(crate) no_history: bool,
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -273,13 +351,8 @@ pub(crate) struct SharedChatArgs {
     #[arg(long, env = "LLM_MODEL")]
     pub(crate) model: Option<String>,
 
-    /// The OpenAI-compatible API base URL.
-    #[arg(long, env = "OPENAI_BASE_URL")]
-    pub(crate) base_url: Option<String>,
-
-    /// The API key. LM Studio does not require one.
-    #[arg(long, env = "OPENAI_API_KEY")]
-    pub(crate) api_key: Option<String>,
+    #[command(flatten)]
+    pub(crate) endpoint: EndpointArgs,
 
     /// A system prompt to send ahead of the user prompt. Falls back to
     /// `default.system` in lait.config.yml when neither this nor
@@ -295,11 +368,8 @@ pub(crate) struct SharedChatArgs {
     #[arg(long)]
     pub(crate) show_reasoning: bool,
 
-    /// Print the request's token usage to stderr after the response (so
-    /// piping stdout stays clean). With `--stream`, asks the server for
-    /// `stream_options: {"include_usage": true}`.
-    #[arg(long)]
-    pub(crate) show_usage: bool,
+    #[command(flatten)]
+    pub(crate) reporting: ReportingArgs,
 
     /// The reasoning effort to request from the model.
     #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
@@ -344,11 +414,6 @@ pub(crate) struct SharedChatArgs {
     /// turn recorded there so far is sent ahead of this call's prompt.
     #[arg(long, value_name = "NAME")]
     pub(crate) session: Option<String>,
-
-    /// Do not record this run in `lait history` (see `--no-config`'s
-    /// counterpart `default.history: false`).
-    #[arg(long)]
-    pub(crate) no_history: bool,
 }
 
 #[derive(Debug, Args)]
@@ -356,13 +421,8 @@ pub(crate) struct ChatArgs {
     #[command(flatten)]
     pub(crate) shared: SharedChatArgs,
 
-    /// Write the response body to PATH instead of stdout (`-o -` writes to
-    /// stdout explicitly). With `--json`, the JSON object goes to the file;
-    /// with `--show-reasoning`, reasoning goes to stderr so the file holds
-    /// the body alone. Without `--stream`, the file is only written after
-    /// the request succeeds, so a failed run leaves no empty file behind.
-    #[arg(short = 'o', long, value_name = "PATH")]
-    pub(crate) output: Option<PathBuf>,
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
 
     /// Print nothing but the response body: notes outside it (reasoning
     /// display, usage display) are suppressed, overriding
@@ -370,14 +430,10 @@ pub(crate) struct ChatArgs {
     #[arg(long)]
     pub(crate) quiet: bool,
 
-    /// Print the response as JSON.
-    #[arg(long, conflicts_with = "stream")]
-    pub(crate) json: bool,
-
     /// Stream the response to stdout as it is generated, instead of waiting
     /// for the full completion. Incompatible with `--json`, which needs the
     /// full response to build its JSON object.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     pub(crate) stream: bool,
 
     /// Request a structured JSON response using the schema in FILE.
@@ -408,23 +464,12 @@ pub(crate) struct ChatArgs {
     /// Run a named prompt template (a `prompts.<NAME>` entry in
     /// lait.config.yml) instead of sending PROMPT/stdin directly as the
     /// request text: PROMPT/stdin becomes the template's `{{ input }}`. See
-    /// `lait prompt <NAME>`/`lait prompt list` for the equivalent subcommand.
+    /// `lait prompt run <NAME>`/`lait prompt list` for the equivalent subcommand.
     #[arg(short = 'p', long = "prompt-name", value_name = "NAME")]
     pub(crate) prompt_name: Option<String>,
 
-    /// Override a named prompt's `vars:` default: `--var KEY=VALUE`. Only
-    /// meaningful together with `-p`/`--prompt-name`. Repeatable; a later
-    /// `--var` for the same key wins.
-    #[arg(long = "var", value_name = "KEY=VALUE")]
-    pub(crate) var: Vec<String>,
-
-    /// Render the response as Markdown for terminal display (headings,
-    /// lists, emphasis, code blocks, tables, ...) instead of printing it as
-    /// raw text. Falls back to raw text automatically when stdout isn't a
-    /// terminal, or when combined with `--stream`. Falls back to
-    /// `default.render` in lait.config.yml when unset here.
-    #[arg(long)]
-    pub(crate) render: bool,
+    #[command(flatten)]
+    pub(crate) var: VarArgs,
 }
 
 /// `lait chat`'s own arguments: just the options a REPL turn can use — see
@@ -501,10 +546,13 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.chat.shared.model.as_deref(), Some("local-model"));
         assert_eq!(
-            cli.chat.shared.base_url.as_deref(),
+            cli.chat.shared.endpoint.base_url.as_deref(),
             Some("http://localhost:1234/v1")
         );
-        assert_eq!(cli.chat.shared.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            cli.chat.shared.endpoint.api_key.as_deref(),
+            Some("test-key")
+        );
         assert!(cli.chat.shared.show_reasoning);
         assert_eq!(
             cli.chat.shared.reasoning_effort,
@@ -728,6 +776,32 @@ mod tests {
             .expect("global flags should be accepted after subcommand arguments");
 
         assert!(cli.no_config);
+    }
+
+    #[test]
+    fn run_subcommand_accepts_global_config_after_its_args() {
+        let cli = Cli::try_parse_from([
+            "lait",
+            "run",
+            "workflow.yml",
+            "hello",
+            "--config",
+            "custom.yml",
+        ])
+        .expect("global flags should be accepted after subcommand arguments");
+
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("custom.yml"))
+        );
+    }
+
+    #[test]
+    fn rejects_config_combined_with_no_config() {
+        assert!(
+            Cli::try_parse_from(["lait", "--config", "custom.yml", "--no-config", "hello"])
+                .is_err()
+        );
     }
 
     #[test]

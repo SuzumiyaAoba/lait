@@ -21,11 +21,11 @@ prompts:
 ```sh
 lait -p translate "Hello"                 # PROMPT/stdin が {{ input }} になる
 lait -p translate "Hello" --var lang=英語  # vars.lang を上書き
-lait prompt translate "Hello"             # サブコマンド形式(同じ結果)
+lait prompt run translate "Hello"         # サブコマンド形式(同じ結果)
 lait prompt list                          # 設定済みプロンプトの一覧
 ```
 
 - `-p`/`--prompt-name` は通常のチャット呼び出し（`lait [OPTIONS] PROMPT`）のオプションの一つです。`--model`/`--stream`/`-o`/`--json` など既存のオプションと自由に組み合わせられます。モデルの解決順は `--model` > `prompts.<name>.model` > `default.model` です。
-- `lait prompt <name> [INPUT]` サブコマンドは `--var` と `--show-usage` のみに対応する、より単純な入口です。モデル・エンドポイントは `prompts.<name>.model`/`default.model`/`lait.config.yml` の `base_url`/`api_key` からのみ解決されます。細かい制御が必要な場合は `-p` を使ってください。
+- `lait prompt run <name> [INPUT]` サブコマンドは `--var`/`--show-usage`/`--no-history`/`-o`/`--render`/`--json` に対応する、より単純な入口です（`--stream`/`--mcp`/`--subagent` はありません）。モデル・エンドポイントは `prompts.<name>.model`/`default.model`/`lait.config.yml` の `base_url`/`api_key` からのみ解決されます。細かい制御が必要な場合は `-p` を使ってください。
 - `--var KEY=VALUE` は繰り返し指定でき、同じキーを複数回指定すると最後の値が使われます。
 - 標準入力からの読み込み（パイプ）にも対応しています（`git diff | lait -p commit-message` のような使い方を想定）。

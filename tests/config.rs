@@ -526,3 +526,95 @@ fn no_config_option_skips_a_malformed_config_file() {
         "request body: {body}"
     );
 }
+
+#[test]
+fn finds_lait_config_yml_in_an_ancestor_directory() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"config-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "default:\n  model: config-model\nbase_url: \"{}\"\n",
+        server.base_url
+    ));
+    let subdir = config.path().join("nested").join("deeper");
+    std::fs::create_dir_all(&subdir).expect("failed to create nested test directory");
+
+    let output = test_command()
+        .current_dir(&subdir)
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"config-model""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn dash_dash_config_reads_an_explicit_path_ignoring_cwd() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"explicit-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let explicit_config = ConfigDirectory::new(&format!(
+        "default:\n  model: explicit-model\nbase_url: \"{}\"\n",
+        server.base_url
+    ));
+    // An unrelated, config-less cwd: proves `--config` is used instead of
+    // (not merely in addition to) any cwd-relative search.
+    let cwd = ConfigDirectory::empty();
+
+    let output = test_command()
+        .current_dir(cwd.path())
+        .args(["--config"])
+        .arg(explicit_config.config_path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"explicit-model""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn dash_dash_config_errors_clearly_on_a_missing_path() {
+    let cwd = ConfigDirectory::empty();
+
+    let output = test_command()
+        .current_dir(cwd.path())
+        .args(["--config", "does-not-exist.yml", "--no-history", "hello"])
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(
+        !output.status.success(),
+        "expected --config with a missing path to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does-not-exist.yml"), "stderr: {stderr}");
+}
+
+#[test]
+fn dash_dash_config_conflicts_with_no_config() {
+    let output = test_command()
+        .args(["--config", "some.yml", "--no-config", "hello"])
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(
+        !output.status.success(),
+        "expected --config and --no-config together to be a usage error"
+    );
+}

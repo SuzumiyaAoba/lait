@@ -12,7 +12,8 @@
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::{self, Read},
+    future::Future,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -25,6 +26,7 @@ use std::{
 use std::os::unix::fs::FileTypeExt;
 
 use anyhow::{Context, Result, bail};
+use tokio_util::sync::CancellationToken;
 
 /// A filesystem operation gets one dedicated OS thread, rather than occupying
 /// Tokio's shared blocking pool.  Keep the number of such threads bounded,
@@ -125,7 +127,7 @@ fn path_lock(path: &Path) -> Arc<tokio::sync::Semaphore> {
 /// write ignores the cooperative flag for a while.
 pub(crate) async fn acquire_path_lock(
     path: &Path,
-    cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     acquire_permit(
         path_lock(path),
@@ -143,13 +145,13 @@ pub(crate) async fn acquire_path_lock(
 pub(crate) async fn run_blocking_with_path_lock<T, F>(
     path: &Path,
     operation: F,
-    mut cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<CancellationToken>,
 ) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&AtomicBool) -> Result<T> + Send + 'static,
 {
-    let lease = acquire_path_lock(path, cancellation.as_mut()).await?;
+    let lease = acquire_path_lock(path, cancellation.as_ref()).await?;
     run_blocking(
         move |cancelled| {
             let _lease = lease;
@@ -162,7 +164,7 @@ where
 
 async fn acquire_worker(
     semaphore: Arc<tokio::sync::Semaphore>,
-    cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     acquire_permit(
         semaphore,
@@ -174,7 +176,7 @@ async fn acquire_worker(
 
 async fn acquire_permit(
     semaphore: Arc<tokio::sync::Semaphore>,
-    cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<&CancellationToken>,
     saturated_message: &'static str,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     let Some(cancellation) = cancellation else {
@@ -184,30 +186,16 @@ async fn acquire_permit(
             .context("blocking I/O permit owner was closed");
     };
 
-    let deadline = tokio::time::Instant::now() + BLOCKING_WORKER_ACQUIRE_TIMEOUT;
-    loop {
-        if *cancellation.borrow() {
+    tokio::select! {
+        biased;
+        permit = semaphore.clone().acquire_owned() => {
+            permit.context("blocking I/O permit owner was closed")
+        }
+        () = cancellation.cancelled() => {
             bail!("blocking I/O was cancelled");
         }
-
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        () = tokio::time::sleep(BLOCKING_WORKER_ACQUIRE_TIMEOUT) => {
             bail!("{saturated_message}");
-        }
-
-        tokio::select! {
-            biased;
-            permit = semaphore.clone().acquire_owned() => {
-                return permit.context("blocking I/O permit owner was closed");
-            }
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    bail!("blocking I/O was cancelled");
-                }
-            }
-            _ = tokio::time::sleep(remaining) => {
-                bail!("{saturated_message}");
-            }
         }
     }
 }
@@ -219,7 +207,7 @@ async fn acquire_permit(
 /// chance to stop.
 pub(crate) async fn run_blocking<T, F>(
     operation: F,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<CancellationToken>,
 ) -> Result<T>
 where
     T: Send + 'static,
@@ -237,7 +225,7 @@ where
 /// unrelated tests which happen to run in parallel in the same process.
 async fn run_blocking_with_pool<T, F>(
     operation: F,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<CancellationToken>,
     worker_pool: Arc<tokio::sync::Semaphore>,
 ) -> Result<T>
 where
@@ -246,12 +234,11 @@ where
 {
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
-    let mut cancellation = cancellation;
-    let permit = acquire_worker(worker_pool, cancellation.as_mut()).await?;
+    let permit = acquire_worker(worker_pool, cancellation.as_ref()).await?;
 
     if cancellation
         .as_ref()
-        .is_some_and(|receiver| *receiver.borrow())
+        .is_some_and(CancellationToken::is_cancelled)
     {
         drop(permit);
         bail!("blocking I/O was cancelled");
@@ -275,7 +262,7 @@ where
         armed: true,
     };
 
-    let Some(mut cancellation) = cancellation else {
+    let Some(cancellation) = cancellation else {
         let result = receiver
             .await
             .context("blocking I/O worker was cancelled")??;
@@ -283,29 +270,21 @@ where
         return Ok(result);
     };
 
-    if *cancellation.borrow() {
-        cancel_worker(&cancelled, &mut receiver).await;
-        bail!("blocking I/O was cancelled");
-    }
-
-    loop {
-        tokio::select! {
-            biased;
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    cancel_worker(&cancelled, &mut receiver).await;
-                    bail!("blocking I/O was cancelled");
-                }
-            }
-            result = &mut receiver => {
-                let result = result.context("blocking I/O worker was cancelled")??;
-                if *cancellation.borrow() {
-                    drop(guard);
-                    bail!("blocking I/O was cancelled");
-                }
-                drop(guard);
-                return Ok(result);
-            }
+    // `biased` polls the cancellation branch first every turn, so it always
+    // wins a tie against an already-ready `receiver` — unlike a
+    // `watch::Receiver`'s edge-triggered `changed()`, `cancelled()` stays
+    // ready forever once cancelled, so there's no need to re-check it inside
+    // the `receiver` arm the way the old watch-channel version had to.
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            cancel_worker(&cancelled, &mut receiver).await;
+            bail!("blocking I/O was cancelled");
+        }
+        result = &mut receiver => {
+            let result = result.context("blocking I/O worker was cancelled")??;
+            drop(guard);
+            Ok(result)
         }
     }
 }
@@ -328,6 +307,47 @@ impl Drop for CancellationGuard {
         if self.armed {
             self.cancelled.store(true, Ordering::Release);
         }
+    }
+}
+
+/// The outcome of [`await_cancellation`]: `future` either finished on its
+/// own, or `cancellation` fired first. Kept as an explicit variant (rather
+/// than folding straight into an error) because some callers need to react
+/// differently to a cancellation than to an ordinary failure — `mcp::call`
+/// evicts the exact cached connection a cancelled request was using, which a
+/// plain `Err` couldn't distinguish from a normal protocol error.
+pub(crate) enum CancellationResult<T> {
+    Completed(T),
+    Cancelled,
+}
+
+/// Awaits `future` while racing it against `cancellation`, so a caller driving
+/// several cancellable operations at once (an LLM request alongside MCP/
+/// subagent work, say) can stop as soon as any of them is told to. Merely
+/// dropping `future` on a timeout is not enough by itself: something has to
+/// actually poll a shared cancellation signal for every such operation to
+/// notice it at the same time, which is exactly what this does.
+///
+/// If `future` and `cancellation` both become ready in the same poll,
+/// cancellation wins — a timeout handler may already have started a cleanup/
+/// retry sequence by the time the `future` branch is checked, and returning
+/// its result here would let a caller believe an attempt that's already being
+/// torn down elsewhere completed normally.
+pub(crate) async fn await_cancellation<F, T>(
+    future: F,
+    cancellation: Option<CancellationToken>,
+) -> CancellationResult<T>
+where
+    F: Future<Output = T>,
+{
+    let Some(cancellation) = cancellation else {
+        return CancellationResult::Completed(future.await);
+    };
+
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => CancellationResult::Cancelled,
+        result = future => CancellationResult::Completed(result),
     }
 }
 
@@ -608,7 +628,7 @@ pub(crate) fn read_to_string_wait_for_fifo_writer(
 /// schemas) that reads exactly one file and returns its contents as a string.
 pub(crate) async fn read_to_string_cancellable(
     path: &Path,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<CancellationToken>,
     max_bytes: usize,
 ) -> Result<String> {
     let path = path.to_owned();
@@ -631,17 +651,180 @@ pub(crate) async fn read_to_string_cancellable(
 /// read, but it belongs to the same timeout-sensitive loader paths.
 pub(crate) async fn canonicalize(
     path: &Path,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<CancellationToken>,
 ) -> Result<PathBuf> {
     let path = path.to_owned();
     run_blocking(move |_| Ok(std::fs::canonicalize(path)?), cancellation).await
+}
+
+/// Writes a workflow node's output from a dedicated OS thread. The worker is
+/// kept off Tokio's runtime because a write to a special file such as a FIFO
+/// can block indefinitely. A timeout sets the worker's cancellation flag and
+/// waits for it to finish; Unix special files are opened non-blocking so that
+/// this cleanup cannot itself get stuck. Regular files use the same direct
+/// create/truncate/write behavior as `fs::write`, with cancellation checks
+/// between bounded chunks so existing inode, permission, hard-link, and
+/// symlink semantics remain intact.
+pub(crate) async fn write_output_file(
+    path: &Path,
+    output: &str,
+    step_cancel: Option<CancellationToken>,
+) -> Result<()> {
+    let path = path.to_owned();
+    let output = output.to_owned();
+    // `run_blocking_with_path_lock` deliberately returns after a bounded
+    // cancellation cleanup even when an OS/network filesystem call ignores
+    // the cancellation flag; transferring the lease to the worker prevents a
+    // retry from writing the same path concurrently with that still-running
+    // worker.
+    let worker_path = path.clone();
+    run_blocking_with_path_lock(
+        &path,
+        move |cancelled| {
+            write_output_file_blocking(&worker_path, &output, cancelled)
+                .with_context(|| format!("failed to write output to '{}'", worker_path.display()))
+        },
+        step_cancel,
+    )
+    .await
+}
+
+/// Performs the blocking half of [`write_output_file`]. On Unix, the target is
+/// opened once with `O_NONBLOCK` and classified from that same handle. This
+/// removes the metadata-then-open TOCTOU window while preserving symlink,
+/// inode, permission, and hard-link behavior for regular files. FIFOs and
+/// other non-regular files continue through non-blocking I/O. Other platforms
+/// reject non-regular handles after a conservative path preflight, rather than
+/// attempting to write a device, named pipe, or reparse point.
+fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = loop {
+            if cancelled.load(Ordering::Acquire) {
+                bail!("output file write was cancelled");
+            }
+            match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => break file,
+                // Opening a FIFO for writing without a reader reports ENXIO
+                // when O_NONBLOCK is set. Poll until a reader appears or the
+                // workflow cancellation flag asks us to stop.
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        if !file.metadata()?.file_type().is_file() {
+            return write_nonblocking_special_file(file, output, cancelled);
+        }
+
+        write_regular_output_file(file, output, cancelled)
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows has no portable non-blocking File API. Reject an already
+        // visible special/reparse target before opening it, then repeat the
+        // check on the opened handle to keep a path swap from turning into a
+        // write to a device or named pipe. Symlinks to regular files retain
+        // the existing follow-and-overwrite behavior.
+        match std::fs::metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                bail!(
+                    "refusing to write non-regular output path '{}'",
+                    path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let file = OpenOptions::new().write(true).create(true).open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            bail!(
+                "refusing to write non-regular output path '{}'",
+                path.display()
+            );
+        }
+        write_regular_output_file(file, output, cancelled)
+    }
+}
+
+/// Writes an ordinary file directly, preserving the target inode and the
+/// overwrite/permission behavior of `fs::write`. Chunking only exists to give
+/// a timed worker a bounded opportunity to observe cancellation.
+fn write_regular_output_file(mut file: File, output: &str, cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    // Truncate only after the handle has been classified as a regular file.
+    // A timeout after this point intentionally leaves an empty/partial file:
+    // direct truncation is what preserves the existing inode, permissions,
+    // hard links, and symlink-following semantics of `fs::write`, but it is
+    // not an atomic replacement. The caller receives an error and must not
+    // treat the partial bytes as a completed node output.
+    file.set_len(0)?;
+    for chunk in output.as_bytes().chunks(64 * 1024) {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("output file write was cancelled");
+        }
+        file.write_all(chunk)?;
+    }
+    file.flush()?;
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Writes FIFOs and other Unix special files with non-blocking I/O. Opening
+/// the descriptor with `O_NONBLOCK` by the caller means no system
+/// call can hold the worker past cancellation. The same handle is used for
+/// classification and writing; reopening the path here would reintroduce a
+/// metadata/open TOCTOU race.
+fn write_nonblocking_special_file(
+    mut file: File,
+    output: &str,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let bytes = output.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("output file write was cancelled");
+        }
+        match file.write(&bytes[offset..]) {
+            Ok(0) => bail!("output file write made no progress"),
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if cancelled.load(Ordering::Acquire) {
+        bail!("output file write was cancelled");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ReadBudget, acquire_path_lock, read_file, read_file_wait_for_fifo_writer,
-        run_blocking_with_path_lock, run_blocking_with_pool,
+        run_blocking_with_path_lock, run_blocking_with_pool, write_output_file,
     };
     use std::{
         fs,
@@ -651,6 +834,7 @@ mod tests {
         },
         time::{Duration, Instant},
     };
+    use tokio_util::sync::CancellationToken;
 
     fn test_worker_pool() -> Arc<tokio::sync::Semaphore> {
         Arc::new(tokio::sync::Semaphore::new(super::MAX_BLOCKING_WORKERS))
@@ -658,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_cleanup_does_not_wait_for_an_uncooperative_worker() {
-        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let token = CancellationToken::new();
         let started = Arc::new(AtomicBool::new(false));
         let worker_started = Arc::clone(&started);
         let task = tokio::spawn(run_blocking_with_pool(
@@ -667,7 +851,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(500));
                 Ok(())
             },
-            Some(receiver),
+            Some(token.clone()),
             test_worker_pool(),
         ));
 
@@ -675,7 +859,7 @@ mod tests {
         while !started.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
-        sender.send(true).unwrap();
+        token.cancel();
         let result = task.await.unwrap();
 
         assert!(result.is_err());
@@ -713,9 +897,8 @@ mod tests {
         while started.load(Ordering::Acquire) < super::MAX_BLOCKING_WORKERS {
             tokio::task::yield_now().await;
         }
-        let (_sender, receiver) = tokio::sync::watch::channel(false);
-        let result =
-            run_blocking_with_pool(move |_| Ok(()), Some(receiver), Arc::clone(&worker_pool));
+        let token = CancellationToken::new();
+        let result = run_blocking_with_pool(move |_| Ok(()), Some(token), Arc::clone(&worker_pool));
         let result = tokio::time::timeout(
             super::BLOCKING_WORKER_ACQUIRE_TIMEOUT + Duration::from_millis(100),
             result,
@@ -756,8 +939,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_already_cancelled_operation_does_not_spawn_a_worker() {
-        let (sender, receiver) = tokio::sync::watch::channel(false);
-        sender.send(true).unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
         let ran = Arc::new(AtomicBool::new(false));
         let worker_ran = Arc::clone(&ran);
 
@@ -766,7 +949,7 @@ mod tests {
                 worker_ran.store(true, Ordering::Release);
                 Ok(())
             },
-            Some(receiver),
+            Some(token),
             test_worker_pool(),
         )
         .await;
@@ -781,12 +964,13 @@ mod tests {
     #[tokio::test]
     async fn a_path_lease_stays_with_an_uncooperative_worker_after_cancellation() {
         let path = crate::test_support::unique_temp_path("lait-test-path-lease", ".out");
-        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let token = CancellationToken::new();
         let started = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let worker_started = Arc::clone(&started);
         let worker_finished = Arc::clone(&finished);
         let worker_path = path.clone();
+        let task_token = token.clone();
         let task = tokio::spawn(async move {
             run_blocking_with_path_lock(
                 &worker_path,
@@ -801,7 +985,7 @@ mod tests {
                     worker_finished.store(true, Ordering::Release);
                     Ok(())
                 },
-                Some(receiver),
+                Some(task_token),
             )
             .await
         });
@@ -809,7 +993,7 @@ mod tests {
         while !started.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
-        sender.send(true).unwrap();
+        token.cancel();
         let cancelled = tokio::time::timeout(Duration::from_millis(250), task)
             .await
             .expect("cancellation cleanup must remain bounded")
@@ -817,10 +1001,10 @@ mod tests {
         assert!(cancelled.is_err());
         assert!(!finished.load(Ordering::Acquire));
 
-        let (_retry_sender, mut retry_receiver) = tokio::sync::watch::channel(false);
+        let retry_token = CancellationToken::new();
         let retry = tokio::time::timeout(
             super::BLOCKING_WORKER_ACQUIRE_TIMEOUT + Duration::from_millis(100),
-            acquire_path_lock(&path, Some(&mut retry_receiver)),
+            acquire_path_lock(&path, Some(&retry_token)),
         )
         .await
         .expect("a retry must not wait indefinitely for a stuck writer")
@@ -834,10 +1018,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(finished.load(Ordering::Acquire));
-        let (_retry_sender, mut retry_receiver) = tokio::sync::watch::channel(false);
-        let _permit = acquire_path_lock(&path, Some(&mut retry_receiver))
-            .await
-            .unwrap();
+        let retry_token = CancellationToken::new();
+        let _permit = acquire_path_lock(&path, Some(&retry_token)).await.unwrap();
     }
 
     #[tokio::test]
@@ -936,18 +1118,18 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let token = CancellationToken::new();
         let worker_path = path.clone();
         let task = tokio::spawn(run_blocking_with_pool(
             move |cancelled| {
                 read_file_wait_for_fifo_writer(&worker_path, cancelled, super::MAX_READ_BYTES)
             },
-            Some(receiver),
+            Some(token.clone()),
             test_worker_pool(),
         ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        sender.send(true).unwrap();
+        token.cancel();
         let result = tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .expect("a FIFO read without a writer must react to cancellation")
@@ -998,5 +1180,130 @@ mod tests {
         assert!(result.is_empty());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_regular_write_does_not_truncate_an_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "lait-cancelled-output-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "original").expect("failed to create output fixture");
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = write_output_file(&path, "replacement", Some(token)).await;
+        let contents = std::fs::read_to_string(&path).expect("output fixture should remain");
+        std::fs::remove_file(&path).expect("failed to remove output fixture");
+
+        assert!(result.is_err(), "a cancelled write should fail");
+        assert_eq!(contents, "original");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_fifo_write_is_joined_before_a_retry_can_write() {
+        use std::{
+            fs::OpenOptions,
+            io::{ErrorKind, Read},
+            os::unix::fs::OpenOptionsExt,
+            sync::mpsc,
+        };
+
+        let path = crate::test_support::unique_temp_path("lait-retry-output-fifo", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo should be available on Unix");
+        assert!(status.success());
+
+        // Keep a reader open without consuming anything. The first writer
+        // therefore fills the pipe and remains blocked, which makes a
+        // detached writer observable when the retry starts.
+        let reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .expect("FIFO reader should open without a writer");
+        let first_output = "x".repeat(512 * 1024);
+        let retry_output = "y".repeat(512 * 1024);
+        let cancel_token = CancellationToken::new();
+        let first_path = path.clone();
+        let first_output_for_task = first_output.clone();
+        let first_token = cancel_token.clone();
+        let first = tokio::spawn(async move {
+            write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_token.cancel();
+        let first_result = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("cancelling the first FIFO writer should finish promptly")
+            .unwrap();
+        assert!(first_result.is_err());
+
+        // Start the retry while the reader is still paused. If the first
+        // writer was not joined above, both writers will eventually publish
+        // their complete payload into the same FIFO.
+        let second_path = path.clone();
+        let second_output = retry_output.clone();
+        let second =
+            tokio::spawn(
+                async move { write_output_file(&second_path, &second_output, None).await },
+            );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (read_done, read_result) = mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => received.extend_from_slice(&buffer[..read]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("failed to read retry FIFO: {error}"),
+                }
+            }
+            read_done.send(received).unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the retry writer should finish after the reader drains the FIFO")
+            .unwrap()
+            .expect("the retry writer should succeed");
+        reader_thread.join().unwrap();
+        let received = read_result
+            .recv_timeout(Duration::from_secs(1))
+            .expect("FIFO reader should observe EOF after the retry writer closes");
+
+        assert!(
+            received.len() >= retry_output.len(),
+            "retry FIFO received {} bytes, less than the retry payload of {}",
+            received.len(),
+            retry_output.len()
+        );
+        let first_prefix_len = received.len() - retry_output.len();
+        assert!(
+            first_prefix_len <= first_output.len(),
+            "cancelled FIFO writer published {} bytes after the retry started",
+            first_prefix_len.saturating_sub(first_output.len())
+        );
+        assert!(
+            received[..first_prefix_len]
+                .iter()
+                .all(|byte| *byte == b'x'),
+            "the cancelled writer's bytes must precede the retry payload"
+        );
+        assert_eq!(&received[first_prefix_len..], retry_output.as_bytes());
+        std::fs::remove_file(path).unwrap();
     }
 }

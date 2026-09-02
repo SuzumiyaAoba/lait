@@ -1,16 +1,19 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::jq;
 
 #[cfg(test)]
 use crate::template;
 
+pub(crate) mod exec;
 mod model;
+pub(crate) mod scope;
 mod validate;
 
 pub(crate) use model::*;
+pub(crate) use scope::WorkflowScope;
 
 #[cfg(test)]
 mod tests;
@@ -23,7 +26,30 @@ pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
 }
 
 fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
-    let workflow: WorkflowFile = serde_yaml::from_str(contents)?;
+    let workflow: WorkflowFile = serde_yaml::from_str(contents).map_err(|error| {
+        // A node with no `type:` at all — the pre-version schema's shape —
+        // fails here with a "missing field `type`" message from the
+        // now-tagged `NodeDefinition` enum. That message alone doesn't say
+        // *why*, so point the author at the fix instead of leaving them to
+        // find B-1's changelog entry.
+        if error.to_string().contains("missing field `type`") {
+            anyhow!(
+                "{error}\n\nevery entry under 'nodes:' now requires a 'type:' \
+                 (prompt/agent/workflow/command/transform); see docs/usage/ja/workflow.md"
+            )
+        } else {
+            error.into()
+        }
+    })?;
+    if let Some(version) = workflow.version
+        && version != CURRENT_WORKFLOW_VERSION
+    {
+        bail!(
+            "unsupported workflow schema 'version: {version}'; this build of lait supports \
+             version {CURRENT_WORKFLOW_VERSION} (omit 'version:' to use the latest one this \
+             build supports)"
+        );
+    }
     if workflow.steps.is_empty() {
         bail!("workflow must contain at least one step");
     }
@@ -56,7 +82,7 @@ pub(crate) async fn eval_when_async(
     filter: &str,
     current_input: &str,
     steps: &StepOutputs,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<bool> {
     jq::apply_bool_cancellable_async(filter, current_input, steps, cancellation)
         .await

@@ -1,4 +1,4 @@
-use super::{StepOutputs, eval_when, parse_workflow};
+use super::{NodeDefinition, StepOutputs, eval_when, parse_workflow};
 use crate::schema::JsonSchemaEntry;
 
 #[test]
@@ -11,8 +11,10 @@ default:
   model: local
 nodes:
   summarize:
+    type: prompt
     prompt: "summarize: {{ input }}"
   translate:
+    type: prompt
     model: cloud
     reasoning_effort: high
     prompt: "translate: {{ input }}"
@@ -27,7 +29,7 @@ steps:
     assert_eq!(workflow.default.model.as_deref(), Some("local"));
     assert_eq!(workflow.steps.len(), 2);
     assert_eq!(workflow.steps[0].label(), Some("summarize"));
-    assert_eq!(workflow.nodes["translate"].model.as_deref(), Some("cloud"));
+    assert_eq!(workflow.nodes["translate"].model(), Some("cloud"));
 }
 
 #[test]
@@ -49,8 +51,10 @@ models:
       model_id: cloud-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{ input }}"
   echo_cloud:
+    type: prompt
     model: cloud
     prompt: "{{ input }}"
 steps:
@@ -70,12 +74,210 @@ fn rejects_workflow_with_no_steps() {
     assert!(parse_workflow("steps: []\n").is_err());
 }
 
+// -- version: --
+
+#[test]
+fn omits_version_and_still_parses_as_the_latest_schema() {
+    let result =
+        parse_workflow("nodes:\n  n:\n    type: transform\n    jq: '.'\nsteps:\n  - use: n\n");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn parses_a_workflow_with_an_explicit_matching_version() {
+    let result = parse_workflow(
+        "version: 1\nnodes:\n  n:\n    type: transform\n    jq: '.'\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn rejects_an_unrecognized_workflow_version() {
+    let result = parse_workflow(
+        "version: 99\nnodes:\n  n:\n    type: transform\n    jq: '.'\nsteps:\n  - use: n\n",
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("version"), "error was: {error}");
+}
+
+// -- type: (NodeDefinition's tag) --
+
+#[test]
+fn rejects_a_node_with_no_type() {
+    let result = parse_workflow("nodes:\n  n: {}\nsteps:\n  - use: n\n");
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("type"), "error was: {error}");
+    assert!(
+        error.contains("prompt/agent/workflow/command/transform"),
+        "error was: {error}"
+    );
+}
+
+#[test]
+fn rejects_an_unrecognized_node_type() {
+    let result = parse_workflow("nodes:\n  n:\n    type: bogus\nsteps:\n  - use: n\n");
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_an_unknown_field_on_a_prompt_node() {
+    // `agent:` is not a `PromptNode` field — `#[serde(deny_unknown_fields)]`
+    // catches it at parse time now, in place of the old flat struct's
+    // runtime "can have at most one of ..." check.
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: prompt\n    prompt: hi\n    agent: agents/a.md\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_an_unknown_field_on_an_agent_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: agent\n    agent: agents/a.md\n    system_prompt: hi\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_an_unknown_field_on_a_workflow_node() {
+    // `WorkflowNode` has no `model`/sampling/capability/`retry`/`timeout`/
+    // schema/attachment fields at all — every model-call knob belongs on the
+    // referenced sub-workflow's own steps instead (see `WorkflowNode`'s doc
+    // comment).
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: workflow\n    workflow: sub.yml\n    model: local\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_node_with_retry() {
+    // `retry`/`timeout` specifically (not just an arbitrary unknown field):
+    // apply to a single action and must be set on the steps inside the
+    // referenced workflow file instead — see `allows_a_workflow_node_with_on_error_at_its_use_site`.
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: workflow\n    workflow: sub.yml\n    retry:\n      max_attempts: 2\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_an_unknown_field_on_a_command_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: command\n    command: [\"wc\"]\n    files: [notes.txt]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_an_unknown_field_on_a_transform_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: transform\n    jq: '.'\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn allows_mcp_on_a_prompt_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    prompt: hi\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_mcp_on_an_agent_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: agent\n    agent: agents/a.md\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_skills_on_a_prompt_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    prompt: hi\n    skills: [code-review]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_skills_on_an_agent_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: agent\n    agent: agents/a.md\n    skills: [code-review]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_subagents_on_a_prompt_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    prompt: hi\n    subagents: [researcher]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_subagents_on_an_agent_node() {
+    let result = parse_workflow(
+        "nodes:\n  n:\n    type: agent\n    agent: agents/a.md\n    subagents: [researcher]\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_a_system_prompt_only_node_with_no_prompt() {
+    let workflow = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    )
+    .expect("workflow should parse");
+    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+        panic!("expected a prompt node");
+    };
+    assert!(n.prompt.is_none());
+    assert_eq!(n.system_prompt.as_deref(), Some("be terse"));
+}
+
+#[test]
+fn allows_system_prompt_together_with_jq_as_a_model_calling_node() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    jq: '.'\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn allows_system_prompt_on_a_prompt_node() {
+    let workflow = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    prompt: hi\n    system_prompt: be terse\nsteps:\n  - use: n\n",
+    )
+    .expect("workflow should parse");
+    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+        panic!("expected a prompt node");
+    };
+    assert_eq!(n.system_prompt.as_deref(), Some("be terse"));
+}
+
+#[test]
+fn rejects_a_prompt_node_with_neither_prompt_nor_system_prompt() {
+    let result = parse_workflow("nodes:\n  n:\n    type: prompt\nsteps:\n  - use: n\n");
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("transform"), "error was: {error}");
+}
+
+#[test]
+fn rejects_a_transform_node_with_neither_jq_nor_write_file() {
+    let result = parse_workflow("nodes:\n  n:\n    type: transform\nsteps:\n  - use: n\n");
+    assert!(result.is_err());
+}
+
 #[test]
 fn parses_a_node_with_output_schema_and_jq() {
     let workflow = parse_workflow(
         r#"
 nodes:
   answer:
+    type: prompt
     prompt: "{{ input }}"
     output_schema: schema.json
     schema_name: answer
@@ -86,7 +288,9 @@ steps:
     )
     .expect("workflow with output_schema and jq should parse");
 
-    let node = &workflow.nodes["answer"];
+    let NodeDefinition::Prompt(node) = &workflow.nodes["answer"] else {
+        panic!("expected a prompt node");
+    };
     assert_eq!(node.output_schema.as_deref(), Some("schema.json"));
     assert_eq!(node.schema_name.as_deref(), Some("answer"));
     assert_eq!(node.jq.as_deref(), Some(".answer"));
@@ -106,6 +310,7 @@ json_schemas:
       required: [answer]
 nodes:
   answer:
+    type: prompt
     prompt: "{{ input }}"
     output_schema: answer
 steps:
@@ -121,10 +326,10 @@ steps:
         }
         JsonSchemaEntry::FilePath { .. } => panic!("expected an inline schema entry"),
     }
-    assert_eq!(
-        workflow.nodes["answer"].output_schema.as_deref(),
-        Some("answer")
-    );
+    let NodeDefinition::Prompt(answer) = &workflow.nodes["answer"] else {
+        panic!("expected a prompt node");
+    };
+    assert_eq!(answer.output_schema.as_deref(), Some("answer"));
 }
 
 #[test]
@@ -136,6 +341,7 @@ json_schemas:
     file_path: schema.json
 nodes:
   answer:
+    type: prompt
     prompt: "{{ input }}"
     output_schema: answer
 steps:
@@ -163,6 +369,7 @@ json_schemas:
     file_path: schema.json
 nodes:
   answer:
+    type: prompt
     prompt: "{{ input }}"
     output_schema: answer
 steps:
@@ -180,6 +387,7 @@ json_schemas:
   answer: {}
 nodes:
   answer:
+    type: prompt
     prompt: "{{ input }}"
     output_schema: answer
 steps:
@@ -195,6 +403,7 @@ fn allows_a_transform_only_node_with_no_prompt() {
         r#"
 nodes:
   transform:
+    type: transform
     jq: ".answer"
 steps:
   - use: transform
@@ -202,8 +411,7 @@ steps:
     )
     .expect("a jq-only node should parse");
 
-    assert!(workflow.nodes["transform"].prompt.is_none());
-    assert_eq!(workflow.nodes["transform"].jq.as_deref(), Some(".answer"));
+    assert_eq!(workflow.nodes["transform"].jq(), Some(".answer"));
 }
 
 #[test]
@@ -212,15 +420,13 @@ fn rejects_a_step_with_neither_use_nor_a_router_nor_stop_or_break() {
 }
 
 #[test]
-fn rejects_a_node_with_neither_prompt_nor_jq() {
-    let result = parse_workflow("nodes:\n  n: {}\nsteps:\n  - use: n\n");
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_output_schema_without_a_prompt() {
+fn rejects_output_schema_on_a_transform_node() {
+    // `output_schema` only exists on `PromptNode` now — setting it on a
+    // `type: transform` node is an unknown-field parse error, in place of
+    // the old flat struct's "no prompt/system_prompt/agent to apply it to"
+    // runtime bail.
     let result = parse_workflow(
-        "nodes:\n  n:\n    jq: \".\"\n    output_schema: schema.json\nsteps:\n  - use: n\n",
+        "nodes:\n  n:\n    type: transform\n    jq: \".\"\n    output_schema: schema.json\nsteps:\n  - use: n\n",
     );
     assert!(result.is_err());
 }
@@ -228,7 +434,7 @@ fn rejects_output_schema_without_a_prompt() {
 #[test]
 fn rejects_schema_name_without_output_schema() {
     let result = parse_workflow(
-        "nodes:\n  n:\n    prompt: \"{{ input }}\"\n    schema_name: answer\nsteps:\n  - use: n\n",
+        "nodes:\n  n:\n    type: prompt\n    prompt: \"{{ input }}\"\n    schema_name: answer\nsteps:\n  - use: n\n",
     );
     assert!(result.is_err());
 }
@@ -239,6 +445,7 @@ fn parses_a_node_with_an_agent() {
         r#"
 nodes:
   extract:
+    type: agent
     agent: agents/extract.md
     jq: ".city"
 steps:
@@ -247,21 +454,10 @@ steps:
     )
     .expect("workflow with an agent node should parse");
 
-    assert_eq!(
-        workflow.nodes["extract"]
-            .agent
-            .as_deref()
-            .and_then(|p| p.to_str()),
-        Some("agents/extract.md")
-    );
-}
-
-#[test]
-fn rejects_a_node_with_both_prompt_and_agent() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    prompt: \"{{ input }}\"\n    agent: agents/extract.md\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
+    let NodeDefinition::Agent(extract) = &workflow.nodes["extract"] else {
+        panic!("expected an agent node");
+    };
+    assert_eq!(extract.agent.to_str(), Some("agents/extract.md"));
 }
 
 #[test]
@@ -270,6 +466,7 @@ fn parses_a_node_with_an_input_schema() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     input_schema: schema.json
 steps:
@@ -278,34 +475,10 @@ steps:
     )
     .expect("workflow with an input_schema should parse");
 
-    assert_eq!(
-        workflow.nodes["n"].input_schema.as_deref(),
-        Some("schema.json")
-    );
-}
-
-#[test]
-fn rejects_a_node_with_agent_and_input_schema() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/extract.md\n    input_schema: schema.json\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_node_with_agent_and_output_schema() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/extract.md\n    output_schema: schema.json\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_node_with_agent_and_schema_name() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/extract.md\n    schema_name: answer\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
+    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+        panic!("expected a prompt node");
+    };
+    assert_eq!(n.input_schema.as_deref(), Some("schema.json"));
 }
 
 #[test]
@@ -314,6 +487,7 @@ fn parses_a_node_with_a_workflow() {
         r#"
 nodes:
   sub:
+    type: workflow
     workflow: ./shared/summarize.yml
     jq: '.'
 steps:
@@ -323,219 +497,10 @@ steps:
     )
     .expect("workflow with a 'workflow' node should parse");
 
-    assert_eq!(
-        workflow.nodes["sub"]
-            .workflow
-            .as_ref()
-            .and_then(|path| path.to_str()),
-        Some("./shared/summarize.yml")
-    );
-}
-
-#[test]
-fn rejects_a_node_with_both_workflow_and_prompt() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    prompt: \"{{ input }}\"\n    workflow: sub.yml\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_node_with_both_workflow_and_agent() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/extract.md\n    workflow: sub.yml\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_model() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    model: local\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_input_schema() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    input_schema: schema.json\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_retry() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    retry:\n      max_attempts: 2\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_mcp() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_max_tool_rounds() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    max_tool_rounds: 4\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_mcp_on_a_jq_only_node() {
-    let result =
-        parse_workflow("nodes:\n  n:\n    jq: '.'\n    mcp: [filesystem]\nsteps:\n  - use: n\n");
-    assert!(result.is_err());
-}
-
-#[test]
-fn allows_mcp_on_a_prompt_node() {
-    let result = parse_workflow(
-        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn allows_mcp_on_an_agent_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/a.md\n    mcp: [filesystem]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_skills() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    skills: [code-review]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_skills_on_a_jq_only_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    jq: '.'\n    skills: [code-review]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn allows_skills_on_a_prompt_node() {
-    let result = parse_workflow(
-        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    skills: [code-review]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn allows_skills_on_an_agent_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/a.md\n    skills: [code-review]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_subagents() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    subagents: [researcher]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_subagents_on_a_jq_only_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    jq: '.'\n    subagents: [researcher]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn allows_subagents_on_a_prompt_node() {
-    let result = parse_workflow(
-        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    subagents: [researcher]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn allows_subagents_on_an_agent_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/a.md\n    subagents: [researcher]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_system_prompt() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    system_prompt: be terse\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn allows_a_system_prompt_only_node_with_no_prompt() {
-    let workflow = parse_workflow(
-        "default:\n  model: local\nnodes:\n  n:\n    system_prompt: be terse\nsteps:\n  - use: n\n",
-    )
-    .expect("workflow should parse");
-    assert!(workflow.nodes["n"].prompt.is_none());
-    assert_eq!(
-        workflow.nodes["n"].system_prompt.as_deref(),
-        Some("be terse")
-    );
-}
-
-#[test]
-fn allows_system_prompt_together_with_jq_as_a_model_calling_node() {
-    let result = parse_workflow(
-        "default:\n  model: local\nnodes:\n  n:\n    jq: '.'\n    system_prompt: be terse\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn rejects_system_prompt_on_an_agent_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    agent: agents/a.md\n    system_prompt: be terse\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn allows_system_prompt_on_a_prompt_node() {
-    let workflow = parse_workflow(
-        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    system_prompt: be terse\nsteps:\n  - use: n\n",
-    )
-    .expect("workflow should parse");
-    assert_eq!(
-        workflow.nodes["n"].system_prompt.as_deref(),
-        Some("be terse")
-    );
-}
-
-#[test]
-fn rejects_a_node_max_tool_rounds_of_zero() {
-    let result = parse_workflow(
-        "default:\n  model: local\nnodes:\n  n:\n    prompt: hi\n    max_tool_rounds: 0\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_default_max_tool_rounds_of_zero() {
-    let result = parse_workflow("default:\n  max_tool_rounds: 0\nsteps:\n  - use: n\n");
-    assert!(result.is_err());
+    let NodeDefinition::Workflow(sub) = &workflow.nodes["sub"] else {
+        panic!("expected a workflow node");
+    };
+    assert_eq!(sub.workflow.to_str(), Some("./shared/summarize.yml"));
 }
 
 #[test]
@@ -548,6 +513,7 @@ fn allows_a_workflow_node_with_on_error_at_its_use_site() {
         r#"
 nodes:
   n:
+    type: workflow
     workflow: sub.yml
 steps:
   - use: n
@@ -565,6 +531,7 @@ fn rejects_a_workflow_combined_with_switch() {
         r#"
 nodes:
   sub:
+    type: workflow
     workflow: sub.yml
 steps:
   - use: sub
@@ -584,6 +551,7 @@ fn allows_a_workflow_step_with_when_jq_and_stop() {
         r#"
 nodes:
   sub:
+    type: workflow
     workflow: sub.yml
     jq: '.'
 steps:
@@ -602,6 +570,7 @@ fn rejects_unknown_top_level_field() {
 unexpected: true
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -616,6 +585,7 @@ fn parses_a_step_with_a_when_guard() {
         r#"
 nodes:
   maybe:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - id: maybe
@@ -634,10 +604,13 @@ fn parses_a_switch_with_cases_and_else() {
         r#"
 nodes:
   escalate:
+    type: prompt
     prompt: "escalate: {{ input }}"
   reply:
+    type: prompt
     prompt: "reply: {{ input }}"
   summarize:
+    type: transform
     jq: ".summary"
 steps:
   - id: route
@@ -671,6 +644,7 @@ fn parses_a_switch_without_else() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - switch:
@@ -724,6 +698,7 @@ fn rejects_a_switch_with_an_empty_else() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - switch:
@@ -743,6 +718,7 @@ fn rejects_a_switch_combined_with_use() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -762,6 +738,7 @@ fn rejects_a_switch_combined_with_when() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - when: 'true'
@@ -781,6 +758,7 @@ fn rejects_a_switch_combined_with_on_error() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - on_error:
@@ -817,8 +795,10 @@ fn parses_a_parallel_with_branches_and_join() {
         r#"
 nodes:
   a:
+    type: prompt
     prompt: "a: {{ input }}"
   b:
+    type: prompt
     prompt: "b: {{ input }}"
 steps:
   - id: fan-out
@@ -850,6 +830,7 @@ fn parses_a_parallel_without_join() {
         r#"
 nodes:
   n:
+    type: transform
     jq: "."
 steps:
   - parallel:
@@ -871,6 +852,7 @@ fn parallel_branch_label_defaults_to_branch_n() {
         r#"
 nodes:
   n:
+    type: transform
     jq: "."
 steps:
   - parallel:
@@ -920,6 +902,7 @@ fn rejects_a_parallel_with_duplicate_branch_ids() {
         r#"
 nodes:
   n:
+    type: transform
     jq: "."
 steps:
   - parallel:
@@ -941,6 +924,7 @@ fn rejects_a_parallel_combined_with_use() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -974,6 +958,7 @@ fn rejects_a_step_with_both_switch_and_parallel() {
         r#"
 nodes:
   n:
+    type: transform
     jq: "."
 steps:
   - switch:
@@ -1010,6 +995,7 @@ fn parses_a_loop_with_while_and_max_iterations() {
         r#"
 nodes:
   bump:
+    type: transform
     jq: '.score += 1'
 steps:
   - id: refine
@@ -1037,6 +1023,7 @@ fn parses_a_loop_with_until() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1059,6 +1046,7 @@ fn rejects_a_loop_with_both_while_and_until() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1078,6 +1066,7 @@ fn rejects_a_loop_with_neither_while_nor_until() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1095,6 +1084,7 @@ fn rejects_a_loop_with_no_max_iterations() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1112,6 +1102,7 @@ fn rejects_a_loop_with_max_iterations_zero() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1144,6 +1135,7 @@ fn rejects_a_loop_combined_with_use() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -1178,6 +1170,7 @@ fn parses_a_for_each_with_items_and_join() {
         r#"
 nodes:
   bump:
+    type: transform
     jq: '. + 1'
 steps:
   - id: process
@@ -1204,6 +1197,7 @@ fn parses_a_for_each_without_join() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - for_each:
@@ -1236,6 +1230,7 @@ fn parses_a_for_each_with_max_concurrency() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - for_each:
@@ -1259,6 +1254,7 @@ fn rejects_a_for_each_with_max_concurrency_zero() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - for_each:
@@ -1325,6 +1321,7 @@ fn rejects_use_of_a_write_file_node_inside_a_for_each_with_max_concurrency_above
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
     write_file: out.txt
 steps:
@@ -1344,6 +1341,7 @@ fn allows_use_of_a_write_file_node_inside_a_sequential_for_each() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
     write_file: out.txt
 steps:
@@ -1362,6 +1360,7 @@ fn rejects_use_of_a_write_file_node_inside_a_sequential_for_each_nested_in_a_con
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
     write_file: out.txt
 steps:
@@ -1384,6 +1383,7 @@ fn rejects_a_for_each_combined_with_when() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - when: 'true'
@@ -1416,6 +1416,7 @@ fn rejects_a_step_with_both_loop_and_for_each() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1453,6 +1454,7 @@ fn parses_a_step_with_break_inside_a_loop() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1476,6 +1478,7 @@ fn parses_a_step_with_break_inside_a_for_each() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - for_each:
@@ -1601,6 +1604,7 @@ fn allows_use_combined_with_stop() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -1628,6 +1632,7 @@ fn rejects_on_error_without_use() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - stop: true
@@ -1645,6 +1650,7 @@ fn parses_a_step_with_retry_timeout_and_on_error() {
         r#"
 nodes:
   call:
+    type: prompt
     prompt: "{{ input }}"
     timeout: 30
     retry:
@@ -1652,6 +1658,7 @@ nodes:
       delay_seconds: 1
       backoff: 2.0
   fallback:
+    type: transform
     jq: '{ fallback: .error }'
 steps:
   - id: call
@@ -1664,8 +1671,8 @@ steps:
     .expect("workflow with retry/timeout/on_error should parse");
 
     let node = &workflow.nodes["call"];
-    assert_eq!(node.timeout, Some(30));
-    let retry = node.retry.as_ref().unwrap();
+    assert_eq!(node.timeout(), Some(30));
+    let retry = node.retry().unwrap();
     assert_eq!(retry.max_attempts, Some(3));
     assert_eq!(retry.delay_seconds, Some(1));
     assert_eq!(retry.backoff, Some(2.0));
@@ -1678,6 +1685,7 @@ fn rejects_a_retry_with_no_max_attempts() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     retry:
       delay_seconds: 1
@@ -1694,6 +1702,7 @@ fn rejects_a_retry_with_max_attempts_zero() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     retry:
       max_attempts: 0
@@ -1710,6 +1719,7 @@ fn rejects_a_timeout_of_zero() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     timeout: 0
 steps:
@@ -1725,6 +1735,7 @@ fn parses_a_node_with_temperature_top_p_and_max_tokens() {
         r#"
 nodes:
   n:
+    type: prompt
     model: local
     temperature: 0.7
     top_p: 0.9
@@ -1736,9 +1747,9 @@ steps:
     )
     .expect("workflow should parse");
 
-    assert_eq!(workflow.nodes["n"].temperature, Some(0.7));
-    assert_eq!(workflow.nodes["n"].top_p, Some(0.9));
-    assert_eq!(workflow.nodes["n"].max_tokens, Some(256));
+    assert_eq!(workflow.nodes["n"].temperature(), Some(0.7));
+    assert_eq!(workflow.nodes["n"].top_p(), Some(0.9));
+    assert_eq!(workflow.nodes["n"].max_tokens(), Some(256));
 }
 
 #[test]
@@ -1752,6 +1763,7 @@ default:
   max_tokens: 128
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -1770,6 +1782,7 @@ fn rejects_a_node_with_an_out_of_range_temperature() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     temperature: 2.5
 steps:
@@ -1785,6 +1798,7 @@ fn rejects_a_node_with_an_out_of_range_top_p() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     top_p: 1.5
 steps:
@@ -1800,6 +1814,7 @@ fn rejects_a_node_with_a_zero_max_tokens() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     max_tokens: 0
 steps:
@@ -1817,22 +1832,8 @@ default:
   temperature: -0.1
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
-steps:
-  - use: n
-"#,
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_temperature_combined_with_workflow() {
-    let result = parse_workflow(
-        r#"
-nodes:
-  n:
-    workflow: ./sub.yml
-    temperature: 0.5
 steps:
   - use: n
 "#,
@@ -1846,6 +1847,7 @@ fn rejects_an_on_error_with_an_empty_steps_list() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -1862,6 +1864,7 @@ fn validates_steps_nested_inside_on_error() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -1879,6 +1882,7 @@ fn on_error_inherits_the_failing_steps_loop_context_for_break() {
         r#"
 nodes:
   caller:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - loop:
@@ -1900,6 +1904,7 @@ fn parses_a_node_with_write_file() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     write_file: out.txt
 steps:
@@ -1909,8 +1914,8 @@ steps:
     .expect("workflow with write_file should parse");
 
     assert_eq!(
-        workflow.nodes["n"].write_file,
-        Some(std::path::PathBuf::from("out.txt"))
+        workflow.nodes["n"].write_file(),
+        Some(std::path::Path::new("out.txt"))
     );
 }
 
@@ -1920,6 +1925,7 @@ fn allows_a_node_with_only_write_file() {
         r#"
 nodes:
   n:
+    type: transform
     write_file: out.txt
 steps:
   - use: n
@@ -1934,6 +1940,7 @@ fn parses_a_node_with_a_command() {
         r#"
 nodes:
   n:
+    type: command
     command: ["wc", "-l"]
 steps:
   - use: n
@@ -1941,63 +1948,16 @@ steps:
     )
     .expect("workflow with a command node should parse");
 
-    assert_eq!(
-        workflow.nodes["n"].command.as_deref(),
-        Some(["wc".to_owned(), "-l".to_owned()].as_slice())
-    );
+    let NodeDefinition::Command(n) = &workflow.nodes["n"] else {
+        panic!("expected a command node");
+    };
+    assert_eq!(n.command, vec!["wc".to_owned(), "-l".to_owned()]);
 }
 
 #[test]
 fn rejects_a_node_with_an_empty_command_list() {
-    let result = parse_workflow("nodes:\n  n:\n    command: []\nsteps:\n  - use: n\n");
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_node_with_both_command_and_prompt() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    command: [\"wc\"]\n    prompt: \"{{ input }}\"\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_node_with_both_command_and_system_prompt() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    command: [\"wc\"]\n    system_prompt: hi\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_node_with_both_command_and_agent() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    command: [\"wc\"]\n    agent: agents/extract.md\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_node_with_both_command_and_workflow() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    command: [\"wc\"]\n    workflow: sub.yml\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_command_node_with_files() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    command: [\"wc\"]\n    files: [notes.txt]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_command_node_with_images() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    command: [\"wc\"]\n    images: [photo.png]\nsteps:\n  - use: n\n",
-    );
+    let result =
+        parse_workflow("nodes:\n  n:\n    type: command\n    command: []\nsteps:\n  - use: n\n");
     assert!(result.is_err());
 }
 
@@ -2007,6 +1967,7 @@ fn a_command_node_can_have_a_jq_filter_and_write_file() {
         r#"
 nodes:
   n:
+    type: command
     command: ["wc", "-l"]
     jq: "tonumber"
     write_file: out.txt
@@ -2023,6 +1984,7 @@ fn parses_a_node_with_files_and_images() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     files: [notes.txt, more.txt]
     images: [photo.png, "https://example.com/cat.png"]
@@ -2032,8 +1994,11 @@ steps:
     )
     .expect("workflow with files/images should parse");
 
+    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+        panic!("expected a prompt node");
+    };
     assert_eq!(
-        workflow.nodes["n"].files.as_deref(),
+        n.files.as_deref(),
         Some(
             [
                 std::path::PathBuf::from("notes.txt"),
@@ -2043,7 +2008,7 @@ steps:
         )
     );
     assert_eq!(
-        workflow.nodes["n"].images.as_deref(),
+        n.images.as_deref(),
         Some(
             [
                 "photo.png".to_owned(),
@@ -2052,37 +2017,6 @@ steps:
             .as_slice()
         )
     );
-}
-
-#[test]
-fn rejects_files_on_a_jq_only_node() {
-    let result =
-        parse_workflow("nodes:\n  n:\n    jq: \".\"\n    files: [notes.txt]\nsteps:\n  - use: n\n");
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_images_on_a_jq_only_node() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    jq: \".\"\n    images: [photo.png]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_files() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    files: [notes.txt]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn rejects_a_workflow_node_with_images() {
-    let result = parse_workflow(
-        "nodes:\n  n:\n    workflow: sub.yml\n    images: [photo.png]\nsteps:\n  - use: n\n",
-    );
-    assert!(result.is_err());
 }
 
 #[test]
@@ -2097,6 +2031,7 @@ default:
   timeout: 30
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -2118,6 +2053,7 @@ default:
     delay_seconds: 1
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -2135,6 +2071,7 @@ default:
     max_attempts: 0
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -2149,6 +2086,7 @@ fn rejects_a_retry_with_a_negative_backoff() {
         r#"
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
     retry:
       max_attempts: 2
@@ -2171,6 +2109,7 @@ default:
     backoff: .inf
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
@@ -2188,11 +2127,26 @@ default:
   timeout: 0
 nodes:
   n:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: n
 "#,
     );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_node_max_tool_rounds_of_zero() {
+    let result = parse_workflow(
+        "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    prompt: hi\n    max_tool_rounds: 0\nsteps:\n  - use: n\n",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_a_workflow_default_max_tool_rounds_of_zero() {
+    let result = parse_workflow("default:\n  max_tool_rounds: 0\nsteps:\n  - use: n\n");
     assert!(result.is_err());
 }
 
@@ -2216,6 +2170,7 @@ fn allows_the_same_node_to_be_used_from_multiple_steps_sites() {
         r#"
 nodes:
   greet:
+    type: prompt
     prompt: "hello: {{ input }}"
 steps:
   - use: greet
@@ -2239,8 +2194,10 @@ fn rejects_a_site_id_colliding_with_a_different_node_id() {
         r#"
 nodes:
   draft:
+    type: prompt
     prompt: "draft: {{ input }}"
   summarize:
+    type: transform
     jq: '.'
 steps:
   - id: summarize
@@ -2256,6 +2213,7 @@ fn allows_a_site_id_equal_to_its_own_used_node_id() {
         r#"
 nodes:
   draft:
+    type: prompt
     prompt: "draft: {{ input }}"
 steps:
   - id: draft
@@ -2271,6 +2229,7 @@ fn rejects_a_router_site_id_colliding_with_a_different_node_id() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - id: n
@@ -2291,6 +2250,7 @@ fn rejects_a_nested_control_site_id_colliding_with_a_different_node_id() {
         r#"
 nodes:
   n:
+    type: transform
     jq: '.'
 steps:
   - switch:
@@ -2308,7 +2268,9 @@ steps:
 #[test]
 fn rejects_a_command_with_an_empty_or_whitespace_program() {
     for program in ["", "  "] {
-        let yaml = format!("nodes:\n  n:\n    command: [\"{program}\"]\nsteps:\n  - use: n\n");
+        let yaml = format!(
+            "nodes:\n  n:\n    type: command\n    command: [\"{program}\"]\nsteps:\n  - use: n\n"
+        );
         let error = parse_workflow(&yaml).unwrap_err().to_string();
         assert!(error.contains("command[0]"), "error was: {error}");
     }

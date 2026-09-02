@@ -2,8 +2,13 @@
 
 [ドキュメント目次に戻る](./README.md)
 
-CLI 引数や環境変数で指定していない値は、コマンドを実行したディレクトリの
-`lait.config.yml` からデフォルトとして読み込まれます。設定できる基本項目は次のとおりです。
+CLI 引数や環境変数で指定していない値は、`lait.config.yml` からデフォルトとして
+読み込まれます。ファイルはカレントディレクトリから探し始め、見つからなければ
+`git` が `.git` を探すのと同じ要領で親ディレクトリを順にさかのぼって探します
+（プロジェクトのサブディレクトリから実行しても見つかります）。`--config <PATH>`
+で読み込むファイルを明示的に指定することもでき、この場合は探索を行わず、
+指定したファイルが存在しなければエラーになります。`--no-config` を指定すると
+探索・読み込み自体を行いません。設定できる基本項目は次のとおりです。
 
 ```yaml
 # lait.config.yml
@@ -24,6 +29,17 @@ default:
 優先されます（システムプロンプトを自前で持つ agent／workflow はこの値を参照しません）。CLI の
 `--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独立してフォールバックします
 （`reasoning_effort` と同じ仕組みで、`retry` のようなブロック単位のフォールバックではありません）。
+
+`default:` にはこの他、`mcp:`/`skills:`/`subagents:`（後述の各節を参照）、`max_tool_rounds:`
+（既定 8）、および次の 2 項目も指定できます。
+
+- `render: true` — `--render` を渡さなくても応答を Markdown として端末表示します。
+  チャット・`lait run`・`lait agent run`・`lait prompt run` のいずれにも効きます
+  （[出力例](./output.md) を参照）。
+- `history: false` — `--no-history` を渡さなくても `lait history` への記録を止めます
+  （[実行履歴](./history.md) を参照）。
+
+いずれも CLI フラグ（`--render`/`--no-history`）が指定されればそちらが優先されます。
 
 ## モデル定義と alias
 
@@ -63,19 +79,33 @@ default:
 
 ## 設定値の優先順位
 
-設定値は項目ごとに、次の優先順位で解決されます。CLI 引数と環境変数の間では CLI 引数が優先されます。
+`base_url`/`api_key` は、次の優先順位で解決されます。CLI 引数と環境変数の間では CLI 引数が優先されます。
 
-`CLI 引数 > 環境変数 > モデル定義 > 既存トップレベル設定 > 組み込み既定値`
+`CLI 引数 > 環境変数 > モデル定義（provider.*） > トップレベル設定（base_url/api_key） > 組み込み既定値`
 
 たとえば alias のモデル定義が `provider.base_url` を持つ場合、その値はトップレベルの `base_url`
 より優先されます。CLI の `--base-url` や `OPENAI_BASE_URL` を指定した場合は、それらがモデル定義を
 上書きします。`provider.api_key` と `default_reasoning_effort` を省略した場合は、対応する
 トップレベルの `api_key`、`default.reasoning_effort` がフォールバックとして使用されます。
 
+`model`/`reasoning_effort`/サンプリングパラメータ/`mcp`/`skills`/`subagents`/`max_tool_rounds` の
+解決順は、**呼び出し経路によって異なる 2 系統**があります（`base_url`/`api_key` とは別のチェーン
+です）。
+
+- **チャット／`lait prompt`／`-p`**: `CLI 引数（環境変数フォールバック込み） > 名前付きプロンプト
+  の値（`prompts.<name>.model` など） > default: の値 > 組み込み既定値`
+- **`lait agent run`／ワークフローノード**: `ノード自身（またはエージェント Markdown の
+  frontmatter）の値 > エージェント Markdown の値（ノードが `agent:` を指す場合） >
+  ワークフローファイルの `default:` > lait.config.yml の `default:` > 組み込み既定値`
+
+どちらの経路でも、`lait.config.yml` の `default:` が最終手前のフォールバック層になります。
+
 `base_url`、`api_key` はトップレベルの項目として、フォールバック用の `model`、`reasoning_effort`、
 `temperature`、`top_p`、`max_tokens` は `default:` の配下にまとめて指定します。設定ファイルの自動読込を
 無効にする場合は `--no-config` を指定してください。この場合は設定ファイルを読み込まず、CLI
-引数、環境変数、既定値だけが使用されます。
+引数、環境変数、既定値だけが使用されます。特定のファイルを明示したい場合は
+`--no-config` の代わりに `--config <PATH>` を使ってください（`--no-config` と
+`--config` は同時に指定できません）。
 
 ## `${VAR_NAME}` による環境変数参照
 
@@ -100,6 +130,10 @@ models:
 - この展開は設定ファイル（`lait.config.yml`、および後述するワークフローファイルの `models:`/
   トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
+- 後述の [MCP サーバー](#mcp-サーバー) の `command`/`args`/`env`/`cwd`/`url`/`headers` も同じ
+  規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
+  パス、`default.system`、ワークフローの `prompt:`/`system_prompt:` には**この展開は適用されません**
+  （こちらは `--var`/handlebars のテンプレート変数で渡してください）。
 
 ## `.env` ファイルの自動読み込み
 
@@ -146,14 +180,41 @@ mcp_servers:
     url: https://mcp.example.com/mcp
     headers:
       Authorization: "Bearer ${SEARCH_TOKEN}"
+    allowed_tools: [search]  # 省略可。省略時は無制限、[] を指定すると全ツール禁止
 ```
 
 - `command:`（stdio）と `url:`（streamable HTTP）はどちらか一方だけを指定します。両方または
   どちらも指定しない場合はエラーになります。
 - `command`/`args`/`env` の値、`cwd`、`url`、`headers` の値は、いずれも `${VAR_NAME}` 展開の対象
-  です（前節と同じ規則）。
+  です（前節と同じ規則）。`allowed_tools` の値は展開対象ではありません。
 - 実際に使われるサーバーだけがその場で接続されます（`mcp:` で名前を挙げていないサーバーは
   起動しません）。
+- `allowed_tools:` は省略時（フィールドなし）は無制限、`[]`（空リスト）を指定するとそのサーバー
+  の全ツールを禁止という意味になり、この2つは区別されます。モデルがそのサーバーの
+  `allowed_tools` に無いツールを呼び出そうとすると、サーバーへ接続する前にエラーになります。
+  詳しくは [MCP サーバーのツールを使う](./mcp.md#呼び出せるツールを制限するallowed_tools) を
+  参照してください。
+
+## 名前付きプロンプト
+
+`prompts:` に名前付きプロンプトを登録すると、`-p/--prompt-name <NAME>`（チャット）または
+`lait prompt run <NAME>` から実行できます。詳しい使い方は
+[名前付きプロンプトを使う](./prompts.md) を参照してください。
+
+```yaml
+# lait.config.yml
+prompts:
+  summarize:
+    template: "次の文章を3行で要約してください。\n\n{{ input }}"
+    model: local            # 省略時は default.model にフォールバック
+    vars:
+      style: casual         # --var style=formal で上書き可能
+```
+
+- `template` は handlebars テンプレートで、`{{ input }}`（位置引数／stdin）と
+  `{{ vars.<key> }}`（`vars:` の既定値、`--var key=value` で上書き可能）を参照できます。
+- `model` を省略した場合は `default.model` にフォールバックします。
+- `lait prompt list` で登録済みのプロンプト名を一覧できます。
 
 ## スキル
 

@@ -109,11 +109,9 @@ fn prompt_subcommand_renders_and_runs_the_named_prompt() {
     let dir = config_with_translate_prompt_and_base_url(&server.base_url);
     let output = test_command()
         .current_dir(dir.path())
-        .arg("prompt")
-        .arg("translate")
-        .arg("Hello")
+        .args(["prompt", "run", "translate", "Hello"])
         .output()
-        .expect("failed to execute lait prompt");
+        .expect("failed to execute lait prompt run");
     let request = server.receive_request();
     server.finish();
 
@@ -121,6 +119,31 @@ fn prompt_subcommand_renders_and_runs_the_named_prompt() {
     assert!(request.body.contains("translate Hello into"));
     assert!(request.body.contains(r#""model":"config-model""#));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
+}
+
+#[test]
+fn prompt_subcommand_emits_json_with_the_same_shape_as_chat() {
+    let server = MockServer::start("200 OK", RESPONSE);
+    let dir = config_with_translate_prompt_and_base_url(&server.base_url);
+    let output = test_command()
+        .current_dir(dir.path())
+        .args(["prompt", "run", "translate", "Hello", "--json"])
+        .output()
+        .expect("failed to execute lait prompt run");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--json output should be valid JSON");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "content": "ok",
+            "reasoning": null,
+            "usage": null,
+        })
+    );
 }
 
 #[test]

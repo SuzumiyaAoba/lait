@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "astro dev",
-    "build": "astro check && astro build",
+    "sync-docs": "node scripts/sync-docs.mjs",
+    "sync-docs:check": "node scripts/sync-docs.mjs --check",
+    "dev": "node scripts/sync-docs.mjs && astro dev",
+    "build": "node scripts/sync-docs.mjs && astro check && astro build",
     "preview": "astro preview",
-    "types:check": "astro check"
+    "types:check": "node scripts/sync-docs.mjs && astro check"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.41.10",

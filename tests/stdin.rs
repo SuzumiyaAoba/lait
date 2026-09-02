@@ -1,13 +1,16 @@
 mod support;
 
-use support::{MockServer, run_lait_with_stdin, without_json_whitespace};
+use support::{LaitCommand, MockServer, without_json_whitespace};
 
 const RESPONSE: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
 
 #[test]
 fn uses_piped_stdin_as_the_prompt_when_no_argument_is_given() {
     let server = MockServer::start("200 OK", RESPONSE);
-    let output = run_lait_with_stdin(&server.base_url, None, "piped prompt\n");
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_prompt(None)
+        .spawn_with_stdin("piped prompt\n");
     let request = server.receive_request();
     server.finish();
 
@@ -22,7 +25,10 @@ fn uses_piped_stdin_as_the_prompt_when_no_argument_is_given() {
 #[test]
 fn appends_piped_stdin_to_the_prompt_argument_as_context() {
     let server = MockServer::start("200 OK", RESPONSE);
-    let output = run_lait_with_stdin(&server.base_url, Some("review this"), "diff text\n");
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_prompt(Some("review this"))
+        .spawn_with_stdin("diff text\n");
     let request = server.receive_request();
     server.finish();
 
@@ -37,7 +43,10 @@ fn appends_piped_stdin_to_the_prompt_argument_as_context() {
 #[test]
 fn a_dash_argument_reads_the_prompt_from_stdin() {
     let server = MockServer::start("200 OK", RESPONSE);
-    let output = run_lait_with_stdin(&server.base_url, Some("-"), "dash prompt\n");
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_prompt(Some("-"))
+        .spawn_with_stdin("dash prompt\n");
     let request = server.receive_request();
     server.finish();
 
@@ -52,7 +61,10 @@ fn a_dash_argument_reads_the_prompt_from_stdin() {
 #[test]
 fn errors_when_stdin_is_empty_and_no_prompt_is_given() {
     // No server: the request must never be sent.
-    let output = run_lait_with_stdin("http://127.0.0.1:9", None, "");
+    let output = LaitCommand::new()
+        .base_url(Some("http://127.0.0.1:9"))
+        .opt_prompt(None)
+        .spawn_with_stdin("");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

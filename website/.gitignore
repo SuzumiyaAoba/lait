@@ -4,6 +4,10 @@
 # generated content
 /.astro/
 
+# generated from ../docs/usage/ja/ by scripts/sync-docs.mjs (`pnpm sync-docs`) —
+# docs/usage/ja/ is the source of truth, see AGENTS.md
+/src/content/docs/docs/*.md
+
 # test & build
 /coverage
 /dist/

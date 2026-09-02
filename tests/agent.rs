@@ -1,6 +1,8 @@
 mod support;
 
-use support::{AgentMarkdownFile, ConfigDirectory, MockServer, run_lait_agent, test_command};
+use support::{
+    AgentMarkdownFile, ConfigDirectory, MockServer, next_temp_path, run_lait_agent, test_command,
+};
 
 const CHAT_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
 
@@ -113,6 +115,62 @@ fn agent_run_rejects_input_missing_a_field_required_by_the_input_schema() {
     assert!(!output.status.success(), "expected lait agent run to fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("city"), "stderr: {stderr}");
+}
+
+#[test]
+fn agent_run_emits_json_with_the_same_shape_as_chat() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\ndefault:\n  model: test-model\n",
+        server.base_url
+    ));
+    let agent = AgentMarkdownFile::new("---\nname: city-fact\n---\n{{ input }}\n");
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["agent", "run", agent.path.to_str().unwrap(), "hi", "--json"])
+        .output()
+        .expect("failed to execute lait agent run");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait agent run failed: {output:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--json output should be valid JSON");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "content": "mock response",
+            "reasoning": null,
+            "usage": null,
+        })
+    );
+}
+
+#[test]
+fn agent_run_writes_the_response_to_a_file_with_o() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\ndefault:\n  model: test-model\n",
+        server.base_url
+    ));
+    let agent = AgentMarkdownFile::new("---\nname: city-fact\n---\n{{ input }}\n");
+    let out_path = next_temp_path("lait-test-agent-output", ".txt");
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["agent", "run", agent.path.to_str().unwrap(), "hi", "-o"])
+        .arg(&out_path)
+        .output()
+        .expect("failed to execute lait agent run");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait agent run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let written = std::fs::read_to_string(&out_path).expect("output file should have been written");
+    std::fs::remove_file(&out_path).ok();
+    assert_eq!(written, "mock response\n");
 }
 
 #[test]

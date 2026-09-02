@@ -172,6 +172,21 @@ pub(crate) fn render_response(
     }
 }
 
+/// The `--json` shape for a run that has no `ChatCompletionResponse` to draw
+/// on — `lait agent run`/`lait run`, whose output is already-extracted text
+/// (an agent's tool-loop result, or a workflow's post-`jq` final step
+/// output). Uses the same `{content, reasoning, usage}` keys as
+/// [`render_response`]'s `--json` (`reasoning` always `null` here, since
+/// neither has a single model turn to draw reasoning from) so `--json`
+/// means one shape everywhere it appears.
+pub(crate) fn render_text_json(content: &str, usage: Option<Usage>) -> Result<String> {
+    Ok(serde_json::to_string(&JsonOutput {
+        content,
+        reasoning: None,
+        usage,
+    })?)
+}
+
 /// The first choice's message, for callers (the tool loop in `app.rs`) that
 /// need to inspect `tool_calls`/raw `content` before deciding whether a lack
 /// of `content` is even an error — unlike `response_content`, this never

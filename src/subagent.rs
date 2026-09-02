@@ -1,12 +1,12 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
+use tokio::sync::OnceCell;
 
 use crate::{
     agent::{self, AgentFile},
@@ -19,7 +19,7 @@ use crate::{
 /// a recursive subagent call (a subagent whose own `subagents:` names
 /// another) needs it to detect a cycle or excessive nesting the same way
 /// `WorkflowScope`/`check_workflow_nesting` do for `workflow:` nodes — see
-/// `app::call_subagent_tool`. `tool_parameters` is resolved once here too
+/// `engine::call_subagent_tool`. `tool_parameters` is resolved once here too
 /// (not rebuilt by `AgentRegistry::tools` on every call): it resolves
 /// `file.input_schema`, which for a `file_path:` entry means reading and
 /// parsing a JSON file — real I/O that a `for_each`/`loop` workflow node
@@ -56,15 +56,16 @@ impl LoadedAgent {
 /// for the registry's lifetime, since an agent file's content doesn't change
 /// over the course of one invocation — without this, a `for_each`/`loop`
 /// node with `agent:` set would re-read and re-parse the same file (and its
-/// `file_path:` input schema) on every iteration. Uses `RefCell`/`Rc`
-/// rather than `tokio::sync::Mutex`/`Arc` like `mcp::McpRegistry`, for the
-/// same reason as `SkillCache`: loading a file is synchronous, so there is no
-/// `.await` to interleave across when `parallel:`/`for_each:` branches (or
-/// concurrent tool calls within one round — see
-/// `app::RequestSettings::complete`) race on the same path.
-pub(crate) struct AgentRegistry<'a> {
-    agents_map: &'a config::AgentMap,
-    loaded: RefCell<HashMap<PathBuf, Rc<LoadedAgent>>>,
+/// `file_path:` input schema) on every iteration. Each path gets its own
+/// `OnceCell`, the same per-entry scheme `SkillCache` uses (see its doc
+/// comment): the outer `Mutex` is only ever held long enough to fetch or
+/// insert a cell, and the cell's `get_or_try_init` is what makes two
+/// concurrent `parallel:`/`for_each:` branches (or concurrent tool calls
+/// within one round — see `engine::RequestSettings::complete`) racing on the
+/// same path share one load instead of two.
+pub(crate) struct AgentRegistry {
+    agents_map: Arc<config::AgentMap>,
+    loaded: Mutex<HashMap<PathBuf, Arc<OnceCell<Arc<LoadedAgent>>>>>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request's
@@ -88,18 +89,18 @@ impl ToolSet {
 
     /// Every qualified tool name this set defines, used only to check for a
     /// collision against another tool source (see
-    /// `app::RequestSettings::complete`, which combines this with
+    /// `engine::RequestSettings::complete`, which combines this with
     /// `mcp::ToolSet`).
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.index.keys().map(String::as_str)
     }
 }
 
-impl<'a> AgentRegistry<'a> {
-    pub(crate) fn new(agents_map: &'a config::AgentMap) -> Self {
+impl AgentRegistry {
+    pub(crate) fn new(agents_map: Arc<config::AgentMap>) -> Self {
         Self {
             agents_map,
-            loaded: RefCell::new(HashMap::new()),
+            loaded: Mutex::new(HashMap::new()),
         }
     }
 
@@ -110,8 +111,8 @@ impl<'a> AgentRegistry<'a> {
     pub(crate) async fn load_cancellable(
         &self,
         name: &str,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Rc<LoadedAgent>> {
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Arc<LoadedAgent>> {
         let path = self.agents_map.get(name).ok_or_else(|| {
             anyhow!(
                 "unknown subagent '{name}'; define it under 'agents:' in {}",
@@ -131,49 +132,68 @@ impl<'a> AgentRegistry<'a> {
     /// verbatim, so the model's arguments pass straight through as the
     /// subagent's own structured input; an agent with no `input_schema` gets
     /// a generic single-field `{ "input": ... }` schema instead — see
-    /// `app::subagent_tool_input`, the matching unwrap logic on the call
-    /// side. The cache is checked before any await.
+    /// `engine::subagent_tool_input`, the matching unwrap logic on the call
+    /// side.
     pub(crate) async fn load_path_cancellable(
         &self,
         path: &Path,
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Rc<LoadedAgent>> {
-        if let Some(cached) = self.loaded.borrow().get(path) {
-            return Ok(Rc::clone(cached));
-        }
-        let (file, canonical_path) = tokio::try_join!(
-            agent::load_agent_cancellable(path, cancellation.clone()),
-            async {
-                async_io::canonicalize(path, cancellation.clone())
-                    .await
-                    .with_context(|| {
-                        format!("failed to resolve agent file path '{}'", path.display())
-                    })
-            },
-        )?;
-        let tool_parameters = match &file.input_schema {
-            Some(entry) => schema::load_schema_value_cancellable(entry, cancellation).await?,
-            None => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "description": "The task or input to pass to the subagent. A string \
-                            for a plain-text task, or a JSON object/array if the subagent \
-                            expects structured input."
-                    }
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Arc<LoadedAgent>> {
+        let cell = Arc::clone(
+            self.loaded
+                .lock()
+                .expect("agent registry lock should not be poisoned")
+                .entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        );
+        // Only the caller that actually wins the race to initialize `cell`
+        // runs this closure — every other concurrent caller loading the same
+        // path just awaits its result, never reaching its own cancellation
+        // checks inside. Race the whole `get_or_try_init` against this
+        // call's own `cancellation` too (below), so a losing
+        // (non-initializing) caller can still bail out promptly on its own
+        // token instead of being stuck waiting on a load it isn't driving.
+        let init_cancellation = cancellation.clone();
+        let init = cell.get_or_try_init(|| async {
+            let (file, canonical_path) = tokio::try_join!(
+                agent::load_agent_cancellable(path, init_cancellation.clone()),
+                async {
+                    async_io::canonicalize(path, init_cancellation.clone())
+                        .await
+                        .with_context(|| {
+                            format!("failed to resolve agent file path '{}'", path.display())
+                        })
                 },
-                "required": ["input"],
-            }),
-        };
-        let loaded = Rc::new(LoadedAgent {
-            file,
-            canonical_path,
-            tool_parameters,
+            )?;
+            let tool_parameters = match &file.input_schema {
+                Some(entry) => {
+                    schema::load_schema_value_cancellable(entry, init_cancellation).await?
+                }
+                None => serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "description": "The task or input to pass to the subagent. A string \
+                                for a plain-text task, or a JSON object/array if the subagent \
+                                expects structured input."
+                        }
+                    },
+                    "required": ["input"],
+                }),
+            };
+            Ok::<_, anyhow::Error>(Arc::new(LoadedAgent {
+                file,
+                canonical_path,
+                tool_parameters,
+            }))
         });
-        self.loaded
-            .borrow_mut()
-            .insert(path.to_path_buf(), Rc::clone(&loaded));
-        Ok(loaded)
+        let loaded = match async_io::await_cancellation(init, cancellation).await {
+            async_io::CancellationResult::Completed(result) => result?,
+            async_io::CancellationResult::Cancelled => {
+                bail!("subagent load was cancelled");
+            }
+        };
+        Ok(Arc::clone(loaded))
     }
 
     /// Builds the OpenAI-shaped tool definitions for `names` (a resolved
@@ -183,7 +203,7 @@ impl<'a> AgentRegistry<'a> {
     pub(crate) async fn tools_cancellable(
         &self,
         names: &[String],
-        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<ToolSet> {
         let loaded_agents = futures_util::future::try_join_all(
             names
@@ -226,11 +246,60 @@ mod tests {
     #[tokio::test]
     async fn errors_on_an_unknown_subagent_name() {
         let agents_map: config::AgentMap = StdHashMap::new();
-        let registry = AgentRegistry::new(&agents_map);
+        let registry = AgentRegistry::new(Arc::new(agents_map));
         let error = registry
             .load_cancellable("missing", None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing"));
+    }
+
+    /// Regression test for the `OnceCell`-per-path cache (see
+    /// `AgentRegistry`'s doc comment): only the first caller for a given
+    /// path actually runs the load and its own cancellation checks — every
+    /// other concurrent caller just awaits that result. Confirms a losing
+    /// (non-initializing) caller still returns promptly on *its own*
+    /// cancellation rather than being stuck until the winning caller's load
+    /// finishes (which, here, never happens — the FIFO is never written to).
+    /// Mirrors `skill::tests::a_second_waiter_can_cancel_while_the_first_is_still_loading`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_waiter_can_cancel_while_the_first_is_still_loading() {
+        let path = crate::test_support::unique_temp_path("lait-test-agent-fifo", "");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let agents_map: config::AgentMap = StdHashMap::new();
+        let registry = AgentRegistry::new(Arc::new(agents_map));
+
+        // A token of its own that's never cancelled: this caller becomes the
+        // cell's initializer and blocks on the FIFO for the rest of the test
+        // (passing `None` here would skip the wait-for-a-writer path
+        // entirely and return immediately instead).
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let mut first = Box::pin(registry.load_path_cancellable(&path, Some(first_token)));
+        tokio::select! {
+            result = &mut first => panic!("first load unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut second = Box::pin(registry.load_path_cancellable(&path, Some(token.clone())));
+        tokio::select! {
+            result = &mut second => panic!("second load unexpectedly returned: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                token.cancel();
+            }
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("a losing waiter's own cancellation should finish promptly")
+            .unwrap_err();
+        assert!(result.to_string().contains("cancel"), "error: {result}");
+
+        drop(first);
+        let _ = std::fs::remove_file(path);
     }
 }

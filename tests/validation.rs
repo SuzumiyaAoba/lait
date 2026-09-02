@@ -3,14 +3,17 @@ mod support;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use support::{
-    ConfigDirectory, JsonSchemaFile, WorkflowFile, run_lait_with_json_schema, run_lait_workflow,
-    test_command,
+    ConfigDirectory, JsonSchemaFile, LaitCommand, WorkflowFile, run_lait_workflow, test_command,
 };
 
 #[test]
 fn reports_invalid_json_schema_file_with_path_context() {
     let schema = JsonSchemaFile::new("{not valid JSON");
-    let output = run_lait_with_json_schema(None, None, "hello", &schema.path, None);
+    let output = LaitCommand::new()
+        .arg("--json-schema")
+        .arg(&schema.path)
+        .prompt("hello")
+        .run();
 
     assert!(
         !output.status.success(),
@@ -36,7 +39,11 @@ fn reports_missing_json_schema_file_with_path_context() {
         "test schema path unexpectedly exists: {path:?}"
     );
 
-    let output = run_lait_with_json_schema(None, None, "hello", &path, None);
+    let output = LaitCommand::new()
+        .arg("--json-schema")
+        .arg(&path)
+        .prompt("hello")
+        .run();
 
     assert!(
         !output.status.success(),
@@ -214,7 +221,7 @@ fn requires_model_option() {
 fn rejects_an_empty_or_whitespace_command_program_before_execution() {
     for program in ["", "  "] {
         let workflow = WorkflowFile::new(&format!(
-            "nodes:\n  n:\n    command: [\"{program}\"]\nsteps:\n  - use: n\n"
+            "nodes:\n  n:\n    type: command\n    command: [\"{program}\"]\nsteps:\n  - use: n\n"
         ));
         let output = run_lait_workflow(&workflow.path, "input");
 

@@ -80,7 +80,7 @@ async fn run_cancellable_async<T, F>(
     filter_source: &str,
     input: &str,
     steps: &Steps,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
     op: F,
 ) -> Result<T>
 where
@@ -108,7 +108,7 @@ pub(crate) async fn apply_cancellable_async(
     filter_source: &str,
     input: &str,
     steps: &Steps,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     run_cancellable_async(filter_source, input, steps, cancellation, apply_cancellable).await
 }
@@ -118,7 +118,7 @@ pub(crate) async fn apply_bool_cancellable_async(
     filter_source: &str,
     input: &str,
     steps: &Steps,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<bool> {
     run_cancellable_async(
         filter_source,
@@ -137,7 +137,7 @@ pub(crate) async fn apply_one_cancellable_async(
     filter_source: &str,
     input: &str,
     steps: &Steps,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     run_cancellable_async(
         filter_source,

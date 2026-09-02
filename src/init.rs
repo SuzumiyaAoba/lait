@@ -59,6 +59,7 @@ description: 入力を要約するサンプルワークフロー
 
 nodes:
   summarize:
+    type: prompt
     # model: local  # 省略時は default.model にフォールバック
     prompt: |
       次の文章を3行で要約してください。
@@ -66,6 +67,7 @@ nodes:
       {{ input }}
   # JSON 出力を jq で加工するノードの例:
   # extract:
+  #   type: prompt
   #   prompt: "..."
   #   output_schema: ./schema.json
   #   jq: '.summary'

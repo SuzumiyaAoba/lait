@@ -54,7 +54,7 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) response_format: Option<ResponseFormat>,
     /// The full message history for this request: for a single-shot call
     /// this is just `initial_messages(system_prompt, prompt)`, but a tool
-    /// loop (`app::RequestSettings::complete`) grows it across rounds with
+    /// loop (`engine::RequestSettings::complete`) grows it across rounds with
     /// the assistant's `tool_calls` message and each tool's `tool`-role
     /// result. Owned (not built from `system_prompt`/`prompt` here) so the
     /// caller can reuse/extend the same history across rounds without lait
@@ -73,10 +73,10 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) stream_include_usage: bool,
     /// Cancellation signal for a workflow/agent attempt.  This is optional
     /// because top-level chat requests have no enclosing step timeout.  Keep
-    /// the receiver on the request so cancellation is observed by the HTTP
+    /// the token on the request so cancellation is observed by the HTTP
     /// future itself rather than only by a caller that may drop that future
     /// before a nested MCP/subagent operation has cleaned up.
-    pub(crate) cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Builds the initial message history shared by every completion request
@@ -155,7 +155,7 @@ pub(crate) fn assistant_message(content: &str) -> Result<ChatCompletionRequestMe
 
 /// Builds the assistant-role message recording a model turn's `tool_calls`
 /// (and any `content` it produced alongside them), the shape a tool loop
-/// (`app::RequestSettings::complete`) appends to its message history right
+/// (`engine::RequestSettings::complete`) appends to its message history right
 /// before running the calls themselves.
 pub(crate) fn assistant_tool_call_message(
     tool_calls: &[ToolCall],
@@ -203,7 +203,7 @@ pub(crate) fn tool_result_message(
 /// from (CLI/env, a `models:` alias, `default:`, or a step/agent override).
 /// Called both eagerly at workflow parse time (`workflow::validate`, so a bad
 /// value fails before any step runs) and again once every fallback layer has
-/// been resolved (`app::resolve_request_settings`, which also covers values
+/// been resolved (`engine::resolve_request_settings`, which also covers values
 /// that only workflow parsing can't see, like a config file's `models:`).
 pub(crate) fn validate_sampling_params(
     temperature: Option<f64>,
@@ -232,7 +232,7 @@ pub(crate) fn validate_sampling_params(
 /// least 1, the same "validate eagerly everywhere, then again once resolved"
 /// pattern as [`validate_sampling_params`]. Called from `agent::parse_agent`,
 /// `workflow::validate::validate_node`/`validate_workflow_defaults`, and
-/// `app::resolve_request_settings`.
+/// `engine::resolve_request_settings`.
 pub(crate) fn validate_max_tool_rounds(
     max_tool_rounds: Option<usize>,
     description: &str,
@@ -319,6 +319,28 @@ pub(crate) fn http_client() -> reqwest::Client {
 
 /// Builds the API client [`complete`] and [`complete_stream`] share, wiring
 /// the request's base URL/API key to the shared `HTTP_CLIENT`.
+///
+/// HTTP-level retry (429/5xx/connect-failure with exponential backoff) is
+/// *not* implemented in this module — `Client::with_http_client` wires every
+/// request through async-openai's own `ReqwestExecutor`, which already wraps
+/// every call in its `OpenAIRetryLayer` (`OpenAIRetryLayer::default()`, 3
+/// retries — 4 attempts total — on HTTP 429/5xx or a native connect error,
+/// waiting 100ms/200ms/400ms between attempts, capped at 8s, honoring a
+/// `Retry-After` header when the server sends one). A 429 whose body parses
+/// as `insufficient_quota` is treated as permanent and not retried; a plain
+/// timeout (as opposed to a failed connect) is not retried either, since
+/// there's no way to tell a slow server from a truly stuck one. Adding a
+/// second retry loop here on top of this would double- or triple-count
+/// attempts (confirmed empirically: layering lait's own retry on top of this
+/// one turned a single persistent failure into a dozen HTTP connections) —
+/// so lait relies on the vendored behavior instead of reimplementing it.
+///
+/// This is a separate layer from a workflow step's own `retry:` setting: the
+/// step-level `retry:` re-runs the *whole* step (including any MCP/tool
+/// calls) on failure, while this layer only re-sends the underlying HTTP
+/// request. Also note `DEFAULT_HTTP_TIMEOUT` bounds a single attempt, not
+/// the whole call — a request that hits 429/5xx repeatedly can take up to
+/// ~4x that long end to end (plus backoff) before this layer gives up.
 fn client(base_url: &str, api_key: &str) -> Client<OpenAIConfig> {
     let config = OpenAIConfig::new()
         .with_api_base(base_url)
@@ -351,37 +373,19 @@ pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<Co
 /// future is not enough for callers that are also driving MCP/subagent work:
 /// the outer timeout can win a `select!` and drop this future before those
 /// operations observe cancellation.  The request itself therefore watches
-/// the same receiver and exits as soon as the attempt is cancelled.
+/// the same token and exits as soon as the attempt is cancelled. Thin
+/// wrapper around `async_io::await_cancellation` (shared with `mcp::call`),
+/// mapping its `CancellationResult` onto this module's plain `Result`.
 async fn await_cancellation<F, T>(
     future: F,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<T>
 where
     F: Future<Output = Result<T, OpenAIError>>,
 {
-    let Some(mut cancellation) = cancellation else {
-        return Ok(future.await?);
-    };
-
-    let mut future = Box::pin(future);
-    loop {
-        if *cancellation.borrow() {
-            bail!("LLM completion was cancelled");
-        }
-        tokio::select! {
-            biased;
-            result = &mut future => {
-                if *cancellation.borrow() {
-                    bail!("LLM completion was cancelled");
-                }
-                return Ok(result?);
-            },
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    bail!("LLM completion was cancelled");
-                }
-            }
-        }
+    match crate::async_io::await_cancellation(future, cancellation).await {
+        crate::async_io::CancellationResult::Completed(result) => Ok(result?),
+        crate::async_io::CancellationResult::Cancelled => bail!("LLM completion was cancelled"),
     }
 }
 

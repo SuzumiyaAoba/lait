@@ -124,6 +124,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -151,6 +152,38 @@ steps:
 }
 
 #[test]
+fn run_emits_json_with_the_same_shape_as_chat() {
+    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let config = ConfigDirectory::new(&format!(
+        "base_url: \"{}\"\ndefault:\n  model: test-model\n",
+        server.base_url
+    ));
+    let workflow = WorkflowFile::new(
+        "nodes:\n  echo:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: echo\n",
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["run", workflow.path.to_str().unwrap(), "hello", "--json"])
+        .output()
+        .expect("failed to execute lait run");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--json output should be valid JSON");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "content": "mock response",
+            "reasoning": null,
+            "usage": null,
+        })
+    );
+}
+
+#[test]
 fn workflow_level_alias_takes_precedence_over_a_config_file_alias_of_the_same_name() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let config = ConfigDirectory::new(
@@ -167,6 +200,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -203,6 +237,7 @@ fn step_falls_back_to_the_config_file_default_model_when_workflow_omits_one() {
         r#"
 nodes:
   echo:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: echo
@@ -247,6 +282,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     temperature: 0.9
     top_p: 0.95
     max_tokens: 512
@@ -289,6 +325,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -321,6 +358,7 @@ default:
   model: from-config
 nodes:
   echo:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: echo
@@ -369,6 +407,7 @@ default:
   skills: [from-default]
 nodes:
   echo:
+    type: prompt
     prompt: "{{ input }}"
     skills: [from-node]
 steps:
@@ -412,6 +451,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     system_prompt: "Reply in {{{{ input }}}}."
     prompt: "{{{{ input }}}}"
 steps:
@@ -451,6 +491,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     system_prompt: from node
     prompt: "{{{{ input }}}}"
 steps:
@@ -487,6 +528,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -521,6 +563,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     system_prompt: "Reply in French."
 steps:
   - use: echo
@@ -564,6 +607,7 @@ models:
       model_id: workflow-model
 nodes:
   answer:
+    type: prompt
     prompt: "{{{{ input }}}}"
     output_schema: "{}"
     schema_name: answer_schema
@@ -627,6 +671,7 @@ json_schemas:
       additionalProperties: false
 nodes:
   answer:
+    type: prompt
     prompt: "{{{{ input }}}}"
     output_schema: answer
     schema_name: answer_schema
@@ -684,6 +729,7 @@ json_schemas:
     file_path: "{}"
 nodes:
   answer:
+    type: prompt
     prompt: "{{{{ input }}}}"
     output_schema: answer
     schema_name: answer_schema
@@ -738,6 +784,7 @@ json_schemas:
       required: [city]
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ json input }}}}"
     input_schema: city
 steps:
@@ -764,7 +811,8 @@ json_schemas:
       required: [city]
 nodes:
   echo:
-    jq: "."
+    type: prompt
+    prompt: "{{ input }}"
     input_schema: city
 steps:
   - use: echo
@@ -796,6 +844,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ json input }}}}"
     input_schema: "{}"
 steps:
@@ -826,7 +875,8 @@ fn step_input_schema_reports_a_missing_schema_file_with_path_context() {
         r#"
 nodes:
   echo:
-    jq: "."
+    type: prompt
+    prompt: "{{{{ input }}}}"
     input_schema: "{}"
 steps:
   - use: echo
@@ -883,6 +933,7 @@ models:
       model_id: workflow-model
 nodes:
   extract:
+    type: agent
     agent: "{}"
 steps:
   - use: extract
@@ -933,6 +984,7 @@ fn workflow_agent_nodes_reject_a_self_referential_subagent_before_recursing() {
         r#"
 nodes:
   invoke:
+    type: agent
     agent: "{}"
 steps:
   - use: invoke
@@ -982,9 +1034,11 @@ models:
       model_id: workflow-model
 nodes:
   extract:
+    type: prompt
     prompt: "{{{{ input }}}}"
     output_schema: "{}"
   summarize:
+    type: agent
     agent: "{}"
 steps:
   - id: extract
@@ -1015,6 +1069,7 @@ fn transform_only_step_reshapes_input_without_calling_the_model() {
         r#"
 nodes:
   extract_name:
+    type: transform
     jq: ".name"
 steps:
   - use: extract_name
@@ -1033,8 +1088,10 @@ fn a_falsy_when_guard_skips_the_step_and_passes_the_input_through_unchanged() {
         r#"
 nodes:
   passthrough:
+    type: transform
     jq: "."
   guarded:
+    type: transform
     jq: '"should not run"'
 steps:
   - use: passthrough
@@ -1059,6 +1116,7 @@ fn a_truthy_when_guard_runs_the_step() {
         r#"
 nodes:
   guarded:
+    type: transform
     jq: '"ran"'
 steps:
   - id: guarded
@@ -1079,10 +1137,13 @@ fn switch_runs_the_first_matching_case_and_skips_the_rest() {
         r#"
 nodes:
   escalated:
+    type: transform
     jq: '"escalated"'
   replied:
+    type: transform
     jq: '"replied"'
   closed:
+    type: transform
     jq: '"closed"'
 steps:
   - switch:
@@ -1110,8 +1171,10 @@ fn switch_runs_else_when_no_case_matches() {
         r#"
 nodes:
   escalated:
+    type: transform
     jq: '"escalated"'
   closed:
+    type: transform
     jq: '"closed"'
 steps:
   - switch:
@@ -1136,6 +1199,7 @@ fn switch_fails_when_no_case_matches_and_there_is_no_else() {
         r#"
 nodes:
   escalated:
+    type: transform
     jq: '"escalated"'
 steps:
   - switch:
@@ -1181,8 +1245,10 @@ models:
       model_id: model-b
 nodes:
   echo_a:
+    type: prompt
     prompt: "{{{{ input }}}}"
   echo_b:
+    type: prompt
     model: cloud
     prompt: "{{{{ input }}}}"
 steps:
@@ -1217,10 +1283,13 @@ fn parallel_join_filter_combines_the_id_keyed_object_into_the_next_input() {
         r#"
 nodes:
   upper:
+    type: transform
     jq: 'ascii_upcase'
   length_of:
+    type: transform
     jq: 'length'
   describe:
+    type: transform
     jq: '.summary + " (" + (.length | tostring) + ")"'
 steps:
   - parallel:
@@ -1249,6 +1318,7 @@ fn parallel_fails_when_a_branch_id_is_duplicated() {
         r#"
 nodes:
   passthrough:
+    type: transform
     jq: "."
 steps:
   - parallel:
@@ -1289,10 +1359,13 @@ models:
       model_id: workflow-model
 nodes:
   escalate:
+    type: prompt
     prompt: "escalate: {{{{ json input }}}}"
   closed:
+    type: transform
     jq: '"closed"'
   notify:
+    type: transform
     jq: '. + " (notified)"'
 steps:
   - switch:
@@ -1330,6 +1403,7 @@ fn loop_while_reruns_steps_until_the_pre_check_condition_goes_false() {
         r#"
 nodes:
   bump:
+    type: transform
     jq: '{n: (.n + 1)}'
 steps:
   - id: count-up
@@ -1356,6 +1430,7 @@ fn loop_while_runs_zero_times_when_the_condition_starts_false() {
         r#"
 nodes:
   never:
+    type: transform
     jq: '"should not run"'
 steps:
   - loop:
@@ -1381,6 +1456,7 @@ fn loop_while_fails_when_max_iterations_is_reached_without_the_condition_going_f
         r#"
 nodes:
   passthrough:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1407,6 +1483,7 @@ fn loop_until_runs_at_least_once_and_stops_once_the_post_check_condition_is_true
         r#"
 nodes:
   bump:
+    type: transform
     jq: '{n: (.n + 1)}'
 steps:
   - id: retry
@@ -1433,6 +1510,7 @@ fn loop_until_fails_when_max_iterations_is_reached_without_the_condition_going_t
         r#"
 nodes:
   passthrough:
+    type: transform
     jq: '.'
 steps:
   - loop:
@@ -1467,6 +1545,7 @@ models:
       model_id: workflow-model
 nodes:
   summarize:
+    type: prompt
     prompt: "summarize: {{{{ input }}}}"
 steps:
   - for_each:
@@ -1495,6 +1574,7 @@ fn for_each_runs_steps_per_item_and_collects_results_in_order() {
         r#"
 nodes:
   doubler:
+    type: transform
     jq: '. * 2'
 steps:
   - id: double
@@ -1520,6 +1600,7 @@ fn for_each_join_filter_combines_the_collected_array_into_the_next_input() {
         r#"
 nodes:
   doubler:
+    type: transform
     jq: '. * 2'
 steps:
   - for_each:
@@ -1542,6 +1623,7 @@ fn for_each_runs_zero_times_on_an_empty_array_and_yields_an_empty_result() {
         r#"
 nodes:
   never:
+    type: transform
     jq: '"should not run"'
 steps:
   - for_each:
@@ -1563,6 +1645,7 @@ fn for_each_fails_when_items_does_not_produce_a_json_array() {
         r#"
 nodes:
   passthrough:
+    type: transform
     jq: '.'
 steps:
   - for_each:
@@ -1599,8 +1682,10 @@ models:
       model_id: workflow-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
   never:
+    type: transform
     jq: '"should not run"'
 steps:
   - id: call
@@ -1629,6 +1714,7 @@ fn switch_records_its_named_output_before_bubbling_break() {
         r#"
 nodes:
   read_route:
+    type: transform
     jq: '$steps.route'
 steps:
   - loop:
@@ -1661,10 +1747,13 @@ fn on_error_records_its_named_output_before_bubbling_break() {
         r#"
 nodes:
   fail:
+    type: command
     command: ["sh", "-c", "exit 1"]
   recover:
+    type: transform
     jq: '"recovered"'
   read_failure:
+    type: transform
     jq: '$steps.failed'
 steps:
   - loop:
@@ -1697,6 +1786,7 @@ fn break_stops_a_loop_before_its_until_condition_or_max_iterations() {
         r#"
 nodes:
   bump:
+    type: transform
     jq: '.n += 1'
 steps:
   - loop:
@@ -1721,6 +1811,7 @@ fn break_stops_a_for_each_early_and_joins_only_the_items_processed_so_far() {
         r#"
 nodes:
   passthrough:
+    type: transform
     jq: '.'
 steps:
   - for_each:
@@ -1744,8 +1835,10 @@ fn stop_inside_a_loop_ends_the_whole_workflow_not_just_the_loop() {
         r#"
 nodes:
   bump:
+    type: transform
     jq: '.n += 1'
   never:
+    type: transform
     jq: '"should not run"'
 steps:
   - loop:
@@ -1782,6 +1875,7 @@ models:
       model_id: workflow-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
     retry:
       max_attempts: 2
@@ -1821,10 +1915,12 @@ models:
       model_id: workflow-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
     retry:
       max_attempts: 2
   recover:
+    type: transform
     jq: '.input'
 steps:
   - id: call
@@ -1862,6 +1958,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -1893,6 +1990,7 @@ models:
       model_id: workflow-model
 nodes:
   call:
+    type: prompt
     prompt: "{{{{ input }}}}"
     timeout: 1
 steps:
@@ -1914,6 +2012,11 @@ steps:
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("timed out"), "stderr: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "a step timeout should exit with code 5: {output:?}"
+    );
 }
 
 #[test]
@@ -1944,10 +2047,12 @@ json_schemas:
       additionalProperties: false
 nodes:
   extract:
+    type: prompt
     prompt: "{{{{ input }}}}"
     output_schema: city
     schema_name: city
   greet:
+    type: prompt
     prompt: "city was {{{{ steps.extract.city }}}}"
 steps:
   - id: extract
@@ -1976,8 +2081,10 @@ fn a_jq_filter_can_reference_an_earlier_named_steps_output_via_dollar_steps() {
         r#"
 nodes:
   check:
+    type: transform
     jq: '{ ok: true }'
   read_check:
+    type: transform
     jq: '$steps.check.ok'
 steps:
   - id: check
@@ -1998,8 +2105,10 @@ fn a_named_step_output_recorded_inside_a_parallel_branch_does_not_leak_outside_i
         r#"
 nodes:
   inner:
+    type: transform
     jq: '"branch value"'
   read_inner:
+    type: transform
     jq: '$steps.inner'
 steps:
   - parallel:
@@ -2027,6 +2136,7 @@ fn concurrent_for_each_preserves_item_order_in_its_results_regardless_of_complet
         r#"
 nodes:
   times10:
+    type: transform
     jq: '. * 10'
 steps:
   - for_each:
@@ -2061,6 +2171,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - for_each:
@@ -2124,6 +2235,7 @@ fn a_workflow_step_runs_a_sub_workflow_and_uses_its_output() {
         r#"
 nodes:
   add_one:
+    type: transform
     jq: '. + 1'
 steps:
   - use: add_one
@@ -2134,6 +2246,7 @@ steps:
         r#"
 nodes:
   sub:
+    type: workflow
     workflow: {sub_name}
     jq: '. * 2'
 steps:
@@ -2154,6 +2267,7 @@ fn a_sub_workflows_falls_back_to_the_callers_default_model() {
         r#"
 nodes:
   echo:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: echo
@@ -2171,6 +2285,7 @@ models:
       model_id: workflow-model
 nodes:
   sub:
+    type: workflow
     workflow: {sub_name}
 steps:
   - use: sub
@@ -2207,6 +2322,7 @@ models:
       model_id: sub-model-id
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -2225,6 +2341,7 @@ models:
       model_id: workflow-model
 nodes:
   sub:
+    type: workflow
     workflow: {sub_name}
 steps:
   - use: sub
@@ -2254,6 +2371,7 @@ fn a_sub_workflows_named_step_outputs_are_isolated_from_the_caller_in_both_direc
         r#"
 nodes:
   inner:
+    type: transform
     jq: '$steps.outer'
 steps:
   - id: inner
@@ -2265,10 +2383,13 @@ steps:
         r#"
 nodes:
   outer:
+    type: transform
     jq: '{{ from_outer: true }}'
   sub:
+    type: workflow
     workflow: {sub_name}
   read_inner:
+    type: transform
     jq: '$steps.inner'
 steps:
   - id: outer
@@ -2357,9 +2478,11 @@ models:
       model_id: workflow-model
 nodes:
   written:
+    type: prompt
     prompt: "{{{{ input }}}}"
     write_file: "{}"
   echo:
+    type: prompt
     prompt: "echo: {{{{ steps.written }}}}"
 steps:
   - id: written
@@ -2414,6 +2537,7 @@ fn write_file_preserves_existing_inode_and_permissions() {
         r#"
 nodes:
   emit:
+    type: transform
     write_file: "{}"
 steps:
   - use: emit
@@ -2474,6 +2598,7 @@ fn write_file_follows_a_symlink_to_an_existing_file() {
         r#"
 nodes:
   emit:
+    type: transform
     write_file: "{}"
 steps:
   - use: emit
@@ -2524,6 +2649,7 @@ fn write_file_respects_an_existing_read_only_file() {
         r#"
 nodes:
   emit:
+    type: transform
     write_file: "{}"
 steps:
   - use: emit
@@ -2577,6 +2703,7 @@ fn write_file_respects_an_existing_read_only_file() {
         r#"
 nodes:
   emit:
+    type: transform
     write_file: "{}"
 steps:
   - use: emit
@@ -2632,6 +2759,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -2669,6 +2797,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{{{ input }}}}"
 steps:
   - use: echo
@@ -2711,6 +2840,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "{{ input }}"
 steps:
   - use: echo
@@ -2742,6 +2872,7 @@ fn a_command_node_pipes_the_current_input_to_stdin_and_its_stdout_becomes_the_ne
         r#"
 nodes:
   upper:
+    type: command
     command: ["tr", "a-z", "A-Z"]
 steps:
   - use: upper
@@ -2763,6 +2894,7 @@ fn a_command_nodes_arguments_are_rendered_as_templates() {
         r#"
 nodes:
   greet:
+    type: command
     command: ["echo", "hello, {{ input }}"]
 steps:
   - use: greet
@@ -2784,6 +2916,7 @@ fn a_command_node_removes_only_one_trailing_crlf_from_stdout() {
         r#"
 nodes:
   endings:
+    type: command
     command: ["printf", "a\r\n\r\n"]
 steps:
   - use: endings
@@ -2810,9 +2943,11 @@ models:
       model_id: workflow-model
 nodes:
   count:
+    type: command
     command: ["wc", "-l"]
     jq: 'tonumber | {{lines: .}}'
   echo:
+    type: prompt
     prompt: "{{{{ json input }}}}"
 steps:
   - id: count
@@ -2838,6 +2973,7 @@ fn a_commands_nonzero_exit_fails_the_step_with_stderr_in_the_error() {
         r#"
 nodes:
   fail:
+    type: command
     command: ["sh", "-c", "echo boom >&2; exit 3"]
 steps:
   - use: fail
@@ -2859,6 +2995,7 @@ fn a_timed_out_command_is_killed_before_the_workflow_returns() {
         r#"
 nodes:
   stuck:
+    type: command
     command: ["sh", "-c", "echo $$ > '{}'; sleep 5"]
     timeout: 1
 steps:
@@ -2902,6 +3039,7 @@ fn a_timed_out_command_kills_descendants_in_its_process_group() {
         r#"
 nodes:
   stuck:
+    type: command
     command: ["sh", "-c", "sleep 5 & echo $! > '{}'; wait"]
     timeout: 1
 steps:
@@ -2968,6 +3106,7 @@ fn a_timed_out_command_kills_descendants_in_its_job_object() {
         r#"
 nodes:
   stuck:
+    type: command
     command: ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$p = Start-Process -FilePath powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Start-Sleep -Seconds 5"]
     timeout: 1
 steps:
@@ -3026,6 +3165,7 @@ fn command_timeout_covers_a_blocking_write_file_action() {
         r#"
 nodes:
   emit:
+    type: command
     command: ["printf", "done"]
     write_file: "{}"
     timeout: 1
@@ -3074,12 +3214,15 @@ fn a_timed_out_write_file_does_not_reach_a_later_on_error_reader() {
         r#"
 nodes:
   emit:
+    type: transform
     write_file: "{}"
     timeout: 1
   consume:
+    type: command
     command: ["sh", "-c", "IFS= read -r value < '{}' && printf 'stale:%s' \"$value\""]
     timeout: 1
   recover:
+    type: transform
     jq: '"recovered"'
 steps:
   - use: emit
@@ -3161,6 +3304,7 @@ fn a_timed_out_write_file_is_finished_before_a_retry_reuses_the_path() {
         r#"
 nodes:
   emit:
+    type: command
     command: ["sh", "-c", "n=0; test -f '{}' && n=$(cat '{}'); n=$((n+1)); printf '%s' \"$n\" > '{}'; printf 'attempt%s' \"$n\""]
     write_file: "{}"
     timeout: 1
@@ -3210,6 +3354,7 @@ fn command_does_not_wait_for_a_stdin_writer_after_the_child_exits() {
         r#"
 nodes:
   exits:
+    type: command
     command: ["sh", "-c", "sleep 5 >/dev/null 2>/dev/null & exit 0"]
 steps:
   - use: exits
@@ -3245,6 +3390,7 @@ fn command_timeout_interrupts_reader_tasks_after_the_child_exits() {
         r#"
 nodes:
   exits:
+    type: command
     command: ["sh", "-c", "sleep 5 & exit 0"]
     timeout: 1
 steps:
@@ -3273,10 +3419,12 @@ fn a_timed_out_jq_worker_is_reaped_before_on_error_and_cannot_write_output() {
         r#"
 nodes:
   spin:
+    type: transform
     jq: 'range(0; 1000000000)'
     write_file: "{}"
     timeout: 1
   recover:
+    type: transform
     jq: '"recovered"'
 steps:
   - use: spin
@@ -3312,8 +3460,10 @@ fn a_nonzero_command_exit_can_be_caught_by_on_error() {
         r#"
 nodes:
   fail:
+    type: command
     command: ["sh", "-c", "exit 1"]
   recover:
+    type: transform
     jq: '"recovered"'
 steps:
   - use: fail
@@ -3338,6 +3488,7 @@ fn an_empty_command_list_is_a_clear_lint_error() {
         r#"
 nodes:
   n:
+    type: command
     command: []
 steps:
   - use: n
@@ -3369,6 +3520,7 @@ models:
       model_id: workflow-model
 nodes:
   echo:
+    type: prompt
     prompt: "summarize: {{{{ input }}}}"
     files: ["{}"]
 steps:
@@ -3407,6 +3559,7 @@ models:
       model_id: workflow-model
 nodes:
   describe:
+    type: prompt
     prompt: "what is this? {{{{ input }}}}"
     images: ["{}"]
 steps:
@@ -3453,6 +3606,7 @@ models:
       model_id: workflow-model
 nodes:
   describe:
+    type: agent
     agent: "{}"
     files: ["{}"]
     images: ["{}"]
@@ -3493,7 +3647,7 @@ fn a_prompt_input_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
     let schema_path = config.path().join("prompt-input-schema.fifo");
     create_fifo(&schema_path);
     let workflow = timeout_workflow(&format!(
-        "    prompt: \"{{{{ input }}}}\"\n    input_schema: \"{}\"\n    timeout: 1",
+        "    type: prompt\n    prompt: \"{{{{ input }}}}\"\n    input_schema: \"{}\"\n    timeout: 1",
         schema_path.display()
     ));
 
@@ -3511,7 +3665,7 @@ fn an_agent_input_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
         schema_path.display()
     ));
     let workflow = timeout_workflow(&format!(
-        "    agent: \"{}\"\n    timeout: 1",
+        "    type: agent\n    agent: \"{}\"\n    timeout: 1",
         agent.path.display()
     ));
 
@@ -3525,7 +3679,7 @@ fn an_agent_file_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
     let agent_path = config.path().join("blocked-agent.md.fifo");
     create_fifo(&agent_path);
     let workflow = timeout_workflow(&format!(
-        "    agent: \"{}\"\n    timeout: 1",
+        "    type: agent\n    agent: \"{}\"\n    timeout: 1",
         agent_path.display()
     ));
 
@@ -3543,7 +3697,7 @@ fn an_agent_output_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
         schema_path.display()
     ));
     let workflow = timeout_workflow(&format!(
-        "    agent: \"{}\"\n    timeout: 1",
+        "    type: agent\n    agent: \"{}\"\n    timeout: 1",
         agent.path.display()
     ));
 
@@ -3557,7 +3711,7 @@ fn a_prompt_output_schema_read_from_a_fifo_is_cancelled_by_the_step_timeout() {
     let schema_path = config.path().join("prompt-output-schema.fifo");
     create_fifo(&schema_path);
     let workflow = timeout_workflow(&format!(
-        "    prompt: \"{{{{ input }}}}\"\n    output_schema: \"{}\"\n    schema_name: answer\n    timeout: 1",
+        "    type: prompt\n    prompt: \"{{{{ input }}}}\"\n    output_schema: \"{}\"\n    schema_name: answer\n    timeout: 1",
         schema_path.display()
     ));
 
@@ -3571,7 +3725,7 @@ fn a_single_file_attachment_read_from_a_fifo_is_cancelled_by_the_step_timeout() 
     let file_path = config.path().join("single-file.fifo");
     create_fifo(&file_path);
     let workflow = timeout_workflow(&format!(
-        "    prompt: \"{{{{ input }}}}\"\n    files: [\"{}\"]\n    timeout: 1",
+        "    type: prompt\n    prompt: \"{{{{ input }}}}\"\n    files: [\"{}\"]\n    timeout: 1",
         file_path.display()
     ));
 
@@ -3587,7 +3741,7 @@ fn multiple_file_attachments_read_from_fifos_are_cancelled_by_the_step_timeout()
     create_fifo(&first_path);
     create_fifo(&second_path);
     let workflow = timeout_workflow(&format!(
-        "    prompt: \"{{{{ input }}}}\"\n    files: [\"{}\", \"{}\"]\n    timeout: 1",
+        "    type: prompt\n    prompt: \"{{{{ input }}}}\"\n    files: [\"{}\", \"{}\"]\n    timeout: 1",
         first_path.display(),
         second_path.display()
     ));
@@ -3602,7 +3756,7 @@ fn a_single_image_attachment_read_from_a_fifo_is_cancelled_by_the_step_timeout()
     let image_path = config.path().join("single-image.fifo");
     create_fifo(&image_path);
     let workflow = timeout_workflow(&format!(
-        "    prompt: \"{{{{ input }}}}\"\n    images: [\"{}\"]\n    timeout: 1",
+        "    type: prompt\n    prompt: \"{{{{ input }}}}\"\n    images: [\"{}\"]\n    timeout: 1",
         image_path.display()
     ));
 
@@ -3618,7 +3772,7 @@ fn multiple_image_attachments_read_from_fifos_are_cancelled_by_the_step_timeout(
     create_fifo(&first_path);
     create_fifo(&second_path);
     let workflow = timeout_workflow(&format!(
-        "    prompt: \"{{{{ input }}}}\"\n    images: [\"{}\", \"{}\"]\n    timeout: 1",
+        "    type: prompt\n    prompt: \"{{{{ input }}}}\"\n    images: [\"{}\", \"{}\"]\n    timeout: 1",
         first_path.display(),
         second_path.display()
     ));

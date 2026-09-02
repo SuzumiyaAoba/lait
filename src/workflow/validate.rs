@@ -164,7 +164,10 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
 
         // `router_count` above guarantees at most one of these is set, so
         // `step.router()` (which just checks them in a fixed order) can't
-        // silently prefer one over another here.
+        // silently prefer one over another here. Matched exhaustively (no
+        // `_` arm), like `run_steps`' and `lint::walk_steps`' own matches on
+        // this same enum, so a new router kind fails to compile here until
+        // this function's nesting-context handling is updated for it too.
         match step.router() {
             Some(Router::Switch(switch)) => {
                 reject_router_incompatible_fields(step, "switch", &label)?;
@@ -212,7 +215,7 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
                 );
             };
             reject_step_id_node_collision(step, nodes, &label)?;
-            if node.write_file.is_some() && ctx.in_concurrent_for_each {
+            if node.write_file().is_some() && ctx.in_concurrent_for_each {
                 bail!(
                     "step '{}' uses node '{}', which has 'write_file' set, inside a 'for_each' body \
                      with 'max_concurrency' above 1; every concurrently running item would write the \
@@ -256,135 +259,66 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
 /// `validate_steps`, this runs once per node regardless of how many `use:`
 /// sites reference it, and does not depend on `FlowContext` — everything
 /// here is a property of the node's own action, not of where it's used.
+///
+/// Mutual exclusion between actions (`prompt`/`agent`/`workflow`/`command`/
+/// `transform`) is no longer this function's job — `NodeDefinition`'s
+/// `type:`-tagged enum makes those combinations structurally impossible
+/// (see its own doc comment), and `#[serde(deny_unknown_fields)]` on each
+/// variant already rejected a field that variant doesn't have before this
+/// ever runs. What's left is value-range validation (sampling params,
+/// `retry`/`timeout`/`max_tool_rounds` shape) and the handful of checks that
+/// need more than one field's value at once within a single variant.
 pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> {
     let description = format!("node '{node_id}'");
 
-    validate_sampling_params(node.temperature, node.top_p, node.max_tokens, &description)?;
-    if let Some(retry) = &node.retry {
+    validate_sampling_params(
+        node.temperature(),
+        node.top_p(),
+        node.max_tokens(),
+        &description,
+    )?;
+    if let Some(retry) = node.retry() {
         validate_retry(retry, &description)?;
     }
-    if let Some(timeout) = node.timeout {
+    if let Some(timeout) = node.timeout() {
         validate_timeout(timeout, &description)?;
     }
-    validate_max_tool_rounds(node.max_tool_rounds, &description)?;
+    validate_max_tool_rounds(node.max_tool_rounds(), &description)?;
 
-    let calls_model = node.calls_model() || node.workflow.is_some();
-    if !calls_model && node.command.is_none() && node.jq.is_none() && node.write_file.is_none() {
-        bail!(
-            "{description} must have a 'prompt', a 'system_prompt', an 'agent', a 'workflow', a \
-             'command', a 'jq' filter, a 'write_file' path, or a combination",
-        );
-    }
-    // A node's `prompt`/`agent`/`workflow`/`command` are its four alternative
-    // "primary actions" — at most one may be set (unlike `system_prompt`,
-    // which is an adjunct to `prompt`/`agent` rather than an action of its
-    // own, and is instead excluded per-action below alongside that action's
-    // other invalid companion fields). Counted the same way
-    // `validate_steps`' `router_count` counts `switch`/`parallel`/`loop`/
-    // `for_each`, so a future fifth action kind is one more array entry, not
-    // another O(n) set of pairwise bails.
-    let action_count = [
-        node.prompt.is_some(),
-        node.agent.is_some(),
-        node.workflow.is_some(),
-        node.command.is_some(),
-    ]
-    .into_iter()
-    .filter(|set| *set)
-    .count();
-    if action_count > 1 {
-        bail!("{description} can have at most one of 'prompt', 'agent', 'workflow', or 'command'");
-    }
-    if let Some(argv) = &node.command {
-        if argv.is_empty() {
-            bail!(
-                "{description} has an empty 'command' list; it must name at least the program \
-                 to run"
-            );
+    match node {
+        NodeDefinition::Prompt(prompt) => {
+            if prompt.prompt.is_none() && prompt.system_prompt.is_none() {
+                bail!(
+                    "{description} has 'type: prompt' but neither 'prompt' nor 'system_prompt'; \
+                     use 'type: transform' for a node with no model call"
+                );
+            }
+            if prompt.output_schema.is_none() && prompt.schema_name.is_some() {
+                bail!("{description} has 'schema_name' but no 'output_schema'");
+            }
         }
-        if argv[0].trim().is_empty() {
-            bail!("{description} has an empty 'command[0]' program; it must name an executable");
+        NodeDefinition::Command(command) => {
+            if command.command.is_empty() {
+                bail!(
+                    "{description} has an empty 'command' list; it must name at least the \
+                     program to run"
+                );
+            }
+            if command.command[0].trim().is_empty() {
+                bail!(
+                    "{description} has an empty 'command[0]' program; it must name an executable"
+                );
+            }
         }
-        if node.system_prompt.is_some() || node.files.is_some() || node.images.is_some() {
-            bail!(
-                "{description} has 'command' set; 'system_prompt'/'files'/'images' only apply \
-                 to a 'prompt'/'system_prompt'/'agent' message and must not be set alongside it"
-            );
+        NodeDefinition::Transform(transform) => {
+            if transform.jq.is_none() && transform.write_file.is_none() {
+                bail!(
+                    "{description} has 'type: transform' but neither 'jq' nor 'write_file'; it \
+                     would do nothing"
+                );
+            }
         }
-    }
-    if node.agent.is_some()
-        && (node.input_schema.is_some()
-            || node.output_schema.is_some()
-            || node.schema_name.is_some()
-            || node.system_prompt.is_some())
-    {
-        bail!(
-            "{description} has 'agent' set; 'input_schema'/'output_schema'/'schema_name'/\
-             'system_prompt' come from the agent file and must not be set on the node"
-        );
-    }
-    if node.workflow.is_some()
-        && (node.model.is_some()
-            || node.reasoning_effort.is_some()
-            || node.temperature.is_some()
-            || node.top_p.is_some()
-            || node.max_tokens.is_some()
-            || node.input_schema.is_some()
-            || node.output_schema.is_some()
-            || node.schema_name.is_some()
-            || node.system_prompt.is_some()
-            || node.files.is_some()
-            || node.images.is_some())
-    {
-        bail!(
-            "{description} has 'workflow' set; 'model'/'reasoning_effort'/'temperature'/'top_p'/\
-             'max_tokens'/'input_schema'/'output_schema'/'schema_name'/'system_prompt'/'files'/\
-             'images' come from the referenced workflow file and must not be set on the node"
-        );
-    }
-    if node.workflow.is_some() && (node.retry.is_some() || node.timeout.is_some()) {
-        bail!(
-            "{description} has 'workflow' set; 'retry'/'timeout' apply to a single action and \
-             must be set on the steps inside the referenced workflow file instead"
-        );
-    }
-    if node.workflow.is_some()
-        && (node.mcp.is_some()
-            || node.max_tool_rounds.is_some()
-            || node.skills.is_some()
-            || node.subagents.is_some())
-    {
-        bail!(
-            "{description} has 'workflow' set; 'mcp'/'max_tool_rounds'/'skills'/'subagents' apply \
-             to a single model call and must be set on the steps inside the referenced workflow \
-             file instead"
-        );
-    }
-    if !calls_model
-        && (node.mcp.is_some()
-            || node.max_tool_rounds.is_some()
-            || node.skills.is_some()
-            || node.subagents.is_some())
-    {
-        bail!(
-            "{description} has 'mcp'/'max_tool_rounds'/'skills'/'subagents' set but no \
-             'prompt'/'system_prompt'/'agent' to apply it to"
-        );
-    }
-    if !calls_model && node.output_schema.is_some() {
-        bail!(
-            "{description} has 'output_schema' but no 'prompt'/'system_prompt'/'agent' to apply \
-             it to"
-        );
-    }
-    if !node.calls_model() && (node.files.is_some() || node.images.is_some()) {
-        bail!(
-            "{description} has 'files'/'images' set but no 'prompt'/'system_prompt'/'agent' to \
-             attach them to"
-        );
-    }
-    if node.output_schema.is_none() && node.schema_name.is_some() {
-        bail!("{description} has 'schema_name' but no 'output_schema'");
+        NodeDefinition::Agent(_) | NodeDefinition::Workflow(_) => {}
     }
     Ok(())
 }

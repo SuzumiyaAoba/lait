@@ -10,37 +10,15 @@ use crate::{
     schema::{self, JsonSchemaEntry},
 };
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentFrontmatter {
-    name: Option<String>,
-    description: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<ReasoningEffort>,
-    temperature: Option<f64>,
-    top_p: Option<f64>,
-    max_tokens: Option<u32>,
-    input_schema: Option<JsonSchemaEntry>,
-    output_schema: Option<JsonSchemaEntry>,
-    #[serde(default)]
-    structured_output: bool,
-    schema_name: Option<String>,
-    /// Names of `mcp_servers:` entries (from `lait.config.yml`) whose tools
-    /// this agent may call.
-    mcp: Option<Vec<String>>,
-    max_tool_rounds: Option<usize>,
-    /// Names of `skills:` entries (from `lait.config.yml`) whose content is
-    /// appended to this agent's system prompt.
-    skills: Option<Vec<String>>,
-    /// Names of `agents:` entries (from `lait.config.yml`) made available as
-    /// callable subagent tools during this agent's tool-call loop.
-    subagents: Option<Vec<String>>,
-}
-
 /// An agent Markdown file: YAML frontmatter (model/reasoning defaults,
 /// input/output schema, whether to request structured output) followed by a
-/// Markdown body that is the system prompt template.
-#[derive(Debug)]
+/// Markdown body that is the system prompt template. Deserialized directly
+/// from the frontmatter YAML — `system_prompt_template` is `#[serde(skip)]`
+/// and filled in from the body afterward (see `parse_agent`) — rather than
+/// through a separate frontmatter struct copied field-by-field into this
+/// one, so the field list exists in exactly one place.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentFile {
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
@@ -51,15 +29,24 @@ pub(crate) struct AgentFile {
     pub(crate) max_tokens: Option<u32>,
     pub(crate) input_schema: Option<JsonSchemaEntry>,
     pub(crate) output_schema: Option<JsonSchemaEntry>,
+    #[serde(default)]
     pub(crate) structured_output: bool,
     pub(crate) schema_name: Option<String>,
+    /// Names of `mcp_servers:` entries (from `lait.config.yml`) whose tools
+    /// this agent may call.
     pub(crate) mcp: Option<Vec<String>>,
     pub(crate) max_tool_rounds: Option<usize>,
+    /// Names of `skills:` entries (from `lait.config.yml`) whose content is
+    /// appended to this agent's system prompt.
     pub(crate) skills: Option<Vec<String>>,
+    /// Names of `agents:` entries (from `lait.config.yml`) made available as
+    /// callable subagent tools during this agent's tool-call loop.
     pub(crate) subagents: Option<Vec<String>>,
     /// The Markdown body, rendered as a handlebars template against the
     /// agent's input (see `crate::template::render`) to produce the system
-    /// prompt actually sent to the model.
+    /// prompt actually sent to the model. Never present in the frontmatter
+    /// YAML itself — see the struct doc above.
+    #[serde(skip)]
     pub(crate) system_prompt_template: String,
 }
 
@@ -93,7 +80,7 @@ pub(crate) fn load_agent(path: &Path) -> Result<AgentFile> {
 /// commands (lint/init/top-level `agent run`) that do not have a step timeout.
 pub(crate) async fn load_agent_cancellable(
     path: &Path,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<AgentFile> {
     let contents =
         async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
@@ -105,41 +92,25 @@ pub(crate) async fn load_agent_cancellable(
 
 fn parse_agent(contents: &str) -> Result<AgentFile> {
     let (frontmatter, body) = frontmatter::split(contents, "agent file")?;
-    let frontmatter: AgentFrontmatter =
+    let mut agent: AgentFile =
         serde_yaml::from_str(frontmatter).context("failed to parse frontmatter")?;
 
-    if frontmatter.structured_output && frontmatter.output_schema.is_none() {
+    if agent.structured_output && agent.output_schema.is_none() {
         bail!("'structured_output: true' requires an 'output_schema'");
     }
-    if !frontmatter.structured_output && frontmatter.output_schema.is_some() {
+    if !agent.structured_output && agent.output_schema.is_some() {
         bail!("'output_schema' is set but 'structured_output' is not true");
     }
     llm::validate_sampling_params(
-        frontmatter.temperature,
-        frontmatter.top_p,
-        frontmatter.max_tokens,
+        agent.temperature,
+        agent.top_p,
+        agent.max_tokens,
         "the agent file",
     )?;
-    llm::validate_max_tool_rounds(frontmatter.max_tool_rounds, "the agent file")?;
+    llm::validate_max_tool_rounds(agent.max_tool_rounds, "the agent file")?;
 
-    Ok(AgentFile {
-        name: frontmatter.name,
-        description: frontmatter.description,
-        model: frontmatter.model,
-        reasoning_effort: frontmatter.reasoning_effort,
-        temperature: frontmatter.temperature,
-        top_p: frontmatter.top_p,
-        max_tokens: frontmatter.max_tokens,
-        input_schema: frontmatter.input_schema,
-        output_schema: frontmatter.output_schema,
-        structured_output: frontmatter.structured_output,
-        schema_name: frontmatter.schema_name,
-        mcp: frontmatter.mcp,
-        max_tool_rounds: frontmatter.max_tool_rounds,
-        skills: frontmatter.skills,
-        subagents: frontmatter.subagents,
-        system_prompt_template: body.trim().to_owned(),
-    })
+    agent.system_prompt_template = body.trim().to_owned();
+    Ok(agent)
 }
 
 #[cfg(test)]
@@ -212,6 +183,17 @@ schema_name: city_fact
     #[test]
     fn rejects_a_file_with_unterminated_frontmatter() {
         assert!(parse_agent("---\nname: agent\nbody without closing delimiter\n").is_err());
+    }
+
+    #[test]
+    fn rejects_a_literal_system_prompt_template_key_in_frontmatter() {
+        // `system_prompt_template` is `#[serde(skip)]` on `AgentFile` (set
+        // from the Markdown body after parsing, never from frontmatter YAML)
+        // — confirms `deny_unknown_fields` still treats it as unknown rather
+        // than silently accepting-and-discarding a frontmatter key that
+        // happens to share the field's name.
+        let result = parse_agent("---\nsystem_prompt_template: nope\n---\nbody\n");
+        assert!(result.is_err());
     }
 
     #[test]

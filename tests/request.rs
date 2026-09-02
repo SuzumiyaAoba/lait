@@ -1,9 +1,8 @@
 mod support;
 
-use support::{
-    JsonSchemaFile, MockServer, run_lait, run_lait_with_json_schema, run_lait_with_request_options,
-    run_lait_with_sampling_options, without_json_whitespace,
-};
+use std::time::Duration;
+
+use support::{JsonSchemaFile, LaitCommand, MockServer, run_lait, without_json_whitespace};
 
 #[test]
 fn sends_prompt_to_openai_compatible_chat_completions() {
@@ -58,13 +57,13 @@ fn sends_strict_json_schema_response_format() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"mock response\"}"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_json_schema(
-        Some(&server.base_url),
-        None,
-        "hello",
-        &schema.path,
-        Some("answer_schema"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .arg("--json-schema")
+        .arg(&schema.path)
+        .opt_arg("--schema-name", Some("answer_schema"))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -95,14 +94,12 @@ fn cli_reasoning_effort_overrides_environment() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_request_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        false,
-        Some("high"),
-        Some("none"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_arg("--reasoning-effort", Some("high"))
+        .env("LLM_REASONING_EFFORT", "none")
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -120,14 +117,11 @@ fn sends_none_reasoning_effort_when_explicitly_requested() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_request_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        false,
-        Some("none"),
-        None,
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_arg("--reasoning-effort", Some("none"))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -145,14 +139,11 @@ fn sends_reasoning_effort_from_environment() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_request_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        false,
-        None,
-        Some("minimal"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .env("LLM_REASONING_EFFORT", "minimal")
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -170,14 +161,13 @@ fn sends_temperature_top_p_and_max_tokens_when_set() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output = run_lait_with_sampling_options(
-        Some(&server.base_url),
-        None,
-        "hello",
-        Some("0.7"),
-        Some("0.9"),
-        Some("256"),
-    );
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .opt_arg("--temperature", Some("0.7"))
+        .opt_arg("--top-p", Some("0.9"))
+        .opt_arg("--max-tokens", Some("256"))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -200,8 +190,10 @@ fn omits_temperature_top_p_and_max_tokens_when_unset() {
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
     );
-    let output =
-        run_lait_with_sampling_options(Some(&server.base_url), None, "hello", None, None, None);
+    let output = LaitCommand::new()
+        .base_url(Some(&server.base_url))
+        .prompt("hello")
+        .run();
     let request = server.receive_request();
     server.finish();
 
@@ -241,5 +233,95 @@ fn reports_openai_api_errors() {
     assert!(
         !output.stderr.is_empty(),
         "API errors should be reported on stderr"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a model API failure should exit with code 4: {output:?}"
+    );
+}
+
+/// HTTP retry against 429/5xx/connect failures is provided by async-openai's
+/// own `OpenAIRetryLayer`, not by any code in `lait` — see the doc comment on
+/// `llm::client`. These three tests pin that vendored behavior at the
+/// integration level rather than re-deriving it, so a future async-openai
+/// upgrade that changes it (e.g. a different retry count) is caught here
+/// instead of silently changing lait's failure characteristics.
+#[test]
+fn retries_a_429_response_and_succeeds_on_the_next_attempt() {
+    let server = MockServer::start_sequence(&[
+        (
+            "429 Too Many Requests",
+            r#"{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+        ),
+    ]);
+    let output = run_lait(Some(&server.base_url), None, "hello");
+    let first_request = server.receive_request();
+    let second_request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(first_request.target, "/v1/chat/completions");
+    assert_eq!(second_request.target, "/v1/chat/completions");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "mock response"
+    );
+}
+
+#[test]
+fn does_not_retry_a_400_response() {
+    let server = MockServer::start(
+        "400 Bad Request",
+        r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#,
+    );
+    let output = run_lait(Some(&server.base_url), None, "hello");
+    let request = server.receive_request();
+    let second_request = server.try_receive_request(Duration::from_millis(600));
+    server.finish();
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    assert_eq!(request.target, "/v1/chat/completions");
+    assert!(
+        second_request.is_none(),
+        "a 400 response should not be retried, but a second request arrived"
+    );
+}
+
+#[test]
+fn gives_up_after_retrying_a_persistent_503() {
+    let server = MockServer::start(
+        "503 Service Unavailable",
+        r#"{"error":{"message":"mock outage","type":"server_error"}}"#,
+    );
+    let output = run_lait(Some(&server.base_url), None, "hello");
+
+    let mut attempts = 0;
+    while server.try_receive_request(Duration::from_secs(2)).is_some() {
+        attempts += 1;
+    }
+    server.finish();
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a persistent model API failure should exit with code 4: {output:?}"
+    );
+    // Asserting a range rather than an exact count: the point is that a
+    // 5xx is retried at all, not pinning async-openai's exact retry budget.
+    assert!(
+        attempts > 1,
+        "a persistent 5xx should be retried at least once, got {attempts} attempt(s)"
     );
 }
