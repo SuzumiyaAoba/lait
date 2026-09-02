@@ -549,6 +549,12 @@ pub(super) fn validate_workflow_defaults(defaults: &WorkflowDefaults) -> Result<
     if let Some(timeout) = defaults.timeout {
         validate_timeout(timeout, "the workflow's 'default.timeout'")?;
     }
+    if let Some(workflow_timeout) = defaults.workflow_timeout {
+        validate_timeout(
+            workflow_timeout,
+            "the workflow's 'default.workflow_timeout'",
+        )?;
+    }
     validate_max_tool_rounds(
         defaults.max_tool_rounds,
         "the workflow's 'default.max_tool_rounds'",

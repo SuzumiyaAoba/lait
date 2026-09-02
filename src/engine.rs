@@ -61,10 +61,12 @@ pub(crate) struct AppContext {
     /// top-level `run_steps`/`complete` call seeds its own cancellation
     /// chain from (a node's own `timeout`/nested `workflow:` call then
     /// derives further child tokens off of that seed, see
-    /// `execute_step_with_retry`). Currently always `None`: no caller wires
-    /// up a real source (e.g. Ctrl-C) yet, but giving it one field here
-    /// means a future one only has to change `new`'s caller, not every
-    /// `run_steps`/`complete` call site.
+    /// `execute_step_with_retry`). Set via `with_cancel` by every async
+    /// command handler in `app.rs`/`repl.rs`, from the process-wide token
+    /// `signal::spawn_handler` cancels on Ctrl-C — `None` only for a caller
+    /// that never calls `with_cancel` (none currently; kept `Option` so a
+    /// future non-interactive caller, e.g. a library embedding, can still
+    /// opt out).
     pub(crate) cancel: Option<tokio_util::sync::CancellationToken>,
     /// `lait run --var KEY=VALUE` overrides (see `cli::VarArgs`), exposed to
     /// workflow templates as `{{ vars.<key> }}` and to jq filters as
@@ -95,6 +97,17 @@ impl AppContext {
     /// use in a builder chain at the call site (`app::run_workflow`).
     pub(crate) fn with_vars(mut self, vars: serde_json::Map<String, serde_json::Value>) -> Self {
         self.vars = vars;
+        self
+    }
+
+    /// Sets this context's `cancel` (see the field doc) — the process-wide
+    /// token `signal::spawn_handler` cancels on Ctrl-C, so every
+    /// `run_steps`/`complete`/blocking-I/O call downstream of this context
+    /// observes it. Every async command handler in `app.rs` (and
+    /// `repl::run`) calls this with the token `app::run` builds once per
+    /// invocation.
+    pub(crate) fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 

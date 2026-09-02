@@ -29,6 +29,7 @@ mod report;
 mod response;
 mod schema;
 mod session;
+mod signal;
 mod skill;
 mod subagent;
 mod template;
@@ -145,5 +146,16 @@ fn classify_error(error: &anyhow::Error, is_lint: bool) -> ExitKind {
 
 fn exit_with_error(error: anyhow::Error, is_lint: bool) -> ! {
     eprintln!("lait: {error:#}");
-    std::process::exit(classify_error(&error, is_lint) as i32);
+    // A graceful (single) Ctrl-C cancels the same way a step's own
+    // `timeout:` does — both render as "cancelled"/"timed out" and would
+    // otherwise both land on `ExitKind::Interrupted`'s generic 5 — so a real
+    // user interrupt is detected out-of-band (`signal::received`) and given
+    // the conventional SIGINT exit code instead. A *second* Ctrl-C never
+    // reaches here at all: `signal::spawn_handler` exits directly.
+    let code = if signal::received() {
+        signal::SIGINT_EXIT_CODE
+    } else {
+        classify_error(&error, is_lint) as i32
+    };
+    std::process::exit(code);
 }

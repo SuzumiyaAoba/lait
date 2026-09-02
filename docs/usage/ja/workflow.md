@@ -743,6 +743,30 @@ steps:
 - `retry.max_attempts` は必須かつ1以上、`timeout` は1以上である必要があります（ノード単位の
   `retry`/`timeout` と同じ検証です）。
 
+### ワークフロー全体のタイムアウト（`default.workflow_timeout`）
+
+`default.timeout` が個々のノードの実行を制限するのに対し、`default.workflow_timeout`
+（秒単位）は `lait run` に渡したワークフローファイル全体の実行時間に上限を設けます。
+超過すると実行中のステップがキャンセルされ、ワークフロー全体が
+「cancelled」エラーで終了します（`--checkpoint` を付けていれば、その時点までの状態が
+チェックポイントとして保存されます）。
+
+```yaml
+# workflow.yml
+default:
+  workflow_timeout: 300   # このファイル全体を5分以内に終わらせる
+nodes:
+  # ...
+```
+
+- `switch`/`parallel`/`loop`/`for_each` を含め、ワークフロー全体の合計時間に対して働きます。
+  個々のノードの `timeout:`/`default.timeout` とは独立しており、両方を同時に設定できます。
+- `lait run` に直接渡したファイル（トップレベル）のみに適用されます。`type: workflow` で
+  呼び出すサブワークフロー自身の `default.workflow_timeout` は（`default:` の他のフィールドと
+  同じくフォールバックの対象にはなりますが）効果を持ちません。サブワークフロー呼び出し自体を
+  制限したい場合は、呼び出し側の `workflow:` ノードにその `timeout:` を設定してください。
+- `0` 以下の値は設定できません（ノード単位の `timeout` と同じ検証です）。
+
 ## 条件分岐（`when` / `switch`）
 
 ステップには [jq](https://jqlang.org/) フィルターを条件式として使う2種類の分岐構文が使えます。

@@ -190,3 +190,14 @@ cargo run -- --api-key "your-api-key" --model "モデル ID" "こんにちは。
 ```sh
 makers run -- --api-key "your-api-key" --model "モデル ID" "こんにちは。"
 ```
+
+## Ctrl-C（SIGINT）による中断
+
+実行中に Ctrl-C を押すと、`lait` は進行中のモデルリクエスト・MCP サーバーとの通信・
+`command` の実行などをキャンセルしてから終了します（`--stream` で出力の途中だった場合、
+そこまでの出力はそのまま残ります）。[`lait run --checkpoint`](./workflow.md)を付けていた
+場合は、中断された時点までの状態がチェックポイントとして保存され、`--resume` で
+再開できます。終了コードはシェルの慣習に合わせて `130` になります。
+
+後始末が固まってしまった場合に備えて、Ctrl-C をもう一度押すと後始末を待たずに
+即座に終了します。

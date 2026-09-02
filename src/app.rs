@@ -90,11 +90,25 @@ pub(crate) fn finish_chat_turn(
 }
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
+    // Built once per invocation and threaded into every async command below
+    // via `AppContext::with_cancel`; each single-shot handler
+    // (`run_workflow`/`run_agent`/`run_prompt`/`run_chat`) arms
+    // `signal::spawn_handler` itself, right where it actually starts using
+    // the token — *not* here, and deliberately never for `repl::run`. A
+    // `CancellationToken` fires once and stays cancelled forever, but the
+    // REPL reuses one `AppContext` across many turns: arming Ctrl-C
+    // process-wide would make the first Ctrl-C (meant to interrupt just the
+    // in-flight turn) silently break every turn after it, with no visible
+    // effect on the one it was pressed during. `lait chat` keeps its
+    // pre-existing Ctrl-C behavior (default disposition: an immediate kill)
+    // until the REPL has its own per-turn cancellation scope.
+    let cancel = tokio_util::sync::CancellationToken::new();
+
     let config_source = ConfigSource::from(&cli);
     match cli.command {
-        Some(Command::Run(run_args)) => run_workflow(run_args, config_source).await,
+        Some(Command::Run(run_args)) => run_workflow(run_args, config_source, cancel).await,
         Some(Command::Agent(agent_command)) => match agent_command.action {
-            AgentAction::Run(args) => run_agent(args, config_source).await,
+            AgentAction::Run(args) => run_agent(args, config_source, cancel).await,
             AgentAction::List => bail!("internal error: `agent list` must run on the sync path"),
         },
         Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
@@ -111,7 +125,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             PromptAction::List => {
                 bail!("internal error: `prompt list` must run on the sync path")
             }
-            PromptAction::Run(run_args) => run_prompt(run_args, config_source).await,
+            PromptAction::Run(run_args) => run_prompt(run_args, config_source, cancel).await,
         },
         Some(Command::History(history_args)) => history::run(history_args),
         Some(Command::Graph(_)) => bail!("internal error: `graph` must run on the sync path"),
@@ -120,7 +134,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Skill(_)) => bail!("internal error: `skill list` must run on the sync path"),
         Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
-        None => run_chat_or_repl(cli.chat, config_source).await,
+        None => run_chat_or_repl(cli.chat, config_source, cancel).await,
     }
 }
 
@@ -134,11 +148,22 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 /// as "the user wants the REPL", so a script's exit-code contract never
 /// silently changes into "launched an interactive prompt that then exits
 /// immediately."
-async fn run_chat_or_repl(chat: ChatArgs, config_source: ConfigSource) -> Result<()> {
+async fn run_chat_or_repl(
+    chat: ChatArgs,
+    config_source: ConfigSource,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     use std::io::IsTerminal;
 
     match resolve_input_with_stdin(chat.prompt.clone())? {
-        Some(prompt) => run_chat(chat, prompt, config_source).await,
+        Some(prompt) => run_chat(chat, prompt, config_source, cancel).await,
+        // `repl::run` deliberately does not receive `cancel`: a
+        // `CancellationToken` fires once and stays cancelled forever, but
+        // the REPL reuses one `AppContext` across many turns — wiring a
+        // single process-wide token in would make the *first* Ctrl-C (meant
+        // to interrupt just the in-flight turn) permanently break every
+        // turn after it. `lait chat` keeps its pre-existing Ctrl-C behavior
+        // until the REPL has its own per-turn cancellation scope.
         None if std::io::stdin().is_terminal() => {
             repl::run(
                 ChatReplArgs {
@@ -342,7 +367,13 @@ pub(crate) fn load_session_history(
 /// Runs a single-shot chat request with an already-resolved `prompt` — see
 /// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
 /// CLI argument and/or piped stdin).
-async fn run_chat(chat: ChatArgs, prompt: String, config_source: ConfigSource) -> Result<()> {
+async fn run_chat(
+    chat: ChatArgs,
+    prompt: String,
+    config_source: ConfigSource,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    crate::signal::spawn_handler(cancel.clone());
     let file_config = Arc::new(config::load_config(&config_source)?);
 
     // `-p`/`--prompt-name` renders a named `prompts:` template against
@@ -371,7 +402,7 @@ async fn run_chat(chat: ChatArgs, prompt: String, config_source: ConfigSource) -
     let system_prompt = resolve_system_prompt(&chat.shared, &file_config)?;
     let image_urls = attachment::resolve_image_urls(&chat.images).await?;
     let session_history = load_session_history(chat.shared.session.as_deref())?;
-    let env = AppContext::new(Arc::clone(&file_config));
+    let env = AppContext::new(Arc::clone(&file_config)).with_cancel(cancel);
 
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
@@ -469,7 +500,12 @@ async fn run_chat(chat: ChatArgs, prompt: String, config_source: ConfigSource) -
 /// see `docs/usage/ja/prompts.md`); reach for `-p` when those are needed.
 /// `-o`/`--render`/`--json`/`--show-usage`/`--no-history` work the same as
 /// every other `run_*` entry point (see `cli::OutputArgs`).
-async fn run_prompt(args: PromptRunArgs, config_source: ConfigSource) -> Result<()> {
+async fn run_prompt(
+    args: PromptRunArgs,
+    config_source: ConfigSource,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    crate::signal::spawn_handler(cancel.clone());
     let file_config = Arc::new(config::load_config(&config_source)?);
 
     let raw_input = resolve_input_with_stdin(args.input.clone())?
@@ -506,7 +542,7 @@ async fn run_prompt(args: PromptRunArgs, config_source: ConfigSource) -> Result<
     )?
     .with_usage_label(format!("prompt '{}'", args.name));
 
-    let env = AppContext::new(Arc::clone(&file_config));
+    let env = AppContext::new(Arc::clone(&file_config)).with_cancel(cancel);
     let response = env
         .finish(settings.complete(
             &env,
@@ -532,7 +568,12 @@ async fn run_prompt(args: PromptRunArgs, config_source: ConfigSource) -> Result<
     )
 }
 
-async fn run_agent(args: AgentRunArgs, config_source: ConfigSource) -> Result<()> {
+async fn run_agent(
+    args: AgentRunArgs,
+    config_source: ConfigSource,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    crate::signal::spawn_handler(cancel.clone());
     let raw_input = resolve_input_with_stdin(args.input.clone())?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let agent_file = agent::load_agent(&args.file)?;
@@ -562,7 +603,7 @@ async fn run_agent(args: AgentRunArgs, config_source: ConfigSource) -> Result<()
     let settings =
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
-    let env = AppContext::new(Arc::clone(&file_config));
+    let env = AppContext::new(Arc::clone(&file_config)).with_cancel(cancel);
     let output = env
         .finish(call_agent(
             &agent_file,
@@ -606,7 +647,12 @@ fn top_level_step_labels(steps: &[workflow::FlowStep]) -> Vec<String> {
         .collect()
 }
 
-async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<()> {
+async fn run_workflow(
+    run_args: RunArgs,
+    config_source: ConfigSource,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    crate::signal::spawn_handler(cancel.clone());
     let file_config = Arc::new(config::load_config(&config_source)?);
     let config_dir = config::resolve_config_dir(&config_source)?;
     let resolved_file =
@@ -694,7 +740,30 @@ async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<
     // repeated.
     let checkpointing = run_args.checkpoint || resumed.is_some();
 
-    let env = AppContext::new(Arc::clone(&file_config)).with_vars(vars.clone());
+    // `default.workflow_timeout` bounds this run's total wall-clock time,
+    // distinct from a node's own `timeout:` (which bounds one step). Built
+    // as a child of the process-wide Ctrl-C token (mirroring how
+    // `execute_step_with_retry` derives a node's own timeout token from its
+    // caller's) so either source cancels the same run token every
+    // downstream call already watches — a spawned sleep-then-cancel task
+    // fires it once the budget is exhausted, same as a step's own timeout.
+    let run_cancel = cancel.child_token();
+    if let Some(seconds) = scope.defaults.workflow_timeout {
+        let timeout_cancel = run_cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            // The step that's actually cancelled only ever sees/reports a
+            // generic "cancelled" error (the same one a Ctrl-C produces) —
+            // this is the one place that knows *why*, so it's the one place
+            // that can say so before the workflow's own error obscures it.
+            eprintln!("lait: 'default.workflow_timeout' ({seconds}s) exceeded; cancelling the run");
+            timeout_cancel.cancel();
+        });
+    }
+
+    let env = AppContext::new(Arc::clone(&file_config))
+        .with_vars(vars.clone())
+        .with_cancel(run_cancel);
     // `completed_index` ends at `wf.steps.len()` when the loop runs to
     // completion, or at the position right after whichever step set
     // `flow != Flow::Continue` (a `stop: true`) when it ends early — either
@@ -742,7 +811,12 @@ async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<
                     Ok(outcome) => outcome,
                     Err(error) => {
                         if checkpointing {
-                            checkpoint::save(&checkpoint::Checkpoint {
+                            // A save failure here must not shadow `error`
+                            // (the workflow's own failure — e.g. "workflow
+                            // execution was cancelled" from a Ctrl-C, which
+                            // the caller still needs to see and propagate)
+                            // — log it to stderr and keep going instead.
+                            let save_result = checkpoint::save(&checkpoint::Checkpoint {
                                 run_id: run_id.clone(),
                                 workflow_path: workflow_path.clone(),
                                 initial_prompt: initial_prompt.clone(),
@@ -755,12 +829,18 @@ async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<
                                 steps_outputs: unchanged_steps_outputs
                                     .expect("cloned above when checkpointing"),
                                 status: checkpoint::RunStatus::Failed,
-                            })?;
-                            eprintln!(
-                                "note: run checkpointed as '{run_id}'; resume with `lait run {} \
-                                 --resume {run_id}`",
-                                run_args.file.display(),
-                            );
+                            });
+                            match save_result {
+                                Ok(()) => eprintln!(
+                                    "note: run checkpointed as '{run_id}'; resume with `lait run \
+                                     {} --resume {run_id}`",
+                                    run_args.file.display(),
+                                ),
+                                Err(save_error) => eprintln!(
+                                    "warning: failed to save checkpoint for run '{run_id}': \
+                                     {save_error:#}"
+                                ),
+                            }
                         }
                         return Err(error);
                     }

@@ -94,6 +94,15 @@ pub(crate) struct WorkflowDefaults {
     /// own. Falls back independently, like `mcp`. Meaningless for an `agent`
     /// node, which supplies its own system prompt from its agent file.
     pub(crate) system_prompt: Option<String>,
+    /// A ceiling (seconds) on the *whole* run's wall-clock time, distinct
+    /// from a node's own `timeout:`/`default.timeout` (which each bound a
+    /// single step's action). Only enforced by `app::run_workflow` for the
+    /// file passed directly to `lait run` — a `workflow:` node's own
+    /// sub-workflow is instead bounded by that node's own `timeout:`, the
+    /// same as any other node, so setting this inside a sub-workflow's
+    /// `default:` has no effect of its own (it still folds like every other
+    /// field here, in case a future caller wants to read it).
+    pub(crate) workflow_timeout: Option<u64>,
 }
 
 impl WorkflowDefaults {
@@ -118,6 +127,7 @@ impl WorkflowDefaults {
             skills: layers.iter().find_map(|layer| layer.skills.clone()),
             subagents: layers.iter().find_map(|layer| layer.subagents.clone()),
             system_prompt: layers.iter().find_map(|layer| layer.system_prompt.clone()),
+            workflow_timeout: layers.iter().find_map(|layer| layer.workflow_timeout),
         }
     }
 }
