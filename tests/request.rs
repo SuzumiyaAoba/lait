@@ -296,7 +296,7 @@ fn does_not_retry_a_400_response() {
 }
 
 #[test]
-fn gives_up_after_three_attempts_against_a_persistent_503() {
+fn gives_up_after_retrying_a_persistent_503() {
     let server = MockServer::start(
         "503 Service Unavailable",
         r#"{"error":{"message":"mock outage","type":"server_error"}}"#,

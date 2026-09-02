@@ -34,6 +34,8 @@ cargo run -- lint workflow.yml agents/city-fact.md
   （1〜64文字、ASCII の英数字・`_`・`-` のみ）
 - `mcp:`（ノード・エージェントファイル・`default.mcp`）に書いた名前が `lait.config.yml` の
   `mcp_servers:` に定義されているか
+- `mcp:` が参照しているサーバーの `allowed_tools`（[MCP サーバーのツールを使う](./mcp.md#呼び出せるツールを制限するallowed_tools)を参照）が空リストになっていないか（警告。空リストの
+  サーバーへのツール呼び出しは実行時に必ず拒否されます）
 - `skills:`（ノード・エージェントファイル・`default.skills`）に書いた名前が `lait.config.yml` の
   `skills:` に定義されているか
 - `subagents:`（ノード・エージェントファイル・`default.subagents`）に書いた名前が

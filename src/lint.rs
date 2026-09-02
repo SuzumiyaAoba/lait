@@ -678,6 +678,37 @@ fn check_mcp_names(
         ctx,
         issues,
     );
+    check_mcp_allowed_tools_not_empty(context, names, ctx, issues);
+}
+
+/// Warns when a node/agent references an MCP server whose `allowed_tools`
+/// (see `McpRegistry::call`) is an explicit empty list — every tool call to
+/// it is unconditionally rejected at runtime, so referencing such a server
+/// at all is almost certainly a mistake. Distinct from
+/// `check_capability_names`'s unknown-name check above: this only fires for
+/// servers that *do* exist, and is a warning (not an error) since lait
+/// cannot know in advance which tool, if any, the model will actually try
+/// to call — an `allowed_tools` list that is merely non-empty could still
+/// reject some calls at runtime with no way to tell in advance.
+fn check_mcp_allowed_tools_not_empty(
+    context: &str,
+    names: Option<&[String]>,
+    ctx: &LintCtx,
+    issues: &mut Vec<LintIssue>,
+) {
+    let Some(names) = names else { return };
+    let Some(config) = ctx.config else { return };
+    for name in names {
+        if let Some(server) = config.mcp_servers.get(name)
+            && let Some(allowed_tools) = &server.allowed_tools
+            && allowed_tools.is_empty()
+        {
+            issues.push(LintIssue::warning(format!(
+                "{context} references MCP server '{name}', whose 'allowed_tools' in {} is an empty list; every tool call to it will be rejected at runtime",
+                config::CONFIG_FILE_NAME
+            )));
+        }
+    }
 }
 
 fn check_skill_names(
@@ -910,6 +941,35 @@ mod tests {
         let issues = lint_fixture(&wf, Some(&config));
         assert!(
             !issues.iter().any(|issue| issue.message.contains("MCP")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn flags_a_referenced_mcp_server_whose_allowed_tools_is_empty() {
+        let mut config = empty_config();
+        config.mcp_servers.insert(
+            "locked-down".to_owned(),
+            config::McpServerConfig {
+                command: Some("true".to_owned()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                url: None,
+                headers: HashMap::new(),
+                allowed_tools: Some(Vec::new()),
+            },
+        );
+        let wf = parse_workflow_fixture(
+            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [locked-down]\nsteps:\n  - use: a\n",
+        );
+        let issues = lint_fixture(&wf, Some(&config));
+        assert!(
+            issues.iter().any(|issue| {
+                issue.severity == Severity::Warning
+                    && issue.message.contains("locked-down")
+                    && issue.message.contains("allowed_tools")
+            }),
             "{issues:?}"
         );
     }
