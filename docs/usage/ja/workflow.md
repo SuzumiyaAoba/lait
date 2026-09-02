@@ -1200,3 +1200,35 @@ printf 'a\nb\nc\n' | cargo run -- run workflow.yml -
   既定値を、無関係なコマンド実行にまで及ぼさないためです）。
 - `command` は `prompt`/`system_prompt`/`agent`/`workflow`/`files`/`images` と併用できません。
   実行するのは1つのアクションだけだからです。
+
+## 実行計画の表示（`lait run --dry-run`）
+
+`lait run` に `--dry-run` を付けると、モデルの呼び出し・MCP サーバーの起動・`command` の
+実行を一切行わずに、そのワークフローが「どう実行されるか」だけを標準出力に表示します。
+
+```sh
+lait run workflow.yml "本文" --dry-run
+```
+
+表示される内容は次のとおりです。
+
+- 各ステップの実行順序と、参照しているノード（`use:`）・その種類（`prompt`/`agent`/
+  `workflow`/`command`/`transform`）。
+- モデルを呼ぶノードについては、エイリアス解決後のモデル ID と `base_url`（ノード →
+  エージェントファイル → ワークフローの `default:` → `lait.config.yml` の `default.model`
+  という、実際の実行と同じ優先順位で解決されます）。モデルが解決できない場合（設定ミス）は、
+  実際に実行したときと同じエラーがここで報告されます。
+- `retry`/`timeout` の実効値（ノード自身の設定か、モデルを呼ぶノードであればワークフローの
+  `default.retry`/`default.timeout` へフォールバックした結果）。
+- `when`/`switch`/`parallel`/`loop`/`for_each` の構造（条件式、`switch` の各 `case`、
+  `parallel` の各 branch、`loop` の条件と `max_iterations`、`for_each` の `items` 式など）。
+- `prompt`/`system_prompt`/`command` のテンプレートは、`<PROMPT>`/`--var` に対しては
+  実際にレンダリングされます。ただし `{{ steps.<id> }}` のようにまだ実行されていない
+  ステップの出力に依存する箇所は展開できないため、テンプレートの原文がそのまま
+  `[unrendered: ...]` という注記付きで表示されます。
+
+`lait lint` がワークフローの静的な参照エラー（存在しないノード/ステップ ID など）を
+検査するのに対して、`--dry-run` は「実際にどのモデルがどんな設定で呼ばれるか」という
+実行時の解決結果まで、LLM 呼び出しのコストをかけずに確認できます。`type: workflow` の
+サブワークフローは展開されず、`workflow: <path>` という行のみ表示されます（必要であれば
+そのサブワークフローに対して直接 `lait run <path> --dry-run` を実行してください）。

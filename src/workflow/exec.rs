@@ -728,6 +728,33 @@ pub(crate) fn run_steps<'a>(
 /// a bounded, predictable worst case rather than an arbitrarily long hang.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
 
+/// The `retry` actually in effect for `node`: its own `retry` if set, else
+/// (only for a node that calls a model — see `NodeDefinition::calls_model`)
+/// `scope`'s `defaults.retry`. Shared by `execute_step_with_retry`, which
+/// runs under it, and `dryrun::print_plan`, which only displays it (`lait run
+/// --dry-run`).
+pub(crate) fn effective_retry<'a>(
+    node: &'a workflow::NodeDefinition,
+    scope: &'a WorkflowScope,
+) -> Option<&'a workflow::RetryDefinition> {
+    node.retry().or(node
+        .calls_model()
+        .then_some(scope.defaults.retry.as_ref())
+        .flatten())
+}
+
+/// The `timeout` actually in effect for `node`, under the same node-first,
+/// model-calling-only fallback rule as [`effective_retry`].
+pub(crate) fn effective_timeout(
+    node: &workflow::NodeDefinition,
+    scope: &WorkflowScope,
+) -> Option<u64> {
+    node.timeout().or(node
+        .calls_model()
+        .then_some(scope.defaults.timeout)
+        .flatten())
+}
+
 /// Runs `execute_step`, applying an effective timeout to each attempt and
 /// retrying per an effective `retry` on failure (a timed-out attempt counts
 /// as a failure). "Effective" means the node's own `retry`/`timeout` if set,
@@ -758,13 +785,8 @@ async fn execute_step_with_retry(
         step_cancel: workflow_cancel,
     } = context;
 
-    let calls_model = node.calls_model();
-    let effective_retry = node.retry().or(calls_model
-        .then_some(scope.defaults.retry.as_ref())
-        .flatten());
-    let effective_timeout = node
-        .timeout()
-        .or(calls_model.then_some(scope.defaults.timeout).flatten());
+    let effective_retry = effective_retry(node, scope);
+    let effective_timeout = effective_timeout(node, scope);
 
     let max_attempts = effective_retry
         .and_then(|retry| retry.max_attempts)
@@ -913,8 +935,10 @@ struct StepContext<'a> {
 /// default precedence chain shared by `execute_step`'s `agent` and `prompt`
 /// branches. `agent_file` is `Some` only for an `agent` node; besides adding
 /// its fallback layer, its presence also selects which hint text a
-/// missing-model error uses.
-fn resolve_step_settings(
+/// missing-model error uses. Also called (read-only, no network) by
+/// `dryrun::print_plan` to display the resolved model/base_url for `lait run
+/// --dry-run`.
+pub(crate) fn resolve_step_settings(
     node: &workflow::NodeDefinition,
     scope: &WorkflowScope,
     file_config: &ConfigFile,

@@ -293,6 +293,14 @@ pub(crate) struct RunArgs {
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
 
+    /// Show the resolved execution plan (step order, resolved model/
+    /// base_url, effective retry/timeout, and when/switch/parallel/loop/
+    /// for_each structure) without calling a model, spawning an MCP server,
+    /// or running a command. PROMPT/--var are used to render each step's
+    /// template as far as they can be (see docs/usage/ja/workflow.md).
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
     #[command(flatten)]
     pub(crate) var: VarArgs,
 

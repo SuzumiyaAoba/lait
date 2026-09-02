@@ -7,6 +7,7 @@ use crate::jq;
 #[cfg(test)]
 use crate::template;
 
+pub(crate) mod dryrun;
 pub(crate) mod exec;
 mod model;
 pub(crate) mod scope;

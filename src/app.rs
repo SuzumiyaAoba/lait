@@ -547,6 +547,11 @@ async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<
 
     let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
     let vars = workflow::build_vars(&run_args.var.var)?;
+
+    if run_args.dry_run {
+        return workflow::dryrun::print_plan(&wf, &scope, &file_config, &prompt, &vars);
+    }
+
     let env = AppContext::new(Arc::clone(&file_config)).with_vars(vars);
     let initial_prompt = prompt.clone();
     let StepsOutcome {
