@@ -621,6 +621,7 @@ impl McpRegistry {
             .index
             .get(qualified_name)
             .ok_or_else(|| anyhow!("model called unknown tool '{qualified_name}'"))?;
+        self.check_tool_is_allowed(server_name, tool_name)?;
         let connection = self.connection(server_name, cancellation.clone()).await?;
 
         let arguments = if arguments_json.trim().is_empty() {
@@ -686,6 +687,33 @@ impl McpRegistry {
         };
 
         Ok(render_tool_result(result))
+    }
+
+    /// Enforces `mcp_servers.<name>.allowed_tools`, if the server's config
+    /// sets it: the field is absent by default (unrestricted, matching
+    /// lait's behavior before this gate existed), but a present list —
+    /// including an empty one, which denies every tool on the server —
+    /// restricts which of the server's tools the model may call. Checked in
+    /// `call` before opening a connection, so a disallowed call never
+    /// reaches the server at all (unlike `tools()`, filtering the
+    /// advertised list there would be bypassable by a model naming a tool
+    /// it was never offered).
+    fn check_tool_is_allowed(&self, server_name: &str, tool_name: &str) -> Result<()> {
+        let Some(server) = self.servers.get(server_name) else {
+            return Ok(());
+        };
+        let Some(allowed_tools) = &server.allowed_tools else {
+            return Ok(());
+        };
+        if allowed_tools.iter().any(|allowed| allowed == tool_name) {
+            return Ok(());
+        }
+        bail!(
+            "MCP server '{server_name}' does not allow calling tool '{tool_name}' \
+             (not listed in its 'allowed_tools' in {}); add it there if this call \
+             should be permitted",
+            config::CONFIG_FILE_NAME
+        );
     }
 
     /// Returns the running connection for `name`, connecting lazily (and
@@ -1686,10 +1714,61 @@ fn render_tool_result(result: rmcp::model::CallToolResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameLimitedReader, qualify_tool_name, render_tool_result, serialized_json_bytes};
+    use super::{
+        FrameLimitedReader, McpRegistry, qualify_tool_name, render_tool_result,
+        serialized_json_bytes,
+    };
+    use crate::config::McpServerConfig;
     use rmcp::model::CallToolResult;
     use serde_json::json;
+    use std::{collections::HashMap, sync::Arc};
     use tokio::io::AsyncReadExt;
+
+    fn server_with_allowed_tools(allowed_tools: Option<Vec<String>>) -> McpRegistry {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "fs".to_owned(),
+            McpServerConfig {
+                command: Some("true".to_owned()),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+                url: None,
+                headers: HashMap::new(),
+                allowed_tools,
+            },
+        );
+        McpRegistry::new(Arc::new(servers))
+    }
+
+    #[test]
+    fn allows_any_tool_when_allowed_tools_is_unset() {
+        let registry = server_with_allowed_tools(None);
+        assert!(registry.check_tool_is_allowed("fs", "read_file").is_ok());
+        assert!(registry.check_tool_is_allowed("fs", "write_file").is_ok());
+    }
+
+    #[test]
+    fn allows_a_tool_named_in_the_allowlist() {
+        let registry = server_with_allowed_tools(Some(vec!["read_file".to_owned()]));
+        assert!(registry.check_tool_is_allowed("fs", "read_file").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_tool_not_named_in_the_allowlist() {
+        let registry = server_with_allowed_tools(Some(vec!["read_file".to_owned()]));
+        let error = registry
+            .check_tool_is_allowed("fs", "write_file")
+            .unwrap_err();
+        assert!(error.to_string().contains("write_file"));
+        assert!(error.to_string().contains("allowed_tools"));
+    }
+
+    #[test]
+    fn an_empty_allowlist_denies_every_tool() {
+        let registry = server_with_allowed_tools(Some(vec![]));
+        assert!(registry.check_tool_is_allowed("fs", "read_file").is_err());
+    }
 
     #[test]
     fn qualifies_a_tool_name_with_its_server() {

@@ -355,6 +355,102 @@ fn start_mock_mcp_server_with_list_cursor(
     (format!("http://{addr}/mcp"), handle)
 }
 
+/// Starts an MCP server for the `allowed_tools` rejection test: like
+/// `start_mock_mcp_server`, but expects only the three requests one
+/// `tools/list` round trip makes (`initialize` / `notifications/initialized`
+/// / `tools/list`) and must never see a `tools/call` — the point of the test
+/// is that a config-level `allowed_tools` gate rejects the call before it
+/// ever reaches the server. Non-blocking with a deadline (like
+/// `start_recovering_mcp_server` below) so a regression that *does* send
+/// `tools/call` fails via the mock's own `panic!` instead of the test
+/// hanging forever waiting for a fourth connection that, by design, should
+/// never arrive.
+fn start_mock_mcp_server_expecting_no_tool_call() -> (String, std::thread::JoinHandle<Vec<String>>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock MCP server");
+    listener
+        .set_nonblocking(true)
+        .expect("failed to make mock MCP server non-blocking");
+    let addr = listener
+        .local_addr()
+        .expect("failed to read mock MCP server address");
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut methods = Vec::new();
+        while Instant::now() < deadline && methods.len() < 3 {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("failed to accept connection: {error}"),
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("failed to make accepted mock MCP connection blocking");
+            let request = read_request(&mut stream).expect("failed to read MCP request");
+            let request: serde_json::Value =
+                serde_json::from_str(&request.body).expect("mock MCP server got non-JSON body");
+            let method = request
+                .get("method")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let id = request.get("id").cloned();
+            methods.push(method.clone());
+
+            let (status, response_body) = match method.as_str() {
+                "initialize" => (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock-mcp", "version": "0.0.1"}
+                        }
+                    })
+                    .to_string(),
+                ),
+                "notifications/initialized" => ("202 Accepted", String::new()),
+                "tools/list" => (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [{
+                                "name": "echo",
+                                "description": "echoes the input back",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"text": {"type": "string"}}
+                                }
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ),
+                other => panic!(
+                    "mock MCP server received an unexpected method '{other}' -- a disallowed tool call should never reach the server"
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("failed to write mock response");
+            stream.flush().expect("failed to flush mock response");
+        }
+        methods
+    });
+    (format!("http://{addr}/mcp"), handle)
+}
+
 /// Starts a server whose first `tools/list` pagination fails with a repeated
 /// cursor, then serves a fresh connection normally. The listener is
 /// non-blocking so the test can also finish when a buggy client retries on the
@@ -504,6 +600,52 @@ fn chat_mode_calls_an_mcp_tool_and_returns_the_models_final_answer() {
     assert!(
         second_body.contains("42"),
         "second request body should carry the tool's result: {second_body}"
+    );
+}
+
+#[test]
+fn chat_mode_rejects_a_tool_call_not_in_the_allowlist() {
+    let llm_server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-1","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"mock__echo","arguments":"{\"text\":\"hi\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    );
+    let (mcp_url, mcp_thread) = start_mock_mcp_server_expecting_no_tool_call();
+    let config = ConfigDirectory::new(&format!(
+        "mcp_servers:\n  mock:\n    url: \"{mcp_url}\"\n    allowed_tools: [\"other_tool\"]\n",
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--model",
+            "test-model",
+            "--base-url",
+            &llm_server.base_url,
+            "--mcp",
+            "mock",
+            "what is the answer?",
+        ])
+        .output()
+        .expect("failed to execute lait");
+
+    let request = llm_server.receive_request();
+    llm_server.finish();
+    let methods = mcp_thread.join().expect("mock MCP server thread panicked");
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("allowed_tools") && stderr.contains("echo"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(request.target, "/v1/chat/completions");
+    assert_eq!(
+        methods,
+        vec!["initialize", "notifications/initialized", "tools/list"],
+        "the disallowed tool call should never have reached the MCP server"
     );
 }
 

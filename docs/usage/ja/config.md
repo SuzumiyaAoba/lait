@@ -180,14 +180,20 @@ mcp_servers:
     url: https://mcp.example.com/mcp
     headers:
       Authorization: "Bearer ${SEARCH_TOKEN}"
+    allowed_tools: [search]  # 省略可。省略時は無制限、[] を指定すると全ツール禁止
 ```
 
 - `command:`（stdio）と `url:`（streamable HTTP）はどちらか一方だけを指定します。両方または
   どちらも指定しない場合はエラーになります。
 - `command`/`args`/`env` の値、`cwd`、`url`、`headers` の値は、いずれも `${VAR_NAME}` 展開の対象
-  です（前節と同じ規則）。
+  です（前節と同じ規則）。`allowed_tools` の値は展開対象ではありません。
 - 実際に使われるサーバーだけがその場で接続されます（`mcp:` で名前を挙げていないサーバーは
   起動しません）。
+- `allowed_tools:` は省略時（フィールドなし）は無制限、`[]`（空リスト）を指定するとそのサーバー
+  の全ツールを禁止という意味になり、この2つは区別されます。モデルがそのサーバーの
+  `allowed_tools` に無いツールを呼び出そうとすると、サーバーへ接続する前にエラーになります。
+  詳しくは [MCP サーバーのツールを使う](./mcp.md#呼び出せるツールを制限するallowed_tools) を
+  参照してください。
 
 ## 名前付きプロンプト
 

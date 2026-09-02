@@ -901,6 +901,7 @@ mod tests {
                 cwd: None,
                 url: None,
                 headers: HashMap::new(),
+                allowed_tools: None,
             },
         );
         let wf = parse_workflow_fixture(

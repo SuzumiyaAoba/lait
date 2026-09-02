@@ -164,6 +164,15 @@ pub(crate) struct McpServerConfig {
     pub(crate) url: Option<String>,
     #[serde(default)]
     pub(crate) headers: HashMap<String, String>,
+    /// Restricts which of this server's tools the model may call. `None`
+    /// (the field omitted) means unrestricted — every tool the server
+    /// advertises is callable, matching lait's behavior before this field
+    /// existed. `Some(vec![])` (an explicit empty list) means the opposite:
+    /// no tool on this server may be called at all. These two are
+    /// deliberately distinguishable (hence `Option<Vec<_>>` rather than a
+    /// bare `Vec` defaulting to empty) — see `McpRegistry::call`, which
+    /// enforces this before ever opening a connection to the server.
+    pub(crate) allowed_tools: Option<Vec<String>>,
 }
 
 /// The transport settings for one MCP server, after resolving `${VAR}`
@@ -570,6 +579,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: HashMap::new(),
+            allowed_tools: None,
         }
     }
 
@@ -581,6 +591,7 @@ mod tests {
             cwd: None,
             url: Some(url.to_owned()),
             headers: HashMap::new(),
+            allowed_tools: None,
         }
     }
 
@@ -613,6 +624,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: HashMap::new(),
+            allowed_tools: None,
         };
         let error = config.resolve_transport("test").unwrap_err();
         assert!(error.to_string().contains("neither"));
