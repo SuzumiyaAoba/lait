@@ -319,6 +319,28 @@ pub(crate) fn http_client() -> reqwest::Client {
 
 /// Builds the API client [`complete`] and [`complete_stream`] share, wiring
 /// the request's base URL/API key to the shared `HTTP_CLIENT`.
+///
+/// HTTP-level retry (429/5xx/connect-failure with exponential backoff) is
+/// *not* implemented in this module — `Client::with_http_client` wires every
+/// request through async-openai's own `ReqwestExecutor`, which already wraps
+/// every call in its `OpenAIRetryLayer` (`OpenAIRetryLayer::default()`, 3
+/// retries — 4 attempts total — on HTTP 429/5xx or a native connect error,
+/// waiting 100ms/200ms/400ms between attempts, capped at 8s, honoring a
+/// `Retry-After` header when the server sends one). A 429 whose body parses
+/// as `insufficient_quota` is treated as permanent and not retried; a plain
+/// timeout (as opposed to a failed connect) is not retried either, since
+/// there's no way to tell a slow server from a truly stuck one. Adding a
+/// second retry loop here on top of this would double- or triple-count
+/// attempts (confirmed empirically: layering lait's own retry on top of this
+/// one turned a single persistent failure into a dozen HTTP connections) —
+/// so lait relies on the vendored behavior instead of reimplementing it.
+///
+/// This is a separate layer from a workflow step's own `retry:` setting: the
+/// step-level `retry:` re-runs the *whole* step (including any MCP/tool
+/// calls) on failure, while this layer only re-sends the underlying HTTP
+/// request. Also note `DEFAULT_HTTP_TIMEOUT` bounds a single attempt, not
+/// the whole call — a request that hits 429/5xx repeatedly can take up to
+/// ~4x that long end to end (plus backoff) before this layer gives up.
 fn client(base_url: &str, api_key: &str) -> Client<OpenAIConfig> {
     let config = OpenAIConfig::new()
         .with_api_base(base_url)

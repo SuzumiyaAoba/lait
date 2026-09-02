@@ -1,5 +1,7 @@
 mod support;
 
+use std::time::Duration;
+
 use support::{JsonSchemaFile, LaitCommand, MockServer, run_lait, without_json_whitespace};
 
 #[test]
@@ -236,5 +238,90 @@ fn reports_openai_api_errors() {
         output.status.code(),
         Some(4),
         "a model API failure should exit with code 4: {output:?}"
+    );
+}
+
+/// HTTP retry against 429/5xx/connect failures is provided by async-openai's
+/// own `OpenAIRetryLayer`, not by any code in `lait` — see the doc comment on
+/// `llm::client`. These three tests pin that vendored behavior at the
+/// integration level rather than re-deriving it, so a future async-openai
+/// upgrade that changes it (e.g. a different retry count) is caught here
+/// instead of silently changing lait's failure characteristics.
+#[test]
+fn retries_a_429_response_and_succeeds_on_the_next_attempt() {
+    let server = MockServer::start_sequence(&[
+        (
+            "429 Too Many Requests",
+            r#"{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+        ),
+    ]);
+    let output = run_lait(Some(&server.base_url), None, "hello");
+    let first_request = server.receive_request();
+    let second_request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(first_request.target, "/v1/chat/completions");
+    assert_eq!(second_request.target, "/v1/chat/completions");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "mock response"
+    );
+}
+
+#[test]
+fn does_not_retry_a_400_response() {
+    let server = MockServer::start(
+        "400 Bad Request",
+        r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#,
+    );
+    let output = run_lait(Some(&server.base_url), None, "hello");
+    let request = server.receive_request();
+    let second_request = server.try_receive_request(Duration::from_millis(600));
+    server.finish();
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    assert_eq!(request.target, "/v1/chat/completions");
+    assert!(
+        second_request.is_none(),
+        "a 400 response should not be retried, but a second request arrived"
+    );
+}
+
+#[test]
+fn gives_up_after_three_attempts_against_a_persistent_503() {
+    let server = MockServer::start(
+        "503 Service Unavailable",
+        r#"{"error":{"message":"mock outage","type":"server_error"}}"#,
+    );
+    let output = run_lait(Some(&server.base_url), None, "hello");
+
+    let mut attempts = 0;
+    while server.try_receive_request(Duration::from_secs(2)).is_some() {
+        attempts += 1;
+    }
+    server.finish();
+
+    assert!(
+        !output.status.success(),
+        "lait unexpectedly succeeded: {output:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a persistent model API failure should exit with code 4: {output:?}"
+    );
+    // Asserting a range rather than an exact count: the point is that a
+    // 5xx is retried at all, not pinning async-openai's exact retry budget.
+    assert!(
+        attempts > 1,
+        "a persistent 5xx should be retried at least once, got {attempts} attempt(s)"
     );
 }

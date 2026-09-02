@@ -231,14 +231,15 @@ impl MockServer {
     /// simulates one transient failure followed by a success.
     ///
     /// Tolerates *more* connections than `responses.len()` — an HTTP-level
-    /// retry (see `llm::complete_with_retry`) attempting again after the
-    /// last configured response, most notably — by repeating the last
-    /// response for each one, on a background thread `finish()` never joins
-    /// (so a test that never sends an extra connection isn't slowed down
-    /// waiting for one that never arrives). A test that wants to assert on
-    /// the exact number of connections still can, by calling
-    /// `receive_request()` exactly `responses.len()` times: extras are
-    /// still recorded on the same channel, just never required.
+    /// retry (async-openai's built-in `OpenAIRetryLayer`, see the doc
+    /// comment on `llm::client`) attempting again after the last configured
+    /// response, most notably — by repeating the last response for each
+    /// one, on a background thread `finish()` never joins (so a test that
+    /// never sends an extra connection isn't slowed down waiting for one
+    /// that never arrives). A test that wants to assert on the exact number
+    /// of connections still can, by calling `receive_request()` exactly
+    /// `responses.len()` times: extras are still recorded on the same
+    /// channel, just never required.
     pub(crate) fn start_sequence(responses: &[(&str, &str)]) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
         let address = listener
@@ -368,6 +369,14 @@ impl MockServer {
         self.requests
             .recv_timeout(Duration::from_secs(5))
             .expect("mock server did not receive a request")
+    }
+
+    /// Like `receive_request`, but returns `None` instead of panicking when
+    /// no request arrives within `timeout` — for asserting a request was
+    /// *not* retried without paying `receive_request`'s full 5-second
+    /// timeout on every such assertion.
+    pub(crate) fn try_receive_request(&self, timeout: Duration) -> Option<HttpRequest> {
+        self.requests.recv_timeout(timeout).ok()
     }
 
     pub(crate) fn finish(self) {
