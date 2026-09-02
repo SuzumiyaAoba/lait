@@ -106,6 +106,7 @@ max_tool_rounds: 8
 # workflow.yml
 nodes:
   research:
+    type: prompt
     prompt: "{{ input }} について調べてください。"
     mcp: [filesystem, remote-search]
 ```

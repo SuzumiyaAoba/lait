@@ -12,6 +12,13 @@
 配列のときは裸の `{{ input }}` は使えません。`{{ input.field }}` でフィールドにアクセスするか、
 `{{ json input }}` で全体をコンパクトな JSON テキストとして展開してください（詳細は後述）。
 
+各ノードは `type:` で種類（`prompt`/`agent`/`workflow`/`command`/`transform` のいずれか）を
+明示する必要があります。種類ごとに使える他のフィールドが異なり（例えば `type: workflow` は
+`model:` を持てません）、その組み合わせは `type:` から一意に決まるため、以前あった「どの
+フィールドが設定されているかで種類を推測する」方式は廃止されました。ワークフローファイル自体は
+任意で `version:`（現在は `1` のみ。省略時は最新版として扱われ、未知の番号を明示すると
+エラーになります）を持てます。
+
 ```yaml
 # workflow.yml
 name: example-flow
@@ -25,17 +32,20 @@ default:
 # nodes: --- 何をするか（定義。順序は持たない）
 nodes:
   summarize:
+    type: prompt
     prompt: |
       次の文章を3行で要約してください。
       {{ input }}
 
   translate:
+    type: prompt
     model: cloud          # ノードごとに上書き可能
     prompt: |
       次の要約を英訳してください。
       {{ input }}
 
   format:
+    type: prompt
     prompt: |
       次の英訳を Markdown の箇条書きにしてください。
       {{ input }}
@@ -51,10 +61,12 @@ steps:
 cargo run -- run workflow.yml "要約・翻訳したい文章..."
 ```
 
-- `nodes:` はキーをノード id とするマップで、順序を持ちません。各ノードは `prompt`/
-  `system_prompt`/`agent`/`workflow`/`command`/`files`/`images`/`jq`/`model`/`reasoning_effort`/
-  `temperature`/`top_p`/`max_tokens`/`input_schema`/`output_schema`/`schema_name`/`write_file`/
-  `retry`/`timeout` を持てます（後述）。
+- `nodes:` はキーをノード id とするマップで、順序を持ちません。各ノードは `type:`（必須。
+  `prompt`/`agent`/`workflow`/`command`/`transform` のいずれか）で種類を宣言し、その種類に応じて
+  `prompt`/`system_prompt`/`agent`/`workflow`/`command`/`files`/`images`/`jq`/`model`/
+  `reasoning_effort`/`temperature`/`top_p`/`max_tokens`/`input_schema`/`output_schema`/
+  `schema_name`/`write_file`/`retry`/`timeout` の一部を持てます（後述。種類ごとに使えるフィールドが
+  決まっており、他の種類のフィールドを書くとパース時にエラーになります）。
 - `steps:` は配列で、各要素（**ステップ**、または**参照サイト**）が `use: <ノードid>` で
   `nodes:` のどれを実行するかを指定します。配列の先頭から逐次実行するのが基本です。
   `when`/`switch` による分岐（後述）、`parallel` による複数のステップ列の同時実行
@@ -71,9 +83,9 @@ cargo run -- run workflow.yml "要約・翻訳したい文章..."
   `$steps` に記録されるキーでもあります。省略した場合は `use:` したノードの id が使われ、
   それも無い場合（`switch`/`parallel`/`loop`/`for_each` に `id` を付けなかった場合）は
   `step-1`、`step-2`… になります。
-- `prompt` も `system_prompt` も `agent` も `workflow` も `command` も持たないノードはモデルを
-  呼び出さず、`jq` によるデータ変換のみを行います（後述）。この場合 `model` は不要です。
-  `command`（後述）を持つノードもモデルを呼び出さず、代わりに任意のコマンドを実行します。
+- `type: transform` のノードはモデルを呼び出さず、`jq`/`write_file` によるデータ変換のみを
+  行います（後述）。`model` は不要です。`type: command`（後述）を持つノードもモデルを呼び出さず、
+  代わりに任意のコマンドを実行します。
 - 最後のステップの出力のみを標準出力に出します。
 - `run` サブコマンドでも `--no-config` は利用できます（例: `lait run workflow.yml "..." --no-config`）。
 
@@ -94,8 +106,10 @@ cargo run -- run workflow.yml "要約・翻訳したい文章..."
 ```yaml
 nodes:
   ask-clarifying-question:
+    type: prompt
     prompt: "不足している情報を尋ねる質問を1つ生成してください: {{ input }}"
   answer:
+    type: prompt
     prompt: "十分な情報があるので回答してください: {{ input }}"
 
 steps:
@@ -156,8 +170,10 @@ default:
 
 nodes:
   summarize:
+    type: prompt
     prompt: "次の文章を要約してください。\n{{ input }}"
   translate:
+    type: prompt
     model: cloud
     prompt: "次の要約を英訳してください。\n{{ input }}"
 
@@ -204,6 +220,7 @@ json_schemas:
     file_path: weather.schema.json
 nodes:
   extract:
+    type: prompt
     prompt: |
       次の文章から都市名と人口を JSON で抽出してください。
       {{ input }}
@@ -212,6 +229,7 @@ nodes:
     jq: ".city"
 
   introduce:
+    type: prompt
     prompt: |
       次の都市名を使って一文で紹介してください。
       {{ input }}
@@ -234,8 +252,10 @@ steps:
 - `jq` の出力が文字列の場合は `jq -r` のように引用符なしのテキストとして展開されます。それ以外
   （オブジェクト・配列・数値など）はコンパクトな JSON テキストとして展開されます。
 - `jq` フィルターが複数の値を出力した場合は改行区切りで連結します。
-- `jq` のみを指定して `prompt`/`system_prompt` を両方省略すると、モデルを呼び出さずにその時点の
-  `{{ input }}` を変換するだけのノードになります（`model` の指定は不要です）。この場合、入力は
+- モデルを呼び出さずにその時点の `{{ input }}` を `jq` で変換するだけのノードは `type: transform`
+  で書きます（`jq`/`write_file` のどちらか一方は必須です）。`type: prompt` は逆に `prompt`/
+  `system_prompt` の少なくとも一方が必須で、両方を省略することはできません（`type: transform`
+  との違いがなくなってしまうためです）。`type: transform` のノードに `jq` を指定する場合、入力は
   有効な JSON である必要があります。
 
 ## ファイルへの出力（`write_file`）
@@ -248,6 +268,7 @@ steps:
 # workflow.yml
 nodes:
   summarize:
+    type: prompt
     prompt: |
       次の文章を3行で要約してください。
       {{ input }}
@@ -291,6 +312,7 @@ json_schemas:
       required: [city]
 nodes:
   introduce:
+    type: prompt
     input_schema: city
     prompt: |
       次の都市名を使って一文で紹介してください。
@@ -328,9 +350,11 @@ default:
   max_tool_rounds: 8
 nodes:
   research:
+    type: prompt
     prompt: "{{ input }} について調べて要約してください。"
     mcp: [filesystem, remote-search]   # ノードで上書き
   summarize:
+    type: agent
     agent: agents/summarize.md
     # mcp を書かなければ agent ファイル → default.mcp の順にフォールバック
 steps:
@@ -370,12 +394,15 @@ default:
   system_prompt: "あなたは日本語のプロの校正者です。"   # ワークフロー全体の既定
 nodes:
   proofread:
+    type: prompt
     system_prompt: "文体は「ですます調」に統一してください。"   # ノードで上書き
     prompt: "{{ input }}"
   translate:
+    type: prompt
     prompt: "{{ input }}"
     # system_prompt を書かなければ default.system_prompt にフォールバック
   classify:
+    type: prompt
     system_prompt: "次のテキストを spam/ham に分類し、ラベルだけを出力してください。"
     # prompt を省略すると、テンプレート展開を挟まず現在の入力がそのままユーザー
     # メッセージとして送られる（agent ノードが current_input をそのまま渡すのと同じ）
@@ -411,9 +438,11 @@ default:
   model: local
 nodes:
   review:
+    type: prompt
     prompt: "次の差分をレビューしてください。\n{{ input }}"
     files: [diff.patch, CONTRIBUTING.md]
   describe:
+    type: prompt
     prompt: "この画像に写っているものを説明してください。"
     images: [photo.png, "https://example.com/cat.png"]
 steps:
@@ -446,9 +475,11 @@ default:
   skills: [code-review]     # ワークフロー全体の既定
 nodes:
   review:
+    type: prompt
     prompt: "次の差分をレビューしてください。\n{{ input }}"
     skills: [code-review, style-guide]   # ノードで上書き
   summarize:
+    type: agent
     agent: agents/summarize.md
     # skills を書かなければ agent ファイル → default.skills の順にフォールバック
 steps:
@@ -486,9 +517,11 @@ default:
   subagents: [researcher]        # ワークフロー全体の既定
 nodes:
   triage:
+    type: prompt
     prompt: "{{ input }} を調査してください。必要であれば researcher に任せてください。"
     subagents: [researcher, fact-checker]   # ノードで上書き
   summarize:
+    type: agent
     agent: agents/summarize.md
     # subagents を書かなければ agent ファイル → default.subagents の順にフォールバック
 steps:
@@ -535,15 +568,18 @@ json_schemas:
       required: [city]
 nodes:
   extract:
+    type: prompt
     prompt: |
       次の文章から都市名を JSON で抽出してください。
       {{ input }}
     output_schema: city_fact
 
   weather:
+    type: prompt
     prompt: "{{ steps.extract.city }} の天気を教えてください。"
 
   combine:
+    type: transform
     jq: '{ city: $steps.extract.city, weather: . }'
 steps:
   - id: extract
@@ -584,6 +620,7 @@ default:
   model: local
 nodes:
   call:
+    type: prompt
     prompt: "{{ input }}"
     timeout: 30
     retry:
@@ -591,6 +628,7 @@ nodes:
       delay_seconds: 1
       backoff: 2.0
   fallback:
+    type: transform
     jq: '{ fallback: .error }'
 steps:
   - id: call
@@ -638,12 +676,15 @@ default:
   timeout: 30
 nodes:
   echo:
+    type: prompt
     prompt: "{{ input }}"          # default.retry / default.timeout が適用される
   echo_override:
+    type: prompt
     prompt: "{{ input }}"
     retry:
       max_attempts: 1              # このノードだけ既定値を上書き（timeout は default の30秒のまま）
   summarize:
+    type: transform
     jq: '.summary'                 # jq のみのノードには適用されない
 steps:
   - use: echo
@@ -681,6 +722,7 @@ steps:
 # workflow.yml
 nodes:
   translate:
+    type: prompt
     prompt: |
       次の文章を英訳してください。
       {{ input }}
@@ -706,6 +748,7 @@ steps:
 # workflow.yml
 nodes:
   triage:
+    type: prompt
     prompt: |
       次の問い合わせを分類してください。
       {{ input }}
@@ -713,16 +756,20 @@ nodes:
     schema_name: triage
 
   escalate:
+    type: prompt
     model: cloud
     prompt: "緊急対応メモを書いてください。\n{{ input }}"
 
   draft-reply:
+    type: prompt
     prompt: "通常対応の返信文を作成してください。\n{{ input }}"
 
   auto-close:
+    type: transform
     jq: ".summary"
 
   notify:
+    type: prompt
     prompt: "次の内容を1行の通知文にしてください。\n{{ input }}"
 
 steps:
@@ -767,18 +814,22 @@ default:
   model: local
 nodes:
   sentiment:
+    type: prompt
     prompt: |
       次の文章の感情を一言で判定してください。
       {{ input }}
   summary:
+    type: prompt
     prompt: |
       次の文章を1行で要約してください。
       {{ input }}
   keywords:
+    type: prompt
     prompt: |
       次の文章からキーワードを3つ抽出してください。
       {{ input }}
   report:
+    type: prompt
     prompt: |
       次の情報からレポートを1段落で書いてください。
       {{ input }}
@@ -838,6 +889,7 @@ default:
   model: local
 nodes:
   retry-once-more:
+    type: prompt
     prompt: |
       前回の失敗理由を踏まえて、もう一度やり直してください。
       {{ input }}
@@ -886,6 +938,7 @@ default:
   model: local
 nodes:
   summarize-item:
+    type: prompt
     prompt: "この項目を要約してください: {{ input }}"
 steps:
   - id: process-items
@@ -925,6 +978,7 @@ default:
   model: local
 nodes:
   summarize-item:
+    type: prompt
     prompt: "この項目を要約してください: {{ input }}"
 steps:
   - for_each:
@@ -960,9 +1014,11 @@ steps:
 # workflow.yml
 nodes:
   check:
+    type: prompt
     prompt: "十分な情報が揃っているか判定してください: {{ input }}"
     output_schema: judgement
   ask-more:
+    type: prompt
     prompt: "不足している情報を尋ねる質問を1つ生成してください: {{ input }}"
 steps:
   - id: check
@@ -979,10 +1035,11 @@ steps:
 # workflow.yml
 nodes:
   refine:
+    type: prompt
     prompt: "{{ input }}"
     output_schema: validation_result
 steps:
-  - id: refine
+  - id: refine-loop
     loop:
       until: '.valid == true'
       max_iterations: 5
@@ -1017,6 +1074,7 @@ default:
   model: local
 nodes:
   summarize:
+    type: workflow
     workflow: ./shared/summarize.yml
     jq: '.summary'
 steps:
@@ -1028,6 +1086,7 @@ steps:
 # shared/summarize.yml
 nodes:
   summarize:
+    type: prompt
     prompt: |
       次の文章を3行で要約してJSON `{ "summary": "..." }` で返してください。
       {{ input }}
@@ -1074,9 +1133,11 @@ steps:
 # workflow.yml
 nodes:
   count-lines:
+    type: command
     command: ["wc", "-l"]
     jq: 'tonumber'
   format:
+    type: prompt
     prompt: "行数: {{ input }}"
 steps:
   - use: count-lines

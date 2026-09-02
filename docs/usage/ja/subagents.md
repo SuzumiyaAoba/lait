@@ -89,6 +89,7 @@ subagents: [researcher]
 # workflow.yml
 nodes:
   triage:
+    type: prompt
     prompt: "{{ input }} について調べてください。"
     subagents: [researcher, fact-checker]
 ```

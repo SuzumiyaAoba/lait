@@ -143,6 +143,7 @@ default:
   model: local
 nodes:
   city-fact:
+    type: agent
     agent: agents/city-fact.md
     jq: ".city"
 steps:
