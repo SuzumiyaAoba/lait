@@ -69,6 +69,36 @@ pub(crate) enum Command {
     /// Print a workflow's control-flow structure as a Mermaid or DOT graph
     /// (see docs/usage/ja/workflow.md).
     Graph(GraphArgs),
+    /// List the workflows registered under `workflows:` in lait.config.yml
+    /// (`lait workflow list`), runnable by name via `lait run <NAME>`.
+    Workflow(WorkflowCommand),
+    /// List the skill files registered under `skills:` in lait.config.yml
+    /// (`lait skill list`).
+    Skill(SkillCommand),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct WorkflowCommand {
+    #[command(subcommand)]
+    pub(crate) action: WorkflowAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum WorkflowAction {
+    /// List every `workflows:` entry configured in lait.config.yml.
+    List,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SkillCommand {
+    #[command(subcommand)]
+    pub(crate) action: SkillAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SkillAction {
+    /// List every `skills:` entry configured in lait.config.yml.
+    List,
 }
 
 #[derive(Debug, Args)]
@@ -343,6 +373,8 @@ pub(crate) struct AgentCommand {
 pub(crate) enum AgentAction {
     /// Run an agent Markdown file with the given input.
     Run(AgentRunArgs),
+    /// List every `agents:` entry configured in lait.config.yml.
+    List,
 }
 
 #[derive(Debug, Args)]

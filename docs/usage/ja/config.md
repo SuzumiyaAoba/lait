@@ -258,3 +258,36 @@ agents:
 - 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
   そのまま名前を付けて登録します）。
 - パスは、`skills:` と同じく、その場では接続を持たず、実際に使われるたびにファイルを読み直します。
+
+## ワークフローの登録と一覧表示
+
+`workflows:` にワークフロー YAML ファイルを登録すると、`lait run <FILE>` の `<FILE>` を
+パスの代わりに名前で指定できるようになります。詳しい使い方は
+[ワークフロー(workflow.yml)](./workflow.md) を参照してください。
+
+```yaml
+# lait.config.yml
+workflows:
+  summarize: ./workflows/summarize.yml
+```
+
+```sh
+lait run summarize "本文"
+```
+
+- `lait run <ARG>` の `<ARG>` がファイルとして存在する場合はそちらが優先されます(`workflows:`
+  に同名のエントリがあっても無視され、その旨が標準エラー出力に注記されます)。ファイルとして
+  存在しない場合にだけ `workflows:` から名前解決されます。
+- パスは `agents:`/`skills:` と異なり、現在の作業ディレクトリではなく、その `workflows:` を
+  定義した `lait.config.yml` 自身のあるディレクトリからの相対パスとして解決されます。これは
+  この節の冒頭で説明した `lait.config.yml` 自体のディレクトリ探索と同じ理由で、
+  サブディレクトリから実行しても常に同じファイルが解決されるようにするためです。
+- `lait workflow list`/`lait agent list`/`lait skill list` は、それぞれ `workflows:`/
+  `agents:`/`skills:` に登録された名前・パス・説明(ワークフローの `description:`/
+  エージェント・スキル Markdown ファイルの frontmatter の `description:`)を一覧表示します。
+  パスが存在しない、または読み込みに失敗したエントリも(警告付きで)一覧には含まれます —
+  登録内容そのものの妥当性チェックは `lait lint` が行います。
+- `lait lint` は `workflows:` の各エントリについて、パスが実際に存在するかどうかも
+  チェックします(渡されたワークフロー/エージェントファイルの静的チェックとは別に行われます)。
+- `${VAR_NAME}` による環境変数展開は、`base_url`/`api_key`/`models[].provider.*`/
+  `mcp_servers[]` の各フィールドのみが対象です。`workflows:` のパスは展開されません。

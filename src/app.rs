@@ -7,13 +7,15 @@ use crate::{
     agent, attachment,
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction, RunArgs},
     cli::{AgentRunArgs, GraphArgs, GraphFormat, PromptRunArgs, SharedChatArgs},
+    cli::{SkillAction, WorkflowAction},
     config::{self, ConfigFile, ConfigSource, ModelMap},
     docgen,
     engine::{
         AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
         agent_file_settings, call_agent, resolve_request_settings, stream_response,
     },
-    history, lint, prompt, repl, report, response, schema, session, template, usage,
+    history, lint, prompt, repl, report, response, schema, session, skill, subagent, template,
+    usage,
     workflow::{
         self, WorkflowScope,
         exec::{RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
@@ -93,6 +95,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Run(run_args)) => run_workflow(run_args, config_source).await,
         Some(Command::Agent(agent_command)) => match agent_command.action {
             AgentAction::Run(args) => run_agent(args, config_source).await,
+            AgentAction::List => bail!("internal error: `agent list` must run on the sync path"),
         },
         Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
         Some(Command::Models(models_args)) => crate::models::run(models_args, config_source).await,
@@ -112,6 +115,10 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         },
         Some(Command::History(history_args)) => history::run(history_args),
         Some(Command::Graph(_)) => bail!("internal error: `graph` must run on the sync path"),
+        Some(Command::Workflow(_)) => {
+            bail!("internal error: `workflow list` must run on the sync path")
+        }
+        Some(Command::Skill(_)) => bail!("internal error: `skill list` must run on the sync path"),
         None => run_chat_or_repl(cli.chat, config_source).await,
     }
 }
@@ -161,13 +168,18 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::Init(_)
             | Command::Sessions(_)
             | Command::History(_)
-            | Command::Graph(_),
+            | Command::Graph(_)
+            | Command::Workflow(_)
+            | Command::Skill(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
         Some(Command::Prompt(prompt_command)) => {
             matches!(prompt_command.action, PromptAction::Run(_))
         }
-        Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => true,
+        Some(Command::Agent(agent_command)) => {
+            matches!(agent_command.action, AgentAction::Run(_))
+        }
+        Some(Command::Run(_) | Command::Chat(_)) | None => true,
     }
 }
 
@@ -198,7 +210,28 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         },
         Some(Command::History(history_args)) => crate::history::run(history_args),
         Some(Command::Graph(graph_args)) => run_graph(graph_args),
-        Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => {
+        Some(Command::Agent(agent_command)) => match agent_command.action {
+            AgentAction::List => {
+                let config_dir = config::resolve_config_dir(&config_source)?;
+                subagent::list(&config::load_config(&config_source)?, config_dir.as_deref())
+            }
+            AgentAction::Run(_) => {
+                bail!("internal error: `agent run` must run on the async path")
+            }
+        },
+        Some(Command::Workflow(workflow_command)) => match workflow_command.action {
+            WorkflowAction::List => {
+                let config_dir = config::resolve_config_dir(&config_source)?;
+                workflow::list(&config::load_config(&config_source)?, config_dir.as_deref())
+            }
+        },
+        Some(Command::Skill(skill_command)) => match skill_command.action {
+            SkillAction::List => {
+                let config_dir = config::resolve_config_dir(&config_source)?;
+                skill::list(&config::load_config(&config_source)?, config_dir.as_deref())
+            }
+        },
+        Some(Command::Run(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
     }
@@ -557,12 +590,15 @@ async fn run_agent(args: AgentRunArgs, config_source: ConfigSource) -> Result<()
 async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<()> {
     let prompt = resolve_input_with_stdin(run_args.prompt.clone())?
         .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
-    let mut wf = workflow::load_workflow(&run_args.file)?;
     let file_config = Arc::new(config::load_config(&config_source)?);
+    let config_dir = config::resolve_config_dir(&config_source)?;
+    let resolved_file =
+        workflow::resolve_run_target(&run_args.file, &file_config, config_dir.as_deref());
+    let mut wf = workflow::load_workflow(&resolved_file)?;
 
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
 
-    let scope = WorkflowScope::top_level(&mut wf, &run_args.file)?;
+    let scope = WorkflowScope::top_level(&mut wf, &resolved_file)?;
     let vars = workflow::build_vars(&run_args.var.var)?;
 
     if run_args.dry_run {

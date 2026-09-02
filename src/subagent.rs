@@ -13,6 +13,44 @@ use crate::{
     async_io, config, mcp, schema,
 };
 
+/// Runs `lait agent list`: prints every configured `agents:` entry's name,
+/// path, and (when the file loads cleanly) its own `description:`.
+/// `config_dir` resolves each entry's path relative to the directory
+/// containing the `lait.config.yml` that defined it, not the current working
+/// directory — see `config::resolve_config_dir`. A registry entry whose file
+/// is missing or fails to parse is still listed (with a note) rather than
+/// aborting the whole command — `lait lint` is where a hard failure on a bad
+/// entry belongs.
+pub(crate) fn list(file_config: &config::ConfigFile, config_dir: Option<&Path>) -> Result<()> {
+    if file_config.agents.is_empty() {
+        println!(
+            "no agents defined in {}; add an 'agents:' entry to define one",
+            config::CONFIG_FILE_NAME
+        );
+        return Ok(());
+    }
+    let mut names: Vec<&String> = file_config.agents.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let raw_path = &file_config.agents[name];
+        let path = match config_dir {
+            Some(dir) => dir.join(raw_path),
+            None => raw_path.clone(),
+        };
+        match agent::load_agent(&path) {
+            Ok(agent_file) => match agent_file.description {
+                Some(description) => println!("{name}  ({}): {description}", path.display()),
+                None => println!("{name}  ({})", path.display()),
+            },
+            Err(error) => {
+                println!("{name}  ({})", path.display());
+                println!("  warning: {error:#}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One agent file (an `agents:` entry, or a workflow node's `agent:` path),
 /// loaded and canonicalized once then cached for the registry's lifetime
 /// (see `AgentRegistry`). `canonical_path` is kept alongside `file` because

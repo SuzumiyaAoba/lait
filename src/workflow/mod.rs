@@ -1,8 +1,11 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::jq;
+use crate::{config::ConfigFile, jq};
 
 #[cfg(test)]
 use crate::template;
@@ -19,6 +22,91 @@ pub(crate) use scope::WorkflowScope;
 
 #[cfg(test)]
 mod tests;
+
+/// Resolves `lait run`'s `FILE` argument: `argument` itself when it exists as
+/// a file, else a `workflows:` registry entry of that name (see
+/// `config::WorkflowMap`), resolved against `config_dir` — the directory of
+/// the `lait.config.yml` that defined the registry, not the current working
+/// directory, so a registry entry keeps working from any subdirectory the
+/// same way `lait.config.yml` itself is found by walking upward (see
+/// `config::find_config_upward`). `config_dir` is `None` when no config file
+/// was read at all (`--no-config`, or `Search` finding nothing), in which
+/// case a registry path (if any; `workflows:` is then always empty anyway)
+/// falls back to being read relative to the current directory. When
+/// `argument` is *both* an existing file and a registered name, the file
+/// wins — noted to stderr so the shadowing isn't silent.
+pub(crate) fn resolve_run_target(
+    argument: &Path,
+    file_config: &ConfigFile,
+    config_dir: Option<&Path>,
+) -> PathBuf {
+    if argument.is_file() {
+        if let Some(name) = argument.to_str()
+            && file_config.workflows.contains_key(name)
+        {
+            eprintln!(
+                "note: '{name}' exists as a file and is also a 'workflows:' entry; running the file"
+            );
+        }
+        return argument.to_path_buf();
+    }
+    let Some(name) = argument.to_str() else {
+        return argument.to_path_buf();
+    };
+    match file_config.workflows.get(name) {
+        Some(registered_path) => {
+            let resolved = match config_dir {
+                Some(dir) => dir.join(registered_path),
+                None => registered_path.clone(),
+            };
+            eprintln!(
+                "note: resolved '{name}' to '{}' via 'workflows:' in {}",
+                resolved.display(),
+                crate::config::CONFIG_FILE_NAME
+            );
+            resolved
+        }
+        None => argument.to_path_buf(),
+    }
+}
+
+/// Runs `lait workflow list`: prints every configured `workflows:` entry's
+/// name, path, and (when the file loads cleanly) its own `description:`.
+/// `config_dir` resolves each entry's path the same way
+/// `resolve_run_target`/`lint::check_workflows_registry` do — see
+/// `config::resolve_config_dir`. A registry entry whose file is missing or
+/// fails to parse is still listed (with a note) rather than aborting the
+/// whole command — `lait lint` is where a hard failure on a bad entry
+/// belongs.
+pub(crate) fn list(file_config: &ConfigFile, config_dir: Option<&Path>) -> Result<()> {
+    if file_config.workflows.is_empty() {
+        println!(
+            "no workflows defined in {}; add a 'workflows:' entry to define one",
+            crate::config::CONFIG_FILE_NAME
+        );
+        return Ok(());
+    }
+    let mut names: Vec<&String> = file_config.workflows.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let raw_path = &file_config.workflows[name];
+        let path = match config_dir {
+            Some(dir) => dir.join(raw_path),
+            None => raw_path.clone(),
+        };
+        match load_workflow(&path) {
+            Ok(wf) => match wf.description {
+                Some(description) => println!("{name}  ({}): {description}", path.display()),
+                None => println!("{name}  ({})", path.display()),
+            },
+            Err(error) => {
+                println!("{name}  ({})", path.display());
+                println!("  warning: {error:#}");
+            }
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
     let contents = fs::read_to_string(path)

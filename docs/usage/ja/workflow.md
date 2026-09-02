@@ -11,6 +11,8 @@
 （[handlebars](https://handlebarsjs.com/)）でレンダリングされるため、入力が JSON オブジェクト/
 配列のときは裸の `{{ input }}` は使えません。`{{ input.field }}` でフィールドにアクセスするか、
 `{{ json input }}` で全体をコンパクトな JSON テキストとして展開してください（詳細は後述）。
+`<FILE>` はパスの代わりに `lait.config.yml` の `workflows:` に登録した名前でも指定できます
+（[設定ファイル](./config.md#ワークフローの登録と一覧表示)を参照）。
 
 各ノードは `type:` で種類（`prompt`/`agent`/`workflow`/`command`/`transform` のいずれか）を
 明示する必要があります。種類ごとに使える他のフィールドが異なり（例えば `type: workflow` は

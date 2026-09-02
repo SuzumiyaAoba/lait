@@ -40,6 +40,52 @@ fn resolve_skill_file_path(configured_path: &Path) -> PathBuf {
     }
 }
 
+/// Runs `lait skill list`: prints every configured `skills:` entry's name,
+/// path, and (when the file loads cleanly) its own `description:`. Reads
+/// the file directly with a plain, synchronous `fs::read_to_string` rather
+/// than through `load_skill`/`SkillCache` — this only ever runs once per
+/// entry, so none of `load_skill`'s cancellation-aware/FIFO-safe machinery
+/// (built for a request that may need to time out) is worth pulling in.
+/// `config_dir` resolves each entry's path relative to the directory
+/// containing the `lait.config.yml` that defined it, not the current working
+/// directory — see `config::resolve_config_dir`. A registry entry whose file
+/// is missing or fails to parse is still listed (with a note) rather than
+/// aborting the whole command — `lait lint` is where a hard failure on a bad
+/// entry belongs.
+pub(crate) fn list(file_config: &config::ConfigFile, config_dir: Option<&Path>) -> Result<()> {
+    if file_config.skills.is_empty() {
+        println!(
+            "no skills defined in {}; add a 'skills:' entry to define one",
+            config::CONFIG_FILE_NAME
+        );
+        return Ok(());
+    }
+    let mut names: Vec<&String> = file_config.skills.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let raw_path = &file_config.skills[name];
+        let configured_path = match config_dir {
+            Some(dir) => dir.join(raw_path),
+            None => raw_path.clone(),
+        };
+        let path = resolve_skill_file_path(&configured_path);
+        match std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read skill file '{}'", path.display()))
+            .and_then(|contents| parse_skill(name, &contents))
+        {
+            Ok(skill) => match skill.description {
+                Some(description) => println!("{name}  ({}): {description}", path.display()),
+                None => println!("{name}  ({})", path.display()),
+            },
+            Err(error) => {
+                println!("{name}  ({})", path.display());
+                println!("  warning: {error:#}");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn load_skill(
     name: &str,
     configured_path: &Path,

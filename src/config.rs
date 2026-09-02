@@ -71,6 +71,19 @@ pub(crate) fn resolve_config_path(source: &ConfigSource) -> Result<Option<PathBu
     }
 }
 
+/// The directory a `workflows:`/`agents:`/`skills:` registry entry's
+/// relative path resolves against: the directory containing the
+/// `lait.config.yml` [`resolve_config_path`] found, or `None` when there is
+/// none (`--no-config`, or `Search` finding nothing — in which case the
+/// registry itself is always empty, since it can only come from a config
+/// file). Kept relative to the config file rather than the current working
+/// directory so a registry entry keeps resolving to the same file
+/// regardless of which subdirectory `lait` is invoked from, the same way
+/// `lait.config.yml` itself is found by walking upward.
+pub(crate) fn resolve_config_dir(source: &ConfigSource) -> Result<Option<PathBuf>> {
+    Ok(resolve_config_path(source)?.and_then(|path| path.parent().map(Path::to_path_buf)))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigFile {
@@ -96,6 +109,14 @@ pub(crate) struct ConfigFile {
     /// `lait prompt <NAME>`. See `crate::prompt`.
     #[serde(default)]
     pub(crate) prompts: PromptMap,
+    /// Named workflow files, runnable by name (`lait run <NAME>`, falling
+    /// back to this map when `<NAME>` doesn't exist as a file) or listed via
+    /// `lait workflow list`. Unlike `mcp_servers:`/`models:`, entries here
+    /// get no `${VAR_NAME}` expansion (see `AGENTS.md`'s Security and
+    /// Configuration section) — a path is not a place secrets belong. See
+    /// `crate::workflow::resolve_run_target`.
+    #[serde(default)]
+    pub(crate) workflows: WorkflowMap,
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
@@ -261,6 +282,12 @@ pub(crate) type ModelMap = HashMap<String, Vec<ModelDefinition>>;
 /// A map of `prompts:` name to its template definition, as used by
 /// `lait.config.yml`'s top-level `prompts:`. See `crate::prompt`.
 pub(crate) type PromptMap = HashMap<String, PromptDefinition>;
+
+/// A map of `workflows:` name to the path of its workflow YAML file, as used
+/// by `lait.config.yml`'s top-level `workflows:`. Resolved relative to the
+/// directory containing the `lait.config.yml` that defined it, not the
+/// current working directory — see `crate::workflow::resolve_run_target`.
+pub(crate) type WorkflowMap = HashMap<String, PathBuf>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

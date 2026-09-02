@@ -110,11 +110,18 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     // passed, the linter needs to tell "absent/skipped" apart from "present
     // but empty" so it can skip `mcp:`/`skills:` name checks (and say why)
     // instead of reporting every referenced name as unknown.
-    let config_present = config::resolve_config_path(&config_source)?.is_some();
+    let config_path = config::resolve_config_path(&config_source)?;
+    let config_present = config_path.is_some();
     let file_config = config::load_config(&config_source)?;
     let config = config_present.then_some(&file_config);
 
     let mut failed_files = 0usize;
+    let registry_ok = if file_config.workflows.is_empty() {
+        true
+    } else {
+        let config_dir = config_path.as_deref().and_then(Path::parent);
+        check_workflows_registry(&file_config, config_dir)
+    };
     for file in &lint_args.files {
         // `lint_file` only ever returns `Err` for a file whose type it can't
         // determine (an unrecognized extension) — treated here as one more
@@ -142,13 +149,52 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
         }
     }
 
-    if failed_files > 0 {
+    if failed_files > 0 || !registry_ok {
         bail!(
-            "{failed_files} of {} file(s) had errors",
-            lint_args.files.len()
+            "{failed_files} of {} file(s) had errors{}",
+            lint_args.files.len(),
+            if registry_ok {
+                String::new()
+            } else {
+                format!(
+                    "; {} 'workflows:' also has errors",
+                    config::CONFIG_FILE_NAME
+                )
+            }
         );
     }
     Ok(())
+}
+
+/// Checks that every `workflows:` entry in `file_config` resolves to a file
+/// that actually exists, the same way `agent`/`workflow` node references are
+/// checked for the files `lint_args.files` names directly — but this is the
+/// one check that has nothing to do with those files: it validates
+/// `lait.config.yml` itself, since nothing inside a workflow YAML ever
+/// references `workflows:` (unlike `mcp:`/`skills:`/`agent:`, which are
+/// checked per-file by `lint_workflow_contents`/`lint_agent_contents`).
+/// `config_dir` mirrors `workflow::resolve_run_target`'s own resolution, so
+/// this reports exactly the path `lait run <NAME>` would actually try to
+/// read. Returns whether every entry resolved; prints one line per entry.
+fn check_workflows_registry(file_config: &ConfigFile, config_dir: Option<&Path>) -> bool {
+    let mut names: Vec<&String> = file_config.workflows.keys().collect();
+    names.sort_unstable();
+    let mut ok = true;
+    println!("{} (workflows:):", config::CONFIG_FILE_NAME);
+    for name in names {
+        let raw_path = &file_config.workflows[name];
+        let resolved = match config_dir {
+            Some(dir) => dir.join(raw_path),
+            None => raw_path.clone(),
+        };
+        if resolved.is_file() {
+            println!("  {name}: OK ({})", resolved.display());
+        } else {
+            println!("  {name}: error: no such file '{}'", resolved.display());
+            ok = false;
+        }
+    }
+    ok
 }
 
 /// Threaded through every check in one `lint_file` call: `config` is looked
