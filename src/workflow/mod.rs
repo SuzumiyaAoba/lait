@@ -9,6 +9,7 @@ use crate::template;
 
 pub(crate) mod dryrun;
 pub(crate) mod exec;
+pub(crate) mod graph;
 mod model;
 pub(crate) mod scope;
 mod validate;

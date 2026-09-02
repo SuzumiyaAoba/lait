@@ -66,6 +66,28 @@ pub(crate) enum Command {
     /// List, show, or search recorded chat/agent/workflow/prompt runs (see
     /// docs/usage/ja/history.md).
     History(HistoryArgs),
+    /// Print a workflow's control-flow structure as a Mermaid or DOT graph
+    /// (see docs/usage/ja/workflow.md).
+    Graph(GraphArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphArgs {
+    /// Path to the workflow YAML file (e.g. workflow.yml).
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = GraphFormat::Mermaid)]
+    pub(crate) format: GraphFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum GraphFormat {
+    /// Mermaid `flowchart` syntax, pastable as-is into a GitHub README/PR.
+    Mermaid,
+    /// Graphviz DOT syntax (`dot -Tpng`/`dot -Tsvg`).
+    Dot,
 }
 
 #[derive(Debug, Args)]

@@ -1232,3 +1232,30 @@ lait run workflow.yml "本文" --dry-run
 実行時の解決結果まで、LLM 呼び出しのコストをかけずに確認できます。`type: workflow` の
 サブワークフローは展開されず、`workflow: <path>` という行のみ表示されます（必要であれば
 そのサブワークフローに対して直接 `lait run <path> --dry-run` を実行してください）。
+
+## グラフ出力（`lait graph`）
+
+`lait graph <FILE>` は、ワークフローの制御フロー（ステップの遷移、`when`/`switch` の
+条件分岐、`parallel` の分岐と合流、`loop`/`for_each` の反復本体）を Mermaid または
+DOT 形式のグラフとして標準出力に表示します。ワークフロー全体の見取り図をドキュメントや
+レビューで共有したいときに使います。
+
+```sh
+lait graph workflow.yml
+lait graph workflow.yml --format dot
+```
+
+- 既定の出力形式は Mermaid の `flowchart` 構文です。そのまま GitHub の README や PR の
+  説明に貼り付けられます（GitHub は ```` ```mermaid ```` フェンスを自動でレンダリングします）。
+- `--format dot` を指定すると Graphviz の DOT 構文で出力します。`dot -Tpng`/`dot -Tsvg`
+  などにそのまま渡せます。
+- 各ステップはノードとして、直列の遷移は矢印として表現されます。`switch` の各 `case`/`else`
+  への分岐は、その `when` 条件式をエッジのラベルとして表示します。`parallel` は分岐
+  （fork）ノードと合流（join）ノードを持ち、各 branch がその間を通ります。`loop`/`for_each`
+  は本体をサブグラフとしてグループ化し、反復条件・`max_iterations`・`items` 式をノードの
+  ラベルに含めます。
+- `type: workflow` のサブワークフローはその場に展開されず、参照先のパスを示す1つの
+  ノードとして表示されます（`--dry-run` と同じ方針です。詳しくはそのファイルに対して
+  直接 `lait graph <path>` を実行してください）。
+- `lait lint`/`lait run --dry-run` と同じく、ワークフローファイルの読み込み・静的な
+  バリデーションのみを行います。モデルの呼び出しは一切発生しません。

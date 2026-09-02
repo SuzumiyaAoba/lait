@@ -6,7 +6,7 @@ use async_openai::types::chat::ChatCompletionRequestMessage;
 use crate::{
     agent, attachment,
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction, RunArgs},
-    cli::{AgentRunArgs, PromptRunArgs, SharedChatArgs},
+    cli::{AgentRunArgs, GraphArgs, GraphFormat, PromptRunArgs, SharedChatArgs},
     config::{self, ConfigFile, ConfigSource, ModelMap},
     docgen,
     engine::{
@@ -111,6 +111,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             PromptAction::Run(run_args) => run_prompt(run_args, config_source).await,
         },
         Some(Command::History(history_args)) => history::run(history_args),
+        Some(Command::Graph(_)) => bail!("internal error: `graph` must run on the sync path"),
         None => run_chat_or_repl(cli.chat, config_source).await,
     }
 }
@@ -159,7 +160,8 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::Man(_)
             | Command::Init(_)
             | Command::Sessions(_)
-            | Command::History(_),
+            | Command::History(_)
+            | Command::Graph(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
         Some(Command::Prompt(prompt_command)) => {
@@ -195,10 +197,25 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
             }
         },
         Some(Command::History(history_args)) => crate::history::run(history_args),
+        Some(Command::Graph(graph_args)) => run_graph(graph_args),
         Some(Command::Run(_) | Command::Agent(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
     }
+}
+
+/// Runs `lait graph`: parses/validates the workflow file the same way `lait
+/// run`/`lait lint` do, then prints its Mermaid/DOT control-flow graph. Pure
+/// local work (no `lait.config.yml`, no model resolution) — a workflow's
+/// `models:`/`default:` never affect what the graph looks like.
+fn run_graph(graph_args: GraphArgs) -> Result<()> {
+    let wf = workflow::load_workflow(&graph_args.file)?;
+    let format = match graph_args.format {
+        GraphFormat::Mermaid => workflow::graph::GraphFormat::Mermaid,
+        GraphFormat::Dot => workflow::graph::GraphFormat::Dot,
+    };
+    print!("{}", workflow::graph::render(&wf, format)?);
+    Ok(())
 }
 
 /// Resolves chat mode's system prompt: `--system` text, else `--system-file`
