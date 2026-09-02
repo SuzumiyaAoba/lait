@@ -14,7 +14,7 @@
 `<FILE>` はパスの代わりに `lait.config.yml` の `workflows:` に登録した名前でも指定できます
 （[設定ファイル](./config.md#ワークフローの登録と一覧表示)を参照）。
 
-各ノードは `type:` で種類（`prompt`/`agent`/`workflow`/`command`/`transform` のいずれか）を
+各ノードは `type:` で種類（`prompt`/`agent`/`workflow`/`command`/`transform`/`ask` のいずれか）を
 明示する必要があります。種類ごとに使える他のフィールドが異なり（例えば `type: workflow` は
 `model:` を持てません）、その組み合わせは `type:` から一意に決まるため、以前あった「どの
 フィールドが設定されているかで種類を推測する」方式は廃止されました。ワークフローファイル自体は
@@ -64,7 +64,7 @@ cargo run -- run workflow.yml "要約・翻訳したい文章..."
 ```
 
 - `nodes:` はキーをノード id とするマップで、順序を持ちません。各ノードは `type:`（必須。
-  `prompt`/`agent`/`workflow`/`command`/`transform` のいずれか）で種類を宣言し、その種類に応じて
+  `prompt`/`agent`/`workflow`/`command`/`transform`/`ask` のいずれか）で種類を宣言し、その種類に応じて
   `prompt`/`system_prompt`/`agent`/`workflow`/`command`/`files`/`images`/`jq`/`model`/
   `reasoning_effort`/`temperature`/`top_p`/`max_tokens`/`input_schema`/`output_schema`/
   `schema_name`/`write_file`/`retry`/`timeout` の一部を持てます（後述。種類ごとに使えるフィールドが
@@ -1040,6 +1040,63 @@ steps:
   `write_file` も使えます）です。
 - 進捗表示も `parallel` と同様になり、要素ごとに `[item-n]` を付けた行が入り交じって出力されます。
 - 値は1以上である必要があります。
+
+## 対話的ユーザー入力（`type: ask`）
+
+`type: ask` のノードは、モデルを呼ばずに、標準入力から人間の回答を受け取ってこのノードの
+出力にします(いわゆる human-in-the-loop)。「LLM の下書き → 人間の確認・修正 → 続きの処理」
+という半自動フローを、ワークフローを分割せずに1つのファイルで表現できます。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+nodes:
+  draft:
+    type: prompt
+    prompt: "次の依頼への返信を下書きしてください: {{ input }}"
+  confirm:
+    type: ask
+    prompt: "この下書きでよいですか? 修正があれば書き直した本文を入力してください。\n{{ steps.draft }}"
+    choices: [yes, no]
+    default: "no"
+  send:
+    type: transform
+    jq: '.'
+steps:
+  - id: draft
+    use: draft
+  - id: confirm
+    use: confirm
+  - use: send
+```
+
+- `prompt:` は他のノードの `prompt`/`system_prompt` と同じ handlebars テンプレートとして
+  レンダリングされ(`{{ input }}`/`{{ steps.<id> }}`/`{{ vars.<key> }}` が使えます)、標準
+  エラー出力に表示されます。`choices:`/`default:` は(`prompt:` と異なり)テンプレートでは
+  なく、そのままの文字列として扱われます。
+- 標準入力が対話的な端末(TTY)のときは、レンダリングされた `prompt:` を表示したうえで
+  標準入力から1行読み取り、その行(末尾の改行は1つだけ取り除かれます)がこのノードの出力に
+  なります。`multiline: true` を指定すると、1行ではなく EOF まで全体を読み取ります。
+- 標準入力が対話的な端末でないとき(CI・パイプ経由の実行など、答える人間がいない環境)は、
+  **何も読み取らずに** `default:` があればその値を採用し、なければエラーになります。これは
+  `ask` に固有の挙動で、`lait run` の `<PROMPT>` の標準入力読み取り(パイプされた内容を
+  そのまま使う)とは異なります — 誰も答えられない環境で読み取りを試みると、閉じたパイプで
+  即座に失敗するか、永久にハングするかのどちらかになってしまうためです。
+- `choices:` を指定すると、回答(対話的に読み取った行、または非対話環境で採用した
+  `default:`)がリストのいずれかと完全一致することを要求します。一致しない場合はその場で
+  エラーになります(再入力を促すループはしません — 非対話環境でループすると永久にハング
+  しうるため)。`default:` を指定する場合、`choices:` のいずれかと一致していなければ、
+  ワークフローの読み込み時点でエラーになります。
+- 他のノードと同じく `jq:`/`write_file:` で回答を後処理でき、`retry:`/`timeout:` も
+  指定できます(いずれもこのノード自身の設定のみが有効で、`default.retry`/`default.timeout`
+  へは自動的にフォールバックしません — `command`/`transform` と同じ扱いです)。
+- `id` を持つ `ask` ステップの回答は、他のノードと同じく `{{ steps.<id> }}`/`$steps.<id>`
+  として以降のステップから参照できます。
+- `parallel` の branch の中、または `max_concurrency` が2以上の `for_each` の本体の中で
+  `ask` ノードを `use:` することはできません(複数の回答待ちが同時に同じ標準入力を奪い合う
+  ことになるため)。逐次実行の `loop`/`for_each`(`max_concurrency: 1`、既定)の中では
+  問題なく使えます。
 
 ## 早期終了（`stop` / `break`）
 

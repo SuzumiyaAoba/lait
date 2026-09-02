@@ -152,6 +152,7 @@ pub(crate) enum NodeDefinition {
     Workflow(WorkflowNode),
     Command(CommandNode),
     Transform(TransformNode),
+    Ask(AskNode),
 }
 
 /// `type: prompt` — sends `prompt` (rendered as a handlebars template) and/or
@@ -348,6 +349,38 @@ pub(crate) struct TransformNode {
     pub(crate) timeout: Option<u64>,
 }
 
+/// `type: ask` — a human-in-the-loop node: renders `prompt` (the same
+/// handlebars template every other node's `prompt`/`system_prompt` uses,
+/// against `{{ input }}`/`{{ steps.<id> }}`/`{{ vars.<key> }}`), prints it,
+/// and reads the answer from stdin as this node's output. No model call, so
+/// no `model`/sampling/`mcp`/`skills`/`subagents` fields — see
+/// `workflow::ask::run_ask` for the actual read, and
+/// `docs/usage/ja/workflow.md` for the non-interactive-stdin behavior.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AskNode {
+    /// The question, rendered like `PromptNode::prompt`.
+    pub(crate) prompt: String,
+    /// Restricts the answer to one of these exact strings (after stripping
+    /// the trailing newline the read itself already strips — no further
+    /// trimming). An answer that doesn't match exactly is a runtime error;
+    /// there is no re-prompt loop (stdin may not be interactive, or may be a
+    /// script feeding fixed input, so looping could hang forever).
+    pub(crate) choices: Option<Vec<String>>,
+    /// Reads until EOF instead of a single line, for a multi-line answer
+    /// (e.g. pasted text). Defaults to `false`.
+    pub(crate) multiline: Option<bool>,
+    /// Used as this node's output, without prompting, when stdin is not an
+    /// interactive terminal (see `run_ask`). Required in that case — with
+    /// neither an interactive terminal nor a `default:`, there is no way to
+    /// get an answer, so the step fails instead of hanging.
+    pub(crate) default: Option<String>,
+    pub(crate) jq: Option<String>,
+    pub(crate) write_file: Option<PathBuf>,
+    pub(crate) retry: Option<RetryDefinition>,
+    pub(crate) timeout: Option<u64>,
+}
+
 impl NodeDefinition {
     /// Whether this node's action is a model call that participates in the
     /// node > agent file > workflow `default:` sampling/capability/retry/
@@ -368,7 +401,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.model.as_deref(),
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -378,7 +412,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.reasoning_effort,
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -388,7 +423,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.temperature,
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -398,7 +434,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.top_p,
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -408,7 +445,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.max_tokens,
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -418,7 +456,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.mcp.as_deref(),
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -428,7 +467,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.max_tool_rounds,
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -438,7 +478,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.skills.as_deref(),
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -448,7 +489,8 @@ impl NodeDefinition {
             NodeDefinition::Agent(node) => node.subagents.as_deref(),
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_) => None,
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
         }
     }
 
@@ -463,6 +505,7 @@ impl NodeDefinition {
             NodeDefinition::Workflow(_) => None,
             NodeDefinition::Command(node) => node.retry.as_ref(),
             NodeDefinition::Transform(node) => node.retry.as_ref(),
+            NodeDefinition::Ask(node) => node.retry.as_ref(),
         }
     }
 
@@ -473,6 +516,7 @@ impl NodeDefinition {
             NodeDefinition::Workflow(_) => None,
             NodeDefinition::Command(node) => node.timeout,
             NodeDefinition::Transform(node) => node.timeout,
+            NodeDefinition::Ask(node) => node.timeout,
         }
     }
 
@@ -484,6 +528,7 @@ impl NodeDefinition {
             NodeDefinition::Workflow(node) => node.jq.as_deref(),
             NodeDefinition::Command(node) => node.jq.as_deref(),
             NodeDefinition::Transform(node) => node.jq.as_deref(),
+            NodeDefinition::Ask(node) => node.jq.as_deref(),
         }
     }
 
@@ -496,6 +541,7 @@ impl NodeDefinition {
             NodeDefinition::Workflow(node) => node.write_file.as_deref(),
             NodeDefinition::Command(node) => node.write_file.as_deref(),
             NodeDefinition::Transform(node) => node.write_file.as_deref(),
+            NodeDefinition::Ask(node) => node.write_file.as_deref(),
         }
     }
 }

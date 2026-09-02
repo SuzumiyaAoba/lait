@@ -247,6 +247,7 @@ fn print_node(
         NodeDefinition::Workflow(_) => "workflow",
         NodeDefinition::Command(_) => "command",
         NodeDefinition::Transform(_) => "transform",
+        NodeDefinition::Ask(_) => "ask",
     };
     println!("{inner}use: {node_id}  (type: {type_name})");
 
@@ -288,6 +289,26 @@ fn print_node(
             println!("{inner}command: {}", rendered.join(" "));
         }
         NodeDefinition::Transform(_) => {}
+        NodeDefinition::Ask(ask_node) => {
+            println!(
+                "{inner}prompt: {}",
+                render_preview(&ask_node.prompt, initial_input, vars)
+            );
+            if let Some(choices) = &ask_node.choices {
+                println!("{inner}choices: {}", choices.join(", "));
+            }
+            if ask_node.multiline == Some(true) {
+                println!("{inner}multiline: true");
+            }
+            match &ask_node.default {
+                Some(default) => println!(
+                    "{inner}default: {default}  (used when stdin is not an interactive terminal)"
+                ),
+                None => println!(
+                    "{inner}default: none  (fails when stdin is not an interactive terminal)"
+                ),
+            }
+        }
     }
 
     if let Some(filter) = node.jq() {

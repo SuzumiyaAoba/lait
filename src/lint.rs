@@ -522,6 +522,9 @@ fn lint_node(
             }
         }
         workflow::NodeDefinition::Transform(_) => {}
+        workflow::NodeDefinition::Ask(ask) => {
+            check_prompt_template(&node_context, "'prompt' template", &ask.prompt, issues);
+        }
     }
 }
 

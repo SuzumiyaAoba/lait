@@ -344,6 +344,7 @@ fn node_type_name(node: &NodeDefinition) -> &'static str {
         NodeDefinition::Workflow(_) => "workflow",
         NodeDefinition::Command(_) => "command",
         NodeDefinition::Transform(_) => "transform",
+        NodeDefinition::Ask(_) => "ask",
     }
 }
 

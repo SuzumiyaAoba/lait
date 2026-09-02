@@ -10,6 +10,7 @@ use crate::{config::ConfigFile, jq};
 #[cfg(test)]
 use crate::template;
 
+mod ask;
 pub(crate) mod dryrun;
 pub(crate) mod exec;
 pub(crate) mod graph;
@@ -125,7 +126,7 @@ fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
         if error.to_string().contains("missing field `type`") {
             anyhow!(
                 "{error}\n\nevery entry under 'nodes:' now requires a 'type:' \
-                 (prompt/agent/workflow/command/transform); see docs/usage/ja/workflow.md"
+                 (prompt/agent/workflow/command/transform/ask); see docs/usage/ja/workflow.md"
             )
         } else {
             error.into()

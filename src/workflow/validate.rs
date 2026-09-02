@@ -215,6 +215,15 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
                 );
             };
             reject_step_id_node_collision(step, nodes, &label)?;
+            if matches!(node, NodeDefinition::Ask(_)) && ctx.in_parallel_branch {
+                bail!(
+                    "step '{}' uses node '{}', which has 'type: ask', inside a 'parallel' branch \
+                     or a 'for_each' body with 'max_concurrency' above 1; concurrent interactive \
+                     prompts reading the same stdin are not supported",
+                    label,
+                    node_id
+                );
+            }
             if node.write_file().is_some() && ctx.in_concurrent_for_each {
                 bail!(
                     "step '{}' uses node '{}', which has 'write_file' set, inside a 'for_each' body \
@@ -316,6 +325,28 @@ pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> 
                     "{description} has 'type: transform' but neither 'jq' nor 'write_file'; it \
                      would do nothing"
                 );
+            }
+        }
+        NodeDefinition::Ask(ask) => {
+            if ask.prompt.trim().is_empty() {
+                bail!("{description} has 'type: ask' with an empty 'prompt'");
+            }
+            if let Some(choices) = &ask.choices {
+                if choices.is_empty() {
+                    bail!("{description} has an empty 'choices' list");
+                }
+                if choices.iter().any(|choice| choice.is_empty()) {
+                    bail!("{description} has an empty string in 'choices'");
+                }
+                if let Some(default) = &ask.default
+                    && !choices.contains(default)
+                {
+                    bail!(
+                        "{description} has 'default: {default}', which is not one of its \
+                         'choices': {}",
+                        choices.join(", ")
+                    );
+                }
             }
         }
         NodeDefinition::Agent(_) | NodeDefinition::Workflow(_) => {}

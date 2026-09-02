@@ -1257,6 +1257,14 @@ async fn execute_step(
                 .with_context(|| format!("step '{label}'"))?
         }
         workflow::NodeDefinition::Transform(_) => current_input.to_string(),
+        workflow::NodeDefinition::Ask(ask_node) => {
+            let input = template::parse_input(current_input);
+            let prompt = template::render(&ask_node.prompt, &input, steps_outputs, &env.vars)
+                .with_context(|| format!("step '{label}'"))?;
+            super::ask::run_ask(&prompt, ask_node, step_cancel.clone())
+                .await
+                .with_context(|| format!("step '{label}'"))?
+        }
     };
 
     if let Some(filter) = node.jq() {
