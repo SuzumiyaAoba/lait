@@ -278,10 +278,14 @@ lait run summarize "本文"
 - `lait run <ARG>` の `<ARG>` がファイルとして存在する場合はそちらが優先されます(`workflows:`
   に同名のエントリがあっても無視され、その旨が標準エラー出力に注記されます)。ファイルとして
   存在しない場合にだけ `workflows:` から名前解決されます。
-- パスは `agents:`/`skills:` と異なり、現在の作業ディレクトリではなく、その `workflows:` を
-  定義した `lait.config.yml` 自身のあるディレクトリからの相対パスとして解決されます。これは
+- `lait run <NAME>`/`lait workflow list`/`lait agent list`/`lait skill list` はいずれも、
+  `workflows:`/`agents:`/`skills:` のパスを、現在の作業ディレクトリではなく、その登録を
+  定義した `lait.config.yml` 自身のあるディレクトリからの相対パスとして解決します。これは
   この節の冒頭で説明した `lait.config.yml` 自体のディレクトリ探索と同じ理由で、
-  サブディレクトリから実行しても常に同じファイルが解決されるようにするためです。
+  サブディレクトリから実行しても常に同じファイルが解決されるようにするためです。ただし
+  `agents:`/`skills:` を実際に**使う**とき(`--subagent`/`skills:` 経由でモデル呼び出しに
+  渡すとき)は、まだ現在の作業ディレクトリからの相対パスとして解決されます — 一覧表示と
+  実際の利用でパスの基準が異なるのは既知の非対称で、グローバル設定(#48)で解消される予定です。
 - `lait workflow list`/`lait agent list`/`lait skill list` は、それぞれ `workflows:`/
   `agents:`/`skills:` に登録された名前・パス・説明(ワークフローの `description:`/
   エージェント・スキル Markdown ファイルの frontmatter の `description:`)を一覧表示します。
