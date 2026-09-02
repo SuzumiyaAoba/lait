@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
-    agent, attachment,
+    agent, attachment, checkpoint,
     cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction, RunArgs},
     cli::{AgentRunArgs, GraphArgs, GraphFormat, PromptRunArgs, SharedChatArgs},
     cli::{SkillAction, WorkflowAction},
@@ -18,7 +18,7 @@ use crate::{
     usage,
     workflow::{
         self, WorkflowScope,
-        exec::{RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
+        exec::{Flow, RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
     },
 };
 
@@ -119,6 +119,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             bail!("internal error: `workflow list` must run on the sync path")
         }
         Some(Command::Skill(_)) => bail!("internal error: `skill list` must run on the sync path"),
+        Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
         None => run_chat_or_repl(cli.chat, config_source).await,
     }
 }
@@ -170,7 +171,8 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::History(_)
             | Command::Graph(_)
             | Command::Workflow(_)
-            | Command::Skill(_),
+            | Command::Skill(_)
+            | Command::Runs(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
         Some(Command::Prompt(prompt_command)) => {
@@ -231,6 +233,7 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
                 skill::list(&config::load_config(&config_source)?, config_dir.as_deref())
             }
         },
+        Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
         Some(Command::Run(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
@@ -587,43 +590,223 @@ async fn run_agent(args: AgentRunArgs, config_source: ConfigSource) -> Result<()
     )
 }
 
+/// Every top-level step's label, by position: this site's own label (see
+/// `FlowStep::label`) if set, else `step-<position>` (1-based). Deliberately
+/// *not* the same value `run_steps`' own progress-counter fallback would
+/// produce for an unlabeled router site — that counter only exists once a
+/// run is actually executing (it also counts nested steps), whereas this
+/// only needs to name each top-level position stably, before anything has
+/// run, so `checkpoint::check_resumable` can detect whether the step
+/// sequence changed since a checkpoint was written.
+fn top_level_step_labels(steps: &[workflow::FlowStep]) -> Vec<String> {
+    steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| step.label_or(index + 1))
+        .collect()
+}
+
 async fn run_workflow(run_args: RunArgs, config_source: ConfigSource) -> Result<()> {
-    let prompt = resolve_input_with_stdin(run_args.prompt.clone())?
-        .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
     let file_config = Arc::new(config::load_config(&config_source)?);
     let config_dir = config::resolve_config_dir(&config_source)?;
     let resolved_file =
         workflow::resolve_run_target(&run_args.file, &file_config, config_dir.as_deref());
-    let mut wf = workflow::load_workflow(&resolved_file)?;
+    let workflow_path = resolved_file.display().to_string();
 
-    announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
-
-    let scope = WorkflowScope::top_level(&mut wf, &resolved_file)?;
-    let vars = workflow::build_vars(&run_args.var.var)?;
-
-    if run_args.dry_run {
-        return workflow::dryrun::print_plan(&wf, &scope, &file_config, &prompt, &vars);
+    let resumed = run_args
+        .resume
+        .as_deref()
+        .map(checkpoint::load)
+        .transpose()?;
+    if let Some(resumed) = &resumed {
+        if resumed.workflow_path != workflow_path {
+            bail!(
+                "run '{}' was checkpointed against workflow '{}', not '{workflow_path}'; pass \
+                 the same FILE to resume it",
+                resumed.run_id,
+                resumed.workflow_path,
+            );
+        }
+        if resumed.status == checkpoint::RunStatus::Completed {
+            bail!(
+                "run '{}' already completed; nothing to resume",
+                resumed.run_id
+            );
+        }
     }
 
-    let env = AppContext::new(Arc::clone(&file_config)).with_vars(vars);
-    let initial_prompt = prompt.clone();
-    let StepsOutcome {
-        output: current_input,
-        ..
-    } = env
-        .finish(run_steps(
-            &wf.steps,
-            prompt,
-            workflow::StepOutputs::new(),
-            RunStepsFrame {
-                scope: &scope,
-                env: &env,
-                start_counter: 0,
-                progress_prefix: "",
-                cancellation: env.cancel.clone(),
-            },
-        ))
-        .await?;
+    let mut wf = workflow::load_workflow(&resolved_file)?;
+    announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
+    let scope = WorkflowScope::top_level(&mut wf, &resolved_file)?;
+    let top_level_labels = top_level_step_labels(&wf.steps);
+
+    let (initial_prompt, vars, start_index, start_counter, start_input, start_steps_outputs) =
+        match &resumed {
+            Some(resumed) => {
+                checkpoint::check_resumable(&top_level_labels, resumed)?;
+                eprintln!(
+                    "==> resuming run '{}' from step {}/{}",
+                    resumed.run_id,
+                    resumed.completed_index + 1,
+                    top_level_labels.len(),
+                );
+                let vars = if run_args.var.var.is_empty() {
+                    resumed.vars.clone()
+                } else {
+                    workflow::build_vars(&run_args.var.var)?
+                };
+                (
+                    resumed.initial_prompt.clone(),
+                    vars,
+                    resumed.completed_index,
+                    resumed.counter,
+                    resumed.current_input.clone(),
+                    resumed.steps_outputs.clone(),
+                )
+            }
+            None => {
+                let prompt =
+                    resolve_input_with_stdin(run_args.prompt.clone())?.ok_or_else(|| {
+                        anyhow!("a PROMPT is required; provide one or pipe input via stdin")
+                    })?;
+                let vars = workflow::build_vars(&run_args.var.var)?;
+                (
+                    prompt.clone(),
+                    vars,
+                    0,
+                    0,
+                    prompt,
+                    workflow::StepOutputs::new(),
+                )
+            }
+        };
+    let run_id = match &resumed {
+        Some(resumed) => resumed.run_id.clone(),
+        None => checkpoint::generate_run_id(),
+    };
+
+    if run_args.dry_run {
+        return workflow::dryrun::print_plan(&wf, &scope, &file_config, &initial_prompt, &vars);
+    }
+
+    // `--resume` implies `--checkpoint`: a run started with `--checkpoint`
+    // stays checkpointed across a resume without the flag needing to be
+    // repeated.
+    let checkpointing = run_args.checkpoint || resumed.is_some();
+
+    let env = AppContext::new(Arc::clone(&file_config)).with_vars(vars.clone());
+    // `completed_index` ends at `wf.steps.len()` when the loop runs to
+    // completion, or at the position right after whichever step set
+    // `flow != Flow::Continue` (a `stop: true`) when it ends early — either
+    // way, the count of top-level steps actually executed this run. Declared
+    // outside the `async` block (mutated from within, read after it) so its
+    // final value is available for the "completed" checkpoint below without
+    // smuggling it out through the block's own `Result`.
+    let mut completed_index = start_index;
+    let run_result: Result<(String, usize, workflow::StepOutputs)> = env
+        .finish(async {
+            let mut current_input = start_input;
+            let mut steps_outputs = start_steps_outputs;
+            let mut counter = start_counter;
+            for (index, step) in wf.steps.iter().enumerate().skip(start_index) {
+                // `run_steps` takes `current_input`/`steps_outputs` by value,
+                // so a failing step leaves nothing to save afterward — clone
+                // them beforehand (they're re-recording unchanged state, plus
+                // any new `vars` this invocation brought in, since the step
+                // itself never produced a new output) rather than trying to
+                // reconstruct them post-failure.
+                let (unchanged_input, unchanged_steps_outputs) = if checkpointing {
+                    (Some(current_input.clone()), Some(steps_outputs.clone()))
+                } else {
+                    (None, None)
+                };
+                let step_outcome = run_steps(
+                    std::slice::from_ref(step),
+                    current_input,
+                    steps_outputs,
+                    RunStepsFrame {
+                        scope: &scope,
+                        env: &env,
+                        start_counter: counter,
+                        progress_prefix: "",
+                        cancellation: env.cancel.clone(),
+                    },
+                )
+                .await;
+                let StepsOutcome {
+                    output,
+                    counter: new_counter,
+                    flow,
+                    steps_outputs: new_steps_outputs,
+                } = match step_outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if checkpointing {
+                            checkpoint::save(&checkpoint::Checkpoint {
+                                run_id: run_id.clone(),
+                                workflow_path: workflow_path.clone(),
+                                initial_prompt: initial_prompt.clone(),
+                                vars: vars.clone(),
+                                top_level_labels: top_level_labels.clone(),
+                                completed_index,
+                                counter,
+                                current_input: unchanged_input
+                                    .expect("cloned above when checkpointing"),
+                                steps_outputs: unchanged_steps_outputs
+                                    .expect("cloned above when checkpointing"),
+                                status: checkpoint::RunStatus::Failed,
+                            })?;
+                            eprintln!(
+                                "note: run checkpointed as '{run_id}'; resume with `lait run {} \
+                                 --resume {run_id}`",
+                                run_args.file.display(),
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+                current_input = output;
+                counter = new_counter;
+                steps_outputs = new_steps_outputs;
+                completed_index = index + 1;
+                if checkpointing {
+                    checkpoint::save(&checkpoint::Checkpoint {
+                        run_id: run_id.clone(),
+                        workflow_path: workflow_path.clone(),
+                        initial_prompt: initial_prompt.clone(),
+                        vars: vars.clone(),
+                        top_level_labels: top_level_labels.clone(),
+                        completed_index,
+                        counter,
+                        current_input: current_input.clone(),
+                        steps_outputs: steps_outputs.clone(),
+                        status: checkpoint::RunStatus::Failed,
+                    })?;
+                }
+                if flow != Flow::Continue {
+                    break;
+                }
+            }
+            Ok((current_input, counter, steps_outputs))
+        })
+        .await;
+    let (current_input, counter, steps_outputs) = run_result?;
+
+    if checkpointing {
+        checkpoint::save(&checkpoint::Checkpoint {
+            run_id,
+            workflow_path,
+            initial_prompt: initial_prompt.clone(),
+            vars,
+            top_level_labels,
+            completed_index,
+            counter,
+            current_input: current_input.clone(),
+            steps_outputs,
+            status: checkpoint::RunStatus::Completed,
+        })?;
+    }
+
     report::emit_run_output(
         &current_input,
         env.usage.total(),

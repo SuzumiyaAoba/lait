@@ -75,6 +75,9 @@ pub(crate) enum Command {
     /// List the skill files registered under `skills:` in lait.config.yml
     /// (`lait skill list`).
     Skill(SkillCommand),
+    /// List or inspect checkpointed `lait run --checkpoint` runs
+    /// (`.lait/runs/`), resumable with `lait run ... --resume <RUN_ID>`.
+    Runs(RunsCommand),
 }
 
 #[derive(Debug, Args)]
@@ -99,6 +102,27 @@ pub(crate) struct SkillCommand {
 pub(crate) enum SkillAction {
     /// List every `skills:` entry configured in lait.config.yml.
     List,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RunsCommand {
+    #[command(subcommand)]
+    pub(crate) action: RunsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RunsAction {
+    /// List every checkpointed run under `.lait/runs/`.
+    List,
+    /// Print one checkpointed run's recorded state.
+    Show(RunsIdArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RunsIdArgs {
+    /// The run id (as printed by `--checkpoint`/`lait runs list`).
+    #[arg(value_name = "RUN_ID")]
+    pub(crate) run_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -352,6 +376,21 @@ pub(crate) struct RunArgs {
     /// template as far as they can be (see docs/usage/ja/workflow.md).
     #[arg(long)]
     pub(crate) dry_run: bool,
+
+    /// Save a checkpoint after every top-level step completes
+    /// (`.lait/runs/<run-id>.json`), so a failed run can be continued with
+    /// `--resume <RUN_ID>` instead of starting over. The run id is printed
+    /// to stderr; see `lait runs list`/`lait runs show`. Implied by
+    /// `--resume` itself.
+    #[arg(long)]
+    pub(crate) checkpoint: bool,
+
+    /// Resume a previously checkpointed run from its last completed
+    /// top-level step (see `--checkpoint`, `lait runs list`). FILE must be
+    /// the same workflow the run was checkpointed against; PROMPT is not
+    /// used (the checkpoint already recorded the original one).
+    #[arg(long, value_name = "RUN_ID", conflicts_with = "dry_run")]
+    pub(crate) resume: Option<String>,
 
     #[command(flatten)]
     pub(crate) var: VarArgs,
