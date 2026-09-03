@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
@@ -22,34 +22,48 @@ use crate::{config::CommandSpec, process};
 /// prompt for Touch ID/a passphrase each time. Never written to disk or
 /// logged (`logging::mask_secret` masks it wherever it might otherwise be
 /// traced).
-static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+///
+/// Each key maps to its own `OnceLock` (rather than a plain
+/// `HashMap<String, String>` checked-then-inserted under one lock) so two
+/// concurrent callers for the *same* spec — e.g. two branches of a
+/// `parallel` workflow node both resolving the same model alias — can't both
+/// observe a miss and both run the command: the second caller's
+/// `OnceLock::get_or_init` blocks on the first's in-flight run instead of
+/// starting a redundant one, which would otherwise fire a secrets-manager
+/// prompt (Touch ID/passphrase) twice, or duplicate a side effect for a
+/// command that has one. The outer `Mutex` is only ever held for the brief
+/// get-or-insert of that per-key cell, never across the command itself, so
+/// concurrent callers for *different* specs still run fully in parallel.
+type SecretCell = Arc<OnceLock<Result<String, String>>>;
+static CACHE: Mutex<Option<HashMap<String, SecretCell>>> = Mutex::new(None);
 
-/// Resolves `spec`, running its command once per distinct spec and caching
-/// the result (see `CACHE`) for the rest of this process's lifetime.
-/// Blocking: `resolve_endpoint`'s only two callers
-/// (`resolve_request_settings`/`models::list_remote`) are both reached only
-/// through the async command path (see `app::needs_async_runtime`), so this
-/// always runs on a tokio worker thread — `tokio::task::block_in_place`
-/// hands the blocking wait off that thread instead of stalling every other
-/// task on it, which matters since a secrets-manager CLI can block for
-/// seconds on a Touch ID/passphrase prompt.
+/// Resolves `spec`, running its command once per distinct spec — including
+/// under concurrent callers, see `CACHE`'s doc comment — and caching the
+/// result for the rest of this process's lifetime. Blocking:
+/// `resolve_endpoint`'s only two callers (`resolve_request_settings`/
+/// `models::list_remote`) are both reached only through the async command
+/// path (see `app::needs_async_runtime`), so this always runs on a tokio
+/// worker thread — `tokio::task::block_in_place` hands the blocking wait off
+/// that thread instead of stalling every other task on it, which matters
+/// since a secrets-manager CLI can block for seconds on a Touch ID/passphrase
+/// prompt.
 pub(crate) fn resolve(spec: &CommandSpec) -> Result<String> {
     let key = cache_key(spec);
-    if let Some(cached) = CACHE
-        .lock()
-        .expect("api_key_cmd cache lock poisoned")
-        .get_or_insert_with(HashMap::new)
-        .get(&key)
-    {
-        return Ok(cached.clone());
+    let cell = Arc::clone(
+        CACHE
+            .lock()
+            .expect("api_key_cmd cache lock poisoned")
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceLock::new())),
+    );
+    let result = tokio::task::block_in_place(|| {
+        cell.get_or_init(|| run(spec).map_err(|error| format!("{error:#}")))
+    });
+    match result {
+        Ok(secret) => Ok(secret.clone()),
+        Err(message) => bail!("{message}"),
     }
-    let secret = tokio::task::block_in_place(|| run(spec))?;
-    CACHE
-        .lock()
-        .expect("api_key_cmd cache lock poisoned")
-        .get_or_insert_with(HashMap::new)
-        .insert(key, secret.clone());
-    Ok(secret)
 }
 
 /// A cache key that never collides a `Shell` spec with an `Argv` one that

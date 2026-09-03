@@ -40,6 +40,7 @@ mod template;
 mod test_support;
 mod usage;
 mod workflow;
+mod xdg;
 
 fn main() {
     // `.env` must be loaded before `Cli::parse()` runs (clap's `env = ...`

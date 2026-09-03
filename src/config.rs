@@ -734,18 +734,11 @@ fn expand_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<S
 /// directory, e.g. `~/Library/Application Support` on macOS, rather than the
 /// literal `~/.config` this feature is specified against).
 fn xdg_config_home() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
-        && !dir.trim().is_empty()
-    {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context(
-            "failed to determine the home directory (HOME/USERPROFILE is not set) to locate the \
-             global configuration file",
-        )?;
-    Ok(PathBuf::from(home).join(".config"))
+    crate::xdg::base_dir(
+        "XDG_CONFIG_HOME",
+        &[".config"],
+        "the global configuration file",
+    )
 }
 
 /// The global config file's path: `$XDG_CONFIG_HOME/lait/config.yml`. Read
