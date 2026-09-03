@@ -546,11 +546,46 @@ steps:
 - サブエージェント自身も、自分の frontmatter で `model`/`mcp`/`skills`/`subagents` などを独立に
   持てます。サブエージェントがさらに別のサブエージェントを呼ぶような入れ子も可能ですが、循環
   （巡り巡って自分自身を呼ぶ）や過度な深さは `workflow:` の入れ子と同様にエラーになります。
-- `--stream` との併用は `mcp` と同じ理由（ストリームの `tool_calls` を再組み立てする実装が
-  まだない）で未対応です。
+- `--stream` と `subagents` は併用できます。`mcp` と同様、ストリームの `tool_calls` は
+  ラウンドごとに再組み立てしてから実行されます。
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.md#サブエージェントの利用)
 にもあります。詳しい仕組みは [サブエージェントを使う](./subagents.md) を参照してください。
+
+## カスタムシェルツールの利用（`tools`）
+
+`prompt`/`system_prompt`/`agent` を持つノードに `tools:` で `lait.config.yml` の `tools:`（登録方法は
+[設定ファイル](./config.md#カスタムシェルツール) を参照）のエントリ名を並べると、そのノードのモデル
+呼び出しに、対応するローカルコマンドが呼び出し可能なツールとして渡されます。`mcp`/`subagents`
+と同じ tool loop の仕組みに乗るため、モデルがツール呼び出しを返すたびに lait がそのコマンドを
+実行して結果を受け取り、モデルに返す、というやり取りを最終回答が出るまで自動で繰り返します。
+
+```yaml
+# workflow.yml
+default:
+  model: local
+  tools: [ripgrep]        # ワークフロー全体の既定
+nodes:
+  search:
+    type: prompt
+    prompt: "{{ input }} に関連するコードを探してください。"
+    tools: [ripgrep]      # ノードで上書き
+steps:
+  - use: search
+```
+
+- `tools` は `mcp`/`skills`/`subagents` と同じ、ノード → （`agent` ノードなら）agent ファイルの
+  frontmatter → ワークフローの `default:` → `lait.config.yml` の `default:` の順にフォールバック
+  します。
+- `tools` は `prompt`/`system_prompt`/`agent` を持つノードだけに指定できます。
+- モデルに渡すツール名は `tool__<ツール名>`（例: `tool__ripgrep`）の形に修飾され、`mcp`/サブ
+  エージェントのツール名と衝突しないようになっています。
+- コマンドの終了コードが非 0、またはタイムアウトした場合はツール呼び出し全体を失敗させず、
+  エラー文字列がツールの実行結果としてモデルに返されます。
+- `--stream` との併用に制限はありません（`mcp`/`subagents` と同じくラウンドごとに再組み立て
+  されます）。
+
+詳しい仕組みは [カスタムシェルツールを使う](./tools.md) を参照してください。
 
 ## ステップ間の値の受け渡し（`{{ steps.<id> }}` / `$steps`）
 

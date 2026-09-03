@@ -318,8 +318,9 @@ mcp_servers:
 
 ## `tool_policy`（ツール呼び出しの allow/deny）と `--approve-tools`
 
-トップレベルの `tool_policy:` は、MCP サーバー・サブエージェントを横断してツール呼び出しを
-名前ベースで許可/拒否します。`--approve-tools` は呼び出し直前に対話的に確認します。詳しくは
+トップレベルの `tool_policy:` は、MCP サーバー・サブエージェント・[カスタムシェルツール](#カスタムシェルツール)
+を横断してツール呼び出しを名前ベースで許可/拒否します。`--approve-tools` は呼び出し直前に対話的に
+確認します。詳しくは
 [MCP サーバーのツールを使う](./mcp.md#tool_policyallowdeny-と---approve-tools対話的承認) を
 参照してください。
 
@@ -393,6 +394,37 @@ agents:
 - 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
   そのまま名前を付けて登録します）。
 - パスは、`skills:` と同じく、その場では接続を持たず、実際に使われるたびにファイルを読み直します。
+
+## カスタムシェルツール
+
+`tools:` にローカルコマンドを登録すると、MCP サーバーを立てずに `--tool`（チャット）・agent
+ファイルの `tools:`・ワークフローノードの `tools:` から名前で参照して、モデルが呼び出せる
+ツールとして使えます。詳しい使い方は [カスタムシェルツールを使う](./tools.md) を参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  model: local
+  tools: [ripgrep]   # 全経路（チャット / agent / workflow）の最終フォールバック
+
+tools:
+  ripgrep:
+    description: "リポジトリ内をパターン検索する"
+    command: ["rg", "--json", "{{ input.pattern }}"]
+    parameters:
+      type: object
+      properties:
+        pattern: { type: string }
+      required: [pattern]
+    timeout: 10   # 秒。省略時は30秒
+```
+
+- `command`（必須、空リスト不可）はシェルを介さず直接 exec されます。各要素はモデルの呼び出し
+  引数を `input` として handlebars テンプレート展開されます（`{{ input.<field> }}`）。
+- `parameters`（省略可、JSON オブジェクトである必要があります）はモデルに渡す JSON Schema です。
+  省略時は引数なしのツールとして扱われます。
+- ツール名は `tool__<名前>` に修飾されます。[`tool_policy`](#tool_policyツール呼び出しの-allowdeny-と---approve-tools)
+  や `--approve-tools` の対象です。
 
 ## ワークフローの登録と一覧表示
 

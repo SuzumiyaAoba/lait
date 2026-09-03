@@ -1002,6 +1002,7 @@ pub(crate) fn resolve_step_settings(
         max_tool_rounds: node.max_tool_rounds(),
         skills: node.skills().map(<[String]>::to_vec),
         subagents: node.subagents().map(<[String]>::to_vec),
+        tools: node.tools().map(<[String]>::to_vec),
     };
     let agent_capability = agent_file
         .map(|agent_file| CapabilityOverrides {
@@ -1009,6 +1010,7 @@ pub(crate) fn resolve_step_settings(
             max_tool_rounds: agent_file.max_tool_rounds,
             skills: agent_file.skills.clone(),
             subagents: agent_file.subagents.clone(),
+            tools: agent_file.tools.clone(),
         })
         .unwrap_or_default();
     let workflow_capability = CapabilityOverrides {
@@ -1016,6 +1018,7 @@ pub(crate) fn resolve_step_settings(
         max_tool_rounds: scope.defaults.max_tool_rounds,
         skills: scope.defaults.skills.clone(),
         subagents: scope.defaults.subagents.clone(),
+        tools: scope.defaults.tools.clone(),
     };
     let capability_overrides =
         CapabilityOverrides::fold(&[node_capability, agent_capability, workflow_capability]);

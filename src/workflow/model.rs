@@ -90,6 +90,9 @@ pub(crate) struct WorkflowDefaults {
     /// Fallback `subagents` for any node that calls a model (`prompt`/
     /// `agent`) and doesn't set its own. Falls back independently, like `mcp`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Fallback `tools` for any node that calls a model (`prompt`/`agent`)
+    /// and doesn't set its own. Falls back independently, like `mcp`.
+    pub(crate) tools: Option<Vec<String>>,
     /// Fallback `system_prompt` for any `prompt` node that doesn't set its
     /// own. Falls back independently, like `mcp`. Meaningless for an `agent`
     /// node, which supplies its own system prompt from its agent file.
@@ -126,6 +129,7 @@ impl WorkflowDefaults {
             max_tool_rounds: layers.iter().find_map(|layer| layer.max_tool_rounds),
             skills: layers.iter().find_map(|layer| layer.skills.clone()),
             subagents: layers.iter().find_map(|layer| layer.subagents.clone()),
+            tools: layers.iter().find_map(|layer| layer.tools.clone()),
             system_prompt: layers.iter().find_map(|layer| layer.system_prompt.clone()),
             workflow_timeout: layers.iter().find_map(|layer| layer.workflow_timeout),
         }
@@ -256,6 +260,10 @@ pub(crate) struct PromptNode {
     /// callable subagent tools during this node's model call. Falls back to
     /// the workflow's `default.subagents`, the same way as `mcp`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Names of `tools:` entries (from `lait.config.yml`) made available as
+    /// callable shell-command tools during this node's model call. Falls
+    /// back to the workflow's `default.tools`, the same way as `mcp`.
+    pub(crate) tools: Option<Vec<String>>,
 }
 
 /// `type: agent` — runs an agent Markdown file (see `agent::load_agent`)
@@ -295,6 +303,9 @@ pub(crate) struct AgentNode {
     /// Falls back to the agent file's own `subagents:`, then the workflow's
     /// `default.subagents`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Falls back to the agent file's own `tools:`, then the workflow's
+    /// `default.tools`.
+    pub(crate) tools: Option<Vec<String>>,
 }
 
 /// `type: workflow` — runs another workflow YAML file against this node's
@@ -497,6 +508,17 @@ impl NodeDefinition {
         match self {
             NodeDefinition::Prompt(node) => node.subagents.as_deref(),
             NodeDefinition::Agent(node) => node.subagents.as_deref(),
+            NodeDefinition::Workflow(_)
+            | NodeDefinition::Command(_)
+            | NodeDefinition::Transform(_)
+            | NodeDefinition::Ask(_) => None,
+        }
+    }
+
+    pub(crate) fn tools(&self) -> Option<&[String]> {
+        match self {
+            NodeDefinition::Prompt(node) => node.tools.as_deref(),
+            NodeDefinition::Agent(node) => node.tools.as_deref(),
             NodeDefinition::Workflow(_)
             | NodeDefinition::Command(_)
             | NodeDefinition::Transform(_)

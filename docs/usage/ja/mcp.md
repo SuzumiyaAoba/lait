@@ -86,8 +86,9 @@ mcp_servers:
 ## `tool_policy`（allow/deny）と `--approve-tools`（対話的承認）
 
 `allowed_tools` がサーバーごとの設定なのに対し、`lait.config.yml` トップレベルの `tool_policy:`
-は MCP サーバー・サブエージェントを横断して、修飾済みツール名（`<サーバー名>__<ツール名>` /
-`agent__<エージェント名>`）単位でツール呼び出しを許可/拒否します。
+は MCP サーバー・サブエージェント・[カスタムシェルツール](./tools.md)を横断して、修飾済みツール名
+（`<サーバー名>__<ツール名>` / `agent__<エージェント名>` / `tool__<ツール名>`）単位でツール呼び出しを
+許可/拒否します。
 
 ```yaml
 # lait.config.yml

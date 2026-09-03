@@ -165,15 +165,64 @@ pub(crate) struct ConfigFile {
     /// `crate::workflow::resolve_run_target`.
     #[serde(default)]
     pub(crate) workflows: WorkflowMap,
-    /// An allow/deny list gating every MCP/subagent tool call by its
-    /// qualified name (`server__tool`/`agent__name`, the same form
-    /// `mcp::qualify_tool_name` produces), checked in
+    /// An allow/deny list gating every MCP/subagent/shell tool call by its
+    /// qualified name (`server__tool`/`agent__name`/`tool__name`, the same
+    /// form `mcp::qualify_tool_name` produces), checked in
     /// `engine::execute_tool_calls` before a call is dispatched — in
     /// addition to (not instead of) a `mcp_servers.<name>.allowed_tools`
     /// entry, which only ever restricts that one server's own raw tool
     /// names. See [`ToolPolicy`].
     #[serde(default)]
     pub(crate) tool_policy: ToolPolicy,
+    /// Named shell-command tools, referenced by a `tools:` list on the
+    /// CLI/agent file/workflow node/`default:` block — an alternative to
+    /// `mcp_servers:` for exposing a single local command (`rg`, `jq`, `gh`,
+    /// ...) as a callable tool without standing up a whole MCP server. See
+    /// `crate::shell_tool`.
+    #[serde(default)]
+    pub(crate) tools: ToolMap,
+}
+
+/// A map of `tools:` name to its shell-command definition, as used by
+/// `lait.config.yml`'s top-level `tools:`. See `crate::shell_tool`.
+pub(crate) type ToolMap = HashMap<String, ShellToolDefinition>;
+
+/// One `tools:` entry: a local command exposed to the model as a callable
+/// tool, without an MCP server. See `crate::shell_tool::call`, which runs
+/// it, and `crate::shell_tool::tools`, which turns it into an OpenAI tool
+/// schema.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShellToolDefinition {
+    /// Shown to the model as the tool's description. `None` is allowed at
+    /// the config-parse level (nothing here requires it), but a model
+    /// generally calls a tool more reliably when it has one.
+    pub(crate) description: Option<String>,
+    /// The command to exec — `command[0]` is the program, `command[1..]` its
+    /// arguments. Each element is rendered as a handlebars template (see
+    /// `crate::template::render`) against the model's JSON call arguments as
+    /// `{{ input.<field> }}` before running, the same template engine and
+    /// `input`/`field` access pattern a workflow's own `prompt:`/`command:`
+    /// templates use. Run directly (`crate::process::run_command`), never
+    /// through a shell — no element can inject a second command via `;`/`|`/
+    /// backticks, even if it's built from an untrusted rendered value.
+    /// Validated non-empty at first use (see `shell_tool::tools`) and by
+    /// `lait lint`, since `process::run_command` panics on an empty argv.
+    pub(crate) command: Vec<String>,
+    /// The JSON Schema describing the tool's call arguments, sent to the
+    /// model verbatim as the OpenAI tool definition's `parameters`. Defaults
+    /// to an empty-object schema (a tool that takes no arguments) when
+    /// omitted.
+    #[serde(default = "default_tool_parameters")]
+    pub(crate) parameters: serde_json::Value,
+    /// How many seconds this tool's command may run before it's killed and
+    /// the call fails — see `shell_tool::DEFAULT_TOOL_TIMEOUT_SECS` for the
+    /// default when this is unset.
+    pub(crate) timeout: Option<u64>,
+}
+
+fn default_tool_parameters() -> serde_json::Value {
+    serde_json::json!({ "type": "object", "properties": {} })
 }
 
 /// `tool_policy:` (see [`ConfigFile::tool_policy`]): `deny` is checked
@@ -270,6 +319,11 @@ pub(crate) struct DefaultSettings {
     /// by default, when an agent file/workflow node doesn't set its own
     /// `subagents:`. Falls back independently, like `temperature`.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Names of `tools:` entries made available as callable shell-command
+    /// tools by default, when a CLI invocation/agent file/workflow node
+    /// doesn't set its own `tools:`. Falls back independently, like `mcp`.
+    /// See `crate::shell_tool`.
+    pub(crate) tools: Option<Vec<String>>,
     /// Whether to render chat's response as Markdown for terminal display by
     /// default, when `--render` isn't passed. See `crate::render`.
     pub(crate) render: Option<bool>,
@@ -541,6 +595,44 @@ pub(crate) fn check_provider_api_key_sources(config: &ConfigFile) -> Vec<String>
         }
     }
     errors
+}
+
+/// Checks every `tools:` entry's `command`/`parameters` for the two things
+/// `process::run_command` and the OpenAI tool-schema wire format both
+/// require but `serde`'s own type-checking can't: a non-empty `command`
+/// (`run_command` panics on an empty argv — see
+/// `ShellToolDefinition::command`'s doc comment) and a `parameters` value
+/// that is a JSON object (a non-object `parameters` would still deserialize
+/// fine as `serde_json::Value`, but is not a valid JSON Schema object for
+/// OpenAI's tool definition). Mirrors `check_provider_api_key_sources`: used
+/// by both `lait lint` (every entry, whether referenced by a `tools:` list
+/// anywhere or not) and `shell_tool::tools` (lazily, only for entries a
+/// request actually names).
+pub(crate) fn check_shell_tool_definition(
+    name: &str,
+    definition: &ShellToolDefinition,
+) -> Result<()> {
+    if definition.command.is_empty() {
+        bail!("tool definition {name:?} has an empty 'command' list");
+    }
+    if !definition.parameters.is_object() {
+        bail!("tool definition {name:?}'s 'parameters' must be a JSON object");
+    }
+    Ok(())
+}
+
+/// `lait lint`'s view of [`check_shell_tool_definition`]: checks every
+/// `tools:` entry, returning one message per violation — see
+/// `check_provider_api_key_sources`'s own doc comment for why this exists
+/// separately from the lazy per-use check.
+pub(crate) fn check_shell_tool_definitions(config: &ConfigFile) -> Vec<String> {
+    let mut names: Vec<&String> = config.tools.keys().collect();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .filter_map(|name| check_shell_tool_definition(name, &config.tools[name]).err())
+        .map(|error| error.to_string())
+        .collect()
 }
 
 /// Resolves `model_name` against a single alias map, returning `Ok(None)` when the
@@ -858,6 +950,8 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
     prompts.extend(project.prompts);
     let mut workflows = global.workflows;
     workflows.extend(project.workflows);
+    let mut tools = global.tools;
+    tools.extend(project.tools);
     // Unioned, not "whichever side is non-empty wins" (like `mcp_servers`'s
     // per-name merge above, not like `api_key`'s whole-pair merge): a
     // global `deny` is a safety floor a project should never be able to
@@ -890,6 +984,7 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
                 .or(global.default.max_tool_rounds),
             skills: project.default.skills.or(global.default.skills),
             subagents: project.default.subagents.or(global.default.subagents),
+            tools: project.default.tools.or(global.default.tools),
             render: project.default.render.or(global.default.render),
             history: project.default.history.or(global.default.history),
             cache: project.default.cache.or(global.default.cache),
@@ -905,6 +1000,7 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
             allow: tool_policy_allow,
             deny: tool_policy_deny,
         },
+        tools,
     }
 }
 
@@ -995,7 +1091,8 @@ fn load_global_config() -> Result<Option<ConfigFile>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigFile, McpServerConfig, McpTransport, ToolPolicy, expand_with, resolve_model,
+        ConfigFile, McpServerConfig, McpTransport, ShellToolDefinition, ToolPolicy,
+        check_shell_tool_definition, expand_with, resolve_model,
     };
     use std::collections::HashMap;
 
@@ -1073,6 +1170,41 @@ mod tests {
             deny: vec![],
         };
         assert!(policy.allows("anything"));
+    }
+
+    #[test]
+    fn check_shell_tool_definition_rejects_an_empty_command() {
+        let definition = ShellToolDefinition {
+            description: None,
+            command: vec![],
+            parameters: serde_json::json!({ "type": "object" }),
+            timeout: None,
+        };
+        let error = check_shell_tool_definition("echo", &definition).unwrap_err();
+        assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn check_shell_tool_definition_rejects_non_object_parameters() {
+        let definition = ShellToolDefinition {
+            description: None,
+            command: vec!["echo".to_owned()],
+            parameters: serde_json::json!("not an object"),
+            timeout: None,
+        };
+        let error = check_shell_tool_definition("echo", &definition).unwrap_err();
+        assert!(error.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn check_shell_tool_definition_accepts_a_valid_definition() {
+        let definition = ShellToolDefinition {
+            description: Some("echoes input".to_owned()),
+            command: vec!["echo".to_owned(), "{{ input.text }}".to_owned()],
+            parameters: serde_json::json!({ "type": "object" }),
+            timeout: Some(5),
+        };
+        assert!(check_shell_tool_definition("echo", &definition).is_ok());
     }
 
     #[test]

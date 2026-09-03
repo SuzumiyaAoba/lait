@@ -42,6 +42,9 @@ pub(crate) struct AgentFile {
     /// Names of `agents:` entries (from `lait.config.yml`) made available as
     /// callable subagent tools during this agent's tool-call loop.
     pub(crate) subagents: Option<Vec<String>>,
+    /// Names of `tools:` entries (from `lait.config.yml`) made available as
+    /// callable shell-command tools during this agent's tool-call loop.
+    pub(crate) tools: Option<Vec<String>>,
     /// The Markdown body, rendered as a handlebars template against the
     /// agent's input (see `crate::template::render`) to produce the system
     /// prompt actually sent to the model. Never present in the frontmatter

@@ -567,6 +567,13 @@ pub(crate) struct SharedChatArgs {
     #[arg(long = "subagent", value_name = "NAME")]
     pub(crate) subagent: Vec<String>,
 
+    /// Name of a `tools:` entry (from lait.config.yml) — a local command
+    /// exposed as a callable tool without an MCP server — this request may
+    /// call. Repeatable. Falls back to `default.tools` in lait.config.yml
+    /// when unset. Freely combinable with `--stream`, like `--mcp` above.
+    #[arg(long = "tool", value_name = "NAME")]
+    pub(crate) tool: Vec<String>,
+
     /// Resume (or start) a named conversation: this call's prompt and the
     /// model's reply are appended to `.lait/sessions/<NAME>.jsonl`, and every
     /// turn recorded there so far is sent ahead of this call's prompt.

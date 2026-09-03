@@ -417,6 +417,7 @@ pub(crate) fn resolve_chat_settings(
             // `default.skills` in `lait.config.yml` (see `resolve_request_settings`).
             skills: None,
             subagents: (!shared.subagent.is_empty()).then(|| shared.subagent.clone()),
+            tools: (!shared.tool.is_empty()).then(|| shared.tool.clone()),
         },
         &ModelMap::default(),
         file_config,

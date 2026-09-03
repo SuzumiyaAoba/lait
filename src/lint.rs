@@ -126,6 +126,7 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
         check_workflows_registry(&file_config)
     };
     let api_key_sources_ok = check_provider_api_key_sources(&file_config);
+    let shell_tool_definitions_ok = check_shell_tool_definitions(&file_config);
     for file in &lint_args.files {
         // `lint_file` only ever returns `Err` for a file whose type it can't
         // determine (an unrecognized extension) — treated here as one more
@@ -153,9 +154,9 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
         }
     }
 
-    if failed_files > 0 || !registry_ok || !api_key_sources_ok {
+    if failed_files > 0 || !registry_ok || !api_key_sources_ok || !shell_tool_definitions_ok {
         bail!(
-            "{failed_files} of {} file(s) had errors{}{}",
+            "{failed_files} of {} file(s) had errors{}{}{}",
             lint_args.files.len(),
             if registry_ok {
                 String::new()
@@ -172,6 +173,11 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
                     "; {} api_key/api_key_cmd also has errors",
                     config::CONFIG_FILE_NAME
                 )
+            },
+            if shell_tool_definitions_ok {
+                String::new()
+            } else {
+                format!("; {} 'tools:' also has errors", config::CONFIG_FILE_NAME)
             }
         );
     }
@@ -188,6 +194,21 @@ fn check_provider_api_key_sources(file_config: &ConfigFile) -> bool {
         return true;
     }
     println!("{} (api_key/api_key_cmd:):", config::CONFIG_FILE_NAME);
+    for error in &errors {
+        println!("  error: {error}");
+    }
+    false
+}
+
+/// Checks every `tools:` entry's `command`/`parameters` (see
+/// `config::check_shell_tool_definitions`), printing one line per
+/// violation. Returns whether every entry was valid.
+fn check_shell_tool_definitions(file_config: &ConfigFile) -> bool {
+    let errors = config::check_shell_tool_definitions(file_config);
+    if errors.is_empty() {
+        return true;
+    }
+    println!("{} (tools:):", config::CONFIG_FILE_NAME);
     for error in &errors {
         println!("  error: {error}");
     }
@@ -297,8 +318,8 @@ fn lint_agent_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
 fn note_skipped_capability_check(ctx: &mut LintCtx, issues: &mut Vec<LintIssue>) {
     if ctx.skipped_capability_check {
         issues.push(LintIssue::warning(format!(
-            "'mcp'/'skills'/'subagents' names were not checked because no {} was found (or \
-             --no-config was used)",
+            "'mcp'/'skills'/'subagents'/'tools' names were not checked because no {} was found \
+             (or --no-config was used)",
             config::CONFIG_FILE_NAME
         )));
     }
@@ -343,6 +364,12 @@ fn lint_workflow_contents(
     check_subagent_names(
         "the workflow's 'default'",
         wf.default.subagents.as_deref(),
+        ctx,
+        issues,
+    );
+    check_tool_names(
+        "the workflow's 'default'",
+        wf.default.tools.as_deref(),
         ctx,
         issues,
     );
@@ -459,6 +486,7 @@ fn lint_node(
     check_mcp_names(&node_context, node.mcp(), ctx, issues);
     check_skill_names(&node_context, node.skills(), ctx, issues);
     check_subagent_names(&node_context, node.subagents(), ctx, issues);
+    check_tool_names(&node_context, node.tools(), ctx, issues);
 
     match node {
         workflow::NodeDefinition::Prompt(prompt) => {
@@ -735,6 +763,7 @@ fn lint_agent_contents(
     check_mcp_names(context, agent_file.mcp.as_deref(), ctx, issues);
     check_skill_names(context, agent_file.skills.as_deref(), ctx, issues);
     check_subagent_names(context, agent_file.subagents.as_deref(), ctx, issues);
+    check_tool_names(context, agent_file.tools.as_deref(), ctx, issues);
 }
 
 fn check_mcp_names(
@@ -814,6 +843,23 @@ fn check_subagent_names(
         "agents:",
         names,
         |config, name| config.agents.contains_key(name),
+        ctx,
+        issues,
+    );
+}
+
+fn check_tool_names(
+    context: &str,
+    names: Option<&[String]>,
+    ctx: &mut LintCtx,
+    issues: &mut Vec<LintIssue>,
+) {
+    check_capability_names(
+        context,
+        "tool",
+        "tools:",
+        names,
+        |config, name| config.tools.contains_key(name),
         ctx,
         issues,
     );

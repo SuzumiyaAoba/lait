@@ -24,7 +24,8 @@ use crate::{
     async_io, cache,
     cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
-    llm, mcp, nesting, process, response, schema, skill, subagent, template, usage, workflow,
+    llm, mcp, nesting, process, response, schema, shell_tool, skill, subagent, template, usage,
+    workflow,
 };
 
 /// The maximum number of tool-call round trips a single completion request
@@ -202,8 +203,8 @@ impl SamplingOverrides {
     }
 }
 
-/// The `mcp`/`max_tool_rounds`/`skills`/`subagents` knobs a caller may set
-/// for a single completion request, bundled the same way as
+/// The `mcp`/`max_tool_rounds`/`skills`/`subagents`/`tools` knobs a caller
+/// may set for a single completion request, bundled the same way as
 /// `SamplingOverrides` and for the same reason (keeps
 /// `resolve_request_settings`'s argument count down; each field falls back
 /// independently to `file_config.default`, not as a whole unit).
@@ -213,6 +214,10 @@ pub(crate) struct CapabilityOverrides {
     pub(crate) max_tool_rounds: Option<usize>,
     pub(crate) skills: Option<Vec<String>>,
     pub(crate) subagents: Option<Vec<String>>,
+    /// Names of `tools:` entries (see `config::ShellToolDefinition`) made
+    /// available as callable shell-command tools during this request's tool
+    /// loop. Falls back independently, like `mcp`.
+    pub(crate) tools: Option<Vec<String>>,
 }
 
 impl CapabilityOverrides {
@@ -224,6 +229,7 @@ impl CapabilityOverrides {
             max_tool_rounds: layers.iter().find_map(|layer| layer.max_tool_rounds),
             skills: layers.iter().find_map(|layer| layer.skills.clone()),
             subagents: layers.iter().find_map(|layer| layer.subagents.clone()),
+            tools: layers.iter().find_map(|layer| layer.tools.clone()),
         }
     }
 }
@@ -286,6 +292,11 @@ pub(crate) struct RequestSettings {
     /// combined with `mcp` the same way in `complete`'s tool loop (empty
     /// tool sources for both keeps `complete`'s fast, tool-free path).
     pub(crate) subagents: Vec<String>,
+    /// Names of `tools:` entries made available as callable shell-command
+    /// tools during this request's tool loop. Empty means "no shell tools" —
+    /// combined with `mcp`/`subagents` the same way, and included in the
+    /// same fast-path check. See `crate::shell_tool`.
+    pub(crate) tools: Vec<String>,
     /// Names these settings' requests in `env.usage`'s `--show-usage`
     /// summary (a step label, an agent name, `"chat"`); every round of a
     /// tool loop records under the same label. Set via `with_usage_label`
@@ -429,11 +440,40 @@ fn read_tool_approval_answer(name: &str) -> Result<ToolApprovalAnswer> {
     }
 }
 
+/// Checks that no qualified tool name is claimed by more than one of the
+/// three tool sources a request can combine — `mcp::qualify_tool_name`
+/// prefixes each source differently (`<server>__`/`agent__`/`tool__`), so a
+/// collision only happens if two *different* servers/agents/shell tools
+/// happen to render to the same sanitized name (or a `tools:` entry is
+/// literally named the same as an `agents:` entry, etc.). Shared by
+/// `complete`/`complete_stream`, which both assemble the same three sets.
+fn check_tool_name_collisions(
+    mcp_tool_set: &mcp::ToolSet,
+    subagent_tool_set: &subagent::ToolSet,
+    shell_tool_set: &shell_tool::ToolSet,
+) -> Result<()> {
+    for name in subagent_tool_set.names() {
+        if mcp_tool_set.contains(name) {
+            bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
+        }
+    }
+    for name in shell_tool_set.names() {
+        if mcp_tool_set.contains(name) {
+            bail!("tool name collision: an MCP tool and a shell tool both qualify to '{name}'");
+        }
+        if subagent_tool_set.subagent_name(name).is_some() {
+            bail!("tool name collision: a subagent and a shell tool both qualify to '{name}'");
+        }
+    }
+    Ok(())
+}
+
 /// Appends one round's tool-call turn to `messages`: an `assistant` message
 /// carrying `tool_calls` (plus whatever `content` preceded them, if any),
 /// then the `tool`-role results of actually running each call — against
-/// `mcp_tool_set` or `subagent_tool_set`, whichever qualifies the call's
-/// name (see `mcp::qualify_tool_name`). Shared by `complete`'s non-streamed
+/// `mcp_tool_set`, `subagent_tool_set`, or `shell_tool_set`, whichever
+/// qualifies the call's name (see `mcp::qualify_tool_name`). Shared by
+/// `complete`'s non-streamed
 /// tool loop and `complete_stream`'s streamed one (see
 /// `response::StreamToolCallAccumulator`, which reassembles a streamed
 /// round's fragments into the same `&[response::ToolCall]` shape a
@@ -463,6 +503,7 @@ async fn execute_tool_calls(
     messages: &mut Vec<ChatCompletionRequestMessage>,
     mcp_tool_set: &mcp::ToolSet,
     subagent_tool_set: &subagent::ToolSet,
+    shell_tool_set: &shell_tool::ToolSet,
     env: &AppContext,
     active_agent_paths: &[PathBuf],
     round: usize,
@@ -511,6 +552,14 @@ async fn execute_tool_calls(
                     &tool_call.function.arguments,
                     env,
                     active_agent_paths,
+                    cancellation.clone(),
+                )
+                .await?
+            } else if let Some(tool_name) = shell_tool_set.tool_name(name) {
+                let definition = &env.file_config.tools[tool_name];
+                shell_tool::call(
+                    definition,
+                    &tool_call.function.arguments,
                     cancellation.clone(),
                 )
                 .await?
@@ -695,7 +744,7 @@ impl RequestSettings {
             .await?;
         let system_prompt = system_prompt.as_deref();
 
-        if self.mcp.is_empty() && self.subagents.is_empty() {
+        if self.mcp.is_empty() && self.subagents.is_empty() && self.tools.is_empty() {
             let messages =
                 llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             return self
@@ -703,26 +752,26 @@ impl RequestSettings {
                 .await;
         }
 
-        // `agent_registry.tools` is synchronous (it only reads local subagent
-        // files), so joining it with the MCP round trip lets both proceed
+        // `agent_registry.tools`/`shell_tool::tools` are both synchronous
+        // (they only read local subagent files/`file_config.tools`), so
+        // joining the MCP round trip with the subagent one lets both proceed
         // together instead of paying the MCP latency before ever touching
-        // disk.
+        // disk; `shell_tool::tools` is cheap enough to just call inline
+        // after.
         let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
             env.registry.tools(&self.mcp, cancellation.clone()),
             env.agent_registry
                 .tools_cancellable(&self.subagents, cancellation.clone()),
         )?;
-        for name in subagent_tool_set.names() {
-            if mcp_tool_set.contains(name) {
-                bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
-            }
-        }
-        // Only `.contains()`/`.subagent_name()` (which read `.index`, not
-        // `.tools`) are used below, so `.tools` doesn't need to survive past
-        // this merge — moving it out avoids cloning every tool definition
-        // (including its full JSON `parameters`).
+        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.file_config.tools)?;
+        check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
+        // Only `.contains()`/`.subagent_name()`/`.tool_name()` (which read
+        // `.index`, not `.tools`) are used below, so `.tools` doesn't need to
+        // survive past this merge — moving it out avoids cloning every tool
+        // definition (including its full JSON `parameters`).
         let mut tools = std::mem::take(&mut mcp_tool_set.tools);
         tools.extend(std::mem::take(&mut subagent_tool_set.tools));
+        tools.extend(std::mem::take(&mut shell_tool_set.tools));
 
         let mut messages =
             llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
@@ -764,6 +813,7 @@ impl RequestSettings {
                 &mut messages,
                 &mcp_tool_set,
                 &subagent_tool_set,
+                &shell_tool_set,
                 env,
                 active_agent_paths,
                 round,
@@ -946,7 +996,7 @@ impl RequestSettings {
             .await?;
         let system_prompt = system_prompt.as_deref();
 
-        if self.mcp.is_empty() && self.subagents.is_empty() {
+        if self.mcp.is_empty() && self.subagents.is_empty() && self.tools.is_empty() {
             let messages =
                 llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             let stream = self
@@ -970,13 +1020,11 @@ impl RequestSettings {
             env.agent_registry
                 .tools_cancellable(&self.subagents, cancellation.clone()),
         )?;
-        for name in subagent_tool_set.names() {
-            if mcp_tool_set.contains(name) {
-                bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
-            }
-        }
+        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.file_config.tools)?;
+        check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
         let mut tools = std::mem::take(&mut mcp_tool_set.tools);
         tools.extend(std::mem::take(&mut subagent_tool_set.tools));
+        tools.extend(std::mem::take(&mut shell_tool_set.tools));
 
         let mut messages =
             llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
@@ -1068,6 +1116,7 @@ impl RequestSettings {
                 &mut messages,
                 &mcp_tool_set,
                 &subagent_tool_set,
+                &shell_tool_set,
                 env,
                 active_agent_paths,
                 round,
@@ -1582,6 +1631,10 @@ pub(crate) fn resolve_request_settings(
         .subagents
         .or_else(|| file_config.default.subagents.clone())
         .unwrap_or_default();
+    let tools = capability_overrides
+        .tools
+        .or_else(|| file_config.default.tools.clone())
+        .unwrap_or_default();
 
     tracing::debug!(
         model_id = %resolved_model.model_id,
@@ -1595,6 +1648,7 @@ pub(crate) fn resolve_request_settings(
         max_tool_rounds,
         skills = ?skills,
         subagents = ?subagents,
+        tools = ?tools,
         "resolved request settings",
     );
 
@@ -1608,6 +1662,7 @@ pub(crate) fn resolve_request_settings(
         max_tool_rounds,
         skills,
         subagents,
+        tools,
         usage_label: String::new(),
     })
 }
@@ -1658,6 +1713,7 @@ pub(crate) fn agent_file_settings(
             max_tool_rounds: agent_file.max_tool_rounds,
             skills: agent_file.skills.clone(),
             subagents: agent_file.subagents.clone(),
+            tools: agent_file.tools.clone(),
         },
         &ModelMap::default(),
         file_config,

@@ -32,6 +32,7 @@ mod response;
 mod schema;
 mod secret;
 mod session;
+mod shell_tool;
 mod signal;
 mod skill;
 mod subagent;

@@ -129,6 +129,23 @@ subagents: [researcher]
 `subagents:` を省略した場合は `lait.config.yml` の `default.subagents` にフォールバックします。
 詳しい仕組みは [サブエージェントを使う](./subagents.md) を参照してください。
 
+## カスタムシェルツールの利用
+
+frontmatter に `tools:`（`lait.config.yml` の `tools:` エントリ名のリスト）を指定すると、
+対応するローカルコマンドが呼び出し可能なツールとして渡されます。`mcp:`/`subagents:` と同じ
+tool loop の仕組みに乗ります。
+
+```markdown
+---
+model: local
+tools: [ripgrep]
+---
+{{ input.task }} を実行してください。
+```
+
+`tools:` を省略した場合は `lait.config.yml` の `default.tools` にフォールバックします。詳しい
+仕組みは [カスタムシェルツールを使う](./tools.md) を参照してください。
+
 ## ワークフローからエージェントファイルを使う
 
 `workflow.yml` の `nodes:` エントリで `prompt`/`input_schema`/`output_schema`/`schema_name` の
