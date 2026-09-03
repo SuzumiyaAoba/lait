@@ -217,7 +217,7 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
                 );
             };
             reject_step_id_node_collision(step, nodes, &label)?;
-            if matches!(node, NodeDefinition::Ask(_)) && ctx.in_parallel_branch {
+            if node.requires_interactive_stdin() && ctx.in_parallel_branch {
                 bail!(
                     "step '{}' uses node '{}', which has 'type: ask', inside a 'parallel' branch \
                      or a 'for_each' body with 'max_concurrency' above 1; concurrent interactive \

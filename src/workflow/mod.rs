@@ -56,10 +56,7 @@ pub(crate) fn resolve_run_target(
     };
     match file_config.workflows.get(name) {
         Some(registered_path) => {
-            let resolved = match config_dir {
-                Some(dir) => dir.join(registered_path),
-                None => registered_path.clone(),
-            };
+            let resolved = crate::config::resolve_registry_path(registered_path, config_dir);
             eprintln!(
                 "note: resolved '{name}' to '{}' via 'workflows:' in {}",
                 resolved.display(),
@@ -75,7 +72,7 @@ pub(crate) fn resolve_run_target(
 /// name, path, and (when the file loads cleanly) its own `description:`.
 /// `config_dir` resolves each entry's path the same way
 /// `resolve_run_target`/`lint::check_workflows_registry` do — see
-/// `config::resolve_config_dir`. A registry entry whose file is missing or
+/// `config::resolve_registry_path`. A registry entry whose file is missing or
 /// fails to parse is still listed (with a note) rather than aborting the
 /// whole command — `lait lint` is where a hard failure on a bad entry
 /// belongs.
@@ -91,20 +88,9 @@ pub(crate) fn list(file_config: &ConfigFile, config_dir: Option<&Path>) -> Resul
     names.sort_unstable();
     for name in names {
         let raw_path = &file_config.workflows[name];
-        let path = match config_dir {
-            Some(dir) => dir.join(raw_path),
-            None => raw_path.clone(),
-        };
-        match load_workflow(&path) {
-            Ok(wf) => match wf.description {
-                Some(description) => println!("{name}  ({}): {description}", path.display()),
-                None => println!("{name}  ({})", path.display()),
-            },
-            Err(error) => {
-                println!("{name}  ({})", path.display());
-                println!("  warning: {error:#}");
-            }
-        }
+        let path = crate::config::resolve_registry_path(raw_path, config_dir);
+        let loaded = load_workflow(&path).map(|wf| wf.description);
+        crate::config::print_registry_entry(name, &path, loaded);
     }
     Ok(())
 }

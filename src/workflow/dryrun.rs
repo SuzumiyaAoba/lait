@@ -34,42 +34,39 @@ pub(crate) fn print_plan(
         "dry run: showing the execution plan only; no model, MCP server, or command process will be invoked"
     );
     let initial_input = template::parse_input(initial_prompt);
-    print_steps(&wf.steps, scope, file_config, &initial_input, vars, "")
+    let ctx = DryRunContext {
+        scope,
+        file_config,
+        initial_input: &initial_input,
+        vars,
+    };
+    print_steps(&wf.steps, &ctx, "")
 }
 
-fn print_steps(
-    steps: &[FlowStep],
-    scope: &WorkflowScope,
-    file_config: &ConfigFile,
-    initial_input: &serde_json::Value,
-    vars: &serde_json::Map<String, serde_json::Value>,
-    indent: &str,
-) -> Result<()> {
+/// Bundled read-only context threaded through the whole recursive
+/// step-tree walk below (`print_steps`/`print_step`/`print_router`/
+/// `print_node`) — every field is invariant across the walk; only `indent`
+/// (kept as each function's own parameter) changes per recursion depth.
+struct DryRunContext<'a> {
+    scope: &'a WorkflowScope,
+    file_config: &'a ConfigFile,
+    initial_input: &'a serde_json::Value,
+    vars: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+fn print_steps(steps: &[FlowStep], ctx: &DryRunContext, indent: &str) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
         let label = step.label_or(index + 1);
-        print_step(
-            step,
-            &label,
-            index + 1,
-            scope,
-            file_config,
-            initial_input,
-            vars,
-            indent,
-        )?;
+        print_step(step, &label, index + 1, ctx, indent)?;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_step(
     step: &FlowStep,
     label: &str,
     counter: usize,
-    scope: &WorkflowScope,
-    file_config: &ConfigFile,
-    initial_input: &serde_json::Value,
-    vars: &serde_json::Map<String, serde_json::Value>,
+    ctx: &DryRunContext,
     indent: &str,
 ) -> Result<()> {
     match &step.when {
@@ -78,7 +75,7 @@ fn print_step(
     }
 
     if let Some(router) = step.router() {
-        print_router(router, scope, file_config, initial_input, vars, indent)?;
+        print_router(router, ctx, indent)?;
         return Ok(());
     }
 
@@ -86,30 +83,15 @@ fn print_step(
         // Guaranteed by `validate::validate_steps` before a workflow ever
         // reaches this point (or `execute_step`'s runtime lookup, which the
         // same comment justifies).
-        let node = scope
+        let node = ctx
+            .scope
             .nodes
             .get(node_id)
             .expect("validate_steps guarantees 'use' resolves in 'nodes'");
-        print_node(
-            node,
-            node_id,
-            label,
-            scope,
-            file_config,
-            initial_input,
-            vars,
-            indent,
-        )?;
+        print_node(node, node_id, label, ctx, indent)?;
         if let Some(on_error) = &step.on_error {
             println!("{indent}    -> on_error:");
-            print_steps(
-                &on_error.steps,
-                scope,
-                file_config,
-                initial_input,
-                vars,
-                &format!("{indent}       "),
-            )?;
+            print_steps(&on_error.steps, ctx, &format!("{indent}       "))?;
         }
     }
 
@@ -125,14 +107,7 @@ fn print_step(
     Ok(())
 }
 
-fn print_router(
-    router: Router<'_>,
-    scope: &WorkflowScope,
-    file_config: &ConfigFile,
-    initial_input: &serde_json::Value,
-    vars: &serde_json::Map<String, serde_json::Value>,
-    indent: &str,
-) -> Result<()> {
+fn print_router(router: Router<'_>, ctx: &DryRunContext, indent: &str) -> Result<()> {
     let inner = format!("{indent}    ");
     let body_indent = format!("{inner}    ");
     match router {
@@ -143,26 +118,12 @@ fn print_router(
                     .clone()
                     .unwrap_or_else(|| format!("case-{}", index + 1));
                 println!("{inner}case '{case_label}': when {}", case.when);
-                print_steps(
-                    &case.steps,
-                    scope,
-                    file_config,
-                    initial_input,
-                    vars,
-                    &body_indent,
-                )?;
+                print_steps(&case.steps, ctx, &body_indent)?;
             }
             match &switch.else_steps {
                 Some(else_steps) => {
                     println!("{inner}else:");
-                    print_steps(
-                        else_steps,
-                        scope,
-                        file_config,
-                        initial_input,
-                        vars,
-                        &body_indent,
-                    )?;
+                    print_steps(else_steps, ctx, &body_indent)?;
                 }
                 None => println!("{inner}else: (none; no matching case is a runtime error)"),
             }
@@ -170,14 +131,7 @@ fn print_router(
         Router::Parallel(parallel) => {
             for (index, branch) in parallel.branches.iter().enumerate() {
                 println!("{inner}branch '{}':", branch.label(index));
-                print_steps(
-                    &branch.steps,
-                    scope,
-                    file_config,
-                    initial_input,
-                    vars,
-                    &body_indent,
-                )?;
+                print_steps(&branch.steps, ctx, &body_indent)?;
             }
             match &parallel.join {
                 Some(filter) => println!("{inner}join: {filter}"),
@@ -198,28 +152,14 @@ fn print_router(
                 .max_iterations
                 .map_or_else(|| "?".to_owned(), |n| n.to_string());
             println!("{inner}{condition}, max_iterations: {max_iterations}");
-            print_steps(
-                &loop_def.steps,
-                scope,
-                file_config,
-                initial_input,
-                vars,
-                &body_indent,
-            )?;
+            print_steps(&loop_def.steps, ctx, &body_indent)?;
         }
         Router::ForEach(for_each) => {
             println!("{inner}items: {}", for_each.items);
             if let Some(max_concurrency) = for_each.max_concurrency {
                 println!("{inner}max_concurrency: {max_concurrency}");
             }
-            print_steps(
-                &for_each.steps,
-                scope,
-                file_config,
-                initial_input,
-                vars,
-                &body_indent,
-            )?;
+            print_steps(&for_each.steps, ctx, &body_indent)?;
             match &for_each.join {
                 Some(filter) => println!("{inner}join: {filter}"),
                 None => println!("{inner}join: (none; per-item outputs are joined into an array)"),
@@ -229,50 +169,38 @@ fn print_router(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_node(
     node: &NodeDefinition,
     node_id: &str,
     label: &str,
-    scope: &WorkflowScope,
-    file_config: &ConfigFile,
-    initial_input: &serde_json::Value,
-    vars: &serde_json::Map<String, serde_json::Value>,
+    ctx: &DryRunContext,
     indent: &str,
 ) -> Result<()> {
     let inner = format!("{indent}    ");
-    let type_name = match node {
-        NodeDefinition::Prompt(_) => "prompt",
-        NodeDefinition::Agent(_) => "agent",
-        NodeDefinition::Workflow(_) => "workflow",
-        NodeDefinition::Command(_) => "command",
-        NodeDefinition::Transform(_) => "transform",
-        NodeDefinition::Ask(_) => "ask",
-    };
-    println!("{inner}use: {node_id}  (type: {type_name})");
+    println!("{inner}use: {node_id}  (type: {})", node.type_name());
 
     match node {
         NodeDefinition::Prompt(prompt_node) => {
             if let Some(template_text) = &prompt_node.prompt {
                 println!(
                     "{inner}prompt: {}",
-                    render_preview(template_text, initial_input, vars)
+                    render_preview(template_text, ctx.initial_input, ctx.vars)
                 );
             }
             if let Some(template_text) = &prompt_node.system_prompt {
                 println!(
                     "{inner}system_prompt: {}",
-                    render_preview(template_text, initial_input, vars)
+                    render_preview(template_text, ctx.initial_input, ctx.vars)
                 );
             }
-            print_model_resolution(node, scope, file_config, None, label, &inner)?;
+            print_model_resolution(node, ctx, None, label, &inner)?;
         }
         NodeDefinition::Agent(agent_node) => {
             println!("{inner}agent: {}", agent_node.agent.display());
             let agent_file = agent::load_agent(&agent_node.agent).with_context(|| {
                 format!("step '{label}': failed to load agent file for dry-run")
             })?;
-            print_model_resolution(node, scope, file_config, Some(&agent_file), label, &inner)?;
+            print_model_resolution(node, ctx, Some(&agent_file), label, &inner)?;
         }
         NodeDefinition::Workflow(workflow_node) => {
             println!(
@@ -284,7 +212,7 @@ fn print_node(
             let rendered: Vec<String> = command_node
                 .command
                 .iter()
-                .map(|arg| render_preview(arg, initial_input, vars))
+                .map(|arg| render_preview(arg, ctx.initial_input, ctx.vars))
                 .collect();
             println!("{inner}command: {}", rendered.join(" "));
         }
@@ -292,7 +220,7 @@ fn print_node(
         NodeDefinition::Ask(ask_node) => {
             println!(
                 "{inner}prompt: {}",
-                render_preview(&ask_node.prompt, initial_input, vars)
+                render_preview(&ask_node.prompt, ctx.initial_input, ctx.vars)
             );
             if let Some(choices) = &ask_node.choices {
                 println!("{inner}choices: {}", choices.join(", "));
@@ -318,7 +246,7 @@ fn print_node(
         println!("{inner}write_file: {}", path.display());
     }
 
-    match effective_retry(node, scope) {
+    match effective_retry(node, ctx.scope) {
         Some(retry) => println!(
             "{inner}retry: max_attempts={}, delay_seconds={}, backoff={}",
             retry.max_attempts.unwrap_or(1),
@@ -327,7 +255,7 @@ fn print_node(
         ),
         None => println!("{inner}retry: none"),
     }
-    match effective_timeout(node, scope) {
+    match effective_timeout(node, ctx.scope) {
         Some(seconds) => println!("{inner}timeout: {seconds}s"),
         None => println!("{inner}timeout: none"),
     }
@@ -341,13 +269,12 @@ fn print_node(
 /// completes a request against it.
 fn print_model_resolution(
     node: &NodeDefinition,
-    scope: &WorkflowScope,
-    file_config: &ConfigFile,
+    ctx: &DryRunContext,
     agent_file: Option<&agent::AgentFile>,
     label: &str,
     inner: &str,
 ) -> Result<()> {
-    let settings = resolve_step_settings(node, scope, file_config, agent_file, label)?;
+    let settings = resolve_step_settings(node, ctx.scope, ctx.file_config, agent_file, label)?;
     println!(
         "{inner}model: {} @ {}",
         settings.resolved_model.model_id, settings.base_url

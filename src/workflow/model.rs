@@ -554,6 +554,30 @@ impl NodeDefinition {
             NodeDefinition::Ask(node) => node.write_file.as_deref(),
         }
     }
+
+    /// This variant's `type:` name as it appears in a workflow YAML file
+    /// (and in `lait run --dry-run`/`lait graph` output).
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            NodeDefinition::Prompt(_) => "prompt",
+            NodeDefinition::Agent(_) => "agent",
+            NodeDefinition::Workflow(_) => "workflow",
+            NodeDefinition::Command(_) => "command",
+            NodeDefinition::Transform(_) => "transform",
+            NodeDefinition::Ask(_) => "ask",
+        }
+    }
+
+    /// Whether this node reads from the process's own stdin when it runs —
+    /// `Ask` only. Such a node cannot safely run anywhere stdin isn't the
+    /// single, sequential, human-facing stream a top-level step gets: inside
+    /// a `parallel` branch or a concurrent `for_each` iteration, several
+    /// instances would race to read the same stdin (see
+    /// `validate::validate_steps`'s concurrency-safety checks, which reject
+    /// this the same way they reject a concurrent `write_file`).
+    pub(crate) fn requires_interactive_stdin(&self) -> bool {
+        matches!(self, NodeDefinition::Ask(_))
+    }
 }
 
 /// A control-flow reference site: one position in a `steps:` list. Carries

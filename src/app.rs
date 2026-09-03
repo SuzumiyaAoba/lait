@@ -239,8 +239,8 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Graph(graph_args)) => run_graph(graph_args),
         Some(Command::Agent(agent_command)) => match agent_command.action {
             AgentAction::List => {
-                let config_dir = config::resolve_config_dir(&config_source)?;
-                subagent::list(&config::load_config(&config_source)?, config_dir.as_deref())
+                let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
+                subagent::list(&file_config, config_dir.as_deref())
             }
             AgentAction::Run(_) => {
                 bail!("internal error: `agent run` must run on the async path")
@@ -248,14 +248,14 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         },
         Some(Command::Workflow(workflow_command)) => match workflow_command.action {
             WorkflowAction::List => {
-                let config_dir = config::resolve_config_dir(&config_source)?;
-                workflow::list(&config::load_config(&config_source)?, config_dir.as_deref())
+                let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
+                workflow::list(&file_config, config_dir.as_deref())
             }
         },
         Some(Command::Skill(skill_command)) => match skill_command.action {
             SkillAction::List => {
-                let config_dir = config::resolve_config_dir(&config_source)?;
-                skill::list(&config::load_config(&config_source)?, config_dir.as_deref())
+                let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
+                skill::list(&file_config, config_dir.as_deref())
             }
         },
         Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
@@ -653,8 +653,8 @@ async fn run_workflow(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
-    let config_dir = config::resolve_config_dir(&config_source)?;
+    let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
+    let file_config = Arc::new(file_config);
     let resolved_file =
         workflow::resolve_run_target(&run_args.file, &file_config, config_dir.as_deref());
     let workflow_path = resolved_file.display().to_string();
@@ -764,6 +764,27 @@ async fn run_workflow(
     let env = AppContext::new(Arc::clone(&file_config))
         .with_vars(vars.clone())
         .with_cancel(run_cancel);
+    // Builds one checkpoint snapshot, filling in the fields that stay the
+    // same for this whole run (`run_id`/`workflow_path`/`initial_prompt`/
+    // `vars`/`top_level_labels`) so each of this run's three save sites below
+    // only has to supply what actually varies.
+    let make_checkpoint =
+        |completed_index: usize,
+         counter: usize,
+         current_input: String,
+         steps_outputs: workflow::StepOutputs,
+         status: checkpoint::RunStatus| checkpoint::Checkpoint {
+            run_id: run_id.clone(),
+            workflow_path: workflow_path.clone(),
+            initial_prompt: initial_prompt.clone(),
+            vars: vars.clone(),
+            top_level_labels: top_level_labels.clone(),
+            completed_index,
+            counter,
+            current_input,
+            steps_outputs,
+            status,
+        };
     // `completed_index` ends at `wf.steps.len()` when the loop runs to
     // completion, or at the position right after whichever step set
     // `flow != Flow::Continue` (a `stop: true`) when it ends early — either
@@ -784,11 +805,8 @@ async fn run_workflow(
                 // any new `vars` this invocation brought in, since the step
                 // itself never produced a new output) rather than trying to
                 // reconstruct them post-failure.
-                let (unchanged_input, unchanged_steps_outputs) = if checkpointing {
-                    (Some(current_input.clone()), Some(steps_outputs.clone()))
-                } else {
-                    (None, None)
-                };
+                let saved_state =
+                    checkpointing.then(|| (current_input.clone(), steps_outputs.clone()));
                 let step_outcome = run_steps(
                     std::slice::from_ref(step),
                     current_input,
@@ -810,26 +828,19 @@ async fn run_workflow(
                 } = match step_outcome {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        if checkpointing {
+                        if let Some((unchanged_input, unchanged_steps_outputs)) = saved_state {
                             // A save failure here must not shadow `error`
                             // (the workflow's own failure — e.g. "workflow
                             // execution was cancelled" from a Ctrl-C, which
                             // the caller still needs to see and propagate)
                             // — log it to stderr and keep going instead.
-                            let save_result = checkpoint::save(&checkpoint::Checkpoint {
-                                run_id: run_id.clone(),
-                                workflow_path: workflow_path.clone(),
-                                initial_prompt: initial_prompt.clone(),
-                                vars: vars.clone(),
-                                top_level_labels: top_level_labels.clone(),
+                            let save_result = checkpoint::save(&make_checkpoint(
                                 completed_index,
                                 counter,
-                                current_input: unchanged_input
-                                    .expect("cloned above when checkpointing"),
-                                steps_outputs: unchanged_steps_outputs
-                                    .expect("cloned above when checkpointing"),
-                                status: checkpoint::RunStatus::Failed,
-                            });
+                                unchanged_input,
+                                unchanged_steps_outputs,
+                                checkpoint::RunStatus::Failed,
+                            ));
                             match save_result {
                                 Ok(()) => eprintln!(
                                     "note: run checkpointed as '{run_id}'; resume with `lait run \
@@ -850,18 +861,13 @@ async fn run_workflow(
                 steps_outputs = new_steps_outputs;
                 completed_index = index + 1;
                 if checkpointing {
-                    checkpoint::save(&checkpoint::Checkpoint {
-                        run_id: run_id.clone(),
-                        workflow_path: workflow_path.clone(),
-                        initial_prompt: initial_prompt.clone(),
-                        vars: vars.clone(),
-                        top_level_labels: top_level_labels.clone(),
+                    checkpoint::save(&make_checkpoint(
                         completed_index,
                         counter,
-                        current_input: current_input.clone(),
-                        steps_outputs: steps_outputs.clone(),
-                        status: checkpoint::RunStatus::Failed,
-                    })?;
+                        current_input.clone(),
+                        steps_outputs.clone(),
+                        checkpoint::RunStatus::Failed,
+                    ))?;
                 }
                 if flow != Flow::Continue {
                     break;
@@ -873,18 +879,13 @@ async fn run_workflow(
     let (current_input, counter, steps_outputs) = run_result?;
 
     if checkpointing {
-        checkpoint::save(&checkpoint::Checkpoint {
-            run_id,
-            workflow_path,
-            initial_prompt: initial_prompt.clone(),
-            vars,
-            top_level_labels,
+        checkpoint::save(&make_checkpoint(
             completed_index,
             counter,
-            current_input: current_input.clone(),
+            current_input.clone(),
             steps_outputs,
-            status: checkpoint::RunStatus::Completed,
-        })?;
+            checkpoint::RunStatus::Completed,
+        ))?;
     }
 
     report::emit_run_output(

@@ -191,7 +191,7 @@ fn render_step(
             let node = nodes
                 .get(node_id)
                 .expect("validate_steps guarantees 'use' resolves in 'nodes'");
-            let mut node_label = format!("[{label}]\ntype: {}", node_type_name(node));
+            let mut node_label = format!("[{label}]\ntype: {}", node.type_name());
             if let NodeDefinition::Workflow(workflow_node) = node {
                 node_label.push_str(&format!("\n{}", workflow_node.workflow.display()));
             }
@@ -331,20 +331,6 @@ fn render_router(
             builder.add_subgraph(format!("[{label}] for_each body"), since);
             (Some(for_each_id.clone()), vec![for_each_id])
         }
-    }
-}
-
-fn node_type_name(node: &NodeDefinition) -> &'static str {
-    match node {
-        NodeDefinition::Prompt(_) => "prompt",
-        NodeDefinition::Agent(_) => "agent",
-        // Not expanded in place — see the module doc. `render_step` folds
-        // the sub-workflow's own path into the node label separately, since
-        // this function only returns a `&'static str`.
-        NodeDefinition::Workflow(_) => "workflow",
-        NodeDefinition::Command(_) => "command",
-        NodeDefinition::Transform(_) => "transform",
-        NodeDefinition::Ask(_) => "ask",
     }
 }
 

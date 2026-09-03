@@ -48,7 +48,7 @@ fn resolve_skill_file_path(configured_path: &Path) -> PathBuf {
 /// (built for a request that may need to time out) is worth pulling in.
 /// `config_dir` resolves each entry's path relative to the directory
 /// containing the `lait.config.yml` that defined it, not the current working
-/// directory — see `config::resolve_config_dir`. A registry entry whose file
+/// directory — see `config::resolve_registry_path`. A registry entry whose file
 /// is missing or fails to parse is still listed (with a note) rather than
 /// aborting the whole command — `lait lint` is where a hard failure on a bad
 /// entry belongs.
@@ -64,24 +64,13 @@ pub(crate) fn list(file_config: &config::ConfigFile, config_dir: Option<&Path>) 
     names.sort_unstable();
     for name in names {
         let raw_path = &file_config.skills[name];
-        let configured_path = match config_dir {
-            Some(dir) => dir.join(raw_path),
-            None => raw_path.clone(),
-        };
+        let configured_path = config::resolve_registry_path(raw_path, config_dir);
         let path = resolve_skill_file_path(&configured_path);
-        match std::fs::read_to_string(&path)
+        let loaded = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read skill file '{}'", path.display()))
             .and_then(|contents| parse_skill(name, &contents))
-        {
-            Ok(skill) => match skill.description {
-                Some(description) => println!("{name}  ({}): {description}", path.display()),
-                None => println!("{name}  ({})", path.display()),
-            },
-            Err(error) => {
-                println!("{name}  ({})", path.display());
-                println!("  warning: {error:#}");
-            }
-        }
+            .map(|skill| skill.description);
+        config::print_registry_entry(name, &path, loaded);
     }
     Ok(())
 }

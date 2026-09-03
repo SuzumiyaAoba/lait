@@ -49,6 +49,15 @@ pub(crate) enum RunStatus {
     Completed,
 }
 
+impl RunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Failed => "failed",
+            RunStatus::Completed => "completed",
+        }
+    }
+}
+
 /// One run's recorded state, written after every top-level step and read
 /// back by `--resume`/`lait runs show`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,10 +228,7 @@ pub(crate) fn run(command: RunsCommand) -> Result<()> {
                 return Ok(());
             }
             for checkpoint in checkpoints {
-                let status = match checkpoint.status {
-                    RunStatus::Failed => "failed",
-                    RunStatus::Completed => "completed",
-                };
+                let status = checkpoint.status.as_str();
                 println!(
                     "{}  ({status}, step {}/{}, {})",
                     checkpoint.run_id,
@@ -235,10 +241,7 @@ pub(crate) fn run(command: RunsCommand) -> Result<()> {
         }
         RunsAction::Show(args) => {
             let checkpoint = load(&args.run_id)?;
-            let status = match checkpoint.status {
-                RunStatus::Failed => "failed",
-                RunStatus::Completed => "completed",
-            };
+            let status = checkpoint.status.as_str();
             println!("run_id: {}", checkpoint.run_id);
             println!("workflow: {}", checkpoint.workflow_path);
             println!("status: {status}");

@@ -518,7 +518,7 @@ pub(crate) async fn run_command(
 /// Removes one line ending from command output. A CRLF pair counts as one
 /// line ending, while additional trailing line endings remain part of the
 /// command's output.
-fn strip_one_trailing_line_ending(mut output: String) -> String {
+pub(crate) fn strip_one_trailing_line_ending(mut output: String) -> String {
     if output.ends_with("\r\n") {
         output.truncate(output.len() - 2);
     } else if output.ends_with(['\n', '\r']) {

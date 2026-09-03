@@ -183,10 +183,7 @@ fn check_workflows_registry(file_config: &ConfigFile, config_dir: Option<&Path>)
     println!("{} (workflows:):", config::CONFIG_FILE_NAME);
     for name in names {
         let raw_path = &file_config.workflows[name];
-        let resolved = match config_dir {
-            Some(dir) => dir.join(raw_path),
-            None => raw_path.clone(),
-        };
+        let resolved = config::resolve_registry_path(raw_path, config_dir);
         if resolved.is_file() {
             println!("  {name}: OK ({})", resolved.display());
         } else {

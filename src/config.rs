@@ -71,17 +71,39 @@ pub(crate) fn resolve_config_path(source: &ConfigSource) -> Result<Option<PathBu
     }
 }
 
-/// The directory a `workflows:`/`agents:`/`skills:` registry entry's
-/// relative path resolves against: the directory containing the
-/// `lait.config.yml` [`resolve_config_path`] found, or `None` when there is
-/// none (`--no-config`, or `Search` finding nothing — in which case the
-/// registry itself is always empty, since it can only come from a config
-/// file). Kept relative to the config file rather than the current working
-/// directory so a registry entry keeps resolving to the same file
-/// regardless of which subdirectory `lait` is invoked from, the same way
-/// `lait.config.yml` itself is found by walking upward.
-pub(crate) fn resolve_config_dir(source: &ConfigSource) -> Result<Option<PathBuf>> {
-    Ok(resolve_config_path(source)?.and_then(|path| path.parent().map(Path::to_path_buf)))
+/// Resolves one `workflows:`/`agents:`/`skills:` registry entry's configured
+/// (possibly relative) path against `config_dir` — the directory containing
+/// the `lait.config.yml` that defined the registry (see
+/// [`load_config_with_dir`]), or `raw_path` unchanged when there is none
+/// (`--no-config`, or `Search` finding nothing — in which case the registry
+/// itself is always empty, since it can only come from a config file). Kept
+/// relative to the config file rather than the current working directory so
+/// a registry entry keeps resolving to the same file regardless of which
+/// subdirectory `lait` is invoked from, the same way `lait.config.yml`
+/// itself is found by walking upward.
+pub(crate) fn resolve_registry_path(raw_path: &Path, config_dir: Option<&Path>) -> PathBuf {
+    match config_dir {
+        Some(dir) => dir.join(raw_path),
+        None => raw_path.to_path_buf(),
+    }
+}
+
+/// Prints one `list` line for a registry entry (`agents:`/`workflows:`/
+/// `skills:`): `name  (path): description` when `loaded` parsed cleanly and
+/// carried a description, `name  (path)` when it parsed but had none, or
+/// `name  (path)` plus a `warning:` line when it didn't parse at all — a bad
+/// entry is still listed rather than aborting the whole command, matching
+/// `lait agent list`/`lait workflow list`/`lait skill list`'s shared
+/// contract (`lait lint` is where a hard failure on a bad entry belongs).
+pub(crate) fn print_registry_entry(name: &str, path: &Path, loaded: Result<Option<String>>) {
+    match loaded {
+        Ok(Some(description)) => println!("{name}  ({}): {description}", path.display()),
+        Ok(None) => println!("{name}  ({})", path.display()),
+        Err(error) => {
+            println!("{name}  ({})", path.display());
+            println!("  warning: {error:#}");
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -474,7 +496,26 @@ fn expand_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<S
 }
 
 pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
-    let Some(path) = resolve_config_path(source)? else {
+    load_config_at(source, resolve_config_path(source)?)
+}
+
+/// [`load_config`] plus the directory `workflows:`/`agents:`/`skills:`
+/// registry entries resolve against (the directory containing the
+/// `lait.config.yml` [`resolve_config_path`] found, or `None` when there is
+/// none), sharing one [`resolve_config_path`] resolution (and its `Search`
+/// upward directory walk) between the two rather than each redoing it — for
+/// a caller like `lait agent/workflow/skill list` that needs both.
+pub(crate) fn load_config_with_dir(source: &ConfigSource) -> Result<(ConfigFile, Option<PathBuf>)> {
+    let path = resolve_config_path(source)?;
+    let config_dir = path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    Ok((load_config_at(source, path)?, config_dir))
+}
+
+fn load_config_at(source: &ConfigSource, path: Option<PathBuf>) -> Result<ConfigFile> {
+    let Some(path) = path else {
         return Ok(ConfigFile::default());
     };
 

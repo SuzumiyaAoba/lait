@@ -7,7 +7,7 @@ use std::io::{BufRead, IsTerminal, Read};
 
 use anyhow::{Context, Result, bail};
 
-use crate::async_io;
+use crate::{async_io, process};
 
 use super::model::AskNode;
 
@@ -77,7 +77,7 @@ fn read_answer(multiline: bool) -> Result<String> {
             .read_line(&mut buffer)
             .context("failed to read from stdin")?;
     }
-    Ok(buffer.trim_end_matches(['\n', '\r']).to_owned())
+    Ok(process::strip_one_trailing_line_ending(buffer))
 }
 
 /// Checks `answer` against `choices` (an exact match, after `read_answer`'s
