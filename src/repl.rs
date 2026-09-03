@@ -16,7 +16,7 @@ use crate::{
     app,
     cli::ChatReplArgs,
     config::{self, ConfigSource},
-    engine::{AppContext, PromptTurn, RequestSettings, stream_response},
+    engine::{AppContext, PromptTurn, RequestSettings},
     llm, response, usage,
 };
 
@@ -169,12 +169,11 @@ pub(crate) async fn run(
     env.finish(repl).await
 }
 
-/// Runs one `lait chat` turn: streams the response to stdout (the REPL's
-/// default), or — when `settings.mcp`/`settings.subagents` names at least
-/// one tool source — falls back to a single non-streamed request printed
-/// once it completes, since `RequestSettings::complete_stream` cannot yet
-/// drive a tool loop (see its own doc comment). Returns the assistant's raw
-/// reply text (never the `Reasoning:`-prefixed display form, the shape
+/// Runs one `lait chat` turn: streams the response to stdout, driving the
+/// same MCP/subagent tool loop `RequestSettings::complete` does when
+/// `settings.mcp`/`settings.subagents` names at least one tool source (see
+/// `RequestSettings::complete_stream`). Returns the assistant's raw reply
+/// text (never the `Reasoning:`-prefixed display form, the shape
 /// `history`/a `--session` log need) alongside this turn's own token usage
 /// (not `env.usage`'s running session total — see the `before`/`after`
 /// delta below — since `env` persists across every REPL turn and `lait
@@ -195,29 +194,25 @@ async fn run_turn(
         prompt,
         image_urls: &[],
     };
-    let content = if settings.mcp.is_empty() && settings.subagents.is_empty() {
-        let stream = settings
-            .complete_stream(env, turn, None, show_usage)
-            .await?;
-        let outcome = stream_response(stream, show_reasoning, None, env.cancel.clone()).await?;
-        if show_usage && let Some(usage) = outcome.usage {
-            env.usage.record(&settings.usage_label, usage);
-        }
-        if show_usage {
-            usage::print_usage_summary(&env.usage);
-        }
-        outcome.content
-    } else {
-        let response = settings
-            .complete(env, &[], turn, None, env.cancel.clone())
-            .await?;
-        let rendered = response::render_response(&response, false, show_reasoning)?;
-        println!("{rendered}");
-        if show_usage {
-            usage::print_usage_summary(&env.usage);
-        }
-        response::content_text(&response).to_owned()
-    };
+    let outcome = settings
+        .complete_stream(
+            env,
+            &[],
+            turn,
+            None,
+            show_usage,
+            show_reasoning,
+            None,
+            env.cancel.clone(),
+        )
+        .await?;
+    if show_usage && let Some(usage) = outcome.usage {
+        env.usage.record(&settings.usage_label, usage);
+    }
+    if show_usage {
+        usage::print_usage_summary(&env.usage);
+    }
+    let content = outcome.content;
     let turn_usage = env.usage.total().map(|after| response::Usage {
         prompt_tokens: after.prompt_tokens.saturating_sub(before.prompt_tokens),
         completion_tokens: after

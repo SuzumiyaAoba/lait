@@ -12,7 +12,7 @@ use crate::{
     docgen,
     engine::{
         AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
-        agent_file_settings, call_agent, resolve_request_settings, stream_response,
+        agent_file_settings, call_agent, resolve_request_settings,
     },
     history, lint, prompt, repl, report, response, schema, session, skill, subagent, template,
     usage,
@@ -464,12 +464,16 @@ async fn run_chat(
 
     if chat.stream {
         let outcome = env
-            .finish(async {
-                let stream = settings
-                    .complete_stream(&env, turn, response_format, show_usage)
-                    .await?;
-                stream_response(stream, show_reasoning, output_path, env.cancel.clone()).await
-            })
+            .finish(settings.complete_stream(
+                &env,
+                &[],
+                turn,
+                response_format,
+                show_usage,
+                show_reasoning,
+                output_path,
+                env.cancel.clone(),
+            ))
             .await?;
         // Streamed usage arrives on the final chunk rather than through
         // `complete`; feed it into the same tally so both chat paths share

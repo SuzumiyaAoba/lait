@@ -151,9 +151,8 @@ CLI フラグ（`--base-url`/`--api-key` など）や `--model` は、サブエ�
 - `output_schema`/`structured_output: true` と `subagents` は併用できます。`mcp` と同様、ツールを
   呼び出している間は `response_format` を送らず、モデルがツール呼び出しを止めた最後のラウンドだけ
   `response_format` を付けて再送します。
-- `--stream`（またはノード・agent の `complete_stream` 相当）と `subagents` の併用は未対応です。
-  ストリームの `tool_calls` は index 付きの断片として届くため、lait 側で再組み立てする実装が
-  まだありません。
+- `--stream` と `subagents` は併用できます。`mcp` と同様、ストリームの `tool_calls` は
+  ラウンドごとに再組み立てしてから実行されます。
 - `max_tool_rounds`（既定 8）に達してもモデルがツール呼び出しを止めない場合はエラーになります。
   サブエージェント自身の呼び出しも、この回数のうち1回のツール呼び出しとしてカウントされます
   （サブエージェント自身の内部の tool loop は、サブエージェント自身の `max_tool_rounds` で

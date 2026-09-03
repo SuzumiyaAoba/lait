@@ -538,20 +538,16 @@ pub(crate) struct SharedChatArgs {
 
     /// Name of an `mcp_servers:` entry (from lait.config.yml) whose tools
     /// this request may call. Repeatable. Falls back to `default.mcp` in
-    /// lait.config.yml when unset. Single-shot chat rejects combining this
-    /// with `--stream` at request-resolve time rather than at parse time (a
-    /// streamed `tool_calls` field arrives as fragments lait does not yet
-    /// reassemble; see `RequestSettings::complete_stream`) — unlike
-    /// `ChatArgs`' own flags, this field is also reachable from `lait chat`,
-    /// which has no single `--stream` flag to declare a clap-level conflict
-    /// against (see `docs/usage/ja/chat.md`).
+    /// lait.config.yml when unset. Freely combinable with `--stream` — a
+    /// streamed `tool_calls` field's fragments are reassembled per round;
+    /// see `RequestSettings::complete_stream`.
     #[arg(long = "mcp", value_name = "NAME")]
     pub(crate) mcp: Vec<String>,
 
     /// Name of an `agents:` entry (from lait.config.yml) made available as a
     /// callable subagent tool this request may call. Repeatable. Falls back
-    /// to `default.subagents` in lait.config.yml when unset. Same
-    /// `--stream` caveat as `--mcp` above.
+    /// to `default.subagents` in lait.config.yml when unset. Freely
+    /// combinable with `--stream`, like `--mcp` above.
     #[arg(long = "subagent", value_name = "NAME")]
     pub(crate) subagent: Vec<String>,
 
@@ -620,8 +616,8 @@ pub(crate) struct ChatArgs {
 
 /// `lait chat`'s own arguments: just the options a REPL turn can use — see
 /// `SharedChatArgs`. There is no `--stream` flag here because the REPL
-/// streams every turn by default (falling back to a non-streamed request
-/// only when `--mcp`/`--subagent` is set — see `repl::run`).
+/// streams every turn by default, including a turn that calls
+/// `--mcp`/`--subagent` tools — see `repl::run_turn`.
 #[derive(Debug, Args)]
 pub(crate) struct ChatReplArgs {
     #[command(flatten)]

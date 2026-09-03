@@ -291,6 +291,71 @@ fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<C
     }
 }
 
+/// Appends one round's tool-call turn to `messages`: an `assistant` message
+/// carrying `tool_calls` (plus whatever `content` preceded them, if any),
+/// then the `tool`-role results of actually running each call — against
+/// `mcp_tool_set` or `subagent_tool_set`, whichever qualifies the call's
+/// name (see `mcp::qualify_tool_name`). Shared by `complete`'s non-streamed
+/// tool loop and `complete_stream`'s streamed one (see
+/// `response::StreamToolCallAccumulator`, which reassembles a streamed
+/// round's fragments into the same `&[response::ToolCall]` shape a
+/// non-streamed response already carries, so both loops converge on this one
+/// dispatch). A model turn's `tool_calls` are independent by construction (it
+/// couldn't have seen one call's result before deciding on another), so
+/// they're run concurrently rather than one at a time; `try_join_all`
+/// preserves `tool_calls`' order regardless of completion order, so the
+/// appended `tool`-role messages stay in a stable, deterministic order.
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_calls(
+    tool_calls: &[response::ToolCall],
+    content: Option<&str>,
+    messages: &mut Vec<ChatCompletionRequestMessage>,
+    mcp_tool_set: &mcp::ToolSet,
+    subagent_tool_set: &subagent::ToolSet,
+    env: &AppContext,
+    active_agent_paths: &[PathBuf],
+    round: usize,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    messages.push(llm::assistant_tool_call_message(tool_calls, content)?);
+
+    let tool_messages =
+        futures_util::future::try_join_all(tool_calls.iter().map(|tool_call| async {
+            let name = &tool_call.function.name;
+            tracing::debug!(
+                tool = %name,
+                arguments = %tool_call.function.arguments,
+                round,
+                "calling tool",
+            );
+            let result = if mcp_tool_set.contains(name) {
+                env.registry
+                    .call(
+                        mcp_tool_set,
+                        name,
+                        &tool_call.function.arguments,
+                        cancellation.clone(),
+                    )
+                    .await?
+            } else if let Some(subagent_name) = subagent_tool_set.subagent_name(name) {
+                call_subagent_tool(
+                    subagent_name,
+                    &tool_call.function.arguments,
+                    env,
+                    active_agent_paths,
+                    cancellation.clone(),
+                )
+                .await?
+            } else {
+                bail!("model called unknown tool '{name}'");
+            };
+            llm::tool_result_message(&tool_call.id, result)
+        }))
+        .await?;
+    messages.extend(tool_messages);
+    Ok(())
+}
+
 /// Classifies whether `error` is worth falling back from, for
 /// `RequestSettings::complete_recorded`/`complete_stream`'s
 /// `advance_to_next_candidate`: a connection failure/timeout, or an API
@@ -524,48 +589,18 @@ impl RequestSettings {
             };
 
             let content = response::first_message(&response).and_then(|message| message.content());
-            messages.push(llm::assistant_tool_call_message(tool_calls, content)?);
-
-            // A model turn's `tool_calls` are independent by construction (it
-            // couldn't have seen one call's result before deciding on
-            // another), so they're run concurrently rather than one at a
-            // time; `try_join_all` preserves `tool_calls`' order regardless
-            // of completion order, so the appended `tool`-role messages stay
-            // in a stable, deterministic order.
-            let tool_messages =
-                futures_util::future::try_join_all(tool_calls.iter().map(|tool_call| async {
-                    let name = &tool_call.function.name;
-                    tracing::debug!(
-                        tool = %name,
-                        arguments = %tool_call.function.arguments,
-                        round,
-                        "calling tool",
-                    );
-                    let result = if mcp_tool_set.contains(name) {
-                        env.registry
-                            .call(
-                                &mcp_tool_set,
-                                name,
-                                &tool_call.function.arguments,
-                                cancellation.clone(),
-                            )
-                            .await?
-                    } else if let Some(subagent_name) = subagent_tool_set.subagent_name(name) {
-                        call_subagent_tool(
-                            subagent_name,
-                            &tool_call.function.arguments,
-                            env,
-                            active_agent_paths,
-                            cancellation.clone(),
-                        )
-                        .await?
-                    } else {
-                        bail!("model called unknown tool '{name}'");
-                    };
-                    llm::tool_result_message(&tool_call.id, result)
-                }))
-                .await?;
-            messages.extend(tool_messages);
+            execute_tool_calls(
+                tool_calls,
+                content,
+                &mut messages,
+                &mcp_tool_set,
+                &subagent_tool_set,
+                env,
+                active_agent_paths,
+                round,
+                cancellation.clone(),
+            )
+            .await?;
         }
     }
 
@@ -656,52 +691,28 @@ impl RequestSettings {
         }
     }
 
-    /// Like [`RequestSettings::complete`], but requests a streamed response.
-    /// Rejects `self.mcp`/`self.subagents` being non-empty: a streamed
-    /// `tool_calls` field arrives as index-keyed fragments that must be
-    /// reassembled before they can be routed to an MCP server or a subagent,
-    /// which lait does not yet do (see `docs/usage/ja/mcp.md`). `self.skills`
-    /// is appended to `system_prompt` the same way as in `complete` — skills
-    /// are static injection, so unlike `mcp`/`subagents` they impose no such
-    /// restriction on streaming.
-    /// `include_usage` asks the server for a final usage chunk (see
-    /// `llm::CompletionRequest::stream_include_usage`); set it only when the
-    /// caller will actually display it (`--show-usage`). `turn.history`/
-    /// `turn.image_urls` behave exactly as in `complete` — see its doc
-    /// comment. Falls back through `self.fallback_candidates`, like
+    /// Sends one streamed request and returns the raw stream — the streaming
+    /// counterpart of `complete_recorded`'s single-request-plus-fallback
+    /// loop, minus the response disk cache (a stream is never cached; see
+    /// `docs/usage/ja/config.md`'s キャッシュ section). `tools` lets a
+    /// streamed round advertise MCP/subagent tools the same way a
+    /// non-streamed round's `tools` slice does — `complete_stream` (below)
+    /// is the only caller, and passes `&[]` for a request with no tool
+    /// sources. Falls back through `self.fallback_candidates`, like
     /// `complete_recorded`, but only up to the point a candidate's
     /// `llm::complete_stream` call itself returns `Err` — once a stream is
     /// established (`Ok`), lait commits to it: a streamed `tool_calls`/
     /// content delta arriving from one candidate can't be silently resent to
     /// another mid-stream.
-    pub(crate) async fn complete_stream(
+    async fn stream_endpoint(
         &self,
         env: &AppContext,
-        turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &[ChatCompletionTools],
         include_usage: bool,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<llm::CompletionStream> {
-        if !self.mcp.is_empty() {
-            bail!(
-                "'--stream'/streaming is not supported together with 'mcp:' yet; drop one of them"
-            );
-        }
-        if !self.subagents.is_empty() {
-            bail!(
-                "'--stream'/streaming is not supported together with 'subagents:' yet; drop one \
-                 of them"
-            );
-        }
-        let system_prompt = self
-            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, None)
-            .await?;
-        let messages = llm::initial_messages(
-            system_prompt.as_deref(),
-            turn.history,
-            turn.prompt,
-            turn.image_urls,
-        )?;
-
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
         loop {
@@ -709,8 +720,8 @@ impl RequestSettings {
                 &endpoint,
                 response_format.clone(),
                 messages.clone(),
-                &[],
-                None,
+                tools,
+                cancellation.clone(),
             );
             request.stream_include_usage = include_usage;
             match llm::complete_stream(request).await {
@@ -727,6 +738,151 @@ impl RequestSettings {
                 }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    /// Like [`RequestSettings::complete`], but streams each round's response
+    /// to `output_path` (`None` for stdout) as it arrives instead of waiting
+    /// for the full completion — driving the same MCP/subagent tool loop
+    /// `complete` does when `self.mcp`/`self.subagents` names at least one
+    /// tool source, reassembling each round's streamed `tool_calls`
+    /// fragments (see `response::StreamToolCallAccumulator`) before handing
+    /// them to the same `execute_tool_calls` dispatch `complete`'s
+    /// non-streamed loop uses. `self.skills` is appended to `system_prompt`
+    /// the same way as in `complete`. `include_usage` asks the server for a
+    /// final usage chunk on every round (see
+    /// `llm::CompletionRequest::stream_include_usage`); set it only when the
+    /// caller will actually display it (`--show-usage`). `turn.history`/
+    /// `turn.image_urls`/`active_agent_paths` behave exactly as in
+    /// `complete` — see its doc comment. Returns the *last* round's
+    /// [`StreamOutcome`] (the one whose content was actually the final
+    /// answer) — an intermediate round's content, if any, was still streamed
+    /// to `output_path` as it arrived, exactly like the final round's, since
+    /// there is no way to know a round is not the last one until after it
+    /// has already finished streaming.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_stream(
+        &self,
+        env: &AppContext,
+        active_agent_paths: &[PathBuf],
+        turn: PromptTurn<'_>,
+        response_format: Option<ResponseFormat>,
+        include_usage: bool,
+        show_reasoning: bool,
+        output_path: Option<&Path>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<StreamOutcome> {
+        let system_prompt = self
+            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, cancellation.clone())
+            .await?;
+        let system_prompt = system_prompt.as_deref();
+
+        if self.mcp.is_empty() && self.subagents.is_empty() {
+            let messages =
+                llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
+            let stream = self
+                .stream_endpoint(
+                    env,
+                    response_format,
+                    messages,
+                    &[],
+                    include_usage,
+                    cancellation.clone(),
+                )
+                .await?;
+            return stream_response(stream, show_reasoning, output_path, false, cancellation).await;
+        }
+
+        // Same tool-set assembly as `complete` — see its own comment on why
+        // MCP discovery and reading the local subagent files are joined
+        // rather than sequenced.
+        let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
+            env.registry.tools(&self.mcp, cancellation.clone()),
+            env.agent_registry
+                .tools_cancellable(&self.subagents, cancellation.clone()),
+        )?;
+        for name in subagent_tool_set.names() {
+            if mcp_tool_set.contains(name) {
+                bail!("tool name collision: an MCP tool and a subagent both qualify to '{name}'");
+            }
+        }
+        let mut tools = std::mem::take(&mut mcp_tool_set.tools);
+        tools.extend(std::mem::take(&mut subagent_tool_set.tools));
+
+        let mut messages =
+            llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
+
+        let mut round = 0usize;
+        loop {
+            round += 1;
+            if round > self.max_tool_rounds {
+                bail!(
+                    "tool loop exceeded max_tool_rounds ({}) without the model producing a final response",
+                    self.max_tool_rounds
+                );
+            }
+
+            let stream = self
+                .stream_endpoint(
+                    env,
+                    None,
+                    messages.clone(),
+                    &tools,
+                    include_usage,
+                    cancellation.clone(),
+                )
+                .await?;
+            // Every round after the first must append rather than truncate
+            // `output_path` — otherwise a later round's `File::create` would
+            // wipe out whatever an earlier round already streamed to it.
+            let outcome = stream_response(
+                stream,
+                show_reasoning,
+                output_path,
+                round > 1,
+                cancellation.clone(),
+            )
+            .await?;
+
+            if outcome.tool_calls.is_empty() {
+                if response_format.is_none() {
+                    return Ok(outcome);
+                }
+                // The model stopped calling tools; re-issue the same history
+                // once more with `response_format` attached, now that doing
+                // so can no longer suppress a tool call — mirrors
+                // `complete`'s own re-issue.
+                let stream = self
+                    .stream_endpoint(
+                        env,
+                        response_format,
+                        messages,
+                        &[],
+                        include_usage,
+                        cancellation.clone(),
+                    )
+                    .await?;
+                return stream_response(stream, show_reasoning, output_path, true, cancellation)
+                    .await;
+            }
+
+            let content = if outcome.content.is_empty() {
+                None
+            } else {
+                Some(outcome.content.as_str())
+            };
+            execute_tool_calls(
+                &outcome.tool_calls,
+                content,
+                &mut messages,
+                &mcp_tool_set,
+                &subagent_tool_set,
+                env,
+                active_agent_paths,
+                round,
+                cancellation.clone(),
+            )
+            .await?;
         }
     }
 
@@ -751,15 +907,23 @@ impl RequestSettings {
 /// complete response: a `Reasoning:` header before the first reasoning
 /// delta, then a blank line before the first content delta. Reasoning deltas
 /// are dropped when `show_reasoning` is unset, same as the non-streaming
-/// path. Fails, like `response::response_content`, if the stream ends
-/// without ever producing content.
+/// path. Also accumulates any streamed `tool_calls` fragments (see
+/// `response::StreamToolCallAccumulator`) — `RequestSettings::complete_stream`
+/// is the only caller that ever sees a non-empty result, since it's the only
+/// one that ever advertises tools on the request this stream answers.
+/// Fails, like `response::response_content`, if the round ends with neither
+/// content nor a tool call — a response with nothing at all to act on.
 /// Returns the accumulated content text (for `--session`/`lait history` to
 /// record — see `StreamOutcome`) alongside the usage carried by the final
 /// chunk, when the request asked for one (see
 /// `RequestSettings::complete_stream`'s `include_usage`) and the server
 /// obliged. `output_path` redirects the content to a file (`-o`): the file
 /// then holds the body alone, so reasoning deltas — normally written ahead of
-/// the content on stdout — go to stderr instead.
+/// the content on stdout — go to stderr instead. `append` opens that file in
+/// append mode instead of truncating it — set by `complete_stream` for every
+/// round after a tool loop's first, so an earlier round's already-streamed
+/// content survives a later round's own file open; ignored when
+/// `output_path` is `None`.
 ///
 /// `cancellation` is raced against each chunk (via `async_io::
 /// await_cancellation`, the same primitive `llm::complete`'s own
@@ -775,10 +939,11 @@ impl RequestSettings {
 /// see below). A stream ending in some other error (a malformed chunk, a
 /// dropped connection) does not get this treatment and can still leave an
 /// empty `-o` file — a pre-existing gap this change doesn't address.
-pub(crate) async fn stream_response(
+async fn stream_response(
     mut stream: llm::CompletionStream,
     show_reasoning: bool,
     output_path: Option<&Path>,
+    append: bool,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<StreamOutcome> {
     use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -801,7 +966,12 @@ pub(crate) async fn stream_response(
             &mut stdout_writer
         }
         Some(path) => {
-            let file = tokio::fs::File::create(path)
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(append)
+                .truncate(!append)
+                .open(path)
                 .await
                 .with_context(|| format!("failed to create output file '{}'", path.display()))?;
             file_writer = tokio::io::BufWriter::new(file);
@@ -812,6 +982,7 @@ pub(crate) async fn stream_response(
     let mut wrote_content = false;
     let mut last_usage = None;
     let mut content_text = String::new();
+    let mut tool_calls = response::StreamToolCallAccumulator::default();
 
     loop {
         let chunk = match async_io::await_cancellation(stream.next(), cancellation.clone()).await {
@@ -825,6 +996,9 @@ pub(crate) async fn stream_response(
         tracing::trace!(chunk = ?chunk, "received stream chunk");
         if let Some(usage) = chunk.usage {
             last_usage = Some(usage);
+        }
+        if let Some(deltas) = response::stream_chunk_tool_call_deltas(&chunk) {
+            tool_calls.push(deltas);
         }
         let (content, reasoning) = response::stream_chunk_deltas(&chunk);
         if show_reasoning && let Some(reasoning) = reasoning {
@@ -858,29 +1032,44 @@ pub(crate) async fn stream_response(
         }
     }
 
-    if !wrote_content {
+    if !wrote_content && tool_calls.is_empty() {
         bail!("API response contained no content in its first choice");
     }
     if !reasoning_inline && wrote_reasoning {
         eprintln!();
     }
-    content_sink.write_all(b"\n").await?;
+    // A round that goes on to call a tool gets no trailing newline: its
+    // content (if any, e.g. "Looking it up... ") is not the end of the
+    // response — the next round's content is appended right after it (see
+    // `RequestSettings::complete_stream`'s `append` handling), and a
+    // newline in between would be a stray artifact splitting what the user
+    // sees as one continuous answer. Only a round with no tool calls — the
+    // actual final answer, whether reached directly or via the
+    // `response_format` re-issue round — gets the newline every non-tool
+    // `--stream` response has always ended with.
+    if wrote_content && tool_calls.is_empty() {
+        content_sink.write_all(b"\n").await?;
+    }
     content_sink.flush().await?;
     Ok(StreamOutcome {
         content: content_text,
         usage: last_usage,
+        tool_calls: tool_calls.finish()?,
     })
 }
 
 /// What `stream_response` produced: the full response text (concatenated
-/// from every content delta, exactly as printed) and the usage its final
-/// chunk carried, if any. The content half exists for callers that need the
-/// complete text after the stream ends even though it was already written
-/// out incrementally — recording a `--session` turn or a `lait history`
-/// entry, neither of which can work from deltas alone.
+/// from every content delta, exactly as printed), the usage its final chunk
+/// carried, if any, and any streamed tool calls it reassembled (empty unless
+/// the round advertised tools and the model asked to call at least one —
+/// see `RequestSettings::complete_stream`). The content half exists for
+/// callers that need the complete text after the stream ends even though it
+/// was already written out incrementally — recording a `--session` turn or a
+/// `lait history` entry, neither of which can work from deltas alone.
 #[derive(Debug)]
 pub(crate) struct StreamOutcome {
     pub(crate) content: String,
+    pub(crate) tool_calls: Vec<response::ToolCall>,
     pub(crate) usage: Option<response::Usage>,
 }
 
@@ -1308,7 +1497,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            stream_response(stream, false, None, Some(cancellation)),
+            stream_response(stream, false, None, false, Some(cancellation)),
         )
         .await
         .expect("stream_response should return promptly once cancelled, not hang");

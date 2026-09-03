@@ -419,6 +419,60 @@ impl MockServer {
         }
     }
 
+    /// Like `start_stream`, but accepts `rounds.len()` connections in order,
+    /// replying to the Nth one with an SSE body built from `rounds[n]` (the
+    /// same per-event framing `start_stream` uses) — for a streamed
+    /// `--stream`/`--mcp`/`--subagent` tool loop, where each round is its
+    /// own HTTP request/response over the same base URL. Unlike
+    /// `start_sequence`, extra connections beyond `rounds.len()` are not
+    /// tolerated (a streamed request is never retried by async-openai's own
+    /// retry layer once bytes start arriving, so a test using this doesn't
+    /// need that headroom).
+    pub(crate) fn start_stream_sequence(rounds: &[&[&str]]) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
+        let address = listener
+            .local_addr()
+            .expect("failed to get mock server address");
+        let (request_sender, requests) = mpsc::channel();
+        let bodies: Vec<String> = rounds
+            .iter()
+            .map(|events| {
+                let mut body = String::new();
+                for event in *events {
+                    body.push_str("data: ");
+                    body.push_str(event);
+                    body.push_str("\n\n");
+                }
+                body.push_str("data: [DONE]\n\n");
+                body
+            })
+            .collect();
+
+        let thread = thread::spawn(move || {
+            for body in &bodies {
+                let (mut stream, _) = listener.accept()?;
+                let request = read_request(&mut stream)?;
+                request_sender
+                    .send(request)
+                    .map_err(|_| io::Error::other("test receiver was dropped"))?;
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+            }
+            Ok(())
+        });
+
+        Self {
+            base_url: format!("http://{address}/v1"),
+            requests,
+            thread,
+        }
+    }
+
     pub(crate) fn receive_request(&self) -> HttpRequest {
         self.requests
             .recv_timeout(Duration::from_secs(5))
