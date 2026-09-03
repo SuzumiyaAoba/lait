@@ -339,10 +339,14 @@ enum ToolDecision {
 /// via `prompt_tool_approval`. This is the *only* place either gate is
 /// enforced; `McpRegistry::call`'s own `allowed_tools` check still applies
 /// underneath it for an MCP tool (the two are independent, both must pass).
+/// `command_preview` is the argv a shell tool call would actually exec (see
+/// `shell_tool::preview_argv`), shown alongside the model's raw arguments —
+/// `None` for an MCP/subagent call, which have no such rendering step.
 async fn tool_decision(
     env: &AppContext,
     qualified_name: &str,
     arguments: &str,
+    command_preview: Option<&str>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ToolDecision> {
     if !env.file_config.tool_policy.allows(qualified_name) {
@@ -362,7 +366,7 @@ async fn tool_decision(
     {
         return Ok(ToolDecision::Allow);
     }
-    match prompt_tool_approval(qualified_name, arguments, cancellation).await? {
+    match prompt_tool_approval(qualified_name, arguments, command_preview, cancellation).await? {
         ToolApprovalAnswer::Once => Ok(ToolDecision::Allow),
         ToolApprovalAnswer::Always => {
             env.always_approved_tools
@@ -394,6 +398,7 @@ enum ToolApprovalAnswer {
 async fn prompt_tool_approval(
     name: &str,
     arguments: &str,
+    command_preview: Option<&str>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ToolApprovalAnswer> {
     use std::io::IsTerminal;
@@ -405,6 +410,14 @@ async fn prompt_tool_approval(
     }
     eprintln!("tool call: {name}");
     eprintln!("arguments: {arguments}");
+    // A shell tool's `command:` template can transform the arguments above
+    // into something quite different from what they look like on their own
+    // (e.g. splicing a path into a larger shell one-liner) — show the
+    // actual argv about to run so approval is informed by what will really
+    // execute, not just the model's raw JSON.
+    if let Some(command_preview) = command_preview {
+        eprintln!("command: {command_preview}");
+    }
     eprint!("allow this call? [y(es)/n(o)/a(lways for this tool)] ");
     let name = name.to_owned();
     async_io::run_blocking(
@@ -513,11 +526,26 @@ async fn execute_tool_calls(
 
     let mut decisions = Vec::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
+        // A shell tool call's `command:` template can render to something
+        // quite different from its raw JSON arguments — see
+        // `tool_decision`'s `command_preview` parameter — so look up the
+        // definition and render a preview whenever this call qualifies to a
+        // shell tool. `None` for MCP/subagent calls, and for a shell tool
+        // whose arguments/template can't be rendered right now (the actual
+        // failure, if any, surfaces from `shell_tool::call` itself once the
+        // call is allowed to run).
+        let command_preview = shell_tool_set
+            .tool_name(&tool_call.function.name)
+            .and_then(|name| env.file_config.tools.get(name))
+            .and_then(|definition| {
+                shell_tool::preview_argv(definition, &tool_call.function.arguments)
+            });
         decisions.push(
             tool_decision(
                 env,
                 &tool_call.function.name,
                 &tool_call.function.arguments,
+                command_preview.as_deref(),
                 cancellation.clone(),
             )
             .await?,

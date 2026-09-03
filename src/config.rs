@@ -914,14 +914,15 @@ pub(crate) fn global_config_path() -> Result<PathBuf> {
 /// (found by [`ConfigSource::Search`]'s upward walk) into the single
 /// `ConfigFile` every reader sees from here on, with `project` winning
 /// wherever the two overlap. `models:`/`mcp_servers:`/`skills:`/`agents:`/
-/// `prompts:`/`workflows:` merge key by key (a name defined in both keeps
-/// the project definition); `default:` merges field by field the same way;
-/// `base_url` keeps the project value when set, else falls back to the
+/// `prompts:`/`workflows:`/`tools:` merge key by key (a name defined in both
+/// keeps the project definition); `default:` merges field by field the same
+/// way; `base_url` keeps the project value when set, else falls back to the
 /// global one. `api_key`/`api_key_cmd` merge as a single unit (whichever the
 /// project sets, of either, wins as a pair) rather than falling back field
-/// by field — see the comment inline below. Registry paths (`workflows:`/
-/// `agents:`/`skills:`) are
-/// already absolute by this point (each was resolved by
+/// by field — see the comment inline below. `tool_policy`'s `allow`/`deny`
+/// are unioned rather than key-by-key or project-wins — see the comment at
+/// its own merge below for why. Registry paths (`workflows:`/`agents:`/
+/// `skills:`) are already absolute by this point (each was resolved by
 /// `resolve_registry_paths_in_place` right after its own file was parsed —
 /// see `parse_config_file`), so combining the two maps needs no
 /// path-origin tracking.

@@ -79,19 +79,60 @@ pub(crate) fn tools(names: &[String], tools_map: &config::ToolMap) -> Result<Too
     Ok(ToolSet { tools, index })
 }
 
-/// Runs `definition`'s command for one tool call: renders every `command`
-/// element as a handlebars template (see `template::render`) against
-/// `arguments_json` (the model's call arguments, parsed as `{{ input.<field>
-/// }}` — the same `input`/dotted-field access a workflow's own templates
-/// use) and execs the result directly, never through a shell.
+/// Renders `definition.command`'s elements as handlebars templates (see
+/// `template::render`) against `input` (the model's call arguments, exposed
+/// as `{{ input.<field> }}` — the same `input`/dotted-field access a
+/// workflow's own templates use), producing the argv `call` execs. Also used
+/// by `preview_argv`, for `--approve-tools`'s confirmation prompt.
+fn render_argv(
+    definition: &config::ShellToolDefinition,
+    input: &serde_json::Value,
+) -> Result<Vec<String>> {
+    let empty_steps = serde_json::Map::new();
+    let empty_vars = serde_json::Map::new();
+    definition
+        .command
+        .iter()
+        .map(|part| template::render(part, input, &empty_steps, &empty_vars))
+        .collect()
+}
+
+/// A best-effort preview of the argv `call` would actually execute for
+/// `arguments_json`, for `--approve-tools`'s confirmation prompt (see
+/// `engine::tool_decision`) — a user approving a shell tool call needs to see
+/// the real command, not just the model's raw JSON arguments, since a
+/// `command:` template can transform them arbitrarily (e.g. splicing a path
+/// into a larger shell one-liner). `None` when the arguments/template can't
+/// be rendered (invalid JSON, a call that omits a field a template
+/// references) rather than erroring — the prompt still shows the raw
+/// arguments in that case, and the real failure (as an `Ok` result string,
+/// or a hard error for unparseable JSON) surfaces from `call` itself if the
+/// call is actually allowed to run.
+pub(crate) fn preview_argv(
+    definition: &config::ShellToolDefinition,
+    arguments_json: &str,
+) -> Option<String> {
+    let input: serde_json::Value = if arguments_json.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(arguments_json).ok()?
+    };
+    let argv = render_argv(definition, &input).ok()?;
+    Some(format!("{argv:?}"))
+}
+
+/// Runs `definition`'s command for one tool call — see `render_argv` for how
+/// `arguments_json` becomes the argv execed directly, never through a shell.
 ///
-/// Unlike an unknown tool name or malformed call arguments (both bail!,
-/// failing the whole round — a model/config mistake worth surfacing loudly),
-/// the command's own outcome is always turned into an `Ok` result text: a
-/// non-zero exit or a timeout is reported back to the model as an error
-/// string (mirroring how an MCP `tools/call` failure is rendered as text,
-/// not propagated), so a single failed shell call doesn't abort the tool
-/// loop — the model can see what went wrong and try something else.
+/// An unknown tool name or call arguments that aren't valid JSON both bail!,
+/// failing the whole round — a model/config mistake worth surfacing loudly,
+/// matching how `McpRegistry::call` treats the same two cases. Everything
+/// past that point — a `command:` template that fails to render because the
+/// call omitted a field it references, a non-zero exit, a timeout — is
+/// always turned into an `Ok` result text instead (mirroring how an MCP
+/// `tools/call` failure is rendered as text, not propagated), so neither a
+/// template mismatch nor a failed command aborts the tool loop — the model
+/// sees what went wrong and can try something else.
 pub(crate) async fn call(
     definition: &config::ShellToolDefinition,
     arguments_json: &str,
@@ -102,13 +143,10 @@ pub(crate) async fn call(
     } else {
         serde_json::from_str(arguments_json).context("tool call arguments must be a JSON object")?
     };
-    let empty_steps = serde_json::Map::new();
-    let empty_vars = serde_json::Map::new();
-    let argv = definition
-        .command
-        .iter()
-        .map(|part| template::render(part, &input, &empty_steps, &empty_vars))
-        .collect::<Result<Vec<String>>>()?;
+    let argv = match render_argv(definition, &input) {
+        Ok(argv) => argv,
+        Err(error) => return Ok(format!("tool command failed: {error:#}")),
+    };
 
     let timeout_secs = definition.timeout.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS);
     let child_cancel = cancellation
@@ -189,5 +227,28 @@ mod tests {
         definition.timeout = Some(0);
         let output = call(&definition, "{}", None).await.unwrap();
         assert!(output.contains("timed out"), "output: {output}");
+    }
+
+    #[tokio::test]
+    async fn a_template_render_failure_is_reported_as_a_result_string_not_an_error() {
+        // `input.text` is never provided, so `template::render`'s strict
+        // mode fails to resolve it — this must not abort the whole round
+        // just because the model omitted an optional-looking field.
+        let definition = definition(&["echo", "{{ input.text }}"]);
+        let output = call(&definition, "{}", None).await.unwrap();
+        assert!(output.contains("tool command failed"), "output: {output}");
+    }
+
+    #[test]
+    fn preview_argv_renders_the_command_that_would_actually_run() {
+        let definition = definition(&["echo", "{{ input.text }}"]);
+        let preview = preview_argv(&definition, r#"{"text":"hi there"}"#).unwrap();
+        assert_eq!(preview, r#"["echo", "hi there"]"#);
+    }
+
+    #[test]
+    fn preview_argv_is_none_when_the_template_cannot_render() {
+        let definition = definition(&["echo", "{{ input.text }}"]);
+        assert!(preview_argv(&definition, "{}").is_none());
     }
 }
