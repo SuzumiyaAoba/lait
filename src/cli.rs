@@ -56,6 +56,22 @@ pub(crate) struct Cli {
     /// `default.cache` in lait.config.yml.
     #[arg(long, global = true)]
     pub(crate) no_cache: bool,
+
+    /// Before running an MCP/subagent tool the model calls, print its name
+    /// and arguments to stderr and ask on stdin whether to allow it: `y`
+    /// (this call only), `n` (deny this call — the model sees a denial as
+    /// the tool's result and the run continues), or `a` (allow this tool
+    /// name for the rest of the run without asking again). Every call in one
+    /// round is confirmed before any of them run, one at a time, so prompts
+    /// never interleave. A denial from this or from `tool_policy` in
+    /// lait.config.yml (see `crate::config::ToolPolicy`) still lets the tool
+    /// loop continue — only an actual error, or the model giving up, ends
+    /// the run. Requires an interactive stdin; errors immediately otherwise
+    /// (piped/CI input has no one to answer, and there is no way to tell a
+    /// closed pipe from a slow human — see `workflow::ask::run_ask`'s same
+    /// reasoning).
+    #[arg(long, global = true)]
+    pub(crate) approve_tools: bool,
 }
 
 #[derive(Debug, Subcommand)]

@@ -316,6 +316,20 @@ mcp_servers:
   詳しくは [MCP サーバーのツールを使う](./mcp.md#呼び出せるツールを制限するallowed_tools) を
   参照してください。
 
+## `tool_policy`（ツール呼び出しの allow/deny）と `--approve-tools`
+
+トップレベルの `tool_policy:` は、MCP サーバー・サブエージェントを横断してツール呼び出しを
+名前ベースで許可/拒否します。`--approve-tools` は呼び出し直前に対話的に確認します。詳しくは
+[MCP サーバーのツールを使う](./mcp.md#tool_policyallowdeny-と---approve-tools対話的承認) を
+参照してください。
+
+```yaml
+# lait.config.yml
+tool_policy:
+  allow: ["fetch_*"]
+  deny: ["*__delete_*"]
+```
+
 ## 名前付きプロンプト
 
 `prompts:` に名前付きプロンプトを登録すると、`-p/--prompt-name <NAME>`（チャット）または

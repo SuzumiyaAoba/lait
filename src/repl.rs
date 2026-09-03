@@ -66,13 +66,16 @@ pub(crate) async fn run(
     args: ChatReplArgs,
     config_source: ConfigSource,
     cache_override: Option<bool>,
+    approve_tools: bool,
 ) -> Result<()> {
     let mut shared = args.shared;
     let file_config = Arc::new(config::load_config(&config_source)?);
     let mut history = app::load_session_history(shared.session.as_deref())?;
     let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
     let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config)).with_cache(cache_enabled, cache_ttl);
+    let env = AppContext::new(Arc::clone(&file_config))
+        .with_cache(cache_enabled, cache_ttl)
+        .with_approve_tools(approve_tools);
 
     eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
 

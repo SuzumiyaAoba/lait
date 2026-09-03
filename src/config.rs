@@ -165,6 +165,64 @@ pub(crate) struct ConfigFile {
     /// `crate::workflow::resolve_run_target`.
     #[serde(default)]
     pub(crate) workflows: WorkflowMap,
+    /// An allow/deny list gating every MCP/subagent tool call by its
+    /// qualified name (`server__tool`/`agent__name`, the same form
+    /// `mcp::qualify_tool_name` produces), checked in
+    /// `engine::execute_tool_calls` before a call is dispatched — in
+    /// addition to (not instead of) a `mcp_servers.<name>.allowed_tools`
+    /// entry, which only ever restricts that one server's own raw tool
+    /// names. See [`ToolPolicy`].
+    #[serde(default)]
+    pub(crate) tool_policy: ToolPolicy,
+}
+
+/// `tool_policy:` (see [`ConfigFile::tool_policy`]): `deny` is checked
+/// first — a match there rejects the call outright, regardless of `allow`.
+/// Otherwise, an empty `allow` (the default) permits everything; a
+/// non-empty `allow` permits only a qualified name matching one of its
+/// patterns. Each pattern is matched with [`glob_match`] — a literal
+/// name, or one with a single leading/trailing `*`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolPolicy {
+    #[serde(default)]
+    pub(crate) allow: Vec<String>,
+    #[serde(default)]
+    pub(crate) deny: Vec<String>,
+}
+
+impl ToolPolicy {
+    /// Whether `qualified_name` (e.g. `mock__echo`, `agent__researcher`) may
+    /// be called under this policy — see the type's own doc comment for the
+    /// deny-then-allow precedence.
+    pub(crate) fn allows(&self, qualified_name: &str) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|pattern| glob_match(pattern, qualified_name))
+        {
+            return false;
+        }
+        self.allow.is_empty()
+            || self
+                .allow
+                .iter()
+                .any(|pattern| glob_match(pattern, qualified_name))
+    }
+}
+
+/// A minimal glob: `prefix*` (starts-with), `*suffix` (ends-with), or a
+/// literal exact match — deliberately not a general glob (no `?`, no
+/// wildcard elsewhere in the pattern, no crate dependency for this). `*`
+/// alone matches everything (an empty starts-with prefix).
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else {
+        pattern == name
+    }
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
@@ -789,6 +847,16 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
     prompts.extend(project.prompts);
     let mut workflows = global.workflows;
     workflows.extend(project.workflows);
+    // Unioned, not "whichever side is non-empty wins" (like `mcp_servers`'s
+    // per-name merge above, not like `api_key`'s whole-pair merge): a
+    // global `deny` is a safety floor a project should never be able to
+    // silently drop just by defining its own unrelated `allow`/`deny`
+    // entries, and a project's own `allow` is naturally additive on top of
+    // whatever the global config already permits.
+    let mut tool_policy_allow = global.tool_policy.allow;
+    tool_policy_allow.extend(project.tool_policy.allow);
+    let mut tool_policy_deny = global.tool_policy.deny;
+    tool_policy_deny.extend(project.tool_policy.deny);
 
     ConfigFile {
         base_url: project.base_url.or(global.base_url),
@@ -822,6 +890,10 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         agents,
         prompts,
         workflows,
+        tool_policy: ToolPolicy {
+            allow: tool_policy_allow,
+            deny: tool_policy_deny,
+        },
     }
 }
 
@@ -911,8 +983,66 @@ fn load_global_config() -> Result<Option<ConfigFile>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigFile, McpServerConfig, McpTransport, expand_with, resolve_model};
+    use super::{
+        ConfigFile, McpServerConfig, McpTransport, ToolPolicy, expand_with, resolve_model,
+    };
     use std::collections::HashMap;
+
+    #[test]
+    fn tool_policy_allows_everything_by_default() {
+        let policy = ToolPolicy::default();
+        assert!(policy.allows("mock__echo"));
+        assert!(policy.allows("anything"));
+    }
+
+    #[test]
+    fn tool_policy_deny_rejects_a_matching_name_even_if_allow_is_empty() {
+        let policy = ToolPolicy {
+            allow: vec![],
+            deny: vec!["mock__echo".to_owned()],
+        };
+        assert!(!policy.allows("mock__echo"));
+        assert!(policy.allows("mock__other"));
+    }
+
+    #[test]
+    fn tool_policy_non_empty_allow_rejects_an_unlisted_name() {
+        let policy = ToolPolicy {
+            allow: vec!["mock__echo".to_owned()],
+            deny: vec![],
+        };
+        assert!(policy.allows("mock__echo"));
+        assert!(!policy.allows("mock__other"));
+    }
+
+    #[test]
+    fn tool_policy_deny_wins_over_a_matching_allow() {
+        let policy = ToolPolicy {
+            allow: vec!["mock__echo".to_owned()],
+            deny: vec!["mock__echo".to_owned()],
+        };
+        assert!(!policy.allows("mock__echo"));
+    }
+
+    #[test]
+    fn tool_policy_glob_matches_a_trailing_wildcard() {
+        let policy = ToolPolicy {
+            allow: vec!["fetch_*".to_owned()],
+            deny: vec![],
+        };
+        assert!(policy.allows("fetch_url"));
+        assert!(!policy.allows("delete_url"));
+    }
+
+    #[test]
+    fn tool_policy_glob_matches_a_leading_wildcard() {
+        let policy = ToolPolicy {
+            allow: vec![],
+            deny: vec!["*_delete".to_owned()],
+        };
+        assert!(!policy.allows("mock__file_delete"));
+        assert!(policy.allows("mock__file_read"));
+    }
 
     #[test]
     fn resolve_model_rejects_an_empty_model_name() {

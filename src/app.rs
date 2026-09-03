@@ -110,12 +110,22 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     // the match below — same reason `config_source` is built up front here
     // rather than re-derived from `cli` at each call site.
     let cache_override = cache_override(cli.cache, cli.no_cache);
+    let approve_tools = cli.approve_tools;
     match cli.command {
         Some(Command::Run(run_args)) => {
-            run_workflow(run_args, config_source, cache_override, cancel).await
+            run_workflow(
+                run_args,
+                config_source,
+                cache_override,
+                approve_tools,
+                cancel,
+            )
+            .await
         }
         Some(Command::Agent(agent_command)) => match agent_command.action {
-            AgentAction::Run(args) => run_agent(args, config_source, cache_override, cancel).await,
+            AgentAction::Run(args) => {
+                run_agent(args, config_source, cache_override, approve_tools, cancel).await
+            }
             AgentAction::List => bail!("internal error: `agent list` must run on the sync path"),
         },
         Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
@@ -128,14 +138,21 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Chat(chat_repl_args)) => {
-            repl::run(chat_repl_args, config_source, cache_override).await
+            repl::run(chat_repl_args, config_source, cache_override, approve_tools).await
         }
         Some(Command::Prompt(prompt_command)) => match prompt_command.action {
             PromptAction::List => {
                 bail!("internal error: `prompt list` must run on the sync path")
             }
             PromptAction::Run(run_args) => {
-                run_prompt(run_args, config_source, cache_override, cancel).await
+                run_prompt(
+                    run_args,
+                    config_source,
+                    cache_override,
+                    approve_tools,
+                    cancel,
+                )
+                .await
             }
         },
         Some(Command::History(history_args)) => history::run(history_args),
@@ -146,7 +163,16 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Skill(_)) => bail!("internal error: `skill list` must run on the sync path"),
         Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
         Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
-        None => run_chat_or_repl(cli.chat, config_source, cache_override, cancel).await,
+        None => {
+            run_chat_or_repl(
+                cli.chat,
+                config_source,
+                cache_override,
+                approve_tools,
+                cancel,
+            )
+            .await
+        }
     }
 }
 
@@ -193,12 +219,23 @@ async fn run_chat_or_repl(
     chat: ChatArgs,
     config_source: ConfigSource,
     cache_override: Option<bool>,
+    approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use std::io::IsTerminal;
 
     match resolve_input_with_stdin(chat.prompt.clone())? {
-        Some(prompt) => run_chat(chat, prompt, config_source, cache_override, cancel).await,
+        Some(prompt) => {
+            run_chat(
+                chat,
+                prompt,
+                config_source,
+                cache_override,
+                approve_tools,
+                cancel,
+            )
+            .await
+        }
         // `repl::run` deliberately does not receive `cancel`: a
         // `CancellationToken` fires once and stays cancelled forever, but
         // the REPL reuses one `AppContext` across many turns — wiring a
@@ -213,6 +250,7 @@ async fn run_chat_or_repl(
                 },
                 config_source,
                 cache_override,
+                approve_tools,
             )
             .await
         }
@@ -408,6 +446,7 @@ async fn run_chat(
     prompt: String,
     config_source: ConfigSource,
     cache_override: Option<bool>,
+    approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
@@ -442,7 +481,8 @@ async fn run_chat(
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
     let env = AppContext::new(Arc::clone(&file_config))
         .with_cancel(cancel)
-        .with_cache(cache_enabled, cache_ttl);
+        .with_cache(cache_enabled, cache_ttl)
+        .with_approve_tools(approve_tools);
 
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
@@ -548,6 +588,7 @@ async fn run_prompt(
     args: PromptRunArgs,
     config_source: ConfigSource,
     cache_override: Option<bool>,
+    approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
@@ -590,7 +631,8 @@ async fn run_prompt(
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
     let env = AppContext::new(Arc::clone(&file_config))
         .with_cancel(cancel)
-        .with_cache(cache_enabled, cache_ttl);
+        .with_cache(cache_enabled, cache_ttl)
+        .with_approve_tools(approve_tools);
     let response = env
         .finish(settings.complete(
             &env,
@@ -620,6 +662,7 @@ async fn run_agent(
     args: AgentRunArgs,
     config_source: ConfigSource,
     cache_override: Option<bool>,
+    approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
@@ -655,7 +698,8 @@ async fn run_agent(
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
     let env = AppContext::new(Arc::clone(&file_config))
         .with_cancel(cancel)
-        .with_cache(cache_enabled, cache_ttl);
+        .with_cache(cache_enabled, cache_ttl)
+        .with_approve_tools(approve_tools);
     let output = env
         .finish(call_agent(
             &agent_file,
@@ -703,6 +747,7 @@ async fn run_workflow(
     run_args: RunArgs,
     config_source: ConfigSource,
     cache_override: Option<bool>,
+    approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
@@ -816,7 +861,8 @@ async fn run_workflow(
     let env = AppContext::new(Arc::clone(&file_config))
         .with_vars(vars.clone())
         .with_cancel(run_cancel)
-        .with_cache(cache_enabled, cache_ttl);
+        .with_cache(cache_enabled, cache_ttl)
+        .with_approve_tools(approve_tools);
     // Builds one checkpoint snapshot, filling in the fields that stay the
     // same for this whole run (`run_id`/`workflow_path`/`initial_prompt`/
     // `vars`/`top_level_labels`) so each of this run's three save sites below

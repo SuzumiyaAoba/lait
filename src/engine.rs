@@ -24,7 +24,7 @@ use crate::{
     async_io, cache,
     cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
-    llm, mcp, nesting, response, schema, skill, subagent, template, usage, workflow,
+    llm, mcp, nesting, process, response, schema, skill, subagent, template, usage, workflow,
 };
 
 /// The maximum number of tool-call round trips a single completion request
@@ -85,6 +85,18 @@ pub(crate) struct AppContext {
     /// How many seconds a cache hit stays valid, when `cache_enabled`. `None`
     /// means cached responses never expire on their own. See `crate::cache`.
     pub(crate) cache_ttl: Option<u64>,
+    /// Whether `execute_tool_calls` should interactively confirm each tool
+    /// call on stdin/stderr before running it (`--approve-tools`), in
+    /// addition to (never instead of) `file_config.tool_policy`'s allow/deny
+    /// gate. `false` for a caller that never calls `with_approve_tools`.
+    pub(crate) approve_tools: bool,
+    /// Qualified tool names (see `mcp::qualify_tool_name`) the user has
+    /// answered `a` for under `--approve-tools`, so `execute_tool_calls`
+    /// stops asking about that name for the rest of this run. A `Mutex`
+    /// (like `usage`'s own interior mutability) rather than requiring `&mut
+    /// AppContext` — `execute_tool_calls` only ever holds a shared `&
+    /// AppContext`, the same as every other tool-loop call.
+    pub(crate) always_approved_tools: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl AppContext {
@@ -104,6 +116,8 @@ impl AppContext {
             vars: serde_json::Map::new(),
             cache_enabled: false,
             cache_ttl: None,
+            approve_tools: false,
+            always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -121,6 +135,14 @@ impl AppContext {
     pub(crate) fn with_cache(mut self, enabled: bool, ttl: Option<u64>) -> Self {
         self.cache_enabled = enabled;
         self.cache_ttl = ttl;
+        self
+    }
+
+    /// Sets this context's `approve_tools` (see the field doc) — every async
+    /// command handler in `app.rs`/`repl.rs` calls this once, with the value
+    /// `app::run` resolved from `--approve-tools`.
+    pub(crate) fn with_approve_tools(mut self, approve_tools: bool) -> Self {
+        self.approve_tools = approve_tools;
         self
     }
 
@@ -291,6 +313,122 @@ fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<C
     }
 }
 
+/// One tool call's pre-dispatch decision — made for every call in a round
+/// before any of them actually run, see `execute_tool_calls`'s own doc
+/// comment on why this has to happen sequentially and up front rather than
+/// inside the concurrent dispatch below.
+enum ToolDecision {
+    Allow,
+    Deny(String),
+}
+
+/// Checks `qualified_name` against `env.file_config.tool_policy` (see
+/// `config::ToolPolicy`) and, when `env.approve_tools` is set and the policy
+/// didn't already deny it, interactively confirms the call — `y`/`n`/`a`,
+/// via `prompt_tool_approval`. This is the *only* place either gate is
+/// enforced; `McpRegistry::call`'s own `allowed_tools` check still applies
+/// underneath it for an MCP tool (the two are independent, both must pass).
+async fn tool_decision(
+    env: &AppContext,
+    qualified_name: &str,
+    arguments: &str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<ToolDecision> {
+    if !env.file_config.tool_policy.allows(qualified_name) {
+        return Ok(ToolDecision::Deny(format!(
+            "denied by 'tool_policy' in {}",
+            config::CONFIG_FILE_NAME
+        )));
+    }
+    if !env.approve_tools {
+        return Ok(ToolDecision::Allow);
+    }
+    if env
+        .always_approved_tools
+        .lock()
+        .expect("always_approved_tools lock poisoned")
+        .contains(qualified_name)
+    {
+        return Ok(ToolDecision::Allow);
+    }
+    match prompt_tool_approval(qualified_name, arguments, cancellation).await? {
+        ToolApprovalAnswer::Once => Ok(ToolDecision::Allow),
+        ToolApprovalAnswer::Always => {
+            env.always_approved_tools
+                .lock()
+                .expect("always_approved_tools lock poisoned")
+                .insert(qualified_name.to_owned());
+            Ok(ToolDecision::Allow)
+        }
+        ToolApprovalAnswer::Deny => Ok(ToolDecision::Deny(
+            "denied interactively (--approve-tools)".to_owned(),
+        )),
+    }
+}
+
+enum ToolApprovalAnswer {
+    Once,
+    Always,
+    Deny,
+}
+
+/// Prompts on stderr and reads one `y`/`n`/`a` answer from stdin for
+/// `--approve-tools` — see `workflow::ask::run_ask`, whose TTY-detection and
+/// non-interactive-is-an-error reasoning this mirrors exactly (a
+/// non-interactive stdin has no one to answer and no way to tell a closed
+/// pipe from a slow human, so this fails fast rather than hanging or
+/// silently denying). Unlike `run_ask`, there is no `default:` to fall back
+/// to here — `--approve-tools` without a terminal is simply a
+/// misconfiguration to report, not a case with a sensible default answer.
+async fn prompt_tool_approval(
+    name: &str,
+    arguments: &str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<ToolApprovalAnswer> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "'--approve-tools' requires an interactive stdin to confirm calling '{name}', but \
+             stdin is not a terminal"
+        );
+    }
+    eprintln!("tool call: {name}");
+    eprintln!("arguments: {arguments}");
+    eprint!("allow this call? [y(es)/n(o)/a(lways for this tool)] ");
+    let name = name.to_owned();
+    async_io::run_blocking(
+        move |_cancelled| read_tool_approval_answer(&name),
+        cancellation,
+    )
+    .await
+}
+
+/// The blocking half of `prompt_tool_approval`, run on a dedicated thread via
+/// `async_io::run_blocking` the same way `workflow::ask::run_ask`'s own
+/// blocking stdin read is. No re-prompt loop on a bad answer, for the same
+/// reason `ask.rs`'s `validate_choice` doesn't retry: stdin may not be
+/// interactive in every sense, and looping risks hanging rather than ever
+/// finishing.
+fn read_tool_approval_answer(name: &str) -> Result<ToolApprovalAnswer> {
+    use std::io::{BufRead, Write};
+    std::io::stderr().flush().ok();
+    let mut buffer = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut buffer)
+        .context("failed to read from stdin")?;
+    let answer = process::strip_one_trailing_line_ending(buffer);
+    match answer.as_str() {
+        "y" | "Y" => Ok(ToolApprovalAnswer::Once),
+        "a" | "A" => Ok(ToolApprovalAnswer::Always),
+        "n" | "N" => Ok(ToolApprovalAnswer::Deny),
+        other => bail!(
+            "unrecognized answer {other:?} to 'allow this call?' for tool '{name}'; expected \
+             'y', 'n', or 'a'"
+        ),
+    }
+}
+
 /// Appends one round's tool-call turn to `messages`: an `assistant` message
 /// carrying `tool_calls` (plus whatever `content` preceded them, if any),
 /// then the `tool`-role results of actually running each call — against
@@ -300,7 +438,20 @@ fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<C
 /// `response::StreamToolCallAccumulator`, which reassembles a streamed
 /// round's fragments into the same `&[response::ToolCall]` shape a
 /// non-streamed response already carries, so both loops converge on this one
-/// dispatch). A model turn's `tool_calls` are independent by construction (it
+/// dispatch).
+///
+/// Every call is checked against `tool_policy`/`--approve-tools` (see
+/// `tool_decision`) *before* any of them run, one at a time in call order —
+/// deliberately not folded into the concurrent dispatch below, because
+/// `--approve-tools` prompts on stderr/stdin and concurrent prompts for
+/// several calls in the same round would interleave into something
+/// unreadable (and unanswerable). A denied call never reaches
+/// `McpRegistry::call`/`call_subagent_tool` at all; it gets a `tool`-role
+/// message carrying the denial reason instead, so the model sees it as a
+/// failed call and the tool loop continues rather than the whole request
+/// failing.
+///
+/// A model turn's *allowed* calls are independent by construction (it
 /// couldn't have seen one call's result before deciding on another), so
 /// they're run concurrently rather than one at a time; `try_join_all`
 /// preserves `tool_calls`' order regardless of completion order, so the
@@ -319,9 +470,26 @@ async fn execute_tool_calls(
 ) -> Result<()> {
     messages.push(llm::assistant_tool_call_message(tool_calls, content)?);
 
-    let tool_messages =
-        futures_util::future::try_join_all(tool_calls.iter().map(|tool_call| async {
+    let mut decisions = Vec::with_capacity(tool_calls.len());
+    for tool_call in tool_calls {
+        decisions.push(
+            tool_decision(
+                env,
+                &tool_call.function.name,
+                &tool_call.function.arguments,
+                cancellation.clone(),
+            )
+            .await?,
+        );
+    }
+
+    let tool_messages = futures_util::future::try_join_all(tool_calls.iter().zip(decisions).map(
+        |(tool_call, decision)| async {
             let name = &tool_call.function.name;
+            if let ToolDecision::Deny(reason) = decision {
+                tracing::debug!(tool = %name, round, reason = %reason, "tool call denied");
+                return llm::tool_result_message(&tool_call.id, reason);
+            }
             tracing::debug!(
                 tool = %name,
                 arguments = %tool_call.function.arguments,
@@ -350,8 +518,9 @@ async fn execute_tool_calls(
                 bail!("model called unknown tool '{name}'");
             };
             llm::tool_result_message(&tool_call.id, result)
-        }))
-        .await?;
+        },
+    ))
+    .await?;
     messages.extend(tool_messages);
     Ok(())
 }
