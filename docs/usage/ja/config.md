@@ -161,6 +161,36 @@ models:
   パス、`default.system`、ワークフローの `prompt:`/`system_prompt:` には**この展開は適用されません**
   （こちらは `--var`/handlebars のテンプレート変数で渡してください）。
 
+## `api_key_cmd` による外部コマンドからのシークレット取得
+
+`${VAR_NAME}` 展開はシェル側で環境変数を事前に export しておく前提ですが、
+`api_key_cmd` を使うと 1Password・pass・gopass・aws secretsmanager などの
+シークレットマネージャーから API キーをその場で取得できます。トップレベルの
+`api_key_cmd`、および `models:` の `provider.api_key_cmd` に指定でき、
+`api_key`（`provider.api_key`）と同時に指定するとエラーになります。
+
+```yaml
+# lait.config.yml
+models:
+  gpt-4o:
+    - provider:
+        base_url: https://api.openai.com/v1
+        api_key_cmd: "op read op://Personal/OpenAI/api-key"   # 1Password CLI の例
+      model_id: gpt-4o
+```
+
+- 文字列を指定するとシェル経由（`sh -c`。Windows では `cmd /C`）で実行され、パイプや
+  クォート、`$VAR` 展開が使えます。YAML の配列で指定すると、シェルを介さず直接
+  実行されます（`api_key_cmd: ["op", "read", "op://Personal/OpenAI/api-key"]`）。
+- コマンドは実際にリクエストを送る際に一度だけ実行され、その結果（stdout の末尾改行を
+  除いたもの）はプロセスの実行中キャッシュされます。ワークフローのステップや
+  `for_each` の反復のたびに再実行されることはありません。
+- 標準出力が空、または終了コードが非 0 の場合は、標準エラー出力を含む分かりやすい
+  エラーになります。
+- `lait models`（`--remote` なし）でのモデル一覧表示ではコマンドは実行されません
+  （実際にリクエストを送る経路でのみ実行されます）。`lait lint` は `api_key`/
+  `api_key_cmd` の同時指定だけを静的にチェックします。
+
 ## `.env` ファイルの自動読み込み
 
 起動時にカレントディレクトリの `.env` ファイルが自動で読み込まれ、**未設定の環境変数のみ**が

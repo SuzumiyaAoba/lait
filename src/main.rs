@@ -29,6 +29,7 @@ mod repl;
 mod report;
 mod response;
 mod schema;
+mod secret;
 mod session;
 mod signal;
 mod skill;

@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::cli::{Cli, ReasoningEffort};
+use crate::{
+    cli::{Cli, ReasoningEffort},
+    secret,
+};
 
 pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
 
@@ -127,6 +130,13 @@ pub(crate) fn print_registry_entry(name: &str, path: &Path, loaded: Result<Optio
 pub(crate) struct ConfigFile {
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
+    /// Runs an external command once to obtain the top-level API key instead
+    /// of embedding it in plaintext (or requiring a pre-exported environment
+    /// variable, like `${VAR}` does) — e.g. a secrets-manager CLI (1Password,
+    /// pass, gopass, aws secretsmanager, ...). Mutually exclusive with
+    /// `api_key`; see `resolve_endpoint`, which enforces that and runs
+    /// whichever layer's command actually wins. See `secret::resolve`.
+    pub(crate) api_key_cmd: Option<CommandSpec>,
     #[serde(default)]
     pub(crate) default: DefaultSettings,
     #[serde(default)]
@@ -360,6 +370,24 @@ pub(crate) struct ModelDefinition {
 struct ProviderConfig {
     base_url: String,
     api_key: Option<String>,
+    /// See `ConfigFile::api_key_cmd`; mutually exclusive with `api_key` at
+    /// this same provider level (a model definition may still fall back to
+    /// the top-level `api_key`/`api_key_cmd` when it sets neither — see
+    /// `resolve_endpoint`).
+    api_key_cmd: Option<CommandSpec>,
+}
+
+/// One `api_key_cmd:` value (top-level or `provider.api_key_cmd`): either a
+/// shell-interpreted string — run via `sh -c` (`cmd /C` on Windows), so
+/// pipes/quoting/subshells work the way a one-liner like `op read
+/// op://Personal/OpenAI/api-key` expects — or a literal argv list, run
+/// directly with no shell involved, for a command whose arguments should
+/// never be shell-interpreted. See `secret::resolve`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum CommandSpec {
+    Shell(String),
+    Argv(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -367,10 +395,64 @@ pub(crate) struct ResolvedModel {
     pub(crate) model_id: String,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
+    pub(crate) api_key_cmd: Option<CommandSpec>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) temperature: Option<f64>,
     pub(crate) top_p: Option<f64>,
     pub(crate) max_tokens: Option<u32>,
+}
+
+/// Rejects `api_key`/`api_key_cmd` set together at the same config layer —
+/// checked eagerly wherever a layer's `ResolvedModel`/endpoint is built
+/// (`resolve_model_alias` for a model definition's `provider.*`,
+/// `resolve_endpoint` for the top-level `ConfigFile`), not just when that
+/// layer actually ends up being used, so a misconfigured layer is never
+/// hidden by a CLI/model-layer override taking precedence over it. `context`
+/// names the layer for the error message (e.g. `"model definition
+/// \"cloud\""`, `"top-level configuration"`).
+fn check_api_key_source(
+    api_key: &Option<String>,
+    api_key_cmd: &Option<CommandSpec>,
+    context: &str,
+) -> Result<()> {
+    if api_key.is_some() && api_key_cmd.is_some() {
+        bail!("{context} sets both 'api_key' and 'api_key_cmd'; set exactly one");
+    }
+    Ok(())
+}
+
+/// `lait lint`'s view of [`check_api_key_source`]: checks the top-level
+/// `api_key`/`api_key_cmd` pair and every `models:` entry's own
+/// `provider.api_key`/`provider.api_key_cmd`, returning one message per
+/// violation (empty when there are none) instead of bailing on the first —
+/// unlike `resolve_model_alias`/`resolve_endpoint`, which only ever validate
+/// whichever single alias/layer a particular run actually resolves, so a
+/// mistake in an alias/layer that CLI overrides currently shadow would
+/// otherwise go unnoticed until someone removes the override.
+pub(crate) fn check_provider_api_key_sources(config: &ConfigFile) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = check_api_key_source(
+        &config.api_key,
+        &config.api_key_cmd,
+        "top-level configuration",
+    ) {
+        errors.push(error.to_string());
+    }
+    let mut names: Vec<&String> = config.models.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let Some(definition) = config.models[name].first() else {
+            continue;
+        };
+        if let Err(error) = check_api_key_source(
+            &definition.provider.api_key,
+            &definition.provider.api_key_cmd,
+            &format!("model definition {name:?}"),
+        ) {
+            errors.push(error.to_string());
+        }
+    }
+    errors
 }
 
 /// Resolves `model_name` against a single alias map, returning `Ok(None)` when the
@@ -389,11 +471,17 @@ pub(crate) fn resolve_model_alias(
     if definition.model_id.trim().is_empty() {
         bail!("model_id in model definition {model_name:?} must not be empty");
     }
+    check_api_key_source(
+        &definition.provider.api_key,
+        &definition.provider.api_key_cmd,
+        &format!("model definition {model_name:?}"),
+    )?;
 
     Ok(Some(ResolvedModel {
         model_id: definition.model_id.clone(),
         base_url: Some(definition.provider.base_url.clone()),
         api_key: definition.provider.api_key.clone(),
+        api_key_cmd: definition.provider.api_key_cmd.clone(),
         reasoning_effort: definition.default_reasoning_effort,
         temperature: definition.default_temperature,
         top_p: definition.default_top_p,
@@ -417,6 +505,7 @@ pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<R
         model_id: model_name,
         base_url: None,
         api_key: None,
+        api_key_cmd: None,
         reasoning_effort: None,
         temperature: None,
         top_p: None,
@@ -443,15 +532,24 @@ pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 /// top-level — falling back to `DEFAULT_BASE_URL`, normalizing the trailing
 /// slash, and rejecting an empty base URL. `${VAR}` placeholders are only
 /// expanded in the config-sourced layers (see `expand_env_placeholders`),
-/// never in an override, which the shell already expands on its own. The API
-/// key comes back as `None` when no layer sets one — `resolve_request_settings`
-/// substitutes its dummy key, `lait models --remote` sends no Authorization
-/// header at all.
+/// never in an override, which the shell already expands on its own.
+///
+/// The API key follows the same three layers, except each of the two
+/// config-sourced ones (`model_api_key`/`model_api_key_cmd`,
+/// `file_config.api_key`/`file_config.api_key_cmd`) may set a literal value
+/// *or* an `api_key_cmd` to run for it — never both (`check_api_key_source`
+/// rejects that regardless of which layer ends up winning). Only the winning
+/// layer's command, if any, is actually run — `secret::resolve` caches by
+/// command, but there is no reason to run a losing layer's command at all.
+/// The result comes back as `None` when no layer sets a key —
+/// `resolve_request_settings` substitutes its dummy key, `lait models
+/// --remote` sends no Authorization header at all.
 pub(crate) fn resolve_endpoint(
     base_url_override: Option<String>,
     api_key_override: Option<String>,
     model_base_url: Option<&str>,
     model_api_key: Option<&str>,
+    model_api_key_cmd: Option<&CommandSpec>,
     file_config: &ConfigFile,
 ) -> Result<(String, Option<String>)> {
     let model_base_url = model_base_url.map(expand_env_placeholders).transpose()?;
@@ -468,13 +566,25 @@ pub(crate) fn resolve_endpoint(
     if base_url.is_empty() {
         return Err(anyhow!("base URL must not be empty"));
     }
-    let model_api_key = model_api_key.map(expand_env_placeholders).transpose()?;
-    let config_api_key = file_config
-        .api_key
-        .as_deref()
-        .map(expand_env_placeholders)
-        .transpose()?;
-    let api_key = api_key_override.or(model_api_key).or(config_api_key);
+
+    check_api_key_source(
+        &file_config.api_key,
+        &file_config.api_key_cmd,
+        "top-level configuration",
+    )?;
+    let api_key = if let Some(api_key) = api_key_override {
+        Some(api_key)
+    } else if let Some(model_api_key) = model_api_key {
+        Some(expand_env_placeholders(model_api_key)?)
+    } else if let Some(command) = model_api_key_cmd {
+        Some(secret::resolve(command)?)
+    } else if let Some(config_api_key) = file_config.api_key.as_deref() {
+        Some(expand_env_placeholders(config_api_key)?)
+    } else if let Some(command) = &file_config.api_key_cmd {
+        Some(secret::resolve(command)?)
+    } else {
+        None
+    };
     Ok((base_url, api_key))
 }
 
@@ -546,13 +656,28 @@ pub(crate) fn global_config_path() -> Result<PathBuf> {
 /// wherever the two overlap. `models:`/`mcp_servers:`/`skills:`/`agents:`/
 /// `prompts:`/`workflows:` merge key by key (a name defined in both keeps
 /// the project definition); `default:` merges field by field the same way;
-/// `base_url`/`api_key` keep the project value when set, else fall back to
-/// the global one. Registry paths (`workflows:`/`agents:`/`skills:`) are
+/// `base_url` keeps the project value when set, else falls back to the
+/// global one. `api_key`/`api_key_cmd` merge as a single unit (whichever the
+/// project sets, of either, wins as a pair) rather than falling back field
+/// by field — see the comment inline below. Registry paths (`workflows:`/
+/// `agents:`/`skills:`) are
 /// already absolute by this point (each was resolved by
 /// `resolve_registry_paths_in_place` right after its own file was parsed —
 /// see `parse_config_file`), so combining the two maps needs no
 /// path-origin tracking.
 fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
+    // `api_key`/`api_key_cmd` are one logical "how do we get the top-level
+    // key" choice, not two independently-falling-back fields — merging them
+    // separately could pair the project's `api_key` with the global's
+    // `api_key_cmd` (or vice versa), tripping `check_api_key_source`'s
+    // both-set rejection even though neither file alone set both. Whichever
+    // file actually set either field wins that file's whole pair.
+    let (api_key, api_key_cmd) = if project.api_key.is_some() || project.api_key_cmd.is_some() {
+        (project.api_key, project.api_key_cmd)
+    } else {
+        (global.api_key, global.api_key_cmd)
+    };
+
     let mut models = global.models;
     models.extend(project.models);
     let mut mcp_servers = global.mcp_servers;
@@ -568,7 +693,8 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
 
     ConfigFile {
         base_url: project.base_url.or(global.base_url),
-        api_key: project.api_key.or(global.api_key),
+        api_key,
+        api_key_cmd,
         default: DefaultSettings {
             model: project.default.model.or(global.default.model),
             reasoning_effort: project

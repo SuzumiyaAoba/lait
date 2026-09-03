@@ -125,6 +125,7 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     } else {
         check_workflows_registry(&file_config)
     };
+    let api_key_sources_ok = check_provider_api_key_sources(&file_config);
     for file in &lint_args.files {
         // `lint_file` only ever returns `Err` for a file whose type it can't
         // determine (an unrecognized extension) — treated here as one more
@@ -152,9 +153,9 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
         }
     }
 
-    if failed_files > 0 || !registry_ok {
+    if failed_files > 0 || !registry_ok || !api_key_sources_ok {
         bail!(
-            "{failed_files} of {} file(s) had errors{}",
+            "{failed_files} of {} file(s) had errors{}{}",
             lint_args.files.len(),
             if registry_ok {
                 String::new()
@@ -163,10 +164,34 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
                     "; {} 'workflows:' also has errors",
                     config::CONFIG_FILE_NAME
                 )
+            },
+            if api_key_sources_ok {
+                String::new()
+            } else {
+                format!(
+                    "; {} api_key/api_key_cmd also has errors",
+                    config::CONFIG_FILE_NAME
+                )
             }
         );
     }
     Ok(())
+}
+
+/// Checks the top-level and every `models:` entry's `api_key`/`api_key_cmd`
+/// pair for the both-set conflict `resolve_model_alias`/`resolve_endpoint`
+/// reject at resolve time (see `config::check_provider_api_key_sources`),
+/// printing one line per violation. Returns whether every pair was valid.
+fn check_provider_api_key_sources(file_config: &ConfigFile) -> bool {
+    let errors = config::check_provider_api_key_sources(file_config);
+    if errors.is_empty() {
+        return true;
+    }
+    println!("{} (api_key/api_key_cmd:):", config::CONFIG_FILE_NAME);
+    for error in &errors {
+        println!("  error: {error}");
+    }
+    false
 }
 
 /// Checks that every `workflows:` entry in `file_config` resolves to a file

@@ -342,3 +342,26 @@ fn lint_flags_an_empty_command_program() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("command[0]"), "stdout: {stdout}");
 }
+
+#[test]
+fn lint_flags_a_model_definition_with_both_api_key_and_api_key_cmd() {
+    let config = ConfigDirectory::new(
+        "models:\n  cloud:\n    - provider:\n        base_url: https://api.example.com/v1\n        api_key: plain-key\n        api_key_cmd: \"printf x\"\n      model_id: cloud-model\n",
+    );
+    let workflow =
+        WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n");
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("lint")
+        .arg(&workflow.path)
+        .output()
+        .expect("failed to execute lait lint");
+
+    assert!(!output.status.success(), "expected lint to fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("cloud") && stdout.contains("api_key") && stdout.contains("api_key_cmd"),
+        "stdout: {stdout}"
+    );
+}

@@ -207,6 +207,7 @@ async fn list_remote(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> 
         args.endpoint.api_key.clone(),
         None,
         None,
+        None,
         file_config,
     )?;
 

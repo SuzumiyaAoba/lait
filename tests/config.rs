@@ -762,6 +762,116 @@ fn no_config_ignores_the_global_config_too() {
 }
 
 #[test]
+fn api_key_cmd_provides_the_authorization_header() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"config-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "default:\n  model: config-model\nbase_url: \"{}\"\napi_key_cmd: \"printf secret-from-cmd\"\n",
+        server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer secret-from-cmd"),
+        "headers: {}",
+        request.headers
+    );
+}
+
+#[test]
+fn api_key_cmd_as_an_argv_list_runs_without_a_shell() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"config-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "default:\n  model: config-model\nbase_url: \"{}\"\napi_key_cmd: [\"printf\", \"argv-secret\"]\n",
+        server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer argv-secret"),
+        "headers: {}",
+        request.headers
+    );
+}
+
+#[test]
+fn api_key_and_api_key_cmd_together_is_a_clear_error() {
+    let config = ConfigDirectory::new(
+        "default:\n  model: config-model\napi_key: plain-key\napi_key_cmd: \"printf x\"\n",
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(!output.status.success(), "expected the request to fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("api_key") && stderr.contains("api_key_cmd"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn model_definition_api_key_cmd_overrides_the_top_level_api_key() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"resolved-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "default:\n  model: local-alias\napi_key: top-level-key\nmodels:\n  local-alias:\n    - provider:\n        base_url: \"{}\"\n        api_key_cmd: \"printf model-secret\"\n      model_id: resolved-model\n",
+        server.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer model-secret"),
+        "headers: {}",
+        request.headers
+    );
+}
+
+#[test]
 fn agent_list_shows_a_globally_registered_agent() {
     let global = GlobalConfigDirectory::new("agents:\n  greeter: ./agents/greeter.md\n");
     let agents_dir = global.config_dir().join("agents");

@@ -902,6 +902,7 @@ pub(crate) fn resolve_request_settings(
         api_key_override,
         resolved_model.base_url.as_deref(),
         resolved_model.api_key.as_deref(),
+        resolved_model.api_key_cmd.as_ref(),
         file_config,
     )?;
     let api_key = api_key.unwrap_or_else(|| {
