@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ChatCompletionResponse {
     choices: Vec<ChatCompletionChoice>,
     /// The token counts the server reported for this request, when it did —
@@ -51,12 +51,12 @@ impl std::fmt::Display for Usage {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChatCompletionChoice {
     message: ChatCompletionResponseMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ChatCompletionResponseMessage {
     content: Option<String>,
     reasoning: Option<String>,
@@ -73,13 +73,13 @@ pub(crate) struct ChatCompletionResponseMessage {
 /// completions shape (`{"id", "type": "function", "function": {"name",
 /// "arguments"}}`). `arguments` is the raw JSON text the model produced, not
 /// yet parsed — parsing/validating it is `McpRegistry::call`'s job.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ToolCall {
     pub(crate) id: String,
     pub(crate) function: ToolCallFunction,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ToolCallFunction {
     pub(crate) name: String,
     pub(crate) arguments: String,

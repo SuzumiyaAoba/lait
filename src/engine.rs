@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 
 use crate::{
     agent::AgentFile,
-    async_io,
+    async_io, cache,
     cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
     llm, mcp, nesting, response, schema, skill, subagent, template, usage, workflow,
@@ -74,6 +74,17 @@ pub(crate) struct AppContext {
     /// `$vars.<key>`. Empty for every caller but `app::run_workflow` — see
     /// `with_vars`.
     pub(crate) vars: serde_json::Map<String, serde_json::Value>,
+    /// Whether `complete_recorded` should check/populate the response disk
+    /// cache (`--cache`/`default.cache`, see `crate::cache`) for this
+    /// invocation. `false` (the default) for a caller that never calls
+    /// `with_cache` — resolved once per invocation, from the same CLI/config
+    /// precedence for every caller (`app::run`), so a workflow's subagent
+    /// calls and a nested `workflow:` call all inherit it unchanged, the
+    /// same way `cancel` does.
+    pub(crate) cache_enabled: bool,
+    /// How many seconds a cache hit stays valid, when `cache_enabled`. `None`
+    /// means cached responses never expire on their own. See `crate::cache`.
+    pub(crate) cache_ttl: Option<u64>,
 }
 
 impl AppContext {
@@ -91,6 +102,8 @@ impl AppContext {
             usage: usage::UsageTally::default(),
             cancel: None,
             vars: serde_json::Map::new(),
+            cache_enabled: false,
+            cache_ttl: None,
         }
     }
 
@@ -98,6 +111,16 @@ impl AppContext {
     /// use in a builder chain at the call site (`app::run_workflow`).
     pub(crate) fn with_vars(mut self, vars: serde_json::Map<String, serde_json::Value>) -> Self {
         self.vars = vars;
+        self
+    }
+
+    /// Sets this context's `cache_enabled`/`cache_ttl` (see the field docs) —
+    /// every async command handler in `app.rs`/`repl.rs` calls this once,
+    /// right where it builds the context, with the value `app::run` resolved
+    /// from `--cache`/`--no-cache`/`default.cache`/`default.cache_ttl`.
+    pub(crate) fn with_cache(mut self, enabled: bool, ttl: Option<u64>) -> Self {
+        self.cache_enabled = enabled;
+        self.cache_ttl = ttl;
         self
     }
 
@@ -546,12 +569,22 @@ impl RequestSettings {
         }
     }
 
-    /// The one way `complete` sends a request: builds it via `request`,
-    /// awaits it, and records the response's usage under
+    /// The one way `complete` sends a request: checks the response disk
+    /// cache first when `env.cache_enabled` (see `crate::cache` and
+    /// `docs/usage/ja/config.md`'s キャッシュ section — a hit skips the
+    /// network entirely and is *not* recorded in `--show-usage`, since no
+    /// request was actually sent), otherwise builds the request via
+    /// `request`, awaits it, records the response's usage under
     /// `self.usage_label` — so no future call site can forget the recording
-    /// and skew `--show-usage`. Tries `self.fallback_candidates` in order
-    /// after a retryable failure (see `is_fallback_eligible`/
-    /// `advance_to_next_candidate`) before giving up.
+    /// and skew `--show-usage` — and, still only on a cache-enabled miss,
+    /// writes the response back to the cache. Tries `self.fallback_candidates`
+    /// in order after a retryable failure (see `is_fallback_eligible`/
+    /// `advance_to_next_candidate`) before giving up. The cache key is
+    /// always computed from the *primary* endpoint (`self.base_url`/
+    /// `self.resolved_model.model_id`), never whichever fallback candidate
+    /// actually served the request — the cache represents "what would this
+    /// logical request return", not which of possibly several endpoints
+    /// happened to answer it.
     async fn complete_recorded(
         &self,
         env: &AppContext,
@@ -560,6 +593,34 @@ impl RequestSettings {
         tools: &[ChatCompletionTools],
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
+        let cache_key = if env.cache_enabled {
+            Some(cache::key(
+                &self.base_url,
+                &self.resolved_model.model_id,
+                self.sampling,
+                &messages,
+                tools,
+                response_format.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        if let Some(cache_key) = &cache_key {
+            match cache::load(cache_key, env.cache_ttl) {
+                Ok(Some(response)) => {
+                    eprintln!("note: cache hit for {}", self.usage_label);
+                    tracing::debug!(cache_key = %cache_key, "response cache hit");
+                    return Ok(response);
+                }
+                Ok(None) => tracing::debug!(cache_key = %cache_key, "response cache miss"),
+                Err(error) => tracing::debug!(
+                    cache_key = %cache_key,
+                    error = %error,
+                    "failed to read response cache entry; treating it as a miss",
+                ),
+            }
+        }
+
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
         loop {
@@ -573,6 +634,11 @@ impl RequestSettings {
             match llm::complete(request).await {
                 Ok(response) => {
                     env.usage.record_response(&self.usage_label, &response);
+                    if let Some(cache_key) = &cache_key
+                        && let Err(error) = cache::save(cache_key, &response)
+                    {
+                        tracing::debug!(error = %error, "failed to write response cache entry");
+                    }
                     return Ok(response);
                 }
                 Err(error) if is_fallback_eligible(&error) => {

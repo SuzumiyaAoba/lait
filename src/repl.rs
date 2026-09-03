@@ -62,12 +62,17 @@ pub(crate) fn parse_meta_command(line: &str) -> Option<MetaCommand<'_>> {
 /// explicit `/exit`). See `parse_meta_command` for the `/exit`/`/clear`/
 /// `/model`/`/system` syntax handled below. Also reached from a prompt-less,
 /// stdin-is-a-terminal bare `lait` invocation — see `app::run_chat_or_repl`.
-pub(crate) async fn run(args: ChatReplArgs, config_source: ConfigSource) -> Result<()> {
+pub(crate) async fn run(
+    args: ChatReplArgs,
+    config_source: ConfigSource,
+    cache_override: Option<bool>,
+) -> Result<()> {
     let mut shared = args.shared;
     let file_config = Arc::new(config::load_config(&config_source)?);
     let mut history = app::load_session_history(shared.session.as_deref())?;
     let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
-    let env = AppContext::new(Arc::clone(&file_config));
+    let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);
+    let env = AppContext::new(Arc::clone(&file_config)).with_cache(cache_enabled, cache_ttl);
 
     eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
 

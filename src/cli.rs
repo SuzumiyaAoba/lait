@@ -41,6 +41,21 @@ pub(crate) struct Cli {
     /// `crate::logging`.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
+
+    /// Cache completion responses under `.lait/cache/`, keyed by the
+    /// request's base URL/model/sampling/messages/tools/response format (not
+    /// the API key). A hit skips the network call entirely and prints a
+    /// `note:` to stderr. Falls back to `default.cache` in lait.config.yml
+    /// when neither this nor `--no-cache` is passed; off by default.
+    /// Streamed (`--stream`) responses are never cached. See
+    /// `crate::cache`.
+    #[arg(long, global = true, conflicts_with = "no_cache")]
+    pub(crate) cache: bool,
+
+    /// Never use or write the response disk cache, overriding
+    /// `default.cache` in lait.config.yml.
+    #[arg(long, global = true)]
+    pub(crate) no_cache: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -88,6 +103,20 @@ pub(crate) enum Command {
     /// List or inspect checkpointed `lait run --checkpoint` runs
     /// (`.lait/runs/`), resumable with `lait run ... --resume <RUN_ID>`.
     Runs(RunsCommand),
+    /// Manage the response disk cache (`.lait/cache/`, see `--cache`).
+    Cache(CacheCommand),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CacheCommand {
+    #[command(subcommand)]
+    pub(crate) action: CacheAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CacheAction {
+    /// Delete every cached response under `.lait/cache/`.
+    Clear,
 }
 
 #[derive(Debug, Args)]

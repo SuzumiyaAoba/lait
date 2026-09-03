@@ -208,6 +208,15 @@ pub(crate) struct DefaultSettings {
     /// set to `false` here), when `--no-history` isn't passed. See
     /// `crate::history`.
     pub(crate) history: Option<bool>,
+    /// Whether to cache completion responses on disk under `.lait/cache/` by
+    /// default (`false` unless set to `true` here), when neither
+    /// `--cache`/`--no-cache` is passed. See `crate::cache`.
+    pub(crate) cache: Option<bool>,
+    /// How many seconds a cached response stays valid, when set. A cache hit
+    /// older than this is treated as a miss (the request is sent for real
+    /// and the cache entry is refreshed). `None` (the default) means cached
+    /// responses never expire on their own. See `crate::cache`.
+    pub(crate) cache_ttl: Option<u64>,
 }
 
 /// A map of `mcp_servers:` name to its connection settings, as used by
@@ -423,12 +432,18 @@ fn check_api_key_source(
 
 /// `lait lint`'s view of [`check_api_key_source`]: checks the top-level
 /// `api_key`/`api_key_cmd` pair and every `models:` entry's own
-/// `provider.api_key`/`provider.api_key_cmd`, returning one message per
-/// violation (empty when there are none) instead of bailing on the first —
-/// unlike `resolve_model_alias`/`resolve_endpoint`, which only ever validate
-/// whichever single alias/layer a particular run actually resolves, so a
-/// mistake in an alias/layer that CLI overrides currently shadow would
-/// otherwise go unnoticed until someone removes the override.
+/// `provider.api_key`/`provider.api_key_cmd` — including fallback (2nd and
+/// later) definitions in a `models:` alias, which `resolve_model_alias`
+/// itself never validates since a run only resolves the first entry up
+/// front (see `resolve_model_fallbacks`, which validates a fallback entry
+/// lazily, only once that entry is actually attempted) — returning one
+/// message per violation (empty when there are none) instead of bailing on
+/// the first. Unlike `resolve_model_alias`/`resolve_endpoint`, which only
+/// ever validate whichever single alias/layer a particular run actually
+/// resolves, so a mistake in an alias/layer that CLI overrides currently
+/// shadow, or in a fallback entry the primary endpoint never fails over to,
+/// would otherwise go unnoticed until it actually gets used — potentially in
+/// production rather than at `lait lint` time.
 pub(crate) fn check_provider_api_key_sources(config: &ConfigFile) -> Vec<String> {
     let mut errors = Vec::new();
     if let Err(error) = check_api_key_source(
@@ -441,15 +456,19 @@ pub(crate) fn check_provider_api_key_sources(config: &ConfigFile) -> Vec<String>
     let mut names: Vec<&String> = config.models.keys().collect();
     names.sort_unstable();
     for name in names {
-        let Some(definition) = config.models[name].first() else {
-            continue;
-        };
-        if let Err(error) = check_api_key_source(
-            &definition.provider.api_key,
-            &definition.provider.api_key_cmd,
-            &format!("model definition {name:?}"),
-        ) {
-            errors.push(error.to_string());
+        for (index, definition) in config.models[name].iter().enumerate() {
+            let context = if index == 0 {
+                format!("model definition {name:?}")
+            } else {
+                format!("model definition {name:?}'s fallback entry #{}", index + 1)
+            };
+            if let Err(error) = check_api_key_source(
+                &definition.provider.api_key,
+                &definition.provider.api_key_cmd,
+                &context,
+            ) {
+                errors.push(error.to_string());
+            }
         }
     }
     errors
@@ -801,6 +820,8 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
             subagents: project.default.subagents.or(global.default.subagents),
             render: project.default.render.or(global.default.render),
             history: project.default.history.or(global.default.history),
+            cache: project.default.cache.or(global.default.cache),
+            cache_ttl: project.default.cache_ttl.or(global.default.cache_ttl),
         },
         models,
         mcp_servers,

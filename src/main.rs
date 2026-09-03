@@ -5,6 +5,7 @@ mod agent;
 mod app;
 mod async_io;
 mod attachment;
+mod cache;
 mod checkpoint;
 mod cli;
 mod config;

@@ -8,6 +8,7 @@
 # APM dependencies
 apm_modules/
 
-# Project-local runtime state: --session conversation logs (.lait/sessions/)
-# and --checkpoint/--resume run state (.lait/runs/)
+# Project-local runtime state: --session conversation logs (.lait/sessions/),
+# --checkpoint/--resume run state (.lait/runs/), and the response disk cache
+# (.lait/cache/, see --cache)
 .lait/
