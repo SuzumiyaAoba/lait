@@ -1,6 +1,8 @@
 mod support;
 
-use support::{ConfigDirectory, MockServer, test_command, without_json_whitespace};
+use support::{
+    ConfigDirectory, GlobalConfigDirectory, MockServer, test_command, without_json_whitespace,
+};
 
 #[test]
 fn loads_options_from_cwd_config_when_cli_and_environment_are_unset() {
@@ -617,4 +619,169 @@ fn dash_dash_config_conflicts_with_no_config() {
         !output.status.success(),
         "expected --config and --no-config together to be a usage error"
     );
+}
+
+#[test]
+fn global_config_alone_resolves_a_model() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"global-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let global = GlobalConfigDirectory::new(&format!(
+        "default:\n  model: global-model\nbase_url: \"{}\"\n",
+        server.base_url
+    ));
+    // No project lait.config.yml anywhere in this cwd's ancestry — the
+    // global file alone must be enough to resolve a model.
+    let cwd = ConfigDirectory::empty();
+
+    let output = test_command()
+        .current_dir(cwd.path())
+        .env("XDG_CONFIG_HOME", global.xdg_config_home())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"global-model""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn project_config_overrides_a_same_named_global_default() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"project-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    // The global file sets both `default.model` and `base_url`; the project
+    // file only overrides the model, so the base_url merge (falling back to
+    // the global value) is exercised too.
+    let global = GlobalConfigDirectory::new(&format!(
+        "default:\n  model: global-model\nbase_url: \"{}\"\n",
+        server.base_url
+    ));
+    let project = ConfigDirectory::new("default:\n  model: project-model\n");
+
+    let output = test_command()
+        .current_dir(project.path())
+        .env("XDG_CONFIG_HOME", global.xdg_config_home())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"project-model""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn dash_dash_config_does_not_read_the_global_config() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"explicit-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    // If `--config` leaked into merging with the global file, the request
+    // would carry `global-model` instead.
+    let global = GlobalConfigDirectory::new("default:\n  model: global-model\n");
+    let explicit_config = ConfigDirectory::new(&format!(
+        "default:\n  model: explicit-model\nbase_url: \"{}\"\n",
+        server.base_url
+    ));
+    let cwd = ConfigDirectory::empty();
+
+    let output = test_command()
+        .current_dir(cwd.path())
+        .env("XDG_CONFIG_HOME", global.xdg_config_home())
+        .args(["--config"])
+        .arg(explicit_config.config_path())
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"explicit-model""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn no_config_ignores_the_global_config_too() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let global = GlobalConfigDirectory::new(&format!(
+        "default:\n  model: global-model\nbase_url: \"{}\"\napi_key: global-key\n",
+        server.base_url
+    ));
+    let cwd = ConfigDirectory::empty();
+
+    let output = test_command()
+        .current_dir(cwd.path())
+        .env("XDG_CONFIG_HOME", global.xdg_config_home())
+        .args([
+            "--no-config",
+            "--model",
+            "cli-model",
+            "--base-url",
+            server.base_url.as_str(),
+            "--api-key",
+            "cli-key",
+            "hello",
+        ])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert!(
+        !request.headers.to_ascii_lowercase().contains("global-key"),
+        "expected --no-config to ignore the global config's api_key, headers: {}",
+        request.headers
+    );
+    let body = without_json_whitespace(&request.body);
+    assert!(
+        body.contains(r#""model":"cli-model""#),
+        "request body: {body}"
+    );
+}
+
+#[test]
+fn agent_list_shows_a_globally_registered_agent() {
+    let global = GlobalConfigDirectory::new("agents:\n  greeter: ./agents/greeter.md\n");
+    let agents_dir = global.config_dir().join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("failed to create test agents directory");
+    std::fs::write(
+        agents_dir.join("greeter.md"),
+        "---\ndescription: greets the user\n---\nHello {{ input }}\n",
+    )
+    .expect("failed to write test agent file");
+    let cwd = ConfigDirectory::empty();
+
+    let output = test_command()
+        .current_dir(cwd.path())
+        .env("XDG_CONFIG_HOME", global.xdg_config_home())
+        .args(["agent", "list"])
+        .output()
+        .expect("failed to execute lait agent list");
+
+    assert!(output.status.success(), "agent list failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("greeter"), "stdout: {stdout}");
+    assert!(stdout.contains("greets the user"), "stdout: {stdout}");
 }

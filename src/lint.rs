@@ -109,9 +109,13 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     // when `lait.config.yml` is absent/not found and when `--no-config` was
     // passed, the linter needs to tell "absent/skipped" apart from "present
     // but empty" so it can skip `mcp:`/`skills:` name checks (and say why)
-    // instead of reporting every referenced name as unknown.
+    // instead of reporting every referenced name as unknown. A global config
+    // (see `config::global_config_path`) counts as "present" too — it's only
+    // ever consulted for `ConfigSource::Search`, same as the project file.
     let config_path = config::resolve_config_path(&config_source)?;
-    let config_present = config_path.is_some();
+    let global_config_present =
+        matches!(config_source, ConfigSource::Search) && config::global_config_path()?.is_file();
+    let config_present = config_path.is_some() || global_config_present;
     let file_config = config::load_config(&config_source)?;
     let config = config_present.then_some(&file_config);
 
@@ -119,8 +123,7 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     let registry_ok = if file_config.workflows.is_empty() {
         true
     } else {
-        let config_dir = config_path.as_deref().and_then(Path::parent);
-        check_workflows_registry(&file_config, config_dir)
+        check_workflows_registry(&file_config)
     };
     for file in &lint_args.files {
         // `lint_file` only ever returns `Err` for a file whose type it can't
@@ -173,17 +176,17 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
 /// `lait.config.yml` itself, since nothing inside a workflow YAML ever
 /// references `workflows:` (unlike `mcp:`/`skills:`/`agent:`, which are
 /// checked per-file by `lint_workflow_contents`/`lint_agent_contents`).
-/// `config_dir` mirrors `workflow::resolve_run_target`'s own resolution, so
-/// this reports exactly the path `lait run <NAME>` would actually try to
-/// read. Returns whether every entry resolved; prints one line per entry.
-fn check_workflows_registry(file_config: &ConfigFile, config_dir: Option<&Path>) -> bool {
+/// Registry paths are already absolute (resolved once at config-load time —
+/// see `config::load_config`), so this reports exactly the path `lait run
+/// <NAME>` (`workflow::resolve_run_target`) would actually try to read.
+/// Returns whether every entry resolved; prints one line per entry.
+fn check_workflows_registry(file_config: &ConfigFile) -> bool {
     let mut names: Vec<&String> = file_config.workflows.keys().collect();
     names.sort_unstable();
     let mut ok = true;
     println!("{} (workflows:):", config::CONFIG_FILE_NAME);
     for name in names {
-        let raw_path = &file_config.workflows[name];
-        let resolved = config::resolve_registry_path(raw_path, config_dir);
+        let resolved = &file_config.workflows[name];
         if resolved.is_file() {
             println!("  {name}: OK ({})", resolved.display());
         } else {

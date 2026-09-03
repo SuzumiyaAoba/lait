@@ -238,25 +238,16 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::History(history_args)) => crate::history::run(history_args),
         Some(Command::Graph(graph_args)) => run_graph(graph_args),
         Some(Command::Agent(agent_command)) => match agent_command.action {
-            AgentAction::List => {
-                let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
-                subagent::list(&file_config, config_dir.as_deref())
-            }
+            AgentAction::List => subagent::list(&config::load_config(&config_source)?),
             AgentAction::Run(_) => {
                 bail!("internal error: `agent run` must run on the async path")
             }
         },
         Some(Command::Workflow(workflow_command)) => match workflow_command.action {
-            WorkflowAction::List => {
-                let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
-                workflow::list(&file_config, config_dir.as_deref())
-            }
+            WorkflowAction::List => workflow::list(&config::load_config(&config_source)?),
         },
         Some(Command::Skill(skill_command)) => match skill_command.action {
-            SkillAction::List => {
-                let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
-                skill::list(&file_config, config_dir.as_deref())
-            }
+            SkillAction::List => skill::list(&config::load_config(&config_source)?),
         },
         Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
         Some(Command::Run(_) | Command::Chat(_)) | None => {
@@ -653,10 +644,8 @@ async fn run_workflow(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let (file_config, config_dir) = config::load_config_with_dir(&config_source)?;
-    let file_config = Arc::new(file_config);
-    let resolved_file =
-        workflow::resolve_run_target(&run_args.file, &file_config, config_dir.as_deref());
+    let file_config = Arc::new(config::load_config(&config_source)?);
+    let resolved_file = workflow::resolve_run_target(&run_args.file, &file_config);
     let workflow_path = resolved_file.display().to_string();
 
     let resumed = run_args

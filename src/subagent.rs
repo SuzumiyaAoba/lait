@@ -15,13 +15,13 @@ use crate::{
 
 /// Runs `lait agent list`: prints every configured `agents:` entry's name,
 /// path, and (when the file loads cleanly) its own `description:`.
-/// `config_dir` resolves each entry's path relative to the directory
-/// containing the `lait.config.yml` that defined it, not the current working
-/// directory — see `config::resolve_registry_path`. A registry entry whose file
-/// is missing or fails to parse is still listed (with a note) rather than
-/// aborting the whole command — `lait lint` is where a hard failure on a bad
-/// entry belongs.
-pub(crate) fn list(file_config: &config::ConfigFile, config_dir: Option<&Path>) -> Result<()> {
+/// Registry paths are already absolute (resolved once at config-load time,
+/// against the directory containing whichever `lait.config.yml`/global
+/// `config.yml` defined the entry — not the current working directory — see
+/// `config::load_config`). A registry entry whose file is missing or fails
+/// to parse is still listed (with a note) rather than aborting the whole
+/// command — `lait lint` is where a hard failure on a bad entry belongs.
+pub(crate) fn list(file_config: &config::ConfigFile) -> Result<()> {
     if file_config.agents.is_empty() {
         println!(
             "no agents defined in {}; add an 'agents:' entry to define one",
@@ -32,10 +32,9 @@ pub(crate) fn list(file_config: &config::ConfigFile, config_dir: Option<&Path>) 
     let mut names: Vec<&String> = file_config.agents.keys().collect();
     names.sort_unstable();
     for name in names {
-        let raw_path = &file_config.agents[name];
-        let path = config::resolve_registry_path(raw_path, config_dir);
-        let loaded = agent::load_agent(&path).map(|agent_file| agent_file.description);
-        config::print_registry_entry(name, &path, loaded);
+        let path = &file_config.agents[name];
+        let loaded = agent::load_agent(path).map(|agent_file| agent_file.description);
+        config::print_registry_entry(name, path, loaded);
     }
     Ok(())
 }

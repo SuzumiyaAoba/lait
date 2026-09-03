@@ -49,6 +49,14 @@ pub(crate) struct ConfigDirectory {
     path: PathBuf,
 }
 
+/// A temporary `$XDG_CONFIG_HOME` holding a global `lait/config.yml`, for
+/// testing the global config file (see `config::global_config_path`).
+/// Distinct from `ConfigDirectory`, which writes a project-local
+/// `lait.config.yml` instead.
+pub(crate) struct GlobalConfigDirectory {
+    xdg_config_home: PathBuf,
+}
+
 impl JsonSchemaFile {
     pub(crate) fn new(contents: &str) -> Self {
         let mut path = None;
@@ -206,6 +214,38 @@ impl Drop for ConfigDirectory {
     }
 }
 
+impl GlobalConfigDirectory {
+    /// Writes `contents` to a fresh temporary directory's `lait/config.yml`,
+    /// the layout `config::global_config_path` expects under `$XDG_CONFIG_HOME`.
+    pub(crate) fn new(contents: &str) -> Self {
+        let xdg_config_home = next_temp_path("lait-test-global-config", "");
+        fs::create_dir_all(xdg_config_home.join("lait"))
+            .expect("failed to create test global config directory");
+        fs::write(xdg_config_home.join("lait").join("config.yml"), contents)
+            .expect("failed to write test global config file");
+        Self { xdg_config_home }
+    }
+
+    /// The value to set `XDG_CONFIG_HOME` to for a child process to pick up
+    /// this directory's `lait/config.yml` as its global config.
+    pub(crate) fn xdg_config_home(&self) -> &Path {
+        &self.xdg_config_home
+    }
+
+    /// The directory the global `config.yml` itself lives in
+    /// (`$XDG_CONFIG_HOME/lait`) — where a registry entry (`workflows:`/
+    /// `agents:`/`skills:`) defined in it resolves relative paths against.
+    pub(crate) fn config_dir(&self) -> PathBuf {
+        self.xdg_config_home.join("lait")
+    }
+}
+
+impl Drop for GlobalConfigDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.xdg_config_home);
+    }
+}
+
 pub(crate) fn test_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
     for variable in [
@@ -216,6 +256,20 @@ pub(crate) fn test_command() -> Command {
     ] {
         command.env_remove(variable);
     }
+    // Isolates every test from the machine's real global config
+    // (`$XDG_CONFIG_HOME/lait/config.yml`, or `~/.config/lait/config.yml`
+    // when `XDG_CONFIG_HOME` is unset — see `config::global_config_path`).
+    // Without this, a developer's own global config (models/mcp_servers/
+    // default: entries) would silently merge into every test run. The path
+    // need not exist: `global_config_path`'s `.is_file()` check simply
+    // returns false, so this needs no filesystem setup and is race-free
+    // under parallel test execution. Tests exercising the global config
+    // itself (`tests/config.rs`) override this with `GlobalConfigDirectory`
+    // and `.env("XDG_CONFIG_HOME", ..)`.
+    command.env(
+        "XDG_CONFIG_HOME",
+        std::env::temp_dir().join("lait-test-no-global-config"),
+    );
     command
 }
 

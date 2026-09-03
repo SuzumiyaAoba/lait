@@ -14,19 +14,24 @@ pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
 /// Where `load_config` should look for `lait.config.yml`, resolved once from
 /// `Cli`'s two mutually exclusive flags (`--config`/`--no-config`, enforced
 /// at the clap level via `conflicts_with`) rather than re-read from `Cli` at
-/// every one of the ten call sites that used to take a bare `no_config: bool`.
+/// every call site that used to take a bare `no_config: bool`.
 #[derive(Clone, Debug)]
 pub(crate) enum ConfigSource {
     /// Neither flag was given: search `CONFIG_FILE_NAME` starting at the
     /// current directory and walking up through its ancestors (like git
-    /// looks for `.git`), falling back to [`ConfigFile::default`] if none is
+    /// looks for `.git`), merging the result (project layer winning) with
+    /// the global config at [`global_config_path`] when that exists — see
+    /// [`load_config`]. Falls back to [`ConfigFile::default`] if neither is
     /// found anywhere.
     Search,
     /// `--config PATH`: read exactly this file. Unlike `Search`, a missing
     /// file here is an error — the user named a specific path, so silently
-    /// falling back to defaults would hide a typo.
+    /// falling back to defaults would hide a typo. The global config is
+    /// never consulted here — the user named a specific file, so silently
+    /// blending in another one would be surprising.
     Explicit(PathBuf),
-    /// `--no-config`: always [`ConfigFile::default`], no filesystem access.
+    /// `--no-config`: always [`ConfigFile::default`], no filesystem access
+    /// (including the global config).
     Disabled,
 }
 
@@ -71,20 +76,31 @@ pub(crate) fn resolve_config_path(source: &ConfigSource) -> Result<Option<PathBu
     }
 }
 
-/// Resolves one `workflows:`/`agents:`/`skills:` registry entry's configured
-/// (possibly relative) path against `config_dir` — the directory containing
-/// the `lait.config.yml` that defined the registry (see
-/// [`load_config_with_dir`]), or `raw_path` unchanged when there is none
-/// (`--no-config`, or `Search` finding nothing — in which case the registry
-/// itself is always empty, since it can only come from a config file). Kept
-/// relative to the config file rather than the current working directory so
-/// a registry entry keeps resolving to the same file regardless of which
-/// subdirectory `lait` is invoked from, the same way `lait.config.yml`
-/// itself is found by walking upward.
-pub(crate) fn resolve_registry_path(raw_path: &Path, config_dir: Option<&Path>) -> PathBuf {
-    match config_dir {
-        Some(dir) => dir.join(raw_path),
-        None => raw_path.to_path_buf(),
+/// Resolves every `workflows:`/`agents:`/`skills:` registry path in `config`
+/// against `config_dir` — the directory containing the `lait.config.yml` (or
+/// global `config.yml`) it was parsed from — replacing each configured
+/// (possibly relative) value with an absolute one. Called once, right after
+/// parsing (see [`parse_config_file`]), rather than at each of
+/// `resolve_run_target`/`lint::check_workflows_registry`/`workflow::list`/
+/// `skill::list`/`subagent::list`'s use sites: with a project config
+/// potentially merged with a global one (see [`load_config`]/
+/// [`merge_config`]), a registry entry's path can no longer carry its own
+/// origin directory alongside it once the two maps are combined, so it has
+/// to already be absolute by then. Kept relative to the config file rather
+/// than the current working directory so a registry entry keeps resolving to
+/// the same file regardless of which subdirectory `lait` is invoked from,
+/// the same way `lait.config.yml` itself is found by walking upward.
+/// `Path::join` leaves an already-absolute value untouched, so this is
+/// idempotent.
+fn resolve_registry_paths_in_place(config: &mut ConfigFile, config_dir: &Path) {
+    for path in config.workflows.values_mut() {
+        *path = config_dir.join(&path);
+    }
+    for path in config.agents.values_mut() {
+        *path = config_dir.join(&path);
+    }
+    for path in config.skills.values_mut() {
+        *path = config_dir.join(&path);
     }
 }
 
@@ -495,23 +511,125 @@ fn expand_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<S
     Ok(result)
 }
 
-pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
-    load_config_at(source, resolve_config_path(source)?)
+/// Resolves `$XDG_CONFIG_HOME`, falling back to `$HOME/.config` (or
+/// `%USERPROFILE%\.config` where `HOME` isn't set) per the XDG Base
+/// Directory spec — mirrors `history::xdg_data_home`'s reasoning for
+/// avoiding a `dirs`-style crate (which would map to a platform-conventional
+/// directory, e.g. `~/Library/Application Support` on macOS, rather than the
+/// literal `~/.config` this feature is specified against).
+fn xdg_config_home() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
+        && !dir.trim().is_empty()
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context(
+            "failed to determine the home directory (HOME/USERPROFILE is not set) to locate the \
+             global configuration file",
+        )?;
+    Ok(PathBuf::from(home).join(".config"))
 }
 
-/// [`load_config`] plus the directory `workflows:`/`agents:`/`skills:`
-/// registry entries resolve against (the directory containing the
-/// `lait.config.yml` [`resolve_config_path`] found, or `None` when there is
-/// none), sharing one [`resolve_config_path`] resolution (and its `Search`
-/// upward directory walk) between the two rather than each redoing it — for
-/// a caller like `lait agent/workflow/skill list` that needs both.
-pub(crate) fn load_config_with_dir(source: &ConfigSource) -> Result<(ConfigFile, Option<PathBuf>)> {
-    let path = resolve_config_path(source)?;
-    let config_dir = path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    Ok((load_config_at(source, path)?, config_dir))
+/// The global config file's path: `$XDG_CONFIG_HOME/lait/config.yml`. Read
+/// (when it exists) by [`load_config`] for [`ConfigSource::Search`] only —
+/// `--config PATH` reads exactly that file, and `--no-config` never calls
+/// this at all.
+pub(crate) fn global_config_path() -> Result<PathBuf> {
+    Ok(xdg_config_home()?.join("lait").join("config.yml"))
+}
+
+/// Merges `global` (loaded from [`global_config_path`]) with `project`
+/// (found by [`ConfigSource::Search`]'s upward walk) into the single
+/// `ConfigFile` every reader sees from here on, with `project` winning
+/// wherever the two overlap. `models:`/`mcp_servers:`/`skills:`/`agents:`/
+/// `prompts:`/`workflows:` merge key by key (a name defined in both keeps
+/// the project definition); `default:` merges field by field the same way;
+/// `base_url`/`api_key` keep the project value when set, else fall back to
+/// the global one. Registry paths (`workflows:`/`agents:`/`skills:`) are
+/// already absolute by this point (each was resolved by
+/// `resolve_registry_paths_in_place` right after its own file was parsed —
+/// see `parse_config_file`), so combining the two maps needs no
+/// path-origin tracking.
+fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
+    let mut models = global.models;
+    models.extend(project.models);
+    let mut mcp_servers = global.mcp_servers;
+    mcp_servers.extend(project.mcp_servers);
+    let mut skills = global.skills;
+    skills.extend(project.skills);
+    let mut agents = global.agents;
+    agents.extend(project.agents);
+    let mut prompts = global.prompts;
+    prompts.extend(project.prompts);
+    let mut workflows = global.workflows;
+    workflows.extend(project.workflows);
+
+    ConfigFile {
+        base_url: project.base_url.or(global.base_url),
+        api_key: project.api_key.or(global.api_key),
+        default: DefaultSettings {
+            model: project.default.model.or(global.default.model),
+            reasoning_effort: project
+                .default
+                .reasoning_effort
+                .or(global.default.reasoning_effort),
+            system: project.default.system.or(global.default.system),
+            temperature: project.default.temperature.or(global.default.temperature),
+            top_p: project.default.top_p.or(global.default.top_p),
+            max_tokens: project.default.max_tokens.or(global.default.max_tokens),
+            mcp: project.default.mcp.or(global.default.mcp),
+            max_tool_rounds: project
+                .default
+                .max_tool_rounds
+                .or(global.default.max_tool_rounds),
+            skills: project.default.skills.or(global.default.skills),
+            subagents: project.default.subagents.or(global.default.subagents),
+            render: project.default.render.or(global.default.render),
+            history: project.default.history.or(global.default.history),
+        },
+        models,
+        mcp_servers,
+        skills,
+        agents,
+        prompts,
+        workflows,
+    }
+}
+
+/// Loads the config `resolve_request_settings`/every other reader sees:
+/// [`ConfigSource::Search`] merges the project config (found by walking
+/// upward from the current directory) with the global config at
+/// [`global_config_path`] when that file exists (see [`merge_config`]) —
+/// [`ConfigSource::Explicit`]/[`ConfigSource::Disabled`] never touch the
+/// global file at all.
+pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
+    let project = load_config_at(source, resolve_config_path(source)?)?;
+    match source {
+        ConfigSource::Search => match load_global_config()? {
+            Some(global) => Ok(merge_config(global, project)),
+            None => Ok(project),
+        },
+        ConfigSource::Explicit(_) | ConfigSource::Disabled => Ok(project),
+    }
+}
+
+/// Parses `contents` (already read from `path`) into a `ConfigFile` and
+/// resolves its registry paths against `path`'s parent directory — the one
+/// piece of post-processing both the project and the global config load
+/// need, factored out so [`load_config_at`]/[`load_global_config`] share it.
+fn parse_config_file(path: &Path, contents: &str) -> Result<ConfigFile> {
+    let mut config: ConfigFile = serde_yaml::from_str(contents).with_context(|| {
+        format!(
+            "failed to parse YAML configuration file '{}'",
+            path.display()
+        )
+    })?;
+    if let Some(dir) = path.parent() {
+        resolve_registry_paths_in_place(&mut config, dir);
+    }
+    Ok(config)
 }
 
 fn load_config_at(source: &ConfigSource, path: Option<PathBuf>) -> Result<ConfigFile> {
@@ -542,12 +660,26 @@ fn load_config_at(source: &ConfigSource, path: Option<PathBuf>) -> Result<Config
         }
     };
 
-    serde_yaml::from_str(&contents).with_context(|| {
+    parse_config_file(&path, &contents)
+}
+
+/// Loads the global config file at [`global_config_path`], or `None` when it
+/// doesn't exist (not an error — the global file is optional). Unlike the
+/// project file's [`load_config_at`], there is no `--no-config`/`Explicit`
+/// case to special-case here: this is only ever called for
+/// [`ConfigSource::Search`] (see [`load_config`]).
+fn load_global_config() -> Result<Option<ConfigFile>> {
+    let path = global_config_path()?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path).with_context(|| {
         format!(
-            "failed to parse YAML configuration file '{}'",
+            "failed to read YAML configuration file '{}'",
             path.display()
         )
-    })
+    })?;
+    Ok(Some(parse_config_file(&path, &contents)?))
 }
 
 #[cfg(test)]
