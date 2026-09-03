@@ -417,7 +417,7 @@ async fn run_chat(
         let outcome = env
             .finish(async {
                 let stream = settings
-                    .complete_stream(&env.skill_cache, turn, response_format, show_usage)
+                    .complete_stream(&env, turn, response_format, show_usage)
                     .await?;
                 stream_response(stream, show_reasoning, output_path, env.cancel.clone()).await
             })

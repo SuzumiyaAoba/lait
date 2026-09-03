@@ -13,8 +13,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use async_openai::types::chat::{
-    ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat,
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat},
 };
 use futures_util::StreamExt;
 
@@ -216,6 +217,15 @@ pub(crate) struct RequestSettings {
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) resolved_model: config::ResolvedModel,
+    /// Further `models:` alias definitions to fall back to, in order, when
+    /// the primary endpoint above fails with a retryable error (a
+    /// connection failure/timeout, or a 5xx/429/408 response) — see
+    /// `complete_recorded`/`complete_stream`'s shared `attempt_with_fallback`
+    /// and `docs/usage/ja/config.md`'s フォールバック section. Empty when
+    /// `model_name` wasn't resolved from a `models:` alias, or a
+    /// `--base-url`/`--api-key` override collapsed every candidate into one
+    /// (see `resolve_request_settings`).
+    pub(crate) fallback_candidates: Vec<config::FallbackCandidate>,
     pub(crate) sampling: SamplingOverrides,
     /// Names of `mcp_servers:` entries whose tools this request may call.
     /// Empty means "no tools" — `complete`'s fast path then behaves exactly
@@ -258,6 +268,57 @@ fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<C
     }
 }
 
+/// Classifies whether `error` is worth falling back from, for
+/// `RequestSettings::complete_recorded`/`complete_stream`'s
+/// `advance_to_next_candidate`: a connection failure/timeout, or an API
+/// response with a 5xx/429/408 status — the same retryable set
+/// async-openai's own `OpenAIRetryLayer` already retries within a single
+/// candidate (see `llm::client`'s doc comment), just at the level of
+/// switching to a different `models:` definition instead of the same one
+/// again. Anything else (a 4xx request/auth error, a malformed response,
+/// lait's own cancellation/timeout errors, which are plain `anyhow!`
+/// strings rather than an `OpenAIError` at all) fails the whole request
+/// immediately — falling back on those would silently paper over what's
+/// very likely the caller's own mistake (a bad request body, wrong
+/// credentials) rather than the transient/capacity problem fallback exists
+/// for.
+fn is_fallback_eligible(error: &anyhow::Error) -> bool {
+    let Some(openai_error) = error.downcast_ref::<OpenAIError>() else {
+        return false;
+    };
+    match openai_error {
+        OpenAIError::ApiError(response) => {
+            let status = response.status_code.as_u16();
+            status >= 500 || status == 429 || status == 408
+        }
+        OpenAIError::Reqwest(reqwest_error) => {
+            reqwest_error.is_connect() || reqwest_error.is_timeout()
+        }
+        _ => false,
+    }
+}
+
+/// The one candidate `RequestSettings::complete_recorded`/`complete_stream`
+/// are currently attempting — the primary endpoint at first, then whichever
+/// `FallbackCandidate` `advance_to_next_candidate` last resolved. Bundled
+/// into one struct purely so `RequestSettings::request` stays under
+/// clippy's `too_many_arguments` threshold.
+struct EndpointAttempt {
+    base_url: String,
+    api_key: String,
+    model_id: String,
+}
+
+impl EndpointAttempt {
+    fn primary(settings: &RequestSettings) -> Self {
+        Self {
+            base_url: settings.base_url.clone(),
+            api_key: settings.api_key.clone(),
+            model_id: settings.resolved_model.model_id.clone(),
+        }
+    }
+}
+
 impl RequestSettings {
     /// Sets `usage_label` — see that field's doc comment.
     pub(crate) fn with_usage_label(mut self, label: impl Into<String>) -> Self {
@@ -265,23 +326,25 @@ impl RequestSettings {
         self
     }
 
-    /// Builds an `llm::CompletionRequest` from these settings plus the
-    /// per-call `response_format`/`messages`/`tools`. The `base_url`/
-    /// `api_key`/`model_id`/sampling fields are the same for every request
-    /// `self` ever builds, so both `complete`'s tool loop and
-    /// `complete_stream` go through here instead of repeating that field
-    /// list at each call site.
+    /// Builds an `llm::CompletionRequest` from these settings' sampling
+    /// parameters (the same for every request `self` ever builds, and never
+    /// affected by which endpoint candidate is being attempted — see
+    /// `FallbackCandidate`'s doc comment) plus `endpoint` (the candidate
+    /// currently being attempted) and the per-call `response_format`/
+    /// `messages`/`tools`. Both `complete`'s tool loop and `complete_stream`
+    /// go through here instead of repeating this field list at each call site.
     fn request<'a>(
         &'a self,
+        endpoint: &'a EndpointAttempt,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &'a [ChatCompletionTools],
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> llm::CompletionRequest<'a> {
         llm::CompletionRequest {
-            base_url: &self.base_url,
-            api_key: &self.api_key,
-            model_id: &self.resolved_model.model_id,
+            base_url: &endpoint.base_url,
+            api_key: &endpoint.api_key,
+            model_id: &endpoint.model_id,
             reasoning_effort: self.sampling.reasoning_effort,
             temperature: self.sampling.temperature,
             top_p: self.sampling.top_p,
@@ -292,6 +355,44 @@ impl RequestSettings {
             stream_include_usage: false,
             cancellation,
         }
+    }
+
+    /// Advances `(base_url, api_key, model_id)` past a failed attempt to the
+    /// next `self.fallback_candidates` entry, resolving that candidate's own
+    /// endpoint (and running its `api_key_cmd`, if it has one) right now —
+    /// never earlier, so a candidate that's never attempted never runs its
+    /// command. Returns `Ok(false)` (leaving the three unchanged) once
+    /// `candidates` is exhausted, telling the caller to give up and return
+    /// its original error instead. Shared by `complete_recorded`/
+    /// `complete_stream`'s otherwise-identical fallback loops — see
+    /// `is_fallback_eligible` for what actually triggers a call to this.
+    fn advance_to_next_candidate(
+        &self,
+        env: &AppContext,
+        candidates: &mut std::slice::Iter<'_, config::FallbackCandidate>,
+        endpoint: &mut EndpointAttempt,
+        error: &anyhow::Error,
+    ) -> Result<bool> {
+        let Some(candidate) = candidates.next() else {
+            return Ok(false);
+        };
+        eprintln!(
+            "warning: request to {} failed ({error:#}); falling back to model definition's \
+             next entry ('{}')",
+            endpoint.base_url, candidate.model_id
+        );
+        tracing::warn!(
+            failed_base_url = %endpoint.base_url,
+            next_model_id = %candidate.model_id,
+            error = %error,
+            "falling back to the next model definition entry",
+        );
+        let (next_base_url, next_api_key) =
+            config::resolve_fallback_endpoint(candidate, &env.file_config)?;
+        endpoint.base_url = next_base_url;
+        endpoint.api_key = next_api_key;
+        endpoint.model_id = candidate.model_id.clone();
+        Ok(true)
     }
 
     /// Sends a completion request built from these settings, driving a
@@ -448,7 +549,9 @@ impl RequestSettings {
     /// The one way `complete` sends a request: builds it via `request`,
     /// awaits it, and records the response's usage under
     /// `self.usage_label` — so no future call site can forget the recording
-    /// and skew `--show-usage`.
+    /// and skew `--show-usage`. Tries `self.fallback_candidates` in order
+    /// after a retryable failure (see `is_fallback_eligible`/
+    /// `advance_to_next_candidate`) before giving up.
     async fn complete_recorded(
         &self,
         env: &AppContext,
@@ -457,10 +560,34 @@ impl RequestSettings {
         tools: &[ChatCompletionTools],
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
-        let response =
-            llm::complete(self.request(response_format, messages, tools, cancellation)).await?;
-        env.usage.record_response(&self.usage_label, &response);
-        Ok(response)
+        let mut endpoint = EndpointAttempt::primary(self);
+        let mut candidates = self.fallback_candidates.iter();
+        loop {
+            let request = self.request(
+                &endpoint,
+                response_format.clone(),
+                messages.clone(),
+                tools,
+                cancellation.clone(),
+            );
+            match llm::complete(request).await {
+                Ok(response) => {
+                    env.usage.record_response(&self.usage_label, &response);
+                    return Ok(response);
+                }
+                Err(error) if is_fallback_eligible(&error) => {
+                    if !self.advance_to_next_candidate(
+                        env,
+                        &mut candidates,
+                        &mut endpoint,
+                        &error,
+                    )? {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Like [`RequestSettings::complete`], but requests a streamed response.
@@ -474,10 +601,16 @@ impl RequestSettings {
     /// `include_usage` asks the server for a final usage chunk (see
     /// `llm::CompletionRequest::stream_include_usage`); set it only when the
     /// caller will actually display it (`--show-usage`). `turn.history`/
-    /// `turn.image_urls` behave exactly as in `complete` — see its doc comment.
+    /// `turn.image_urls` behave exactly as in `complete` — see its doc
+    /// comment. Falls back through `self.fallback_candidates`, like
+    /// `complete_recorded`, but only up to the point a candidate's
+    /// `llm::complete_stream` call itself returns `Err` — once a stream is
+    /// established (`Ok`), lait commits to it: a streamed `tool_calls`/
+    /// content delta arriving from one candidate can't be silently resent to
+    /// another mid-stream.
     pub(crate) async fn complete_stream(
         &self,
-        skill_cache: &skill::SkillCache,
+        env: &AppContext,
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
         include_usage: bool,
@@ -494,7 +627,7 @@ impl RequestSettings {
             );
         }
         let system_prompt = self
-            .system_prompt_with_skills(skill_cache, turn.system_prompt, None)
+            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, None)
             .await?;
         let messages = llm::initial_messages(
             system_prompt.as_deref(),
@@ -502,9 +635,33 @@ impl RequestSettings {
             turn.prompt,
             turn.image_urls,
         )?;
-        let mut request = self.request(response_format, messages, &[], None);
-        request.stream_include_usage = include_usage;
-        llm::complete_stream(request).await
+
+        let mut endpoint = EndpointAttempt::primary(self);
+        let mut candidates = self.fallback_candidates.iter();
+        loop {
+            let mut request = self.request(
+                &endpoint,
+                response_format.clone(),
+                messages.clone(),
+                &[],
+                None,
+            );
+            request.stream_include_usage = include_usage;
+            match llm::complete_stream(request).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) if is_fallback_eligible(&error) => {
+                    if !self.advance_to_next_candidate(
+                        env,
+                        &mut candidates,
+                        &mut endpoint,
+                        &error,
+                    )? {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Shared by `complete`/`complete_stream`: resolves `self.skills` against
@@ -893,6 +1050,23 @@ pub(crate) fn resolve_request_settings(
     local_models: &ModelMap,
     file_config: &ConfigFile,
 ) -> Result<RequestSettings> {
+    // A `--base-url`/`--api-key` override pins every attempt to the same
+    // endpoint regardless of which model-definition entry it came from, so
+    // fallback candidates (each with their own `base_url`) would be
+    // meaningless — collapse to a single candidate (see
+    // `docs/usage/ja/config.md`'s フォールバック section). Otherwise, the
+    // candidates come from whichever map `model_name` actually resolved
+    // against below (`local_models`, e.g. a workflow's embedded `models:`,
+    // takes precedence over `file_config.models` the same way
+    // `resolve_model_alias`/`resolve_model` do).
+    let fallback_candidates = if base_url_override.is_some() || api_key_override.is_some() {
+        Vec::new()
+    } else if local_models.contains_key(&model_name) {
+        config::resolve_model_fallbacks(&model_name, local_models)?
+    } else {
+        config::resolve_model_fallbacks(&model_name, &file_config.models)?
+    };
+
     let resolved_model = match config::resolve_model_alias(&model_name, local_models)? {
         Some(resolved) => resolved,
         None => config::resolve_model(model_name, file_config)?,
@@ -982,6 +1156,7 @@ pub(crate) fn resolve_request_settings(
         base_url,
         api_key,
         resolved_model,
+        fallback_candidates,
         sampling,
         mcp,
         max_tool_rounds,

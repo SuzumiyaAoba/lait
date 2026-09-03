@@ -192,7 +192,7 @@ async fn run_turn(
     };
     let content = if settings.mcp.is_empty() && settings.subagents.is_empty() {
         let stream = settings
-            .complete_stream(&env.skill_cache, turn, None, show_usage)
+            .complete_stream(env, turn, None, show_usage)
             .await?;
         let outcome = stream_response(stream, show_reasoning, None, env.cancel.clone()).await?;
         if show_usage && let Some(usage) = outcome.usage {

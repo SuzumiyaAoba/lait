@@ -489,6 +489,93 @@ pub(crate) fn resolve_model_alias(
     }))
 }
 
+/// One `models:` alias definition beyond the first (which
+/// `resolve_model_alias`/`ResolvedModel` already covers) — the endpoint
+/// `RequestSettings::complete_recorded`/`complete_stream` falls back to when
+/// an earlier candidate fails with a retryable error. Unlike `ResolvedModel`,
+/// this carries no sampling defaults: `docs/usage/ja/config.md`'s "複数
+/// プロバイダーによるフォールバック" section documents that a fallback
+/// candidate's `default_reasoning_effort`/`default_temperature`/etc. are
+/// never used — only the first (primary) definition's sampling defaults
+/// apply, regardless of which candidate the request actually lands on.
+#[derive(Debug, Clone)]
+pub(crate) struct FallbackCandidate {
+    pub(crate) model_id: String,
+    pub(crate) base_url: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) api_key_cmd: Option<CommandSpec>,
+}
+
+/// Resolves every `models:` alias definition after the first into a
+/// [`FallbackCandidate`] list, in order — empty when `model_name` isn't an
+/// alias in `models`, or the alias has only one definition. Validated the
+/// same way `resolve_model_alias` validates the first definition (empty
+/// `model_id`, `api_key`+`api_key_cmd` both set), so a broken fallback entry
+/// is caught even on a run where the primary candidate always succeeds and
+/// the broken one is never actually attempted.
+pub(crate) fn resolve_model_fallbacks(
+    model_name: &str,
+    models: &ModelMap,
+) -> Result<Vec<FallbackCandidate>> {
+    let Some(definitions) = models.get(model_name) else {
+        return Ok(Vec::new());
+    };
+    definitions
+        .iter()
+        .skip(1)
+        .map(|definition| {
+            if definition.model_id.trim().is_empty() {
+                bail!("model_id in model definition {model_name:?} must not be empty");
+            }
+            check_api_key_source(
+                &definition.provider.api_key,
+                &definition.provider.api_key_cmd,
+                &format!("model definition {model_name:?}"),
+            )?;
+            Ok(FallbackCandidate {
+                model_id: definition.model_id.clone(),
+                base_url: definition.provider.base_url.clone(),
+                api_key: definition.provider.api_key.clone(),
+                api_key_cmd: definition.provider.api_key_cmd.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Resolves `candidate`'s endpoint (`${VAR}`-expanded, trailing slash
+/// trimmed — the same normalization `resolve_endpoint` applies to the
+/// primary candidate) and API key (literal, `api_key_cmd`, or falling back
+/// to the top-level `api_key`/`api_key_cmd` — the same three-tier order
+/// `resolve_endpoint` uses for the primary candidate's own model-definition
+/// layer). Only called for a candidate `RequestSettings::complete_recorded`/
+/// `complete_stream` is actually about to attempt, so a losing candidate's
+/// `api_key_cmd` (if any) is never run — see `secret::resolve`.
+pub(crate) fn resolve_fallback_endpoint(
+    candidate: &FallbackCandidate,
+    file_config: &ConfigFile,
+) -> Result<(String, String)> {
+    let base_url = expand_env_placeholders(&candidate.base_url)?;
+    let base_url = base_url.trim_end_matches('/').to_owned();
+    if base_url.is_empty() {
+        bail!("base URL must not be empty");
+    }
+    let api_key = if let Some(api_key) = candidate.api_key.as_deref() {
+        expand_env_placeholders(api_key)?
+    } else if let Some(command) = &candidate.api_key_cmd {
+        secret::resolve(command)?
+    } else if let Some(api_key) = file_config.api_key.as_deref() {
+        expand_env_placeholders(api_key)?
+    } else if let Some(command) = &file_config.api_key_cmd {
+        secret::resolve(command)?
+    } else {
+        // Mirrors `resolve_request_settings`'s own dummy-key substitution —
+        // async-openai always builds an Authorization header, and LM Studio
+        // ignores its value.
+        "lm-studio".to_owned()
+    };
+    Ok((base_url, api_key))
+}
+
 pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
     // Catches an empty/whitespace `model:` from any layer (an agent file's
     // frontmatter, a workflow's `default.model`, a node's own `model:`) that
