@@ -211,18 +211,29 @@ impl ToolPolicy {
     }
 }
 
-/// A minimal glob: `prefix*` (starts-with), `*suffix` (ends-with), or a
-/// literal exact match — deliberately not a general glob (no `?`, no
-/// wildcard elsewhere in the pattern, no crate dependency for this). `*`
-/// alone matches everything (an empty starts-with prefix).
+/// A minimal glob: `*substring*` (contains), `prefix*` (starts-with),
+/// `*suffix` (ends-with), or a literal exact match — deliberately not a
+/// general glob (no `?`, no wildcard elsewhere in the pattern, no crate
+/// dependency for this). `*` alone matches everything. The both-ends case is
+/// checked first: a naive "strip a trailing `*`, else strip a leading `*`"
+/// order would take `*substring*` for a `prefix*` pattern with the literal
+/// prefix `"*substring"`, which then can never match any real tool name
+/// (qualified tool names never contain `*`) — silently turning an intended
+/// "contains" deny/allow rule into a permanent no-op instead of an error.
 fn glob_match(pattern: &str, name: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        name.starts_with(prefix)
-    } else if let Some(suffix) = pattern.strip_prefix('*') {
-        name.ends_with(suffix)
-    } else {
-        pattern == name
+    if pattern == "*" {
+        return true;
     }
+    if let Some(middle) = pattern.strip_prefix('*').and_then(|p| p.strip_suffix('*')) {
+        return name.contains(middle);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return name.ends_with(suffix);
+    }
+    pattern == name
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
@@ -1042,6 +1053,26 @@ mod tests {
         };
         assert!(!policy.allows("mock__file_delete"));
         assert!(policy.allows("mock__file_read"));
+    }
+
+    #[test]
+    fn tool_policy_glob_matches_a_wildcard_on_both_ends_as_a_substring() {
+        let policy = ToolPolicy {
+            allow: vec![],
+            deny: vec!["*delete*".to_owned()],
+        };
+        assert!(!policy.allows("fs__delete_file"));
+        assert!(!policy.allows("fs__soft_delete"));
+        assert!(policy.allows("fs__read_file"));
+    }
+
+    #[test]
+    fn tool_policy_bare_wildcard_matches_every_name() {
+        let policy = ToolPolicy {
+            allow: vec!["*".to_owned()],
+            deny: vec![],
+        };
+        assert!(policy.allows("anything"));
     }
 
     #[test]

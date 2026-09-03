@@ -1020,7 +1020,15 @@ impl RequestSettings {
                 // The model stopped calling tools; re-issue the same history
                 // once more with `response_format` attached, now that doing
                 // so can no longer suppress a tool call — mirrors
-                // `complete`'s own re-issue.
+                // `complete`'s own re-issue. This round's own outcome is
+                // discarded in favor of the reissue's, so — unlike the
+                // `return Ok(outcome)` above, whose usage the caller records
+                // from the returned `StreamOutcome` — its usage has to be
+                // recorded here or it's lost entirely; see the fallthrough
+                // branch below for why every non-final round needs this.
+                if let Some(usage) = outcome.usage {
+                    env.usage.record(&self.usage_label, usage);
+                }
                 let stream = self
                     .stream_endpoint(
                         env,
@@ -1033,6 +1041,20 @@ impl RequestSettings {
                     .await?;
                 return stream_response(stream, show_reasoning, output_path, true, cancellation)
                     .await;
+            }
+
+            // Unlike `complete_recorded` (the non-streamed tool loop's
+            // single choke point, which records every round's usage as it
+            // happens), this round's `StreamOutcome` is consumed by
+            // `execute_tool_calls` below and never reaches a caller — only
+            // the loop's *final* round is ever returned, and that's the one
+            // `app::run_chat`/`repl::run_turn` record from the returned
+            // `StreamOutcome`. Recording here is this round's only chance to
+            // be counted at all; skipping it (as this loop did before) would
+            // silently undercount `--show-usage` by every tool-calling round
+            // but the last.
+            if let Some(usage) = outcome.usage {
+                env.usage.record(&self.usage_label, usage);
             }
 
             let content = if outcome.content.is_empty() {
