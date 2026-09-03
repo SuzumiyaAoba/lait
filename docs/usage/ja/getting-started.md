@@ -62,6 +62,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--quiet` | — | 応答本文以外の注記（reasoning 表示・usage 表示）をすべて抑制します（`--show-reasoning`/`--show-usage` より優先）。 |
 | `--no-config` | — | カレントディレクトリの `lait.config.yml` を読み込みません。 |
 | `--no-env` | — | カレントディレクトリの `.env` を読み込みません（詳細は [設定ファイル](./config.md)）。 |
+| `-v`, `--verbose`（繰り返し可） | `LAIT_LOG` | ログの詳細度を上げます。`-v` で解決後のモデル・base_url・サンプリングパラメータ・`mcp`/`skills`/`subagents`、ワークフローのステップ開始/終了・リトライ、ツール呼び出し（名前と引数）を表示。`-vv` でさらにリクエスト/レスポンス JSON 全体をダンプします。すべて標準エラー出力へ書かれるため標準出力のパイプ利用は壊れません。API キーは常にマスクされます。`LAIT_LOG`（`tracing_subscriber::EnvFilter` の書式。例: `debug`、`lait=trace,reqwest=info`）を設定すると `-v`/`-vv` より優先されます。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。省略して標準入力から渡すこともできます（下記）。 |
 
 ### 標準入力からのプロンプト（パイプ対応）

@@ -352,8 +352,10 @@ pub(crate) async fn complete(request: CompletionRequest<'_>) -> Result<ChatCompl
     let client = client(request.base_url, request.api_key);
     let cancellation = request.cancellation.clone();
     let chat_request = build_chat_request(request, false)?;
+    trace_request(&chat_request);
     let response: ChatCompletionResponse =
         await_cancellation(client.chat().create_byot(chat_request), cancellation).await?;
+    tracing::trace!(response = ?response, "received completion response");
     Ok(response)
 }
 
@@ -363,9 +365,25 @@ pub(crate) async fn complete_stream(request: CompletionRequest<'_>) -> Result<Co
     let client = client(request.base_url, request.api_key);
     let cancellation = request.cancellation.clone();
     let chat_request = build_chat_request(request, true)?;
+    trace_request(&chat_request);
     let stream =
         await_cancellation(client.chat().create_stream_byot(chat_request), cancellation).await?;
     Ok(stream)
+}
+
+/// Dumps `chat_request` as JSON at trace level (`-vv`/`LAIT_LOG=trace`),
+/// shared by [`complete`]/[`complete_stream`]. Safe to log whole: the request
+/// body never carries `api_key` (that only ever becomes the client's
+/// `Authorization` header, built separately in `client()` above and never
+/// serialized as part of `CreateChatCompletionRequest`).
+fn trace_request(chat_request: &CreateChatCompletionRequest) {
+    if !tracing::event_enabled!(tracing::Level::TRACE) {
+        return;
+    }
+    match serde_json::to_string(chat_request) {
+        Ok(body) => tracing::trace!(request = %body, "sending completion request"),
+        Err(error) => tracing::trace!(error = %error, "failed to serialize request for tracing"),
+    }
 }
 
 /// Awaits one LLM request while keeping the enclosing workflow attempt's

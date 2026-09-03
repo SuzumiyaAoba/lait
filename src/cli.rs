@@ -31,6 +31,16 @@ pub(crate) struct Cli {
     /// provides `--help` output and validation.)
     #[arg(long, global = true)]
     pub(crate) no_env: bool,
+
+    /// Increase log verbosity: once (`-v`) for debug-level tracing of
+    /// resolved request settings, workflow step timing/retries, and tool
+    /// calls; twice (`-vv`) to also dump full request/response JSON. Always
+    /// written to stderr, never stdout, so a piped answer stays clean; API
+    /// keys are masked. `LAIT_LOG` (an `EnvFilter` directive string, e.g.
+    /// `debug` or `lait=trace,reqwest=info`) overrides this when set. See
+    /// `crate::logging`.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
 }
 
 #[derive(Debug, Subcommand)]

@@ -18,6 +18,7 @@ mod jq;
 mod jsonl;
 mod lint;
 mod llm;
+mod logging;
 mod mcp;
 mod models;
 mod nesting;
@@ -59,6 +60,7 @@ fn main() {
     }
 
     let cli = cli::Cli::parse();
+    logging::init(cli.verbose);
     // Captured before `cli` is moved into `run_blocking`/`run` below — the
     // one classification `classify_error` can't reliably do from the
     // rendered message alone (see `ExitKind::Validation`'s doc).

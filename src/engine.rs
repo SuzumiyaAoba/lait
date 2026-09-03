@@ -411,6 +411,12 @@ impl RequestSettings {
             let tool_messages =
                 futures_util::future::try_join_all(tool_calls.iter().map(|tool_call| async {
                     let name = &tool_call.function.name;
+                    tracing::debug!(
+                        tool = %name,
+                        arguments = %tool_call.function.arguments,
+                        round,
+                        "calling tool",
+                    );
                     let result = if mcp_tool_set.contains(name) {
                         env.registry
                             .call(
@@ -593,6 +599,7 @@ pub(crate) async fn stream_response(
             async_io::CancellationResult::Completed(None) => break,
             async_io::CancellationResult::Completed(Some(chunk)) => chunk?,
         };
+        tracing::trace!(chunk = ?chunk, "received stream chunk");
         if let Some(usage) = chunk.usage {
             last_usage = Some(usage);
         }
@@ -954,6 +961,21 @@ pub(crate) fn resolve_request_settings(
         .subagents
         .or_else(|| file_config.default.subagents.clone())
         .unwrap_or_default();
+
+    tracing::debug!(
+        model_id = %resolved_model.model_id,
+        base_url = %base_url,
+        api_key = %crate::logging::mask_secret(&api_key),
+        reasoning_effort = ?sampling.reasoning_effort,
+        temperature = ?sampling.temperature,
+        top_p = ?sampling.top_p,
+        max_tokens = ?sampling.max_tokens,
+        mcp = ?mcp,
+        max_tool_rounds,
+        skills = ?skills,
+        subagents = ?subagents,
+        "resolved request settings",
+    );
 
     Ok(RequestSettings {
         base_url,
