@@ -14,6 +14,50 @@ cargo run -- lint workflow.yml agents/city-fact.md
 引数には拡張子が異なる複数のファイルをまとめて渡せます。あるファイルにエラーがあっても、
 残りのファイルは最後までチェックされます。1件でもエラーがあれば終了コードは `0` 以外になります。
 
+## ディレクトリを渡す
+
+引数にディレクトリを渡すと、その配下を再帰的に探索して `.yml`/`.yaml` ファイルと、
+`---` フロントマターで始まる `.md` ファイル（agent ファイル）をまとめてチェックします
+（フロントマターのない通常の Markdown、たとえば README は自動的にスキップされます）。
+`.git` などのドット始まりのディレクトリ、`target/`、`node_modules/` は探索対象から除外されます。
+
+```sh
+lait lint .
+lait lint workflow.yml agents/
+```
+
+## `--format text|json|github`
+
+既定は `text`（上記の人が読む形式）です。CI やエディタ連携向けに次の2つを選べます。
+
+- `--format json`: `file`/`line`/`severity`/`message` を持つ構造化レコードの配列を標準出力に
+  出力します。`line` は、YAML 自体のパースエラーであれば実際の行番号、それ以外の指摘
+  （未使用ノードや不明な参照など）ではメッセージ中の最初のクォート識別子をファイル内で
+  検索したベストエフォートの行番号です。特定できない場合は `null` になります
+  （`lait.config.yml` 由来の指摘は常に `null` です）。
+- `--format github`: GitHub Actions のアノテーション形式
+  `::error file=<path>,line=<n>::<message>` / `::warning file=<path>,line=<n>::<message>`
+  を1行ずつ出力します。行番号が特定できない場合は `line=` 部分を省略します（ファイル単位の
+  注釈として扱われます）。CI のジョブ内でこの出力をそのまま流すと、該当ファイル・行に
+  PR 上で直接エラーが表示されます。
+
+いずれの形式でも終了コードの扱いは変わりません（1件でもエラーがあれば非 0）。
+
+```sh
+$ lait lint . --format json
+[
+  {
+    "file": "workflow.yml",
+    "line": 12,
+    "severity": "warning",
+    "message": "node 'unused-step' is defined in 'nodes:' but never referenced by a step's 'use'"
+  }
+]
+
+$ lait lint . --format github
+::warning file=workflow.yml,line=12::node 'unused-step' is defined in 'nodes:' but never referenced by a step's 'use'
+```
+
 ## チェック内容
 
 `lait run`/`lait agent run` がファイルを読み込む際に必ず行う構造チェック（frontmatter・

@@ -495,11 +495,33 @@ pub(crate) struct AgentRunArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct LintArgs {
-    /// Paths to workflow YAML files (.yml/.yaml) and/or agent Markdown files
-    /// (.md) to check. Every file is checked even if an earlier one has
-    /// errors.
-    #[arg(value_name = "FILE", required = true)]
+    /// Paths to workflow YAML files (.yml/.yaml), agent Markdown files
+    /// (.md), and/or directories to search recursively for such files.
+    /// Every file is checked even if an earlier one has errors. Inside a
+    /// directory, a '.md' file is only checked when it starts with a '---'
+    /// frontmatter delimiter (other Markdown is skipped); dot-directories
+    /// (e.g. '.git'), 'target/', and 'node_modules/' are never descended
+    /// into.
+    #[arg(value_name = "PATH", required = true)]
     pub(crate) files: Vec<PathBuf>,
+
+    /// Output format: 'text' (default, human-readable, one report per
+    /// file), 'json' (a structured file/line/severity/message record per
+    /// finding, for editor/CI tooling), or 'github' (GitHub Actions
+    /// '::error file=...,line=...::'/'::warning ...::' annotations, so a
+    /// finding is shown directly on the PR diff).
+    #[arg(long, value_enum, default_value_t = LintFormat::Text)]
+    pub(crate) format: LintFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LintFormat {
+    /// Human-readable per-file report (the default).
+    Text,
+    /// A JSON array of `{file, line, severity, message}` records.
+    Json,
+    /// GitHub Actions `::error`/`::warning` annotation lines.
+    Github,
 }
 
 /// The chat options shared by single-shot chat (`ChatArgs`, flattened at the
