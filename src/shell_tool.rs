@@ -112,13 +112,20 @@ pub(crate) fn preview_argv(
     definition: &config::ShellToolDefinition,
     arguments_json: &str,
 ) -> Option<String> {
-    let input: serde_json::Value = if arguments_json.trim().is_empty() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        serde_json::from_str(arguments_json).ok()?
-    };
+    let input = parse_call_arguments(arguments_json).ok()?;
     let argv = render_argv(definition, &input).ok()?;
     Some(format!("{argv:?}"))
+}
+
+/// Parses a tool call's raw `arguments_json` into the JSON object `call`/
+/// `preview_argv` render against a `command:` template — treating a blank
+/// string (a call with no arguments) as `{}` rather than a parse error.
+fn parse_call_arguments(arguments_json: &str) -> Result<serde_json::Value> {
+    if arguments_json.trim().is_empty() {
+        Ok(serde_json::Value::Object(serde_json::Map::new()))
+    } else {
+        serde_json::from_str(arguments_json).context("tool call arguments must be a JSON object")
+    }
 }
 
 /// Runs `definition`'s command for one tool call — see `render_argv` for how
@@ -138,11 +145,7 @@ pub(crate) async fn call(
     arguments_json: &str,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
-    let input: serde_json::Value = if arguments_json.trim().is_empty() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        serde_json::from_str(arguments_json).context("tool call arguments must be a JSON object")?
-    };
+    let input = parse_call_arguments(arguments_json)?;
     let argv = match render_argv(definition, &input) {
         Ok(argv) => argv,
         Err(error) => return Ok(format!("tool command failed: {error:#}")),

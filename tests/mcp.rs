@@ -14,8 +14,8 @@ use std::{
 use std::{fs, path::Path};
 
 use support::{
-    ConfigDirectory, HttpRequest, MockServer, WorkflowFile, read_request, test_command,
-    without_json_whitespace,
+    ConfigDirectory, HttpRequest, MockServer, WorkflowFile, read_request, start_mock_mcp_server,
+    start_mock_mcp_server_with_list_cursor, test_command, without_json_whitespace,
 };
 
 #[cfg(unix)]
@@ -73,18 +73,6 @@ fn stdio_mcp_config(script: &Path, marker: &Path, alive: &Path) -> ConfigDirecto
         marker.display(),
         alive.display(),
     ))
-}
-
-/// A hand-rolled streamable-HTTP MCP server for integration tests: routes on
-/// the JSON-RPC `method` field (something `support::MockServer` can't do,
-/// since it just replays canned bodies in connection order) and answers
-/// `initialize` / `notifications/initialized` / `tools/list` / `tools/call` —
-/// the four requests one tool-call round trip makes. Exposes a single tool,
-/// `echo`, that always returns a fixed string regardless of its arguments.
-/// Request parsing itself reuses `support::read_request`, the same raw
-/// header/`Content-Length`/body reader `support::MockServer` uses.
-fn start_mock_mcp_server() -> (String, std::thread::JoinHandle<()>) {
-    start_mock_mcp_server_with_list_cursor(None)
 }
 
 /// Starts a bounded OpenAI-compatible server for timeout/retry tests. Unlike
@@ -258,98 +246,6 @@ fn start_timeout_retry_mcp_server() -> (String, std::thread::JoinHandle<Vec<Stri
                 .expect("mock MCP methods still have outstanding references")
                 .into_inner()
                 .expect("mock MCP methods mutex was poisoned")
-        }
-    });
-    (format!("http://{addr}/mcp"), handle)
-}
-
-/// Starts the same test server but includes `nextCursor` in every
-/// `tools/list` response when `next_cursor` is `Some`. This exercises the
-/// client's pagination safety checks without involving an LLM request: the
-/// repeated cursor must be rejected while listing tools.
-fn start_mock_mcp_server_with_list_cursor(
-    next_cursor: Option<&'static str>,
-) -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock MCP server");
-    let addr = listener
-        .local_addr()
-        .expect("failed to read mock MCP server address");
-    let handle = std::thread::spawn(move || {
-        let mut expected_cursor = None;
-        for _ in 0..4 {
-            let (mut stream, _) = listener.accept().expect("failed to accept connection");
-            let request = read_request(&mut stream).expect("failed to read MCP request");
-            let request: serde_json::Value =
-                serde_json::from_str(&request.body).expect("mock MCP server got non-JSON body");
-            let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            let id = request.get("id").cloned();
-            if method == "tools/list"
-                && let Some(expected_cursor) = expected_cursor
-            {
-                let actual_cursor = request
-                    .get("params")
-                    .and_then(|params| params.get("cursor"))
-                    .and_then(serde_json::Value::as_str);
-                assert_eq!(actual_cursor, Some(expected_cursor));
-            }
-
-            let (status, response_body) = match method {
-                "initialize" => (
-                    "200 OK",
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "protocolVersion": "2025-06-18",
-                            "capabilities": {},
-                            "serverInfo": {"name": "mock-mcp", "version": "0.0.1"}
-                        }
-                    })
-                    .to_string(),
-                ),
-                "notifications/initialized" => ("202 Accepted", String::new()),
-                "tools/list" => {
-                    let mut body = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "tools": [{
-                                "name": "echo",
-                                "description": "echoes the input back",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {"text": {"type": "string"}}
-                                }
-                            }]
-                        }
-                    });
-                    if let Some(next_cursor) = next_cursor {
-                        body["result"]["nextCursor"] = serde_json::json!(next_cursor);
-                        expected_cursor = Some(next_cursor);
-                    }
-                    ("200 OK", body.to_string())
-                }
-                "tools/call" => (
-                    "200 OK",
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": "42"}]
-                        }
-                    })
-                    .to_string(),
-                ),
-                other => panic!("mock MCP server received an unexpected method '{other}'"),
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len(),
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("failed to write mock response");
-            stream.flush().expect("failed to flush mock response");
         }
     });
     (format!("http://{addr}/mcp"), handle)

@@ -75,10 +75,18 @@ pub(crate) fn key(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct CacheEntry {
     created_at: chrono::DateTime<chrono::Utc>,
     response: response::ChatCompletionResponse,
+}
+
+/// The borrowed shape of [`CacheEntry`] used to serialize a save without
+/// cloning the response just to own it alongside `created_at`.
+#[derive(Debug, Serialize)]
+struct CacheEntryRef<'a> {
+    created_at: chrono::DateTime<chrono::Utc>,
+    response: &'a response::ChatCompletionResponse,
 }
 
 fn entry_path(key: &str) -> PathBuf {
@@ -124,9 +132,9 @@ pub(crate) fn save(key: &str, response: &response::ChatCompletionResponse) -> Re
         .expect("entry_path always returns a path under CACHE_DIR");
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory '{}'", dir.display()))?;
-    let entry = CacheEntry {
+    let entry = CacheEntryRef {
         created_at: chrono::Utc::now(),
-        response: response.clone(),
+        response,
     };
     let body = serde_json::to_string_pretty(&entry).context("failed to serialize cache entry")?;
     let tmp_path = Path::new(CACHE_DIR).join(format!("{key}.json.tmp"));

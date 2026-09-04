@@ -239,18 +239,11 @@ pub(crate) fn stream_chunk_deltas(
         .content
         .as_deref()
         .filter(|text| !text.is_empty());
-    let reasoning = choice
-        .delta
-        .reasoning
-        .as_deref()
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            choice
-                .delta
-                .reasoning_content
-                .as_deref()
-                .filter(|text| !text.is_empty())
-        });
+    let reasoning = non_blank_or(
+        choice.delta.reasoning.as_deref(),
+        choice.delta.reasoning_content.as_deref(),
+        |text| !text.is_empty(),
+    );
     (content, reasoning)
 }
 
@@ -338,20 +331,29 @@ fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&s
 /// chat `-o` path, which sends reasoning to stderr while the file gets the
 /// body alone.
 pub(crate) fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
-    response.choices.first().and_then(|choice| {
-        choice
-            .message
-            .reasoning
-            .as_deref()
-            .filter(|reasoning| !reasoning.trim().is_empty())
-            .or_else(|| {
-                choice
-                    .message
-                    .reasoning_content
-                    .as_deref()
-                    .filter(|reasoning| !reasoning.trim().is_empty())
-            })
-    })
+    let choice = response.choices.first()?;
+    non_blank_or(
+        choice.message.reasoning.as_deref(),
+        choice.message.reasoning_content.as_deref(),
+        |reasoning| !reasoning.trim().is_empty(),
+    )
+}
+
+/// `current` if it passes `is_present`, else `legacy` if it passes
+/// `is_present` — the shared current-field/legacy-`reasoning_content`
+/// fallback used by both [`response_reasoning`] and [`stream_chunk_deltas`].
+/// Takes the presence predicate rather than hardcoding it: the full response
+/// treats whitespace-only reasoning as absent (`.trim().is_empty()`), while a
+/// stream delta only treats a literal empty string as absent, since a chunk
+/// may legitimately carry a single space as part of a larger reasoning run.
+fn non_blank_or<'a>(
+    current: Option<&'a str>,
+    legacy: Option<&'a str>,
+    is_present: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    current
+        .filter(|text| is_present(text))
+        .or_else(|| legacy.filter(|text| is_present(text)))
 }
 
 fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool) -> String {

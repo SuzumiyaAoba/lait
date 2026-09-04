@@ -739,14 +739,15 @@ pub(crate) fn resolve_fallback_endpoint(
     if base_url.is_empty() {
         bail!("base URL must not be empty");
     }
-    let api_key = if let Some(api_key) = candidate.api_key.as_deref() {
-        expand_env_placeholders(api_key)?
-    } else if let Some(command) = &candidate.api_key_cmd {
-        secret::resolve(command)?
-    } else if let Some(api_key) = file_config.api_key.as_deref() {
-        expand_env_placeholders(api_key)?
-    } else if let Some(command) = &file_config.api_key_cmd {
-        secret::resolve(command)?
+    let api_key = if let Some(api_key) =
+        resolve_literal_or_cmd(candidate.api_key.as_deref(), candidate.api_key_cmd.as_ref())?
+    {
+        api_key
+    } else if let Some(api_key) = resolve_literal_or_cmd(
+        file_config.api_key.as_deref(),
+        file_config.api_key_cmd.as_ref(),
+    )? {
+        api_key
     } else {
         // Mirrors `resolve_request_settings`'s own dummy-key substitution —
         // async-openai always builds an Authorization header, and LM Studio
@@ -754,6 +755,23 @@ pub(crate) fn resolve_fallback_endpoint(
         "lm-studio".to_owned()
     };
     Ok((base_url, api_key))
+}
+
+/// Resolves one `api_key`/`api_key_cmd` layer — a literal value (`${VAR}`-
+/// expanded) or an `api_key_cmd` to run for it — the same two-source pair
+/// every layer (candidate, model-definition, top-level config) offers.
+/// `None` when neither is set.
+fn resolve_literal_or_cmd(
+    api_key: Option<&str>,
+    api_key_cmd: Option<&CommandSpec>,
+) -> Result<Option<String>> {
+    if let Some(api_key) = api_key {
+        Ok(Some(expand_env_placeholders(api_key)?))
+    } else if let Some(command) = api_key_cmd {
+        Ok(Some(secret::resolve(command)?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
@@ -841,16 +859,13 @@ pub(crate) fn resolve_endpoint(
     )?;
     let api_key = if let Some(api_key) = api_key_override {
         Some(api_key)
-    } else if let Some(model_api_key) = model_api_key {
-        Some(expand_env_placeholders(model_api_key)?)
-    } else if let Some(command) = model_api_key_cmd {
-        Some(secret::resolve(command)?)
-    } else if let Some(config_api_key) = file_config.api_key.as_deref() {
-        Some(expand_env_placeholders(config_api_key)?)
-    } else if let Some(command) = &file_config.api_key_cmd {
-        Some(secret::resolve(command)?)
+    } else if let Some(api_key) = resolve_literal_or_cmd(model_api_key, model_api_key_cmd)? {
+        Some(api_key)
     } else {
-        None
+        resolve_literal_or_cmd(
+            file_config.api_key.as_deref(),
+            file_config.api_key_cmd.as_ref(),
+        )?
     };
     Ok((base_url, api_key))
 }

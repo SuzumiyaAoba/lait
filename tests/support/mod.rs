@@ -383,40 +383,7 @@ impl MockServer {
     /// a canned response, not truly incremental), which is enough since the
     /// client parses events out of the byte stream as they're read either way.
     pub(crate) fn start_stream(events: &[&str]) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
-        let address = listener
-            .local_addr()
-            .expect("failed to get mock server address");
-        let (request_sender, requests) = mpsc::channel();
-        let mut body = String::new();
-        for event in events {
-            body.push_str("data: ");
-            body.push_str(event);
-            body.push_str("\n\n");
-        }
-        body.push_str("data: [DONE]\n\n");
-
-        let thread = thread::spawn(move || {
-            let (mut stream, _) = listener.accept()?;
-            let request = read_request(&mut stream)?;
-            request_sender
-                .send(request)
-                .map_err(|_| io::Error::other("test receiver was dropped"))?;
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            );
-            stream.write_all(response.as_bytes())?;
-            stream.flush()?;
-            Ok(())
-        });
-
-        Self {
-            base_url: format!("http://{address}/v1"),
-            requests,
-            thread,
-        }
+        Self::start_stream_sequence(&[events])
     }
 
     /// Like `start_stream`, but accepts `rounds.len()` connections in order,
@@ -567,6 +534,110 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// A hand-rolled streamable-HTTP MCP server for integration tests: routes on
+/// the JSON-RPC `method` field (something `MockServer` can't do, since it
+/// just replays canned bodies in connection order) and answers `initialize`
+/// / `notifications/initialized` / `tools/list` / `tools/call` — the four
+/// requests one tool-call round trip makes. Exposes a single tool, `echo`,
+/// that always returns a fixed string regardless of its arguments. Shared by
+/// every integration test binary that needs a minimal MCP tool-call
+/// round trip (`tests/mcp.rs`, `tests/streaming.rs`).
+pub(crate) fn start_mock_mcp_server() -> (String, JoinHandle<()>) {
+    start_mock_mcp_server_with_list_cursor(None)
+}
+
+/// Starts the same test server but includes `nextCursor` in every
+/// `tools/list` response when `next_cursor` is `Some`. This exercises a
+/// client's pagination safety checks without involving an LLM request: a
+/// repeated cursor must be rejected while listing tools.
+pub(crate) fn start_mock_mcp_server_with_list_cursor(
+    next_cursor: Option<&'static str>,
+) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock MCP server");
+    let addr = listener
+        .local_addr()
+        .expect("failed to read mock MCP server address");
+    let handle = thread::spawn(move || {
+        let mut expected_cursor = None;
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().expect("failed to accept connection");
+            let request = read_request(&mut stream).expect("failed to read MCP request");
+            let request: serde_json::Value =
+                serde_json::from_str(&request.body).expect("mock MCP server got non-JSON body");
+            let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = request.get("id").cloned();
+            if method == "tools/list"
+                && let Some(expected_cursor) = expected_cursor
+            {
+                let actual_cursor = request
+                    .get("params")
+                    .and_then(|params| params.get("cursor"))
+                    .and_then(serde_json::Value::as_str);
+                assert_eq!(actual_cursor, Some(expected_cursor));
+            }
+
+            let (status, response_body) = match method {
+                "initialize" => (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock-mcp", "version": "0.0.1"}
+                        }
+                    })
+                    .to_string(),
+                ),
+                "notifications/initialized" => ("202 Accepted", String::new()),
+                "tools/list" => {
+                    let mut body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [{
+                                "name": "echo",
+                                "description": "echoes the input back",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"text": {"type": "string"}}
+                                }
+                            }]
+                        }
+                    });
+                    if let Some(next_cursor) = next_cursor {
+                        body["result"]["nextCursor"] = serde_json::json!(next_cursor);
+                        expected_cursor = Some(next_cursor);
+                    }
+                    ("200 OK", body.to_string())
+                }
+                "tools/call" => (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{"type": "text", "text": "42"}]
+                        }
+                    })
+                    .to_string(),
+                ),
+                other => panic!("mock MCP server received an unexpected method '{other}'"),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("failed to write mock response");
+            stream.flush().expect("failed to flush mock response");
+        }
+    });
+    (format!("http://{addr}/mcp"), handle)
 }
 
 /// Builds a `lait` single-shot chat invocation for tests: `--model

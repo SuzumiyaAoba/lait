@@ -184,35 +184,35 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     Ok(())
 }
 
-/// Checks the top-level and every `models:` entry's `api_key`/`api_key_cmd`
-/// pair for the both-set conflict `resolve_model_alias`/`resolve_endpoint`
-/// reject at resolve time (see `config::check_provider_api_key_sources`),
-/// printing one line per violation. Returns whether every pair was valid.
-fn check_provider_api_key_sources(file_config: &ConfigFile) -> bool {
-    let errors = config::check_provider_api_key_sources(file_config);
+/// Prints one `  error: {error}` line per entry under a `{CONFIG_FILE_NAME}
+/// ({section}):` header, if any. Returns whether `errors` was empty.
+fn report_config_errors(section: &str, errors: Vec<String>) -> bool {
     if errors.is_empty() {
         return true;
     }
-    println!("{} (api_key/api_key_cmd:):", config::CONFIG_FILE_NAME);
+    println!("{} ({section}):", config::CONFIG_FILE_NAME);
     for error in &errors {
         println!("  error: {error}");
     }
     false
 }
 
+/// Checks the top-level and every `models:` entry's `api_key`/`api_key_cmd`
+/// pair for the both-set conflict `resolve_model_alias`/`resolve_endpoint`
+/// reject at resolve time (see `config::check_provider_api_key_sources`),
+/// printing one line per violation. Returns whether every pair was valid.
+fn check_provider_api_key_sources(file_config: &ConfigFile) -> bool {
+    report_config_errors(
+        "api_key/api_key_cmd:",
+        config::check_provider_api_key_sources(file_config),
+    )
+}
+
 /// Checks every `tools:` entry's `command`/`parameters` (see
 /// `config::check_shell_tool_definitions`), printing one line per
 /// violation. Returns whether every entry was valid.
 fn check_shell_tool_definitions(file_config: &ConfigFile) -> bool {
-    let errors = config::check_shell_tool_definitions(file_config);
-    if errors.is_empty() {
-        return true;
-    }
-    println!("{} (tools:):", config::CONFIG_FILE_NAME);
-    for error in &errors {
-        println!("  error: {error}");
-    }
-    false
+    report_config_errors("tools:", config::check_shell_tool_definitions(file_config))
 }
 
 /// Checks that every `workflows:` entry in `file_config` resolves to a file

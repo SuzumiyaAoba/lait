@@ -339,14 +339,19 @@ enum ToolDecision {
 /// via `prompt_tool_approval`. This is the *only* place either gate is
 /// enforced; `McpRegistry::call`'s own `allowed_tools` check still applies
 /// underneath it for an MCP tool (the two are independent, both must pass).
-/// `command_preview` is the argv a shell tool call would actually exec (see
-/// `shell_tool::preview_argv`), shown alongside the model's raw arguments —
-/// `None` for an MCP/subagent call, which have no such rendering step.
+/// `command_preview` renders the argv a shell tool call would actually exec
+/// (see `shell_tool::preview_argv`) for display alongside the model's raw
+/// arguments — `None` for an MCP/subagent call, which have no such rendering
+/// step. Taken as a closure rather than the rendered `Option<String>` itself
+/// so the parse+render only happens on the path that actually reaches
+/// `prompt_tool_approval` below — never for a call `tool_policy` denies
+/// outright, approval isn't enabled for, or is already in
+/// `always_approved_tools`.
 async fn tool_decision(
     env: &AppContext,
     qualified_name: &str,
     arguments: &str,
-    command_preview: Option<&str>,
+    command_preview: impl FnOnce() -> Option<String>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ToolDecision> {
     if !env.file_config.tool_policy.allows(qualified_name) {
@@ -366,7 +371,15 @@ async fn tool_decision(
     {
         return Ok(ToolDecision::Allow);
     }
-    match prompt_tool_approval(qualified_name, arguments, command_preview, cancellation).await? {
+    let command_preview = command_preview();
+    match prompt_tool_approval(
+        qualified_name,
+        arguments,
+        command_preview.as_deref(),
+        cancellation,
+    )
+    .await?
+    {
         ToolApprovalAnswer::Once => Ok(ToolDecision::Allow),
         ToolApprovalAnswer::Always => {
             env.always_approved_tools
@@ -533,19 +546,23 @@ async fn execute_tool_calls(
         // shell tool. `None` for MCP/subagent calls, and for a shell tool
         // whose arguments/template can't be rendered right now (the actual
         // failure, if any, surfaces from `shell_tool::call` itself once the
-        // call is allowed to run).
-        let command_preview = shell_tool_set
-            .tool_name(&tool_call.function.name)
-            .and_then(|name| env.file_config.tools.get(name))
-            .and_then(|definition| {
-                shell_tool::preview_argv(definition, &tool_call.function.arguments)
-            });
+        // call is allowed to run). `tool_decision` only invokes this closure
+        // on the path that actually reaches its interactive
+        // `--approve-tools` prompt, so it's free on every other path.
+        let command_preview = || {
+            shell_tool_set
+                .tool_name(&tool_call.function.name)
+                .and_then(|name| env.file_config.tools.get(name))
+                .and_then(|definition| {
+                    shell_tool::preview_argv(definition, &tool_call.function.arguments)
+                })
+        };
         decisions.push(
             tool_decision(
                 env,
                 &tool_call.function.name,
                 &tool_call.function.arguments,
-                command_preview.as_deref(),
+                command_preview,
                 cancellation.clone(),
             )
             .await?,
@@ -780,26 +797,8 @@ impl RequestSettings {
                 .await;
         }
 
-        // `agent_registry.tools`/`shell_tool::tools` are both synchronous
-        // (they only read local subagent files/`file_config.tools`), so
-        // joining the MCP round trip with the subagent one lets both proceed
-        // together instead of paying the MCP latency before ever touching
-        // disk; `shell_tool::tools` is cheap enough to just call inline
-        // after.
-        let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
-            env.registry.tools(&self.mcp, cancellation.clone()),
-            env.agent_registry
-                .tools_cancellable(&self.subagents, cancellation.clone()),
-        )?;
-        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.file_config.tools)?;
-        check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
-        // Only `.contains()`/`.subagent_name()`/`.tool_name()` (which read
-        // `.index`, not `.tools`) are used below, so `.tools` doesn't need to
-        // survive past this merge — moving it out avoids cloning every tool
-        // definition (including its full JSON `parameters`).
-        let mut tools = std::mem::take(&mut mcp_tool_set.tools);
-        tools.extend(std::mem::take(&mut subagent_tool_set.tools));
-        tools.extend(std::mem::take(&mut shell_tool_set.tools));
+        let (mcp_tool_set, subagent_tool_set, shell_tool_set, tools) =
+            self.assemble_tool_sets(env, cancellation.clone()).await?;
 
         let mut messages =
             llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
@@ -849,6 +848,46 @@ impl RequestSettings {
             )
             .await?;
         }
+    }
+
+    /// Builds the three tool sets (`mcp:`, `subagents:`, `tools:`) `complete`/
+    /// `complete_stream` dispatch calls against, plus their merged OpenAI-
+    /// shaped `tools:` payload — shared by both since streamed and
+    /// non-streamed requests assemble tools identically, only how each round
+    /// is issued differs. `agent_registry.tools`/`shell_tool::tools` are both
+    /// synchronous (they only read local subagent files/`file_config.tools`),
+    /// so joining the MCP round trip with the subagent one lets both proceed
+    /// together instead of paying the MCP latency before ever touching disk;
+    /// `shell_tool::tools` is cheap enough to just call inline after.
+    ///
+    /// Callers must not call this when `self.mcp`/`self.subagents`/
+    /// `self.tools` are all empty — that's the plain-completion fast path,
+    /// handled separately above.
+    async fn assemble_tool_sets(
+        &self,
+        env: &AppContext,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<(
+        mcp::ToolSet,
+        subagent::ToolSet,
+        shell_tool::ToolSet,
+        Vec<ChatCompletionTools>,
+    )> {
+        let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
+            env.registry.tools(&self.mcp, cancellation.clone()),
+            env.agent_registry
+                .tools_cancellable(&self.subagents, cancellation.clone()),
+        )?;
+        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.file_config.tools)?;
+        check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
+        // Only `.contains()`/`.subagent_name()`/`.tool_name()` (which read
+        // `.index`, not `.tools`) are used by callers below, so `.tools`
+        // doesn't need to survive past this merge — moving it out avoids
+        // cloning every tool definition (including its full JSON `parameters`).
+        let mut tools = std::mem::take(&mut mcp_tool_set.tools);
+        tools.extend(std::mem::take(&mut subagent_tool_set.tools));
+        tools.extend(std::mem::take(&mut shell_tool_set.tools));
+        Ok((mcp_tool_set, subagent_tool_set, shell_tool_set, tools))
     }
 
     /// The one way `complete` sends a request: checks the response disk
@@ -1040,19 +1079,8 @@ impl RequestSettings {
             return stream_response(stream, show_reasoning, output_path, false, cancellation).await;
         }
 
-        // Same tool-set assembly as `complete` — see its own comment on why
-        // MCP discovery and reading the local subagent files are joined
-        // rather than sequenced.
-        let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
-            env.registry.tools(&self.mcp, cancellation.clone()),
-            env.agent_registry
-                .tools_cancellable(&self.subagents, cancellation.clone()),
-        )?;
-        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.file_config.tools)?;
-        check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
-        let mut tools = std::mem::take(&mut mcp_tool_set.tools);
-        tools.extend(std::mem::take(&mut subagent_tool_set.tools));
-        tools.extend(std::mem::take(&mut shell_tool_set.tools));
+        let (mcp_tool_set, subagent_tool_set, shell_tool_set, tools) =
+            self.assemble_tool_sets(env, cancellation.clone()).await?;
 
         let mut messages =
             llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
