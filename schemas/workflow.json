@@ -1,0 +1,320 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SuzumiyaAoba/lait/master/schemas/workflow.json",
+  "title": "lait workflow.yml",
+  "description": "A lait workflow file (nodes: what to do, steps: how to wire it together). See docs/usage/ja/workflow.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["steps"],
+  "properties": {
+    "version": {
+      "description": "This file's schema version. Omit for the latest version this build supports.",
+      "type": "integer",
+      "const": 1
+    },
+    "name": { "type": "string" },
+    "description": { "type": "string" },
+    "default": { "$ref": "#/$defs/workflowDefaults" },
+    "models": { "$ref": "#/$defs/modelMap" },
+    "json_schemas": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/jsonSchemaEntry" }
+    },
+    "nodes": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/nodeDefinition" }
+    },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/flowStep" }
+    }
+  },
+  "$defs": {
+    "reasoningEffort": {
+      "type": "string",
+      "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+    },
+    "retryDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "delay_seconds": { "type": "integer", "minimum": 0 },
+        "backoff": { "type": "number" }
+      }
+    },
+    "commandSpec": {
+      "description": "A shell-interpreted string, or a literal argv list run with no shell.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+    "providerConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url"],
+      "properties": {
+        "base_url": { "type": "string" },
+        "api_key": { "type": "string" },
+        "api_key_cmd": { "$ref": "#/$defs/commandSpec" }
+      }
+    },
+    "modelDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model_id"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/providerConfig" },
+        "model_id": { "type": "string" },
+        "default_reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
+        "default_temperature": { "type": "number" },
+        "default_top_p": { "type": "number" },
+        "default_max_tokens": { "type": "integer" }
+      }
+    },
+    "modelMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/modelDefinition" },
+        "minItems": 1
+      }
+    },
+    "jsonSchemaEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file_path"],
+          "properties": { "file_path": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema"],
+          "properties": { "schema": {} }
+        }
+      ]
+    },
+    "workflowDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string" },
+        "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
+        "temperature": { "type": "number" },
+        "top_p": { "type": "number" },
+        "max_tokens": { "type": "integer" },
+        "retry": { "$ref": "#/$defs/retryDefinition" },
+        "timeout": { "type": "integer", "minimum": 0 },
+        "mcp": { "type": "array", "items": { "type": "string" } },
+        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "subagents": { "type": "array", "items": { "type": "string" } },
+        "tools": { "type": "array", "items": { "type": "string" } },
+        "system_prompt": { "type": "string" },
+        "workflow_timeout": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "promptNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "prompt" },
+        "model": { "type": "string" },
+        "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
+        "temperature": { "type": "number" },
+        "top_p": { "type": "number" },
+        "max_tokens": { "type": "integer" },
+        "prompt": { "type": "string" },
+        "system_prompt": { "type": "string" },
+        "files": { "type": "array", "items": { "type": "string" } },
+        "images": { "type": "array", "items": { "type": "string" } },
+        "input_schema": { "type": "string" },
+        "output_schema": { "type": "string" },
+        "schema_name": { "type": "string" },
+        "jq": { "type": "string" },
+        "write_file": { "type": "string" },
+        "retry": { "$ref": "#/$defs/retryDefinition" },
+        "timeout": { "type": "integer", "minimum": 0 },
+        "mcp": { "type": "array", "items": { "type": "string" } },
+        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "subagents": { "type": "array", "items": { "type": "string" } },
+        "tools": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "agentNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "agent"],
+      "properties": {
+        "type": { "const": "agent" },
+        "agent": { "type": "string" },
+        "model": { "type": "string" },
+        "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
+        "temperature": { "type": "number" },
+        "top_p": { "type": "number" },
+        "max_tokens": { "type": "integer" },
+        "files": { "type": "array", "items": { "type": "string" } },
+        "images": { "type": "array", "items": { "type": "string" } },
+        "jq": { "type": "string" },
+        "write_file": { "type": "string" },
+        "retry": { "$ref": "#/$defs/retryDefinition" },
+        "timeout": { "type": "integer", "minimum": 0 },
+        "mcp": { "type": "array", "items": { "type": "string" } },
+        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "subagents": { "type": "array", "items": { "type": "string" } },
+        "tools": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "workflowNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "workflow"],
+      "properties": {
+        "type": { "const": "workflow" },
+        "workflow": { "type": "string" },
+        "jq": { "type": "string" },
+        "write_file": { "type": "string" }
+      }
+    },
+    "commandNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "command"],
+      "properties": {
+        "type": { "const": "command" },
+        "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "jq": { "type": "string" },
+        "write_file": { "type": "string" },
+        "retry": { "$ref": "#/$defs/retryDefinition" },
+        "timeout": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "transformNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "transform" },
+        "jq": { "type": "string" },
+        "write_file": { "type": "string" },
+        "retry": { "$ref": "#/$defs/retryDefinition" },
+        "timeout": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "askNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "prompt"],
+      "properties": {
+        "type": { "const": "ask" },
+        "prompt": { "type": "string" },
+        "choices": { "type": "array", "items": { "type": "string" } },
+        "multiline": { "type": "boolean" },
+        "default": { "type": "string" },
+        "jq": { "type": "string" },
+        "write_file": { "type": "string" },
+        "retry": { "$ref": "#/$defs/retryDefinition" },
+        "timeout": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "nodeDefinition": {
+      "oneOf": [
+        { "$ref": "#/$defs/promptNode" },
+        { "$ref": "#/$defs/agentNode" },
+        { "$ref": "#/$defs/workflowNode" },
+        { "$ref": "#/$defs/commandNode" },
+        { "$ref": "#/$defs/transformNode" },
+        { "$ref": "#/$defs/askNode" }
+      ]
+    },
+    "onErrorDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["steps"],
+      "properties": {
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+      }
+    },
+    "caseDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["when", "steps"],
+      "properties": {
+        "id": { "type": "string" },
+        "when": { "type": "string" },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+      }
+    },
+    "switchDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cases"],
+      "properties": {
+        "cases": { "type": "array", "items": { "$ref": "#/$defs/caseDefinition" } },
+        "else": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+      }
+    },
+    "branchDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["steps"],
+      "properties": {
+        "id": { "type": "string" },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+      }
+    },
+    "parallelDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branches"],
+      "properties": {
+        "branches": { "type": "array", "items": { "$ref": "#/$defs/branchDefinition" } },
+        "join": { "type": "string" }
+      }
+    },
+    "loopDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_iterations", "steps"],
+      "properties": {
+        "while": { "type": "string" },
+        "until": { "type": "string" },
+        "max_iterations": { "type": "integer", "minimum": 1 },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+      }
+    },
+    "forEachDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["items", "steps"],
+      "properties": {
+        "items": { "type": "string" },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } },
+        "join": { "type": "string" },
+        "max_concurrency": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "flowStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "use": { "type": "string" },
+        "when": { "type": "string" },
+        "on_error": { "$ref": "#/$defs/onErrorDefinition" },
+        "switch": { "$ref": "#/$defs/switchDefinition" },
+        "parallel": { "$ref": "#/$defs/parallelDefinition" },
+        "loop": { "$ref": "#/$defs/loopDefinition" },
+        "for_each": { "$ref": "#/$defs/forEachDefinition" },
+        "stop": { "type": "boolean" },
+        "break": { "type": "boolean" }
+      }
+    }
+  }
+}

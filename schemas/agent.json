@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SuzumiyaAoba/lait/master/schemas/agent.json",
+  "title": "lait agent frontmatter",
+  "description": "The YAML frontmatter of a lait agent Markdown file (agent.md). The body after the closing '---' is the system prompt template and is not covered by this schema. See docs/usage/ja/agent.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string" },
+    "description": { "type": "string" },
+    "model": { "type": "string" },
+    "reasoning_effort": {
+      "type": "string",
+      "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+    },
+    "temperature": { "type": "number" },
+    "top_p": { "type": "number" },
+    "max_tokens": { "type": "integer" },
+    "input_schema": { "$ref": "#/$defs/jsonSchemaEntry" },
+    "output_schema": { "$ref": "#/$defs/jsonSchemaEntry" },
+    "structured_output": { "type": "boolean" },
+    "schema_name": { "type": "string" },
+    "mcp": { "type": "array", "items": { "type": "string" } },
+    "max_tool_rounds": { "type": "integer", "minimum": 0 },
+    "skills": { "type": "array", "items": { "type": "string" } },
+    "subagents": { "type": "array", "items": { "type": "string" } },
+    "tools": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "jsonSchemaEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file_path"],
+          "properties": { "file_path": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema"],
+          "properties": { "schema": {} }
+        }
+      ]
+    }
+  }
+}

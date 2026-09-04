@@ -47,3 +47,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "proce
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+jsonschema = "0.53.0"

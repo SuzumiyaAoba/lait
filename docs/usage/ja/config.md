@@ -10,6 +10,9 @@ CLI 引数や環境変数で指定していない値は、`lait.config.yml` か�
 指定したファイルが存在しなければエラーになります。`--no-config` を指定すると
 探索・読み込み自体を行いません。まずはモデルと接続先だけを指定した、次の最小構成から始められます。
 
+エディタで補完・検証を効かせたい場合は [`lait schema config`](./schema.md) が出力する
+JSON Schema を使えます。
+
 ```yaml
 # lait.config.yml
 base_url: http://localhost:1234/v1

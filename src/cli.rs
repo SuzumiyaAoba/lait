@@ -122,6 +122,27 @@ pub(crate) enum Command {
     Runs(RunsCommand),
     /// Manage the response disk cache (`.lait/cache/`, see `--cache`).
     Cache(CacheCommand),
+    /// Print the JSON Schema (draft 2020-12) for workflow.yml, lait.config.yml,
+    /// or an agent file's frontmatter, for editor completion/validation (e.g.
+    /// yaml-language-server). See docs/usage/ja/schema.md.
+    Schema(SchemaArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SchemaArgs {
+    /// Which file format to print the JSON Schema for.
+    #[arg(value_enum, value_name = "KIND")]
+    pub(crate) kind: SchemaKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SchemaKind {
+    /// The schema for a workflow YAML file (`workflow.yml`).
+    Workflow,
+    /// The schema for `lait.config.yml`.
+    Config,
+    /// The schema for an agent Markdown file's YAML frontmatter (`agent.md`).
+    Agent,
 }
 
 #[derive(Debug, Args)]

@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use async_openai::types::chat::{ResponseFormat, ResponseFormatJsonSchema};
 use serde::Deserialize;
 
-use crate::async_io;
+use crate::{
+    async_io,
+    cli::{SchemaArgs, SchemaKind},
+};
 
 /// A map of schema name to its definition, as used by a workflow file's
 /// top-level `json_schemas:` and an agent file's `input_schema:`/`output_schema:`.
@@ -360,9 +363,42 @@ pub(crate) fn build_json_schema(schema: serde_json::Value, name: &str) -> Result
     })
 }
 
+/// The hand-maintained JSON Schema (draft 2020-12) documents `lait schema`
+/// prints, embedded at build time from `schemas/`. Kept hand-written rather
+/// than derived (e.g. via `schemars`) since `config::ConfigFile`/
+/// `workflow::model::WorkflowFile` lean heavily on `#[serde(deny_unknown_fields)]`,
+/// `#[serde(untagged)]`, and per-variant structs that don't map cleanly onto a
+/// derive macro; see this module's tests for the cross-check against the real
+/// parsers that keeps these from silently drifting.
+fn embedded_schema_source(kind: SchemaKind) -> &'static str {
+    match kind {
+        SchemaKind::Workflow => include_str!("../schemas/workflow.json"),
+        SchemaKind::Config => include_str!("../schemas/config.json"),
+        SchemaKind::Agent => include_str!("../schemas/agent.json"),
+    }
+}
+
+/// Parses `kind`'s embedded schema document and re-renders it pretty-printed,
+/// which doubles as a self-check that the committed `schemas/*.json` file is
+/// itself well-formed JSON.
+pub(crate) fn document_schema_json(kind: SchemaKind) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(embedded_schema_source(kind))
+        .context("internal error: embedded JSON Schema failed to parse")?;
+    serde_json::to_string_pretty(&value).context("failed to render JSON Schema")
+}
+
+/// Runs `lait schema workflow|config|agent`: prints the requested document's
+/// JSON Schema to stdout. Purely local — see `app::needs_async_runtime`.
+pub(crate) fn run(args: SchemaArgs) -> Result<()> {
+    println!("{}", document_schema_json(args.kind)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{unrecognized_type_names, validate_input_against_schema};
+    use super::{
+        SchemaKind, document_schema_json, unrecognized_type_names, validate_input_against_schema,
+    };
     use serde_json::json;
 
     #[test]
@@ -541,6 +577,330 @@ mod tests {
         });
         assert!(
             validate_input_against_schema(&schema, &json!({"city": "Tokyo", "extra": 1})).is_ok()
+        );
+    }
+
+    // The three `lait schema` documents below are hand-written (see
+    // `document_schema_json`'s doc comment for why), so nothing at compile
+    // time keeps them from drifting away from what `config::ConfigFile`/
+    // `workflow::model::WorkflowFile`/`agent::AgentFile` actually accept.
+    // Every test below feeds the *same* YAML text (parsed once into
+    // `serde_json::Value` for the schema validator, and once through the
+    // real crate parser) to both, so a field this module's authors forget to
+    // mirror into the JSON Schema shows up as a test failure here rather
+    // than silently going stale.
+
+    fn compiled_schema(kind: SchemaKind) -> jsonschema::Validator {
+        let document: serde_json::Value =
+            serde_json::from_str(&document_schema_json(kind).unwrap())
+                .expect("embedded schema document must be valid JSON");
+        jsonschema::validator_for(&document).expect("embedded schema document must compile")
+    }
+
+    fn yaml_to_json(yaml: &str) -> serde_json::Value {
+        serde_yaml::from_str(yaml).expect("fixture YAML must itself be well-formed")
+    }
+
+    /// A unique path under the OS temp directory for a real-parser fixture
+    /// (`workflow::load_workflow`/`agent::load_agent` both read from disk) —
+    /// same shape as `init.rs`'s own template tests.
+    fn temp_fixture_path(label: &str, extension: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "lait-schema-test-{label}-{}-{n}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn every_embedded_schema_compiles() {
+        for kind in [SchemaKind::Workflow, SchemaKind::Config, SchemaKind::Agent] {
+            compiled_schema(kind);
+        }
+    }
+
+    const COMPREHENSIVE_WORKFLOW_YAML: &str = r#"
+version: 1
+name: sample
+description: exercises most of the workflow vocabulary
+default:
+  model: local
+  reasoning_effort: medium
+  temperature: 0.5
+  retry:
+    max_attempts: 3
+    delay_seconds: 1
+    backoff: 2.0
+  timeout: 30
+  mcp: [fs]
+  skills: [style]
+  subagents: [helper]
+  tools: [echo]
+  workflow_timeout: 120
+models:
+  local:
+    - provider:
+        base_url: http://localhost:1234/v1
+        api_key: sk-test
+      model_id: my-model
+      default_reasoning_effort: high
+json_schemas:
+  inline_example:
+    schema:
+      type: object
+  file_example:
+    file_path: ./schema.json
+nodes:
+  summarize:
+    type: prompt
+    model: local
+    prompt: "summarize {{ input }}"
+    system_prompt: "you are concise"
+    files: ["./context.txt"]
+    images: ["./picture.png"]
+    input_schema: inline_example
+    output_schema: inline_example
+    schema_name: summary
+    jq: ".summary"
+    write_file: ./out.txt
+    retry:
+      max_attempts: 2
+    timeout: 10
+    mcp: [fs]
+    max_tool_rounds: 4
+    skills: [style]
+    subagents: [helper]
+    tools: [echo]
+  delegate:
+    type: agent
+    agent: ./agents/researcher.md
+    model: local
+  sub:
+    type: workflow
+    workflow: ./sub.yml
+  run_cmd:
+    type: command
+    command: ["echo", "{{ input }}"]
+  reshape:
+    type: transform
+    jq: "."
+  confirm:
+    type: ask
+    prompt: "continue?"
+    choices: ["yes", "no"]
+    default: "yes"
+steps:
+  - id: route
+    switch:
+      cases:
+        - when: "true"
+          steps:
+            - use: summarize
+      else:
+        - use: reshape
+  - id: fanout
+    parallel:
+      branches:
+        - id: branch-a
+          steps:
+            - use: run_cmd
+        - id: branch-b
+          steps:
+            - use: reshape
+      join: "."
+  - id: repeat
+    loop:
+      while: "false"
+      max_iterations: 3
+      steps:
+        - use: reshape
+  - id: each
+    for_each:
+      items: "[1, 2, 3]"
+      max_concurrency: 2
+      steps:
+        - use: reshape
+  - use: delegate
+  - use: sub
+  - use: confirm
+  - stop: true
+"#;
+
+    #[test]
+    fn workflow_schema_accepts_a_document_the_real_parser_accepts() {
+        let path = temp_fixture_path("workflow-ok", "yml");
+        std::fs::write(&path, COMPREHENSIVE_WORKFLOW_YAML).unwrap();
+        let parsed = crate::workflow::load_workflow(&path);
+        std::fs::remove_file(&path).ok();
+        parsed.expect("fixture must be accepted by the real workflow parser");
+
+        let validator = compiled_schema(SchemaKind::Workflow);
+        let instance = yaml_to_json(COMPREHENSIVE_WORKFLOW_YAML);
+        assert!(
+            validator.is_valid(&instance),
+            "schema rejected a document the real parser accepts: {:?}",
+            validator.iter_errors(&instance).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn workflow_schema_rejects_a_document_missing_required_steps() {
+        let invalid = "name: no-steps\n";
+        let validator = compiled_schema(SchemaKind::Workflow);
+        assert!(!validator.is_valid(&yaml_to_json(invalid)));
+
+        let path = temp_fixture_path("workflow-bad", "yml");
+        std::fs::write(&path, invalid).unwrap();
+        let parsed = crate::workflow::load_workflow(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            parsed.is_err(),
+            "the real workflow parser must also reject a file with no steps"
+        );
+    }
+
+    const COMPREHENSIVE_CONFIG_YAML: &str = r#"
+base_url: http://localhost:1234/v1
+api_key: sk-test
+default:
+  model: local
+  reasoning_effort: medium
+  system: "you are concise"
+  temperature: 0.5
+  top_p: 0.9
+  max_tokens: 512
+  mcp: [fs]
+  max_tool_rounds: 4
+  skills: [style]
+  subagents: [helper]
+  tools: [echo]
+  render: true
+  history: true
+  cache: true
+  cache_ttl: 3600
+models:
+  local:
+    - provider:
+        base_url: http://localhost:1234/v1
+        api_key: sk-test
+      model_id: my-model
+      default_reasoning_effort: high
+      default_temperature: 0.7
+mcp_servers:
+  fs:
+    command: npx
+    args: ["-y", "server-fs"]
+    env:
+      TOKEN: abc
+    allowed_tools: [read_file]
+skills:
+  style: ./skills/style.md
+agents:
+  helper: ./agents/helper.md
+prompts:
+  greet:
+    template: "Hello {{ input }}"
+    model: local
+    vars:
+      name: world
+workflows:
+  main: ./workflow.yml
+tool_policy:
+  allow: ["fs__*"]
+  deny: ["fs__delete"]
+tools:
+  echo:
+    description: echoes input
+    command: ["echo", "{{ input.text }}"]
+    parameters:
+      type: object
+      properties:
+        text: { type: string }
+    timeout: 5
+"#;
+
+    #[test]
+    fn config_schema_accepts_a_document_the_real_parser_accepts() {
+        let parsed: Result<crate::config::ConfigFile, _> =
+            serde_yaml::from_str(COMPREHENSIVE_CONFIG_YAML);
+        parsed.expect("fixture must be accepted by the real config parser");
+
+        let validator = compiled_schema(SchemaKind::Config);
+        let instance = yaml_to_json(COMPREHENSIVE_CONFIG_YAML);
+        assert!(
+            validator.is_valid(&instance),
+            "schema rejected a document the real parser accepts: {:?}",
+            validator.iter_errors(&instance).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn config_schema_rejects_an_unknown_top_level_field() {
+        let invalid = "not_a_real_field: 1\n";
+        let validator = compiled_schema(SchemaKind::Config);
+        assert!(!validator.is_valid(&yaml_to_json(invalid)));
+
+        let parsed: Result<crate::config::ConfigFile, _> = serde_yaml::from_str(invalid);
+        assert!(
+            parsed.is_err(),
+            "the real config parser must also reject an unknown top-level field"
+        );
+    }
+
+    const COMPREHENSIVE_AGENT_FRONTMATTER_YAML: &str = r#"
+name: sample-agent
+description: exercises most of the agent frontmatter vocabulary
+model: local
+reasoning_effort: medium
+temperature: 0.5
+top_p: 0.9
+max_tokens: 512
+input_schema:
+  schema:
+    type: object
+    required: [text]
+output_schema:
+  file_path: ./schema.json
+structured_output: true
+schema_name: summary
+mcp: [fs]
+max_tool_rounds: 4
+skills: [style]
+subagents: [helper]
+tools: [echo]
+"#;
+
+    #[test]
+    fn agent_schema_accepts_a_document_the_real_parser_accepts() {
+        let mut file_contents = "---\n".to_owned();
+        file_contents.push_str(COMPREHENSIVE_AGENT_FRONTMATTER_YAML.trim_start_matches('\n'));
+        file_contents.push_str("---\n\nYou are a helpful assistant.\n");
+        let path = temp_fixture_path("agent-ok", "md");
+        std::fs::write(&path, &file_contents).unwrap();
+        let parsed = crate::agent::load_agent(&path);
+        std::fs::remove_file(&path).ok();
+        parsed.expect("fixture must be accepted by the real agent parser");
+
+        let validator = compiled_schema(SchemaKind::Agent);
+        let instance = yaml_to_json(COMPREHENSIVE_AGENT_FRONTMATTER_YAML);
+        assert!(
+            validator.is_valid(&instance),
+            "schema rejected a document the real parser accepts: {:?}",
+            validator.iter_errors(&instance).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn agent_schema_rejects_an_invalid_reasoning_effort() {
+        let invalid = "reasoning_effort: extreme\n";
+        let validator = compiled_schema(SchemaKind::Agent);
+        assert!(!validator.is_valid(&yaml_to_json(invalid)));
+
+        let parsed: Result<crate::agent::AgentFile, _> = serde_yaml::from_str(invalid);
+        assert!(
+            parsed.is_err(),
+            "the real agent frontmatter parser must also reject an unknown reasoning_effort"
         );
     }
 }

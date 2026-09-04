@@ -4,7 +4,8 @@
 
 `lait agent run <FILE> <INPUT>` サブコマンドで、Markdown ファイル1つでエージェントを定義・
 実行できます。ファイルは YAML の frontmatter（`---` で区切られたブロック）とそれに続く
-Markdown 本文で構成され、本文がシステムプロンプトのテンプレートになります。
+Markdown 本文で構成され、本文がシステムプロンプトのテンプレートになります。frontmatter の
+補完・検証には [`lait schema agent`](./schema.md) が出力する JSON Schema を使えます。
 
 ```markdown
 ---

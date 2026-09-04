@@ -163,6 +163,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Skill(_)) => bail!("internal error: `skill list` must run on the sync path"),
         Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
         Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
+        Some(Command::Schema(_)) => bail!("internal error: `schema` must run on the sync path"),
         None => {
             run_chat_or_repl(
                 cli.chat,
@@ -279,7 +280,8 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::Workflow(_)
             | Command::Skill(_)
             | Command::Runs(_)
-            | Command::Cache(_),
+            | Command::Cache(_)
+            | Command::Schema(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
         Some(Command::Prompt(prompt_command)) => {
@@ -333,6 +335,7 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         },
         Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
         Some(Command::Cache(cache_command)) => crate::cache::run(cache_command),
+        Some(Command::Schema(schema_args)) => crate::schema::run(schema_args),
         Some(Command::Run(_) | Command::Chat(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }

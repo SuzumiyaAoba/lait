@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SuzumiyaAoba/lait/master/schemas/config.json",
+  "title": "lait.config.yml",
+  "description": "lait's project/global configuration file. See docs/usage/ja/config.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "base_url": { "type": "string" },
+    "api_key": { "type": "string" },
+    "api_key_cmd": { "$ref": "#/$defs/commandSpec" },
+    "default": { "$ref": "#/$defs/defaultSettings" },
+    "models": { "$ref": "#/$defs/modelMap" },
+    "mcp_servers": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/mcpServerConfig" }
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "prompts": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/promptDefinition" }
+    },
+    "workflows": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "tool_policy": { "$ref": "#/$defs/toolPolicy" },
+    "tools": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/shellToolDefinition" }
+    }
+  },
+  "$defs": {
+    "reasoningEffort": {
+      "type": "string",
+      "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+    },
+    "commandSpec": {
+      "description": "A shell-interpreted string, or a literal argv list run with no shell.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+    "providerConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url"],
+      "properties": {
+        "base_url": { "type": "string" },
+        "api_key": { "type": "string" },
+        "api_key_cmd": { "$ref": "#/$defs/commandSpec" }
+      }
+    },
+    "modelDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model_id"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/providerConfig" },
+        "model_id": { "type": "string" },
+        "default_reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
+        "default_temperature": { "type": "number" },
+        "default_top_p": { "type": "number" },
+        "default_max_tokens": { "type": "integer" }
+      }
+    },
+    "modelMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/modelDefinition" },
+        "minItems": 1
+      }
+    },
+    "defaultSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string" },
+        "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
+        "system": { "type": "string" },
+        "temperature": { "type": "number" },
+        "top_p": { "type": "number" },
+        "max_tokens": { "type": "integer" },
+        "mcp": { "type": "array", "items": { "type": "string" } },
+        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "subagents": { "type": "array", "items": { "type": "string" } },
+        "tools": { "type": "array", "items": { "type": "string" } },
+        "render": { "type": "boolean" },
+        "history": { "type": "boolean" },
+        "cache": { "type": "boolean" },
+        "cache_ttl": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "mcpServerConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "cwd": { "type": "string" },
+        "url": { "type": "string" },
+        "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+        "allowed_tools": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "promptDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["template"],
+      "properties": {
+        "template": { "type": "string" },
+        "model": { "type": "string" },
+        "vars": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "toolPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": { "type": "array", "items": { "type": "string" } },
+        "deny": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "shellToolDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "description": { "type": "string" },
+        "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "parameters": { "type": "object" },
+        "timeout": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
