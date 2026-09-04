@@ -2,22 +2,56 @@
 
 [ドキュメント目次に戻る](./README.md)
 
-`lait` は `async-openai` を使って OpenAI Compatible API に接続し、単体のプロンプトをチャット補完として送信する CLI です。LM Studio のローカルサーバーを利用した動作確認や、LLM API 接続のサンプルとして使えます。
+`lait` は OpenAI Compatible API にプロンプトを送信する CLI です。LM Studio のようなローカルサーバーにも、認証が必要なクラウド API にも接続できます。
+
+## インストール
+
+通常利用では、次のいずれかを選んでください。
+
+- バイナリ: [GitHub Releases](https://github.com/SuzumiyaAoba/lait/releases) から、お使いの OS 向けのアーカイブを取得します。
+- Homebrew（macOS）:
+
+  ```sh
+  brew install SuzumiyaAoba/tap/lait
+  ```
+
+- `cargo binstall`:
+
+  ```sh
+  cargo binstall lait
+  ```
+
+ソースコードを変更しながら試す場合は、リポジトリを取得して `cargo run --` を使います。Rust の導入やリリース手順は [開発](./development.md) を参照してください。
+
+## 最短手順
+
+次の4段階で最初のリクエストを送れます。
+
+1. `lait` をインストールする（開発中はこのページの例の `cargo run --` に置き換える）。
+2. LM Studio などの OpenAI Compatible API を起動し、使用するモデル ID を確認する。
+3. `lait --model "<MODEL_ID>" "こんにちは。"` を実行する。
+4. 接続先やモデルを毎回指定したくなったら、`lait init` で `lait.config.yml` を作成する。
+
+インストール済みのバイナリを実行する例:
+
+```sh
+lait --model "<MODEL_ID>" "Rustについて一文で説明してください。"
+```
+
+ソースから開発中に実行する例:
+
+```sh
+cargo run -- --model "<MODEL_ID>" "Rustについて一文で説明してください。"
+```
 
 ## 必要な環境
 
-- Rust stable
-- `rustfmt` と `clippy`（`rust-toolchain.toml` により自動的に指定されます）
+- 実行時: LM Studio などの OpenAI Compatible API と、そこで利用できるモデル。
+- ソースからビルドする場合: Rust stable、`rustfmt`、`clippy`（`rust-toolchain.toml` により自動的に指定されます）。
 
-## 基本的な使い方
+### `makers` を使う場合
 
-リポジトリのルートで次のコマンドを実行します。
-
-```sh
-cargo run -- --model <MODEL_ID_OR_ALIAS> "プロンプト"
-```
-
-`makers`（cargo-make）を使う場合は、CLI の引数を `run` タスクの後ろに渡します。
+`cargo-make` の `makers` をインストール済みなら、CLI の引数を `run` タスクの後ろに渡せます。通常の利用では `lait`、ソース開発では `cargo run --` を使えば十分です。
 
 ```sh
 makers run -- --model <MODEL_ID> "プロンプト"
@@ -27,7 +61,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 `xcrun --sdk macosx --show-sdk-path` の SDK を自動的に設定してから `cargo run` を実行します。
 Nix など別の `cc` が PATH にあっても、`aws-lc-sys` のリンクに必要な macOS SDK が使われます。
 
-## LM Studio の準備
+## 接続先の準備（LM Studio の例）
 
 実行前に、次の状態にしてください。
 
@@ -35,37 +69,58 @@ Nix など別の `cc` が PATH にあっても、`aws-lc-sys` のリンクに必
 2. LM Studio の Developer（Local Server）画面からサーバーを起動する。
 3. ロードしたモデルの ID（`<MODEL_ID>`）を確認する。
 
-LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です。別のホストやポートで起動している場合は、`--base-url` または `OPENAI_BASE_URL` で変更できます。
+LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です。別のホストやポートで起動している場合は、`--base-url` または `OPENAI_BASE_URL` で変更できます。LM Studio 以外を使う場合も、接続先が案内する OpenAI Compatible API のベース URL を同じ方法で指定してください。
 
 ## CLI 引数と環境変数
 
+よく使うものから順にまとめています。ワークフローや agent 固有のオプションは、それぞれの専門ページを参照してください。
+
+### 接続と入力
+
 | CLI 引数 | 環境変数 | 説明 |
 | --- | --- | --- |
-| `--base-url <URL>` | `OPENAI_BASE_URL` | OpenAI Compatible API のベース URL。既定値は `http://localhost:1234/v1`。 |
-| `--model <MODEL_ID_OR_ALIAS>` | `LLM_MODEL` | モデル ID または設定ファイルの alias。CLI 引数、環境変数、または設定ファイルで指定できます。 |
-| `--api-key <KEY>` | `OPENAI_API_KEY` | API キー。任意。認証を有効にしたサーバーで指定します。 |
-| `--show-reasoning` | — | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` にも対応）を回答前に表示します。既定では非表示です。 |
-| `--stream` | — | 応答が生成され次第、標準出力へ逐次書き出します。API へは `stream: true` を送信します。完全な応答をまとめて JSON 化する `--json` とは同時に指定できません。 |
-| `--json` | — | CLI の応答を JSON 形式で出力します。API の Structured Outputs を指定する `--json-schema` とは別の機能です。`--stream` とは同時に指定できません。 |
-| `--json-schema <FILE>` | — | API の Structured Outputs に使用する JSON Schema ファイル。指定時は `response_format` の `type` を `json_schema`、`strict` を `true` として送信します。 |
-| `--schema-name <NAME>` | — | Structured Outputs のスキーマ名。既定値は `structured_output` です。`--json-schema` と組み合わせて使用します。 |
-| `--reasoning-effort <EFFORT>` | `LLM_REASONING_EFFORT` | 推論の実行レベル。`none`、`minimal`、`low`、`medium`、`high`、`xhigh` のいずれかを指定します。未指定時は API リクエストにフィールドを追加しません。 |
-| `--temperature <FLOAT>` | `LLM_TEMPERATURE` | サンプリング温度（`0.0`〜`2.0`）。低いほど決定的、高いほどランダムな応答になります。未指定時は API リクエストにフィールドを追加しません。 |
-| `--top-p <FLOAT>` | `LLM_TOP_P` | nucleus sampling の確率質量（`0.0`〜`1.0`）。`--temperature` の代替として使います。未指定時は API リクエストにフィールドを追加しません。 |
-| `--max-tokens <INT>` | `LLM_MAX_TOKENS` | 応答として生成するトークン数の上限（`1`以上）。API へは（非推奨の `max_tokens` ではなく）`max_completion_tokens` として送信されます。未指定時は API リクエストにフィールドを追加しません。 |
-| `--mcp <NAME>` | — | `lait.config.yml` の `mcp_servers:` エントリ名。繰り返し指定可能。指定した MCP サーバーのツールをモデルに渡します（詳細は [MCP サーバーのツールを使う](./mcp.md)）。`--stream` とは同時に指定できません。 |
-| `--subagent <NAME>` | — | `lait.config.yml` の `agents:` エントリ名。繰り返し指定可能。指定したエージェント Markdown ファイルを、モデル自身が呼び出すかどうか判断できる「サブエージェント」ツールとして渡します（詳細は [サブエージェントを使う](./subagents.md)）。`--stream` とは同時に指定できません。 |
-| `--system <TEXT>` | — | ユーザープロンプトの前に送るシステムプロンプト。未指定時は `lait.config.yml` の `default.system` にフォールバックします。`--system-file` とは同時に指定できません。 |
+| `--model <MODEL_ID_OR_ALIAS>` | `LLM_MODEL` | モデル ID または設定ファイルの alias。未指定時は `default.model` を使います。 |
+| `--base-url <URL>` | `OPENAI_BASE_URL` | API のベース URL。未指定時は `http://localhost:1234/v1` です。 |
+| `--api-key <KEY>` | `OPENAI_API_KEY` | 認証が必要なサーバーの API キー。不要なサーバーでは省略できます。 |
+| `<PROMPT>` | — | 送信するプロンプト。省略時は標準入力から読み込みます（下記）。 |
+
+### 出力・入力の形式
+
+| CLI 引数 | 説明 |
+| --- | --- |
+| `--stream` | 応答を生成された部分から表示します。`--json` とは併用できません。MCP や subagent のツール呼び出しとも併用できます。 |
+| `--json` | CLI の応答を JSON（`content`、`reasoning`、`usage`）で出力します。Structured Outputs の指定とは別の機能です。 |
+| `--json-schema <FILE>` | API の Structured Outputs に使う JSON Schema ファイルです。スキーマ名は `--schema-name <NAME>`（既定値 `structured_output`）で変更できます。詳しくは [出力例](./output.md) を参照してください。 |
+| `--show-reasoning` | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` を含む）を回答前に表示します。 |
+| `--show-usage` | トークン使用量を標準エラー出力に表示します。`lait run` や `lait agent run` でも使えます。 |
+| `-o, --output <PATH>` | 応答を PATH に書き込みます。`-o -` は標準出力です。非ストリーミング時は成功後に書き込み、ストリーミング時は生成中に書き込みます。 |
+| `--render` | 端末で応答を Markdown として表示します。詳しくは [出力例](./output.md) を参照してください。 |
+| `--quiet` | reasoning や usage など本文以外の注記を抑制します。 |
+| `--file <PATH>` | ファイルの内容をプロンプトに添付します（繰り返し可）。詳しくは [ファイル・画像の添付](./attachments.md) を参照してください。 |
+| `--image <PATH_OR_URL>` | 画像を添付します（繰り返し可）。vision 対応モデルが必要です。 |
+| `--session <NAME>` | 会話を保存・再開します。詳しくは [会話セッションと対話モード](./chat.md) を参照してください。 |
+| `-p, --prompt-name <NAME>` | `prompts:` の名前付きテンプレートを使います。`--var KEY=VALUE` で変数を渡せます（[名前付きプロンプト](./prompts.md)）。 |
+
+### モデル・ツール・設定の詳細
+
+| CLI 引数 | 環境変数 | 説明 |
+| --- | --- | --- |
+| `--reasoning-effort <EFFORT>` | `LLM_REASONING_EFFORT` | 推論レベル（`none`、`minimal`、`low`、`medium`、`high`、`xhigh`）。 |
+| `--temperature <FLOAT>` | `LLM_TEMPERATURE` | サンプリング温度（`0.0`〜`2.0`）。 |
+| `--top-p <FLOAT>` | `LLM_TOP_P` | nucleus sampling の確率質量（`0.0`〜`1.0`）。 |
+| `--max-tokens <INT>` | `LLM_MAX_TOKENS` | 生成トークン数の上限（`1`以上）。 |
+| `--system <TEXT>` | — | システムプロンプトを指定します。`--system-file` と同時には使えません。 |
 | `--system-file <FILE>` | — | システムプロンプトをファイルから読み込みます。 |
-| `--show-usage` | — | 応答後にトークン使用量（`prompt`/`completion`/`total`）を標準エラー出力へ表示します（標準出力のパイプ利用を壊しません）。`--stream` 指定時はサーバーに `stream_options: {"include_usage": true}` を要求します。`lait run`/`lait agent run` でも使え、ワークフローではステップごとの内訳と合計を表示します。 |
-| `-o, --output <PATH>` | — | 応答本文を標準出力ではなく PATH に書き込みます（`--json` 併用時は JSON を書き込み、`-o -` は標準出力の明示指定）。`--stream` 以外では成功後にのみ書き込むため、失敗時に空ファイルが残りません。 |
-| `--quiet` | — | 応答本文以外の注記（reasoning 表示・usage 表示）をすべて抑制します（`--show-reasoning`/`--show-usage` より優先）。 |
-| `--no-config` | — | カレントディレクトリの `lait.config.yml` を読み込みません。 |
-| `--no-env` | — | カレントディレクトリの `.env` を読み込みません（詳細は [設定ファイル](./config.md)）。 |
-| `-v`, `--verbose`（繰り返し可） | `LAIT_LOG` | ログの詳細度を上げます。`-v` で解決後のモデル・base_url・サンプリングパラメータ・`mcp`/`skills`/`subagents`、ワークフローのステップ開始/終了・リトライ、ツール呼び出し（名前と引数）を表示。`-vv` でさらにリクエスト/レスポンス JSON 全体をダンプします。すべて標準エラー出力へ書かれるため標準出力のパイプ利用は壊れません。API キーは常にマスクされます。`LAIT_LOG`（`tracing_subscriber::EnvFilter` の書式。例: `debug`、`lait=trace,reqwest=info`）を設定すると `-v`/`-vv` より優先されます。 |
-| `--cache` | — | レスポンスを `.lait/cache/` にディスクキャッシュします（詳細は [設定ファイル](./config.md)）。`--no-cache` とは同時に指定できません。`--stream` 併用時はキャッシュされません。 |
-| `--no-cache` | — | `default.cache: true` を上書きしてキャッシュを無効にします。 |
-| `<PROMPT>` | — | 送信する単一のプロンプト。省略して標準入力から渡すこともできます（下記）。 |
+| `--mcp <NAME>` | — | `mcp_servers:` の MCP サーバーをツールとして渡します（繰り返し可）。`--stream` と併用できます（[MCP](./mcp.md)）。 |
+| `--subagent <NAME>` | — | `agents:` の agent を subagent ツールとして渡します（繰り返し可）。`--stream` と併用できます（[サブエージェント](./subagents.md)）。 |
+| `--tool <NAME>` | — | `tools:` のカスタムシェルツールを渡します（繰り返し可、[カスタムシェルツール](./tools.md)）。 |
+| `--var KEY=VALUE` | — | テンプレート変数を指定します。`lait run` や名前付きプロンプトで使えます。 |
+| `--config <PATH>` | — | 指定した設定ファイルだけを読み込みます。 |
+| `--no-config` | — | 設定ファイルを読み込みません。 |
+| `--no-env` | — | カレントディレクトリの `.env` を読み込みません（[設定ファイル](./config.md)）。 |
+| `--cache` / `--no-cache` | — | 応答キャッシュを有効化／無効化します（`--stream` はキャッシュされません）。 |
+| `-v`, `--verbose` | `LAIT_LOG` | 詳細ログを標準エラー出力に出します。`-vv` ではリクエスト／レスポンス JSON も表示します（[トラブルシュート](./troubleshooting.md)）。 |
+| `--approve-tools` | — | ツール実行前に対話的な承認を求めます（[MCP](./mcp.md)）。 |
 
 ### 標準入力からのプロンプト（パイプ対応）
 
@@ -80,7 +135,7 @@ git diff | lait "この変更をレビューして"
 cat question.txt | lait
 ```
 
-同じ規則は `lait run <FILE> [PROMPT]` と `lait agent run <FILE> [INPUT]` の入力（`{{ input }}`）にも適用されます。
+同じ規則は `lait run <FILE> [PROMPT]` と `lait agent run <FILE> [INPUT]` にも適用されます。agent の入力は JSON として解釈できる場合があり、その場合はシステムプロンプトから `{{ input.field }}` のように参照できます。
 
 ### そのほかのサブコマンド
 
@@ -95,8 +150,10 @@ cat question.txt | lait
 詳細なオプションは次のコマンドで確認できます。
 
 ```sh
-cargo run -- --help
+cargo run -- --help   # ソースから開発中の場合
 cargo run -- --version
+lait --help           # インストール済みの場合
+lait --version
 makers --list-all-steps
 ```
 
