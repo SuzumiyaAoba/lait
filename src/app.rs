@@ -9,7 +9,7 @@ use crate::{
     cli::{AgentRunArgs, GraphArgs, GraphFormat, PromptRunArgs, SharedChatArgs},
     cli::{SkillAction, WorkflowAction},
     config::{self, ConfigFile, ConfigSource, ModelMap},
-    docgen,
+    docgen, doctor,
     engine::{
         AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
         agent_file_settings, call_agent, resolve_request_settings,
@@ -164,6 +164,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
         Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
         Some(Command::Schema(_)) => bail!("internal error: `schema` must run on the sync path"),
+        Some(Command::Doctor(doctor_args)) => doctor::run(doctor_args, config_source).await,
         None => {
             run_chat_or_repl(
                 cli.chat,
@@ -290,7 +291,7 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
         Some(Command::Agent(agent_command)) => {
             matches!(agent_command.action, AgentAction::Run(_))
         }
-        Some(Command::Run(_) | Command::Chat(_)) | None => true,
+        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_)) | None => true,
     }
 }
 
@@ -336,7 +337,7 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
         Some(Command::Cache(cache_command)) => crate::cache::run(cache_command),
         Some(Command::Schema(schema_args)) => crate::schema::run(schema_args),
-        Some(Command::Run(_) | Command::Chat(_)) | None => {
+        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_)) | None => {
             bail!("internal error: an async command reached run_blocking")
         }
     }

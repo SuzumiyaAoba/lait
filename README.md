@@ -60,7 +60,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 ### まず読む
 
 - [はじめに](./docs/usage/ja/getting-started.md) — インストール、最短手順、主要な CLI オプション。
-- [トラブルシュート](./docs/usage/ja/troubleshooting.md) — 接続・認証・モデル・ログの確認。
+- [トラブルシュート](./docs/usage/ja/troubleshooting.md) — `lait doctor` による一括診断、接続・認証・モデル・ログの確認。
 
 ### 設定・自動化
 

@@ -31,7 +31,7 @@
 - [出力例](./output.md) — 通常出力、ストリーミング、JSON、Structured Outputs、Markdown 表示。
 - [会話セッションと対話モード（lait chat）](./chat.md) — REPL と `--session` による会話の保存・再開。
 - [実行履歴（lait history）](./history.md) — 実行履歴の一覧、表示、検索、無効化。
-- [トラブルシュート](./troubleshooting.md) — 接続・認証・モデル・終了コード・詳細ログの確認。
+- [トラブルシュート](./troubleshooting.md) — `lait doctor` による環境・設定・接続の一括診断、接続・認証・モデル・終了コード・詳細ログの確認。
 
 ## 開発
 

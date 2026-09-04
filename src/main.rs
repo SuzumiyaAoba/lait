@@ -10,6 +10,7 @@ mod checkpoint;
 mod cli;
 mod config;
 mod docgen;
+mod doctor;
 mod dotenv;
 mod engine;
 mod frontmatter;

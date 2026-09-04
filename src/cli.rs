@@ -126,6 +126,19 @@ pub(crate) enum Command {
     /// or an agent file's frontmatter, for editor completion/validation (e.g.
     /// yaml-language-server). See docs/usage/ja/schema.md.
     Schema(SchemaArgs),
+    /// Diagnose the environment/configuration/connectivity in one pass:
+    /// lait.config.yml parsing, `${VAR}` environment variables, model
+    /// resolution, provider connectivity and authentication, whether
+    /// configured model ids exist on the server, `mcp_servers:` startup, and
+    /// `agents:`/`skills:` file references. See docs/usage/ja/troubleshooting.md.
+    Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Print machine-readable JSON instead of a human-readable report.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1071,5 +1084,27 @@ mod tests {
             .expect("global flags should be accepted after subcommand arguments");
 
         assert!(cli.no_config);
+    }
+
+    #[test]
+    fn parses_doctor_subcommand() {
+        let cli =
+            Cli::try_parse_from(["lait", "doctor"]).expect("valid doctor arguments should parse");
+
+        match cli.command {
+            Some(Command::Doctor(doctor_args)) => assert!(!doctor_args.json),
+            _ => panic!("expected the doctor subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_doctor_subcommand_with_json() {
+        let cli = Cli::try_parse_from(["lait", "doctor", "--json"])
+            .expect("valid doctor arguments should parse");
+
+        match cli.command {
+            Some(Command::Doctor(doctor_args)) => assert!(doctor_args.json),
+            _ => panic!("expected the doctor subcommand to be selected"),
+        }
     }
 }
