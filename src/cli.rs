@@ -31,6 +31,48 @@ pub(crate) struct Cli {
     /// provides `--help` output and validation.)
     #[arg(long, global = true)]
     pub(crate) no_env: bool,
+
+    /// Increase log verbosity: once (`-v`) for debug-level tracing of
+    /// resolved request settings, workflow step timing/retries, and tool
+    /// calls; twice (`-vv`) to also dump full request/response JSON. Always
+    /// written to stderr, never stdout, so a piped answer stays clean; API
+    /// keys are masked. `LAIT_LOG` (an `EnvFilter` directive string, e.g.
+    /// `debug` or `lait=trace,reqwest=info`) overrides this when set. See
+    /// `crate::logging`.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
+
+    /// Cache completion responses under `.lait/cache/`, keyed by the
+    /// request's base URL/model/sampling/messages/tools/response format (not
+    /// the API key). A hit skips the network call entirely and prints a
+    /// `note:` to stderr. Falls back to `default.cache` in lait.config.yml
+    /// when neither this nor `--no-cache` is passed; off by default.
+    /// Streamed (`--stream`) responses are never cached. See
+    /// `crate::cache`.
+    #[arg(long, global = true, conflicts_with = "no_cache")]
+    pub(crate) cache: bool,
+
+    /// Never use or write the response disk cache, overriding
+    /// `default.cache` in lait.config.yml.
+    #[arg(long, global = true)]
+    pub(crate) no_cache: bool,
+
+    /// Before running an MCP/subagent/`tools:` shell tool the model calls,
+    /// print its name and arguments to stderr (plus the actual command a
+    /// shell tool would exec, once its `command:` template is rendered) and
+    /// ask on stdin whether to allow it: `y` (this call only), `n` (deny
+    /// this call — the model sees a denial as the tool's result and the run
+    /// continues), or `a` (allow this tool name for the rest of the run
+    /// without asking again). Every call in one round is confirmed before
+    /// any of them run, one at a time, so prompts never interleave. A denial
+    /// from this or from `tool_policy` in lait.config.yml (see
+    /// `crate::config::ToolPolicy`) still lets the tool loop continue — only
+    /// an actual error, or the model giving up, ends the run. Requires an
+    /// interactive stdin; errors immediately otherwise (piped/CI input has
+    /// no one to answer, and there is no way to tell a closed pipe from a
+    /// slow human — see `workflow::ask::run_ask`'s same reasoning).
+    #[arg(long, global = true)]
+    pub(crate) approve_tools: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,6 +120,20 @@ pub(crate) enum Command {
     /// List or inspect checkpointed `lait run --checkpoint` runs
     /// (`.lait/runs/`), resumable with `lait run ... --resume <RUN_ID>`.
     Runs(RunsCommand),
+    /// Manage the response disk cache (`.lait/cache/`, see `--cache`).
+    Cache(CacheCommand),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CacheCommand {
+    #[command(subcommand)]
+    pub(crate) action: CacheAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CacheAction {
+    /// Delete every cached response under `.lait/cache/`.
+    Clear,
 }
 
 #[derive(Debug, Args)]
@@ -499,22 +555,25 @@ pub(crate) struct SharedChatArgs {
 
     /// Name of an `mcp_servers:` entry (from lait.config.yml) whose tools
     /// this request may call. Repeatable. Falls back to `default.mcp` in
-    /// lait.config.yml when unset. Single-shot chat rejects combining this
-    /// with `--stream` at request-resolve time rather than at parse time (a
-    /// streamed `tool_calls` field arrives as fragments lait does not yet
-    /// reassemble; see `RequestSettings::complete_stream`) — unlike
-    /// `ChatArgs`' own flags, this field is also reachable from `lait chat`,
-    /// which has no single `--stream` flag to declare a clap-level conflict
-    /// against (see `docs/usage/ja/chat.md`).
+    /// lait.config.yml when unset. Freely combinable with `--stream` — a
+    /// streamed `tool_calls` field's fragments are reassembled per round;
+    /// see `RequestSettings::complete_stream`.
     #[arg(long = "mcp", value_name = "NAME")]
     pub(crate) mcp: Vec<String>,
 
     /// Name of an `agents:` entry (from lait.config.yml) made available as a
     /// callable subagent tool this request may call. Repeatable. Falls back
-    /// to `default.subagents` in lait.config.yml when unset. Same
-    /// `--stream` caveat as `--mcp` above.
+    /// to `default.subagents` in lait.config.yml when unset. Freely
+    /// combinable with `--stream`, like `--mcp` above.
     #[arg(long = "subagent", value_name = "NAME")]
     pub(crate) subagent: Vec<String>,
+
+    /// Name of a `tools:` entry (from lait.config.yml) — a local command
+    /// exposed as a callable tool without an MCP server — this request may
+    /// call. Repeatable. Falls back to `default.tools` in lait.config.yml
+    /// when unset. Freely combinable with `--stream`, like `--mcp` above.
+    #[arg(long = "tool", value_name = "NAME")]
+    pub(crate) tool: Vec<String>,
 
     /// Resume (or start) a named conversation: this call's prompt and the
     /// model's reply are appended to `.lait/sessions/<NAME>.jsonl`, and every
@@ -581,8 +640,8 @@ pub(crate) struct ChatArgs {
 
 /// `lait chat`'s own arguments: just the options a REPL turn can use — see
 /// `SharedChatArgs`. There is no `--stream` flag here because the REPL
-/// streams every turn by default (falling back to a non-streamed request
-/// only when `--mcp`/`--subagent` is set — see `repl::run`).
+/// streams every turn by default, including a turn that calls
+/// `--mcp`/`--subagent` tools — see `repl::run_turn`.
 #[derive(Debug, Args)]
 pub(crate) struct ChatReplArgs {
     #[command(flatten)]

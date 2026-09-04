@@ -26,21 +26,15 @@ mod tests;
 
 /// Resolves `lait run`'s `FILE` argument: `argument` itself when it exists as
 /// a file, else a `workflows:` registry entry of that name (see
-/// `config::WorkflowMap`), resolved against `config_dir` — the directory of
-/// the `lait.config.yml` that defined the registry, not the current working
-/// directory, so a registry entry keeps working from any subdirectory the
-/// same way `lait.config.yml` itself is found by walking upward (see
-/// `config::find_config_upward`). `config_dir` is `None` when no config file
-/// was read at all (`--no-config`, or `Search` finding nothing), in which
-/// case a registry path (if any; `workflows:` is then always empty anyway)
-/// falls back to being read relative to the current directory. When
-/// `argument` is *both* an existing file and a registered name, the file
-/// wins — noted to stderr so the shadowing isn't silent.
-pub(crate) fn resolve_run_target(
-    argument: &Path,
-    file_config: &ConfigFile,
-    config_dir: Option<&Path>,
-) -> PathBuf {
+/// `config::WorkflowMap`). A registry entry's path is already absolute by
+/// this point — resolved once at config-load time against the directory of
+/// whichever config file (project or global) defined it, see
+/// `config::load_config`'s `parse_config_file` — so it keeps working from
+/// any subdirectory the same way `lait.config.yml` itself is found by
+/// walking upward (see `config::find_config_upward`). When `argument` is
+/// *both* an existing file and a registered name, the file wins — noted to
+/// stderr so the shadowing isn't silent.
+pub(crate) fn resolve_run_target(argument: &Path, file_config: &ConfigFile) -> PathBuf {
     if argument.is_file() {
         if let Some(name) = argument.to_str()
             && file_config.workflows.contains_key(name)
@@ -55,28 +49,24 @@ pub(crate) fn resolve_run_target(
         return argument.to_path_buf();
     };
     match file_config.workflows.get(name) {
-        Some(registered_path) => {
-            let resolved = crate::config::resolve_registry_path(registered_path, config_dir);
+        Some(resolved) => {
             eprintln!(
                 "note: resolved '{name}' to '{}' via 'workflows:' in {}",
                 resolved.display(),
                 crate::config::CONFIG_FILE_NAME
             );
-            resolved
+            resolved.clone()
         }
         None => argument.to_path_buf(),
     }
 }
 
 /// Runs `lait workflow list`: prints every configured `workflows:` entry's
-/// name, path, and (when the file loads cleanly) its own `description:`.
-/// `config_dir` resolves each entry's path the same way
-/// `resolve_run_target`/`lint::check_workflows_registry` do — see
-/// `config::resolve_registry_path`. A registry entry whose file is missing or
-/// fails to parse is still listed (with a note) rather than aborting the
-/// whole command — `lait lint` is where a hard failure on a bad entry
-/// belongs.
-pub(crate) fn list(file_config: &ConfigFile, config_dir: Option<&Path>) -> Result<()> {
+/// name, path, and (when the file loads cleanly) its own `description:`. A
+/// registry entry whose file is missing or fails to parse is still listed
+/// (with a note) rather than aborting the whole command — `lait lint` is
+/// where a hard failure on a bad entry belongs.
+pub(crate) fn list(file_config: &ConfigFile) -> Result<()> {
     if file_config.workflows.is_empty() {
         println!(
             "no workflows defined in {}; add a 'workflows:' entry to define one",
@@ -87,10 +77,9 @@ pub(crate) fn list(file_config: &ConfigFile, config_dir: Option<&Path>) -> Resul
     let mut names: Vec<&String> = file_config.workflows.keys().collect();
     names.sort_unstable();
     for name in names {
-        let raw_path = &file_config.workflows[name];
-        let path = crate::config::resolve_registry_path(raw_path, config_dir);
-        let loaded = load_workflow(&path).map(|wf| wf.description);
-        crate::config::print_registry_entry(name, &path, loaded);
+        let path = &file_config.workflows[name];
+        let loaded = load_workflow(path).map(|wf| wf.description);
+        crate::config::print_registry_entry(name, path, loaded);
     }
     Ok(())
 }

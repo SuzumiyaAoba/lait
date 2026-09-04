@@ -109,9 +109,13 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     // when `lait.config.yml` is absent/not found and when `--no-config` was
     // passed, the linter needs to tell "absent/skipped" apart from "present
     // but empty" so it can skip `mcp:`/`skills:` name checks (and say why)
-    // instead of reporting every referenced name as unknown.
+    // instead of reporting every referenced name as unknown. A global config
+    // (see `config::global_config_path`) counts as "present" too — it's only
+    // ever consulted for `ConfigSource::Search`, same as the project file.
     let config_path = config::resolve_config_path(&config_source)?;
-    let config_present = config_path.is_some();
+    let global_config_present =
+        matches!(config_source, ConfigSource::Search) && config::global_config_path()?.is_file();
+    let config_present = config_path.is_some() || global_config_present;
     let file_config = config::load_config(&config_source)?;
     let config = config_present.then_some(&file_config);
 
@@ -119,9 +123,10 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     let registry_ok = if file_config.workflows.is_empty() {
         true
     } else {
-        let config_dir = config_path.as_deref().and_then(Path::parent);
-        check_workflows_registry(&file_config, config_dir)
+        check_workflows_registry(&file_config)
     };
+    let api_key_sources_ok = check_provider_api_key_sources(&file_config);
+    let shell_tool_definitions_ok = check_shell_tool_definitions(&file_config);
     for file in &lint_args.files {
         // `lint_file` only ever returns `Err` for a file whose type it can't
         // determine (an unrecognized extension) — treated here as one more
@@ -149,9 +154,9 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
         }
     }
 
-    if failed_files > 0 || !registry_ok {
+    if failed_files > 0 || !registry_ok || !api_key_sources_ok || !shell_tool_definitions_ok {
         bail!(
-            "{failed_files} of {} file(s) had errors{}",
+            "{failed_files} of {} file(s) had errors{}{}{}",
             lint_args.files.len(),
             if registry_ok {
                 String::new()
@@ -160,10 +165,54 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
                     "; {} 'workflows:' also has errors",
                     config::CONFIG_FILE_NAME
                 )
+            },
+            if api_key_sources_ok {
+                String::new()
+            } else {
+                format!(
+                    "; {} api_key/api_key_cmd also has errors",
+                    config::CONFIG_FILE_NAME
+                )
+            },
+            if shell_tool_definitions_ok {
+                String::new()
+            } else {
+                format!("; {} 'tools:' also has errors", config::CONFIG_FILE_NAME)
             }
         );
     }
     Ok(())
+}
+
+/// Prints one `  error: {error}` line per entry under a `{CONFIG_FILE_NAME}
+/// ({section}):` header, if any. Returns whether `errors` was empty.
+fn report_config_errors(section: &str, errors: Vec<String>) -> bool {
+    if errors.is_empty() {
+        return true;
+    }
+    println!("{} ({section}):", config::CONFIG_FILE_NAME);
+    for error in &errors {
+        println!("  error: {error}");
+    }
+    false
+}
+
+/// Checks the top-level and every `models:` entry's `api_key`/`api_key_cmd`
+/// pair for the both-set conflict `resolve_model_alias`/`resolve_endpoint`
+/// reject at resolve time (see `config::check_provider_api_key_sources`),
+/// printing one line per violation. Returns whether every pair was valid.
+fn check_provider_api_key_sources(file_config: &ConfigFile) -> bool {
+    report_config_errors(
+        "api_key/api_key_cmd:",
+        config::check_provider_api_key_sources(file_config),
+    )
+}
+
+/// Checks every `tools:` entry's `command`/`parameters` (see
+/// `config::check_shell_tool_definitions`), printing one line per
+/// violation. Returns whether every entry was valid.
+fn check_shell_tool_definitions(file_config: &ConfigFile) -> bool {
+    report_config_errors("tools:", config::check_shell_tool_definitions(file_config))
 }
 
 /// Checks that every `workflows:` entry in `file_config` resolves to a file
@@ -173,17 +222,17 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
 /// `lait.config.yml` itself, since nothing inside a workflow YAML ever
 /// references `workflows:` (unlike `mcp:`/`skills:`/`agent:`, which are
 /// checked per-file by `lint_workflow_contents`/`lint_agent_contents`).
-/// `config_dir` mirrors `workflow::resolve_run_target`'s own resolution, so
-/// this reports exactly the path `lait run <NAME>` would actually try to
-/// read. Returns whether every entry resolved; prints one line per entry.
-fn check_workflows_registry(file_config: &ConfigFile, config_dir: Option<&Path>) -> bool {
+/// Registry paths are already absolute (resolved once at config-load time —
+/// see `config::load_config`), so this reports exactly the path `lait run
+/// <NAME>` (`workflow::resolve_run_target`) would actually try to read.
+/// Returns whether every entry resolved; prints one line per entry.
+fn check_workflows_registry(file_config: &ConfigFile) -> bool {
     let mut names: Vec<&String> = file_config.workflows.keys().collect();
     names.sort_unstable();
     let mut ok = true;
     println!("{} (workflows:):", config::CONFIG_FILE_NAME);
     for name in names {
-        let raw_path = &file_config.workflows[name];
-        let resolved = config::resolve_registry_path(raw_path, config_dir);
+        let resolved = &file_config.workflows[name];
         if resolved.is_file() {
             println!("  {name}: OK ({})", resolved.display());
         } else {
@@ -269,8 +318,8 @@ fn lint_agent_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
 fn note_skipped_capability_check(ctx: &mut LintCtx, issues: &mut Vec<LintIssue>) {
     if ctx.skipped_capability_check {
         issues.push(LintIssue::warning(format!(
-            "'mcp'/'skills'/'subagents' names were not checked because no {} was found (or \
-             --no-config was used)",
+            "'mcp'/'skills'/'subagents'/'tools' names were not checked because no {} was found \
+             (or --no-config was used)",
             config::CONFIG_FILE_NAME
         )));
     }
@@ -315,6 +364,12 @@ fn lint_workflow_contents(
     check_subagent_names(
         "the workflow's 'default'",
         wf.default.subagents.as_deref(),
+        ctx,
+        issues,
+    );
+    check_tool_names(
+        "the workflow's 'default'",
+        wf.default.tools.as_deref(),
         ctx,
         issues,
     );
@@ -431,6 +486,7 @@ fn lint_node(
     check_mcp_names(&node_context, node.mcp(), ctx, issues);
     check_skill_names(&node_context, node.skills(), ctx, issues);
     check_subagent_names(&node_context, node.subagents(), ctx, issues);
+    check_tool_names(&node_context, node.tools(), ctx, issues);
 
     match node {
         workflow::NodeDefinition::Prompt(prompt) => {
@@ -707,6 +763,7 @@ fn lint_agent_contents(
     check_mcp_names(context, agent_file.mcp.as_deref(), ctx, issues);
     check_skill_names(context, agent_file.skills.as_deref(), ctx, issues);
     check_subagent_names(context, agent_file.subagents.as_deref(), ctx, issues);
+    check_tool_names(context, agent_file.tools.as_deref(), ctx, issues);
 }
 
 fn check_mcp_names(
@@ -786,6 +843,23 @@ fn check_subagent_names(
         "agents:",
         names,
         |config, name| config.agents.contains_key(name),
+        ctx,
+        issues,
+    );
+}
+
+fn check_tool_names(
+    context: &str,
+    names: Option<&[String]>,
+    ctx: &mut LintCtx,
+    issues: &mut Vec<LintIssue>,
+) {
+    check_capability_names(
+        context,
+        "tool",
+        "tools:",
+        names,
+        |config, name| config.tools.contains_key(name),
         ctx,
         issues,
     );

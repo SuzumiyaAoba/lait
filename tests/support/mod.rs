@@ -49,6 +49,14 @@ pub(crate) struct ConfigDirectory {
     path: PathBuf,
 }
 
+/// A temporary `$XDG_CONFIG_HOME` holding a global `lait/config.yml`, for
+/// testing the global config file (see `config::global_config_path`).
+/// Distinct from `ConfigDirectory`, which writes a project-local
+/// `lait.config.yml` instead.
+pub(crate) struct GlobalConfigDirectory {
+    xdg_config_home: PathBuf,
+}
+
 impl JsonSchemaFile {
     pub(crate) fn new(contents: &str) -> Self {
         let mut path = None;
@@ -206,6 +214,38 @@ impl Drop for ConfigDirectory {
     }
 }
 
+impl GlobalConfigDirectory {
+    /// Writes `contents` to a fresh temporary directory's `lait/config.yml`,
+    /// the layout `config::global_config_path` expects under `$XDG_CONFIG_HOME`.
+    pub(crate) fn new(contents: &str) -> Self {
+        let xdg_config_home = next_temp_path("lait-test-global-config", "");
+        fs::create_dir_all(xdg_config_home.join("lait"))
+            .expect("failed to create test global config directory");
+        fs::write(xdg_config_home.join("lait").join("config.yml"), contents)
+            .expect("failed to write test global config file");
+        Self { xdg_config_home }
+    }
+
+    /// The value to set `XDG_CONFIG_HOME` to for a child process to pick up
+    /// this directory's `lait/config.yml` as its global config.
+    pub(crate) fn xdg_config_home(&self) -> &Path {
+        &self.xdg_config_home
+    }
+
+    /// The directory the global `config.yml` itself lives in
+    /// (`$XDG_CONFIG_HOME/lait`) — where a registry entry (`workflows:`/
+    /// `agents:`/`skills:`) defined in it resolves relative paths against.
+    pub(crate) fn config_dir(&self) -> PathBuf {
+        self.xdg_config_home.join("lait")
+    }
+}
+
+impl Drop for GlobalConfigDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.xdg_config_home);
+    }
+}
+
 pub(crate) fn test_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
     for variable in [
@@ -216,6 +256,20 @@ pub(crate) fn test_command() -> Command {
     ] {
         command.env_remove(variable);
     }
+    // Isolates every test from the machine's real global config
+    // (`$XDG_CONFIG_HOME/lait/config.yml`, or `~/.config/lait/config.yml`
+    // when `XDG_CONFIG_HOME` is unset — see `config::global_config_path`).
+    // Without this, a developer's own global config (models/mcp_servers/
+    // default: entries) would silently merge into every test run. The path
+    // need not exist: `global_config_path`'s `.is_file()` check simply
+    // returns false, so this needs no filesystem setup and is race-free
+    // under parallel test execution. Tests exercising the global config
+    // itself (`tests/config.rs`) override this with `GlobalConfigDirectory`
+    // and `.env("XDG_CONFIG_HOME", ..)`.
+    command.env(
+        "XDG_CONFIG_HOME",
+        std::env::temp_dir().join("lait-test-no-global-config"),
+    );
     command
 }
 
@@ -329,32 +383,53 @@ impl MockServer {
     /// a canned response, not truly incremental), which is enough since the
     /// client parses events out of the byte stream as they're read either way.
     pub(crate) fn start_stream(events: &[&str]) -> Self {
+        Self::start_stream_sequence(&[events])
+    }
+
+    /// Like `start_stream`, but accepts `rounds.len()` connections in order,
+    /// replying to the Nth one with an SSE body built from `rounds[n]` (the
+    /// same per-event framing `start_stream` uses) — for a streamed
+    /// `--stream`/`--mcp`/`--subagent` tool loop, where each round is its
+    /// own HTTP request/response over the same base URL. Unlike
+    /// `start_sequence`, extra connections beyond `rounds.len()` are not
+    /// tolerated (a streamed request is never retried by async-openai's own
+    /// retry layer once bytes start arriving, so a test using this doesn't
+    /// need that headroom).
+    pub(crate) fn start_stream_sequence(rounds: &[&[&str]]) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock server");
         let address = listener
             .local_addr()
             .expect("failed to get mock server address");
         let (request_sender, requests) = mpsc::channel();
-        let mut body = String::new();
-        for event in events {
-            body.push_str("data: ");
-            body.push_str(event);
-            body.push_str("\n\n");
-        }
-        body.push_str("data: [DONE]\n\n");
+        let bodies: Vec<String> = rounds
+            .iter()
+            .map(|events| {
+                let mut body = String::new();
+                for event in *events {
+                    body.push_str("data: ");
+                    body.push_str(event);
+                    body.push_str("\n\n");
+                }
+                body.push_str("data: [DONE]\n\n");
+                body
+            })
+            .collect();
 
         let thread = thread::spawn(move || {
-            let (mut stream, _) = listener.accept()?;
-            let request = read_request(&mut stream)?;
-            request_sender
-                .send(request)
-                .map_err(|_| io::Error::other("test receiver was dropped"))?;
+            for body in &bodies {
+                let (mut stream, _) = listener.accept()?;
+                let request = read_request(&mut stream)?;
+                request_sender
+                    .send(request)
+                    .map_err(|_| io::Error::other("test receiver was dropped"))?;
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            );
-            stream.write_all(response.as_bytes())?;
-            stream.flush()?;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+            }
             Ok(())
         });
 
@@ -459,6 +534,110 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// A hand-rolled streamable-HTTP MCP server for integration tests: routes on
+/// the JSON-RPC `method` field (something `MockServer` can't do, since it
+/// just replays canned bodies in connection order) and answers `initialize`
+/// / `notifications/initialized` / `tools/list` / `tools/call` — the four
+/// requests one tool-call round trip makes. Exposes a single tool, `echo`,
+/// that always returns a fixed string regardless of its arguments. Shared by
+/// every integration test binary that needs a minimal MCP tool-call
+/// round trip (`tests/mcp.rs`, `tests/streaming.rs`).
+pub(crate) fn start_mock_mcp_server() -> (String, JoinHandle<()>) {
+    start_mock_mcp_server_with_list_cursor(None)
+}
+
+/// Starts the same test server but includes `nextCursor` in every
+/// `tools/list` response when `next_cursor` is `Some`. This exercises a
+/// client's pagination safety checks without involving an LLM request: a
+/// repeated cursor must be rejected while listing tools.
+pub(crate) fn start_mock_mcp_server_with_list_cursor(
+    next_cursor: Option<&'static str>,
+) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock MCP server");
+    let addr = listener
+        .local_addr()
+        .expect("failed to read mock MCP server address");
+    let handle = thread::spawn(move || {
+        let mut expected_cursor = None;
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().expect("failed to accept connection");
+            let request = read_request(&mut stream).expect("failed to read MCP request");
+            let request: serde_json::Value =
+                serde_json::from_str(&request.body).expect("mock MCP server got non-JSON body");
+            let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = request.get("id").cloned();
+            if method == "tools/list"
+                && let Some(expected_cursor) = expected_cursor
+            {
+                let actual_cursor = request
+                    .get("params")
+                    .and_then(|params| params.get("cursor"))
+                    .and_then(serde_json::Value::as_str);
+                assert_eq!(actual_cursor, Some(expected_cursor));
+            }
+
+            let (status, response_body) = match method {
+                "initialize" => (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock-mcp", "version": "0.0.1"}
+                        }
+                    })
+                    .to_string(),
+                ),
+                "notifications/initialized" => ("202 Accepted", String::new()),
+                "tools/list" => {
+                    let mut body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [{
+                                "name": "echo",
+                                "description": "echoes the input back",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"text": {"type": "string"}}
+                                }
+                            }]
+                        }
+                    });
+                    if let Some(next_cursor) = next_cursor {
+                        body["result"]["nextCursor"] = serde_json::json!(next_cursor);
+                        expected_cursor = Some(next_cursor);
+                    }
+                    ("200 OK", body.to_string())
+                }
+                "tools/call" => (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{"type": "text", "text": "42"}]
+                        }
+                    })
+                    .to_string(),
+                ),
+                other => panic!("mock MCP server received an unexpected method '{other}'"),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("failed to write mock response");
+            stream.flush().expect("failed to flush mock response");
+        }
+    });
+    (format!("http://{addr}/mcp"), handle)
 }
 
 /// Builds a `lait` single-shot chat invocation for tests: `--model

@@ -5,6 +5,7 @@ mod agent;
 mod app;
 mod async_io;
 mod attachment;
+mod cache;
 mod checkpoint;
 mod cli;
 mod config;
@@ -18,6 +19,7 @@ mod jq;
 mod jsonl;
 mod lint;
 mod llm;
+mod logging;
 mod mcp;
 mod models;
 mod nesting;
@@ -28,7 +30,9 @@ mod repl;
 mod report;
 mod response;
 mod schema;
+mod secret;
 mod session;
+mod shell_tool;
 mod signal;
 mod skill;
 mod subagent;
@@ -37,6 +41,7 @@ mod template;
 mod test_support;
 mod usage;
 mod workflow;
+mod xdg;
 
 fn main() {
     // `.env` must be loaded before `Cli::parse()` runs (clap's `env = ...`
@@ -59,6 +64,7 @@ fn main() {
     }
 
     let cli = cli::Cli::parse();
+    logging::init(cli.verbose);
     // Captured before `cli` is moved into `run_blocking`/`run` below — the
     // one classification `classify_error` can't reliably do from the
     // rendered message alone (see `ExitKind::Validation`'s doc).

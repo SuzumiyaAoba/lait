@@ -20,6 +20,8 @@ cargo run -- --stream --model "モデル ID" "Rustについて一文で説明し
 
 応答全体を一つの JSON オブジェクトとして出力する `--json` は、逐次出力とは両立しないため `--stream` と同時には指定できません。`--json-schema` との併用は可能ですが、Structured Outputs の JSON はチャンク単位の断片として届くため、完成した JSON として読みたい場合は `--stream` を外してください。
 
+`--mcp`/`--subagent`（[MCP サーバー](./mcp.md)/[サブエージェント](./subagents.md)）とも併用できます。ツールを呼び出すラウンドを含め、各ラウンドのテキストは届いた分から順に表示され、ツール呼び出しが尽きたラウンドの内容が最終応答になります。
+
 ## `--json-schema`（Structured Outputs）
 
 `--json-schema` を指定すると、API の Structured Outputs に JSON Schema を渡せます。`--json-schema` はモデルの応答形式を指定するオプションで、CLI の標準出力形式は変更しません。スキーマは JSON ファイルに記述します。

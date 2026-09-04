@@ -46,13 +46,13 @@ fn resolve_skill_file_path(configured_path: &Path) -> PathBuf {
 /// than through `load_skill`/`SkillCache` — this only ever runs once per
 /// entry, so none of `load_skill`'s cancellation-aware/FIFO-safe machinery
 /// (built for a request that may need to time out) is worth pulling in.
-/// `config_dir` resolves each entry's path relative to the directory
-/// containing the `lait.config.yml` that defined it, not the current working
-/// directory — see `config::resolve_registry_path`. A registry entry whose file
-/// is missing or fails to parse is still listed (with a note) rather than
-/// aborting the whole command — `lait lint` is where a hard failure on a bad
-/// entry belongs.
-pub(crate) fn list(file_config: &config::ConfigFile, config_dir: Option<&Path>) -> Result<()> {
+/// Registry paths are already absolute (resolved once at config-load time,
+/// against the directory containing whichever `lait.config.yml`/global
+/// `config.yml` defined the entry — not the current working directory — see
+/// `config::load_config`). A registry entry whose file is missing or fails
+/// to parse is still listed (with a note) rather than aborting the whole
+/// command — `lait lint` is where a hard failure on a bad entry belongs.
+pub(crate) fn list(file_config: &config::ConfigFile) -> Result<()> {
     if file_config.skills.is_empty() {
         println!(
             "no skills defined in {}; add a 'skills:' entry to define one",
@@ -63,9 +63,8 @@ pub(crate) fn list(file_config: &config::ConfigFile, config_dir: Option<&Path>) 
     let mut names: Vec<&String> = file_config.skills.keys().collect();
     names.sort_unstable();
     for name in names {
-        let raw_path = &file_config.skills[name];
-        let configured_path = config::resolve_registry_path(raw_path, config_dir);
-        let path = resolve_skill_file_path(&configured_path);
+        let configured_path = &file_config.skills[name];
+        let path = resolve_skill_file_path(configured_path);
         let loaded = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read skill file '{}'", path.display()))
             .and_then(|contents| parse_skill(name, &contents))

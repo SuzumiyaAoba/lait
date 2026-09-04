@@ -41,6 +41,32 @@ default:
 
 いずれも CLI フラグ（`--render`/`--no-history`）が指定されればそちらが優先されます。
 
+## グローバル設定ファイル
+
+プロジェクトの `lait.config.yml` に加えて、`$XDG_CONFIG_HOME/lait/config.yml`
+（`XDG_CONFIG_HOME` 未設定時は `~/.config/lait/config.yml`）をグローバル設定として
+読み込みます。全プロジェクト共通のモデル定義や MCP サーバー、ローカル LLM の接続先などを
+ここにまとめておけば、プロジェクトごとに複製する必要がありません。
+
+読み込みはプロジェクト設定と同じ「カレントディレクトリから探索する」経路
+（`--config`/`--no-config` のどちらも指定しなかった場合）でのみ行われ、見つかった
+プロジェクト設定とマージされます。マージ規則は次のとおりです。
+
+- `models:`/`mcp_servers:`/`skills:`/`agents:`/`prompts:`/`workflows:` は
+  キー単位でマージします。同じ名前がグローバルとプロジェクトの両方にあれば
+  プロジェクト側が勝ちます。
+- `default:` は項目単位でマージします（`default.model` はプロジェクトが指定して
+  いればそれを使い、未指定ならグローバルの値にフォールバックします）。
+- `base_url`/`api_key` はプロジェクトが指定していればそちらを使い、未指定なら
+  グローバルの値にフォールバックします。
+
+`workflows:`/`agents:`/`skills:` の登録エントリの相対パスは、それを定義した設定ファイル
+自身のディレクトリを起点に解決されます（グローバル設定内のエントリなら
+`$XDG_CONFIG_HOME/lait/` が起点になります）。
+
+`--config <PATH>` を指定した場合はそのファイルだけを読み込み、グローバル設定は一切
+参照しません。`--no-config` を指定した場合もグローバル設定を含めて何も読み込みません。
+
 ## モデル定義と alias
 
 複数の呼び出しモデルを設定ファイルに定義し、alias で使い回せます。`models` は alias をキー、
@@ -76,6 +102,44 @@ default:
 場合は、対応する配列の先頭要素が使用され、その要素の `model_id` とプロバイダー設定が
 リクエストに適用されます。生のモデル ID を指定した場合は、従来どおりトップレベル設定の
 `base_url` などが使用されます。
+
+## 複数プロバイダーによるフォールバック
+
+`models:` の alias に配列の 2 番目以降の要素を追加すると、先頭要素への接続が失敗した際に
+順番にフォールバックします。ローカルの LM Studio を優先し、落ちていればクラウド API に
+切り替える、といった構成が YAML だけで実現できます。
+
+```yaml
+# lait.config.yml
+models:
+  gpt:
+    - provider:
+        base_url: http://localhost:1234/v1   # 優先: ローカル LM Studio
+      model_id: local-model
+    - provider:
+        base_url: https://api.openai.com/v1  # フォールバック: クラウド
+        api_key: "${OPENAI_API_KEY}"
+      model_id: gpt-4o
+```
+
+- フォールバックする条件は、接続エラー・タイムアウト、または応答が `5xx`・`429`・`408` の
+  場合だけです。`4xx`（リクエスト不正・認証エラーなど）はフォールバックせずそのまま
+  失敗します — 呼び出し側の設定ミスである可能性が高く、握りつぶすと気づきにくくなるためです。
+- どの要素で成功したかは、切り替わった時点で `warning:` として標準エラー出力に、詳細は
+  `-v`/`LAIT_LOG`（[verbose ログ](getting-started.md)参照）で確認できます。
+- 2 番目以降の要素にも `default_reasoning_effort`/`default_temperature`/`default_top_p`/
+  `default_max_tokens` を書けますが、**実際には使用されません**。サンプリングの既定値は
+  常に先頭要素のものが使われます（どの要素にリクエストが着地するかは実行時にしか
+  分からないため、リクエストごとに既定値が変わらないようにしています）。
+- `--base-url`/`--api-key` を明示指定した場合、フォールバック先も含めてすべてのリクエストが
+  その 1 つのエンドポイントに固定され、フォールバックは行われません。
+- ストリーミング（`--stream`）は、ストリームが確立する前の失敗にのみフォールバックします。
+  一度バイトが届き始めたストリームは、途中で別のプロバイダーに切り替えることはできません。
+- 各要素は `api_key` の代わりに [`api_key_cmd`](#api_key_cmd-による外部コマンドからのシークレット取得)
+  を使えます。フォールバック先のコマンドは、実際にそのフォールバック先が試行されるときにだけ
+  実行されます。
+- async-openai 側の内部リトライ（3 回・バックオフ付き）を経てから失敗が返るため、
+  フォールバックの切り替えには数秒かかることがあります。
 
 ## 設定値の優先順位
 
@@ -134,6 +198,63 @@ models:
   規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
   パス、`default.system`、ワークフローの `prompt:`/`system_prompt:` には**この展開は適用されません**
   （こちらは `--var`/handlebars のテンプレート変数で渡してください）。
+
+## `api_key_cmd` による外部コマンドからのシークレット取得
+
+`${VAR_NAME}` 展開はシェル側で環境変数を事前に export しておく前提ですが、
+`api_key_cmd` を使うと 1Password・pass・gopass・aws secretsmanager などの
+シークレットマネージャーから API キーをその場で取得できます。トップレベルの
+`api_key_cmd`、および `models:` の `provider.api_key_cmd` に指定でき、
+`api_key`（`provider.api_key`）と同時に指定するとエラーになります。
+
+```yaml
+# lait.config.yml
+models:
+  gpt-4o:
+    - provider:
+        base_url: https://api.openai.com/v1
+        api_key_cmd: "op read op://Personal/OpenAI/api-key"   # 1Password CLI の例
+      model_id: gpt-4o
+```
+
+- 文字列を指定するとシェル経由（`sh -c`。Windows では `cmd /C`）で実行され、パイプや
+  クォート、`$VAR` 展開が使えます。YAML の配列で指定すると、シェルを介さず直接
+  実行されます（`api_key_cmd: ["op", "read", "op://Personal/OpenAI/api-key"]`）。
+- コマンドは実際にリクエストを送る際に一度だけ実行され、その結果（stdout の末尾改行を
+  除いたもの）はプロセスの実行中キャッシュされます。ワークフローのステップや
+  `for_each` の反復のたびに再実行されることはありません。
+- 標準出力が空、または終了コードが非 0 の場合は、標準エラー出力を含む分かりやすい
+  エラーになります。
+- `lait models`（`--remote` なし）でのモデル一覧表示ではコマンドは実行されません
+  （実際にリクエストを送る経路でのみ実行されます）。`lait lint` は `api_key`/
+  `api_key_cmd` の同時指定だけを静的にチェックします。
+
+## レスポンスのディスクキャッシュ（`--cache`）
+
+`--cache`（または `default.cache: true`）を指定すると、レスポンスを `.lait/cache/`
+にディスクキャッシュします。ワークフローやプロンプトの反復開発で、変更していない
+ステップの LLM 呼び出しが毎回走るのを避けられます。
+
+```yaml
+# lait.config.yml
+default:
+  cache: true
+  cache_ttl: 3600   # 省略時は無期限（秒単位）
+```
+
+- キャッシュのキーは、base URL・モデル ID・サンプリングパラメータ（`reasoning_effort`/
+  `temperature`/`top_p`/`max_tokens`）・メッセージ列・ツール定義・`response_format`
+  から計算します。**API キーはキーに含まれません** — 認証情報だけが異なる2つの
+  リクエストは同じキャッシュエントリを共有します。
+- ヒットした場合は API を呼ばず、その旨を `note:` として標準エラー出力に注記します
+  （`--show-usage` の集計にもキャッシュヒット分は含まれません — 実際にはリクエストを
+  送っていないためです）。
+- MCP/サブエージェントのツール呼び出しを含むラウンドは、各ラウンドのリクエスト単位で
+  キャッシュされます。
+- **`--stream` によるストリーミング応答はキャッシュの対象外です。**
+- `--no-cache` を指定するとキャッシュの参照・書き込みの両方を無効にします
+  （`default.cache: true` を上書きします）。`--cache`/`--no-cache` は同時に指定できません。
+- `lait cache clear` で `.lait/cache/` の内容をすべて削除できます。
 
 ## `.env` ファイルの自動読み込み
 
@@ -194,6 +315,21 @@ mcp_servers:
   `allowed_tools` に無いツールを呼び出そうとすると、サーバーへ接続する前にエラーになります。
   詳しくは [MCP サーバーのツールを使う](./mcp.md#呼び出せるツールを制限するallowed_tools) を
   参照してください。
+
+## `tool_policy`（ツール呼び出しの allow/deny）と `--approve-tools`
+
+トップレベルの `tool_policy:` は、MCP サーバー・サブエージェント・[カスタムシェルツール](#カスタムシェルツール)
+を横断してツール呼び出しを名前ベースで許可/拒否します。`--approve-tools` は呼び出し直前に対話的に
+確認します。詳しくは
+[MCP サーバーのツールを使う](./mcp.md#tool_policyallowdeny-と---approve-tools対話的承認) を
+参照してください。
+
+```yaml
+# lait.config.yml
+tool_policy:
+  allow: ["fetch_*"]
+  deny: ["*__delete_*"]
+```
 
 ## 名前付きプロンプト
 
@@ -258,6 +394,37 @@ agents:
 - 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
   そのまま名前を付けて登録します）。
 - パスは、`skills:` と同じく、その場では接続を持たず、実際に使われるたびにファイルを読み直します。
+
+## カスタムシェルツール
+
+`tools:` にローカルコマンドを登録すると、MCP サーバーを立てずに `--tool`（チャット）・agent
+ファイルの `tools:`・ワークフローノードの `tools:` から名前で参照して、モデルが呼び出せる
+ツールとして使えます。詳しい使い方は [カスタムシェルツールを使う](./tools.md) を参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  model: local
+  tools: [ripgrep]   # 全経路（チャット / agent / workflow）の最終フォールバック
+
+tools:
+  ripgrep:
+    description: "リポジトリ内をパターン検索する"
+    command: ["rg", "--json", "{{ input.pattern }}"]
+    parameters:
+      type: object
+      properties:
+        pattern: { type: string }
+      required: [pattern]
+    timeout: 10   # 秒。省略時は30秒
+```
+
+- `command`（必須、空リスト不可）はシェルを介さず直接 exec されます。各要素はモデルの呼び出し
+  引数を `input` として handlebars テンプレート展開されます（`{{ input.<field> }}`）。
+- `parameters`（省略可、JSON オブジェクトである必要があります）はモデルに渡す JSON Schema です。
+  省略時は引数なしのツールとして扱われます。
+- ツール名は `tool__<名前>` に修飾されます。[`tool_policy`](#tool_policyツール呼び出しの-allowdeny-と---approve-tools)
+  や `--approve-tools` の対象です。
 
 ## ワークフローの登録と一覧表示
 

@@ -1,6 +1,9 @@
 mod support;
 
-use support::{ConfigDirectory, LaitCommand, MockServer, test_command, without_json_whitespace};
+use support::{
+    ConfigDirectory, LaitCommand, MockServer, start_mock_mcp_server, test_command,
+    without_json_whitespace,
+};
 
 #[test]
 fn streams_content_deltas_to_stdout() {
@@ -129,4 +132,115 @@ fn rejects_stream_combined_with_json() {
         .expect("failed to execute lait");
 
     assert!(!output.status.success());
+}
+
+/// `--stream` combined with `--mcp`: the model's first streamed round ends
+/// in a `tool_calls` delta split across several chunks (id/name in one,
+/// `arguments` split across two more — the shape a real OpenAI-compatible
+/// server streams), which lait must reassemble (see
+/// `response::StreamToolCallAccumulator`) before it can call the MCP tool
+/// and start a second streamed round for the model's final answer.
+#[test]
+fn streams_a_round_that_calls_an_mcp_tool_then_streams_the_final_answer() {
+    let llm_server = MockServer::start_stream_sequence(&[
+        &[
+            r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"mock__echo","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"text\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ],
+        &[
+            r#"{"id":"2","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"content":"the answer is 42"},"finish_reason":null}]}"#,
+            r#"{"id":"2","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ],
+    ]);
+    let (mcp_url, mcp_thread) = start_mock_mcp_server();
+    let config = ConfigDirectory::new(&format!("mcp_servers:\n  mock:\n    url: \"{mcp_url}\"\n"));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--model",
+            "test-model",
+            "--base-url",
+            &llm_server.base_url,
+            "--stream",
+            "--mcp",
+            "mock",
+            "what is the answer?",
+        ])
+        .output()
+        .expect("failed to execute lait");
+
+    let first_request = llm_server.receive_request();
+    let second_request = llm_server.receive_request();
+    llm_server.finish();
+    mcp_thread.join().expect("mock MCP server thread panicked");
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "the answer is 42"
+    );
+
+    let first_body = without_json_whitespace(&first_request.body);
+    assert!(
+        first_body.contains(r#""stream":true"#) && first_body.contains(r#""name":"mock__echo""#),
+        "first request body: {first_body}"
+    );
+    let second_body = without_json_whitespace(&second_request.body);
+    assert!(
+        second_body.contains(r#""role":"tool""#) && second_body.contains("hi"),
+        "second request body: {second_body}"
+    );
+}
+
+/// A regression test for a bug the multi-round streaming tool loop could
+/// introduce: `-o` writes each round's content to the same file, and a
+/// naive per-round `File::create` would truncate whatever an earlier round
+/// already wrote. The first round's own content ("Looking it up... ") must
+/// survive into the file alongside the second (final) round's.
+#[test]
+fn streaming_multiple_rounds_append_to_the_same_output_file() {
+    let dir = ConfigDirectory::empty();
+    let out_path = dir.path().join("out.txt");
+
+    let llm_server = MockServer::start_stream_sequence(&[
+        &[
+            r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"content":"Looking it up... "},"finish_reason":null}]}"#,
+            r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"mock__echo","arguments":"{\"text\":\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ],
+        &[
+            r#"{"id":"2","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"content":"the answer is 42"},"finish_reason":null}]}"#,
+            r#"{"id":"2","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ],
+    ]);
+    let (mcp_url, mcp_thread) = start_mock_mcp_server();
+    let config = ConfigDirectory::new(&format!("mcp_servers:\n  mock:\n    url: \"{mcp_url}\"\n"));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--model",
+            "test-model",
+            "--base-url",
+            &llm_server.base_url,
+            "--stream",
+            "--mcp",
+            "mock",
+            "-o",
+        ])
+        .arg(&out_path)
+        .arg("what is the answer?")
+        .output()
+        .expect("failed to execute lait");
+    llm_server.receive_request();
+    llm_server.receive_request();
+    llm_server.finish();
+    mcp_thread.join().expect("mock MCP server thread panicked");
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let written = std::fs::read_to_string(&out_path).expect("output file should exist");
+    assert_eq!(written, "Looking it up... the answer is 42\n");
 }

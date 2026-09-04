@@ -16,7 +16,7 @@ use crate::{
     app,
     cli::ChatReplArgs,
     config::{self, ConfigSource},
-    engine::{AppContext, PromptTurn, RequestSettings, stream_response},
+    engine::{AppContext, PromptTurn, RequestSettings},
     llm, response, usage,
 };
 
@@ -62,12 +62,20 @@ pub(crate) fn parse_meta_command(line: &str) -> Option<MetaCommand<'_>> {
 /// explicit `/exit`). See `parse_meta_command` for the `/exit`/`/clear`/
 /// `/model`/`/system` syntax handled below. Also reached from a prompt-less,
 /// stdin-is-a-terminal bare `lait` invocation — see `app::run_chat_or_repl`.
-pub(crate) async fn run(args: ChatReplArgs, config_source: ConfigSource) -> Result<()> {
+pub(crate) async fn run(
+    args: ChatReplArgs,
+    config_source: ConfigSource,
+    cache_override: Option<bool>,
+    approve_tools: bool,
+) -> Result<()> {
     let mut shared = args.shared;
     let file_config = Arc::new(config::load_config(&config_source)?);
     let mut history = app::load_session_history(shared.session.as_deref())?;
     let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
-    let env = AppContext::new(Arc::clone(&file_config));
+    let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);
+    let env = AppContext::new(Arc::clone(&file_config))
+        .with_cache(cache_enabled, cache_ttl)
+        .with_approve_tools(approve_tools);
 
     eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
 
@@ -164,12 +172,11 @@ pub(crate) async fn run(args: ChatReplArgs, config_source: ConfigSource) -> Resu
     env.finish(repl).await
 }
 
-/// Runs one `lait chat` turn: streams the response to stdout (the REPL's
-/// default), or — when `settings.mcp`/`settings.subagents` names at least
-/// one tool source — falls back to a single non-streamed request printed
-/// once it completes, since `RequestSettings::complete_stream` cannot yet
-/// drive a tool loop (see its own doc comment). Returns the assistant's raw
-/// reply text (never the `Reasoning:`-prefixed display form, the shape
+/// Runs one `lait chat` turn: streams the response to stdout, driving the
+/// same MCP/subagent tool loop `RequestSettings::complete` does when
+/// `settings.mcp`/`settings.subagents` names at least one tool source (see
+/// `RequestSettings::complete_stream`). Returns the assistant's raw reply
+/// text (never the `Reasoning:`-prefixed display form, the shape
 /// `history`/a `--session` log need) alongside this turn's own token usage
 /// (not `env.usage`'s running session total — see the `before`/`after`
 /// delta below — since `env` persists across every REPL turn and `lait
@@ -190,29 +197,25 @@ async fn run_turn(
         prompt,
         image_urls: &[],
     };
-    let content = if settings.mcp.is_empty() && settings.subagents.is_empty() {
-        let stream = settings
-            .complete_stream(&env.skill_cache, turn, None, show_usage)
-            .await?;
-        let outcome = stream_response(stream, show_reasoning, None, env.cancel.clone()).await?;
-        if show_usage && let Some(usage) = outcome.usage {
-            env.usage.record(&settings.usage_label, usage);
-        }
-        if show_usage {
-            usage::print_usage_summary(&env.usage);
-        }
-        outcome.content
-    } else {
-        let response = settings
-            .complete(env, &[], turn, None, env.cancel.clone())
-            .await?;
-        let rendered = response::render_response(&response, false, show_reasoning)?;
-        println!("{rendered}");
-        if show_usage {
-            usage::print_usage_summary(&env.usage);
-        }
-        response::content_text(&response).to_owned()
-    };
+    let outcome = settings
+        .complete_stream(
+            env,
+            &[],
+            turn,
+            None,
+            show_usage,
+            show_reasoning,
+            None,
+            env.cancel.clone(),
+        )
+        .await?;
+    if show_usage && let Some(usage) = outcome.usage {
+        env.usage.record(&settings.usage_label, usage);
+    }
+    if show_usage {
+        usage::print_usage_summary(&env.usage);
+    }
+    let content = outcome.content;
     let turn_usage = env.usage.total().map(|after| response::Usage {
         prompt_tokens: after.prompt_tokens.saturating_sub(before.prompt_tokens),
         completion_tokens: after

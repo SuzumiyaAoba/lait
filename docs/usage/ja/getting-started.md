@@ -62,6 +62,9 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--quiet` | — | 応答本文以外の注記（reasoning 表示・usage 表示）をすべて抑制します（`--show-reasoning`/`--show-usage` より優先）。 |
 | `--no-config` | — | カレントディレクトリの `lait.config.yml` を読み込みません。 |
 | `--no-env` | — | カレントディレクトリの `.env` を読み込みません（詳細は [設定ファイル](./config.md)）。 |
+| `-v`, `--verbose`（繰り返し可） | `LAIT_LOG` | ログの詳細度を上げます。`-v` で解決後のモデル・base_url・サンプリングパラメータ・`mcp`/`skills`/`subagents`、ワークフローのステップ開始/終了・リトライ、ツール呼び出し（名前と引数）を表示。`-vv` でさらにリクエスト/レスポンス JSON 全体をダンプします。すべて標準エラー出力へ書かれるため標準出力のパイプ利用は壊れません。API キーは常にマスクされます。`LAIT_LOG`（`tracing_subscriber::EnvFilter` の書式。例: `debug`、`lait=trace,reqwest=info`）を設定すると `-v`/`-vv` より優先されます。 |
+| `--cache` | — | レスポンスを `.lait/cache/` にディスクキャッシュします（詳細は [設定ファイル](./config.md)）。`--no-cache` とは同時に指定できません。`--stream` 併用時はキャッシュされません。 |
+| `--no-cache` | — | `default.cache: true` を上書きしてキャッシュを無効にします。 |
 | `<PROMPT>` | — | 送信する単一のプロンプト。省略して標準入力から渡すこともできます（下記）。 |
 
 ### 標準入力からのプロンプト（パイプ対応）
@@ -87,6 +90,7 @@ cat question.txt | lait
 | `lait init` | 最小の `lait.config.yml` を生成します。`lait init workflow [PATH]` / `lait init agent [PATH]` はコメント付きの雛形を生成します（既存ファイルは上書きしません）。 |
 | `lait completions <SHELL>` | bash / zsh / fish / powershell / elvish の補完スクリプトを標準出力へ生成します。 |
 | `lait man --dir <DIR>` | `lait.1`、`lait-run.1` などの man ページを生成します。 |
+| `lait cache clear` | `.lait/cache/` の内容をすべて削除します（詳細は [設定ファイル](./config.md)）。 |
 
 詳細なオプションは次のコマンドで確認できます。
 

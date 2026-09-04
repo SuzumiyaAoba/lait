@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -44,18 +44,7 @@ pub(crate) struct HistoryEntry {
 /// Support` on macOS) rather than the literal `~/.local/share` this feature
 /// is specified against.
 fn xdg_data_home() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_DATA_HOME")
-        && !dir.trim().is_empty()
-    {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context(
-            "failed to determine the home directory (HOME/USERPROFILE is not set) to locate the \
-             history file",
-        )?;
-    Ok(PathBuf::from(home).join(".local").join("share"))
+    crate::xdg::base_dir("XDG_DATA_HOME", &[".local", "share"], "the history file")
 }
 
 fn history_path() -> Result<PathBuf> {

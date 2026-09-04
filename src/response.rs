@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ChatCompletionResponse {
     choices: Vec<ChatCompletionChoice>,
     /// The token counts the server reported for this request, when it did —
@@ -51,12 +51,12 @@ impl std::fmt::Display for Usage {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChatCompletionChoice {
     message: ChatCompletionResponseMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ChatCompletionResponseMessage {
     content: Option<String>,
     reasoning: Option<String>,
@@ -73,13 +73,13 @@ pub(crate) struct ChatCompletionResponseMessage {
 /// completions shape (`{"id", "type": "function", "function": {"name",
 /// "arguments"}}`). `arguments` is the raw JSON text the model produced, not
 /// yet parsed — parsing/validating it is `McpRegistry::call`'s job.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ToolCall {
     pub(crate) id: String,
     pub(crate) function: ToolCallFunction,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ToolCallFunction {
     pub(crate) name: String,
     pub(crate) arguments: String,
@@ -119,6 +119,107 @@ struct ChatCompletionStreamDelta {
     content: Option<String>,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
+    /// Index-keyed tool-call fragments — a streamed `tool_calls` field
+    /// arrives split across many chunks (each naming which call it belongs
+    /// to via `index`, since several calls can interleave), unlike the
+    /// non-streamed response's already-complete `ToolCall` list. See
+    /// `StreamToolCallAccumulator`, which reassembles them.
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+/// One fragment of a streamed tool call, keyed by `index` (stable across the
+/// whole call, not a `Vec` position — a chunk may carry fragments for
+/// several in-progress calls, or skip an index that isn't updated this
+/// chunk). `id`/`function.name` are only ever set once, on the fragment that
+/// starts a given `index`; `function.arguments` arrives incrementally and
+/// must be concatenated in order. See `StreamToolCallAccumulator::push`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StreamToolCallDelta {
+    pub(crate) index: usize,
+    #[serde(default)]
+    pub(crate) id: Option<String>,
+    #[serde(default)]
+    pub(crate) function: Option<StreamToolCallFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StreamToolCallFunctionDelta {
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[serde(default)]
+    pub(crate) arguments: Option<String>,
+}
+
+/// Reassembles a streamed `tool_calls` field's index-keyed fragments (see
+/// `StreamToolCallDelta`) into the same `Vec<ToolCall>` shape a non-streamed
+/// response carries, so `engine::RequestSettings::complete_stream`'s tool
+/// loop can hand them to the same dispatch/execution path
+/// `complete`'s does. Fragments are collected in a `BTreeMap` keyed by
+/// `index` so `finish` reconstructs them in the order the server first
+/// introduced each call, matching how a non-streamed response's `tool_calls`
+/// array is already ordered.
+#[derive(Debug, Default)]
+pub(crate) struct StreamToolCallAccumulator {
+    by_index: std::collections::BTreeMap<usize, PartialToolCall>,
+}
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl StreamToolCallAccumulator {
+    /// Folds one chunk's tool-call fragments in. Call once per chunk that
+    /// carries any (`ChatCompletionStreamChunk`'s first choice `delta.
+    /// tool_calls`).
+    pub(crate) fn push(&mut self, deltas: &[StreamToolCallDelta]) {
+        for delta in deltas {
+            let partial = self.by_index.entry(delta.index).or_default();
+            if let Some(id) = &delta.id {
+                partial.id = Some(id.clone());
+            }
+            if let Some(function) = &delta.function {
+                if let Some(name) = &function.name {
+                    partial.name = Some(name.clone());
+                }
+                if let Some(arguments) = &function.arguments {
+                    partial.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_index.is_empty()
+    }
+
+    /// Reconstructs every accumulated call, in `index` order. Errors if a
+    /// call never received an `id` or a `function.name` fragment — a
+    /// malformed or truncated stream, since a well-formed one always sets
+    /// both on that call's first fragment.
+    pub(crate) fn finish(self) -> Result<Vec<ToolCall>> {
+        self.by_index
+            .into_values()
+            .map(|partial| {
+                let id = partial
+                    .id
+                    .ok_or_else(|| anyhow!("a streamed tool call never received an 'id'"))?;
+                let name = partial.name.ok_or_else(|| {
+                    anyhow!("a streamed tool call never received a function 'name'")
+                })?;
+                Ok(ToolCall {
+                    id,
+                    function: ToolCallFunction {
+                        name,
+                        arguments: partial.arguments,
+                    },
+                })
+            })
+            .collect()
+    }
 }
 
 /// The content-delta and reasoning-delta text carried by a chunk's first
@@ -138,19 +239,22 @@ pub(crate) fn stream_chunk_deltas(
         .content
         .as_deref()
         .filter(|text| !text.is_empty());
-    let reasoning = choice
-        .delta
-        .reasoning
-        .as_deref()
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            choice
-                .delta
-                .reasoning_content
-                .as_deref()
-                .filter(|text| !text.is_empty())
-        });
+    let reasoning = non_blank_or(
+        choice.delta.reasoning.as_deref(),
+        choice.delta.reasoning_content.as_deref(),
+        |text| !text.is_empty(),
+    );
     (content, reasoning)
+}
+
+/// The tool-call delta fragments carried by a chunk's first choice, if any —
+/// see `StreamToolCallAccumulator::push`, which this feeds. `None` for the
+/// vast majority of chunks (plain content/reasoning deltas, or a choiceless
+/// usage-only final chunk).
+pub(crate) fn stream_chunk_tool_call_deltas(
+    chunk: &ChatCompletionStreamChunk,
+) -> Option<&[StreamToolCallDelta]> {
+    chunk.choices.first()?.delta.tool_calls.as_deref()
 }
 
 pub(crate) fn render_response(
@@ -227,20 +331,29 @@ fn response_content(response: &ChatCompletionResponse) -> std::result::Result<&s
 /// chat `-o` path, which sends reasoning to stderr while the file gets the
 /// body alone.
 pub(crate) fn response_reasoning(response: &ChatCompletionResponse) -> Option<&str> {
-    response.choices.first().and_then(|choice| {
-        choice
-            .message
-            .reasoning
-            .as_deref()
-            .filter(|reasoning| !reasoning.trim().is_empty())
-            .or_else(|| {
-                choice
-                    .message
-                    .reasoning_content
-                    .as_deref()
-                    .filter(|reasoning| !reasoning.trim().is_empty())
-            })
-    })
+    let choice = response.choices.first()?;
+    non_blank_or(
+        choice.message.reasoning.as_deref(),
+        choice.message.reasoning_content.as_deref(),
+        |reasoning| !reasoning.trim().is_empty(),
+    )
+}
+
+/// `current` if it passes `is_present`, else `legacy` if it passes
+/// `is_present` — the shared current-field/legacy-`reasoning_content`
+/// fallback used by both [`response_reasoning`] and [`stream_chunk_deltas`].
+/// Takes the presence predicate rather than hardcoding it: the full response
+/// treats whitespace-only reasoning as absent (`.trim().is_empty()`), while a
+/// stream delta only treats a literal empty string as absent, since a chunk
+/// may legitimately carry a single space as part of a larger reasoning run.
+fn non_blank_or<'a>(
+    current: Option<&'a str>,
+    legacy: Option<&'a str>,
+    is_present: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    current
+        .filter(|text| is_present(text))
+        .or_else(|| legacy.filter(|text| is_present(text)))
 }
 
 fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool) -> String {
@@ -255,8 +368,9 @@ fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool)
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCompletionResponse, ChatCompletionStreamChunk, Usage, format_response,
-        response_content, response_reasoning, stream_chunk_deltas,
+        ChatCompletionResponse, ChatCompletionStreamChunk, StreamToolCallAccumulator, Usage,
+        format_response, response_content, response_reasoning, stream_chunk_deltas,
+        stream_chunk_tool_call_deltas,
     };
 
     #[test]
@@ -387,5 +501,90 @@ mod tests {
         }))
         .expect("chunk fixture should deserialize");
         assert_eq!(stream_chunk_deltas(&chunk), (None, Some("legacy delta")));
+    }
+
+    #[test]
+    fn extracts_tool_call_deltas_from_a_stream_chunk() {
+        let chunk = serde_json::from_value::<ChatCompletionStreamChunk>(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "echo", "arguments": ""}}
+            ]}}]
+        }))
+        .expect("chunk fixture should deserialize");
+        let deltas = stream_chunk_tool_call_deltas(&chunk).expect("expected tool call deltas");
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].index, 0);
+        assert_eq!(deltas[0].id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn a_chunk_with_no_tool_calls_has_no_tool_call_deltas() {
+        let chunk = serde_json::from_value::<ChatCompletionStreamChunk>(serde_json::json!({
+            "choices": [{"delta": {"content": "hi"}}]
+        }))
+        .expect("chunk fixture should deserialize");
+        assert!(stream_chunk_tool_call_deltas(&chunk).is_none());
+    }
+
+    #[test]
+    fn accumulator_reassembles_arguments_split_across_many_fragments() {
+        let mut accumulator = StreamToolCallAccumulator::default();
+        assert!(accumulator.is_empty());
+
+        let first = serde_json::from_value::<ChatCompletionStreamChunk>(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "echo", "arguments": "{\"te"}}
+            ]}}]
+        }))
+        .expect("chunk fixture should deserialize");
+        accumulator.push(stream_chunk_tool_call_deltas(&first).unwrap());
+        assert!(!accumulator.is_empty());
+
+        let second = serde_json::from_value::<ChatCompletionStreamChunk>(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "xt\":\"hi\"}"}}
+            ]}}]
+        }))
+        .expect("chunk fixture should deserialize");
+        accumulator.push(stream_chunk_tool_call_deltas(&second).unwrap());
+
+        let calls = accumulator.finish().expect("expected a complete tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "echo");
+        assert_eq!(calls[0].function.arguments, r#"{"text":"hi"}"#);
+    }
+
+    #[test]
+    fn accumulator_reassembles_interleaved_calls_in_index_order() {
+        let mut accumulator = StreamToolCallAccumulator::default();
+        let chunk = serde_json::from_value::<ChatCompletionStreamChunk>(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 1, "id": "call_b", "function": {"name": "second", "arguments": ""}},
+                {"index": 0, "id": "call_a", "function": {"name": "first", "arguments": ""}}
+            ]}}]
+        }))
+        .expect("chunk fixture should deserialize");
+        accumulator.push(stream_chunk_tool_call_deltas(&chunk).unwrap());
+
+        let calls = accumulator
+            .finish()
+            .expect("expected two complete tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[1].id, "call_b");
+    }
+
+    #[test]
+    fn accumulator_errors_on_a_call_that_never_received_a_name() {
+        let mut accumulator = StreamToolCallAccumulator::default();
+        let chunk = serde_json::from_value::<ChatCompletionStreamChunk>(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"arguments": "{}"}}
+            ]}}]
+        }))
+        .expect("chunk fixture should deserialize");
+        accumulator.push(stream_chunk_tool_call_deltas(&chunk).unwrap());
+        assert!(accumulator.finish().is_err());
     }
 }
