@@ -164,11 +164,7 @@ fn collect_lintable_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         } else if file_type.is_file() {
             match path.extension().and_then(|extension| extension.to_str()) {
                 Some("yml") | Some("yaml") => out.push(path),
-                Some("md") => {
-                    if has_frontmatter_delimiter(&path)? {
-                        out.push(path);
-                    }
-                }
+                Some("md") if has_frontmatter_delimiter(&path)? => out.push(path),
                 _ => {}
             }
         }
