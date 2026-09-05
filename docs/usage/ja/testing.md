@@ -1,5 +1,7 @@
 # 決定的テスト（record & replay / lait test）
 
+[ドキュメント目次に戻る](./README.md)
+
 ワークフローが複雑化(分岐・ループ・サブワークフロー)すると、リグレッション検知の手段が [lint](./lint.md) だけでは足りなくなります。`lait run --record`/`--replay` と `lait test` は、実際のモデル API を呼ばずにワークフローの制御フローを決定的に検証する仕組みです。
 
 ## `lait run --record <DIR>`
