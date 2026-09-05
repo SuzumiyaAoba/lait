@@ -40,7 +40,7 @@ fn read_stdin_text() -> Result<String> {
 /// is the whole input when no argument is given, or is appended to the
 /// argument as context when one is. Returns `Ok(None)` when there is no
 /// input from either source — each caller reports that with its own message.
-fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
+pub(crate) fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
     use std::io::IsTerminal;
 
     if positional.as_deref() == Some("-") {
@@ -165,6 +165,9 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
         Some(Command::Schema(_)) => bail!("internal error: `schema` must run on the sync path"),
         Some(Command::Doctor(doctor_args)) => doctor::run(doctor_args, config_source).await,
+        Some(Command::Compare(compare_args)) => {
+            crate::compare::run(compare_args, config_source, cache_override, cancel).await
+        }
         None => {
             run_chat_or_repl(
                 cli.chat,
@@ -291,7 +294,8 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
         Some(Command::Agent(agent_command)) => {
             matches!(agent_command.action, AgentAction::Run(_))
         }
-        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_)) | None => true,
+        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_) | Command::Compare(_))
+        | None => true,
     }
 }
 
@@ -337,7 +341,8 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
         Some(Command::Cache(cache_command)) => crate::cache::run(cache_command),
         Some(Command::Schema(schema_args)) => crate::schema::run(schema_args),
-        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_)) | None => {
+        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_) | Command::Compare(_))
+        | None => {
             bail!("internal error: an async command reached run_blocking")
         }
     }

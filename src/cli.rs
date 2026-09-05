@@ -132,6 +132,9 @@ pub(crate) enum Command {
     /// configured model ids exist on the server, `mcp_servers:` startup, and
     /// `agents:`/`skills:` file references. See docs/usage/ja/troubleshooting.md.
     Doctor(DoctorArgs),
+    /// Send the same prompt to two or more models and print each one's
+    /// response, timing, and usage side by side. See docs/usage/ja/compare.md.
+    Compare(CompareArgs),
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +159,46 @@ pub(crate) enum SchemaKind {
     Config,
     /// The schema for an agent Markdown file's YAML frontmatter (`agent.md`).
     Agent,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CompareArgs {
+    /// A configured model name or model identifier to compare. Repeatable;
+    /// at least two are required (enforced by `app::run`, not clap, the same
+    /// way `lait run`/`lait agent run` validate PROMPT/INPUT at the app
+    /// layer rather than declaratively).
+    #[arg(long = "model", value_name = "NAME", required = true)]
+    pub(crate) models: Vec<String>,
+
+    /// The prompt sent to every model. May be omitted when input is piped
+    /// via stdin (which is then used as the prompt).
+    #[arg(value_name = "PROMPT")]
+    pub(crate) prompt: Option<String>,
+
+    /// The reasoning effort to request from every model, overriding each
+    /// model's own configured default.
+    #[arg(long, value_enum)]
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+
+    /// Sampling temperature (0.0-2.0), applied uniformly to every model
+    /// compared, overriding each model's own configured default.
+    #[arg(long)]
+    pub(crate) temperature: Option<f64>,
+
+    /// Nucleus sampling probability mass (0.0-1.0), applied uniformly to
+    /// every model compared, overriding each model's own configured default.
+    #[arg(long)]
+    pub(crate) top_p: Option<f64>,
+
+    /// An upper bound on generated tokens, applied uniformly to every model
+    /// compared, overriding each model's own configured default.
+    #[arg(long)]
+    pub(crate) max_tokens: Option<u32>,
+
+    /// Print machine-readable JSON (an array of per-model results) instead
+    /// of a human-readable report.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1105,6 +1148,69 @@ mod tests {
         match cli.command {
             Some(Command::Doctor(doctor_args)) => assert!(doctor_args.json),
             _ => panic!("expected the doctor subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_compare_subcommand_with_repeated_model_flags() {
+        let cli = Cli::try_parse_from(["lait", "compare", "--model", "a", "--model", "b", "hello"])
+            .expect("valid compare subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Compare(compare_args)) => {
+                assert_eq!(compare_args.models, vec!["a".to_owned(), "b".to_owned()]);
+                assert_eq!(compare_args.prompt.as_deref(), Some("hello"));
+                assert!(!compare_args.json);
+            }
+            _ => panic!("expected the compare subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn compare_subcommand_prompt_is_optional_for_app_level_validation() {
+        // PROMPT is optional at the clap level so it can come from piped
+        // stdin instead; app-level code enforces that one of the two exists
+        // (see `app::resolve_input_with_stdin`).
+        let cli = Cli::try_parse_from(["lait", "compare", "--model", "a", "--model", "b"])
+            .expect("prompt-less compare should still parse");
+        match cli.command {
+            Some(Command::Compare(compare_args)) => assert!(compare_args.prompt.is_none()),
+            _ => panic!("expected the compare subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn compare_subcommand_requires_at_least_one_model_flag() {
+        // clap only enforces "at least one"; `app::compare::run` enforces
+        // the real "at least two" requirement at the app layer.
+        assert!(Cli::try_parse_from(["lait", "compare", "hello"]).is_err());
+    }
+
+    #[test]
+    fn parses_compare_subcommand_with_json_and_sampling_overrides() {
+        let cli = Cli::try_parse_from([
+            "lait",
+            "compare",
+            "--model",
+            "a",
+            "--model",
+            "b",
+            "--json",
+            "--temperature",
+            "0.5",
+            "--max-tokens",
+            "128",
+            "hello",
+        ])
+        .expect("valid compare subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Compare(compare_args)) => {
+                assert!(compare_args.json);
+                assert_eq!(compare_args.temperature, Some(0.5));
+                assert_eq!(compare_args.max_tokens, Some(128));
+            }
+            _ => panic!("expected the compare subcommand to be selected"),
         }
     }
 }

@@ -74,6 +74,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 - [MCP サーバーのツールを使う](./docs/usage/ja/mcp.md) — 外部ツールをモデルから呼び出す方法。
 - [カスタムシェルツールを使う](./docs/usage/ja/tools.md) — ローカルコマンドをツールとして公開する方法。
 - [出力例](./docs/usage/ja/output.md) — 通常出力、ストリーミング、JSON、Markdown 表示。
+- [モデル比較（lait compare）](./docs/usage/ja/compare.md) — 同一プロンプトを複数モデルへ並行送信して比較する方法。
 
 全ページの一覧は [日本語利用ガイドの目次](./docs/usage/ja/README.md) を参照してください。
 

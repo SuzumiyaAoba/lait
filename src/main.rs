@@ -8,6 +8,7 @@ mod attachment;
 mod cache;
 mod checkpoint;
 mod cli;
+mod compare;
 mod config;
 mod docgen;
 mod doctor;
