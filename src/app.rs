@@ -169,6 +169,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             crate::compare::run(compare_args, config_source, cache_override, cancel).await
         }
         Some(Command::Test(test_args)) => test_run::run(test_args, config_source, cancel).await,
+        Some(Command::Eval(eval_args)) => crate::eval::run(eval_args, config_source, cancel).await,
         None => {
             run_chat_or_repl(
                 cli.chat,
@@ -300,7 +301,8 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::Chat(_)
             | Command::Doctor(_)
             | Command::Compare(_)
-            | Command::Test(_),
+            | Command::Test(_)
+            | Command::Eval(_),
         )
         | None => true,
     }
@@ -353,7 +355,8 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
             | Command::Chat(_)
             | Command::Doctor(_)
             | Command::Compare(_)
-            | Command::Test(_),
+            | Command::Test(_)
+            | Command::Eval(_),
         )
         | None => {
             bail!("internal error: an async command reached run_blocking")

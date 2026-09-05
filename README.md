@@ -69,6 +69,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 - [エージェント Markdown ファイル（agent.md）](./docs/usage/ja/agent.md) — agent の定義と実行。
 - [JSON Schema でエディタ補完（lait schema）](./docs/usage/ja/schema.md) — workflow/config/agent の JSON Schema と yaml-language-server 連携。
 - [決定的テスト（record & replay / lait test）](./docs/usage/ja/testing.md) — API を呼ばずにワークフローの制御フローを検証する方法。
+- [出力品質の評価（lait eval）](./docs/usage/ja/eval.md) — 実際のモデルに対してテストケースを実行し、contains/jq/llm_judge で出力品質を評価する方法。
 
 ### ツール・運用
 

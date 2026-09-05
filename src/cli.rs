@@ -139,6 +139,11 @@ pub(crate) enum Command {
     /// replay cassette directory, and assertions) with no network access,
     /// reporting pass/fail. See docs/usage/ja/testing.md.
     Test(TestArgs),
+    /// Run an eval definition file (YAML: a target workflow or model+prompt,
+    /// test cases, and `assert:` checks — including `llm_judge`) against a
+    /// live model connection, reporting a per-case success rate. See
+    /// docs/usage/ja/eval.md.
+    Eval(EvalArgs),
 }
 
 #[derive(Debug, Args)]
@@ -223,6 +228,32 @@ pub(crate) enum TestFormat {
     #[default]
     Text,
     /// A structured JSON report (one entry per test file).
+    Json,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct EvalArgs {
+    /// Path to the eval definition YAML file (see docs/usage/ja/eval.md).
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// Run every case this many times, reporting a success rate instead of a
+    /// plain pass/fail — useful for non-deterministic models/`llm_judge`.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) repeat: u32,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = EvalFormat::Text)]
+    pub(crate) format: EvalFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum EvalFormat {
+    /// A per-case success-rate report with failing assertions detailed.
+    #[default]
+    Text,
+    /// A structured JSON report (one entry per case, with every repeat's
+    /// outcome).
     Json,
 }
 
@@ -829,7 +860,7 @@ pub(crate) enum ReasoningEffort {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentAction, AgentCommand, Cli, Command, ReasoningEffort, TestFormat};
+    use super::{AgentAction, AgentCommand, Cli, Command, EvalFormat, ReasoningEffort, TestFormat};
     use clap::Parser;
 
     #[test]
@@ -1341,5 +1372,41 @@ mod tests {
             Some(Command::Test(test_args)) => assert_eq!(test_args.format, TestFormat::Json),
             _ => panic!("expected the test subcommand to be selected"),
         }
+    }
+
+    #[test]
+    fn parses_eval_subcommand_with_defaults() {
+        let cli = Cli::try_parse_from(["lait", "eval", "eval.yml"])
+            .expect("valid eval subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Eval(eval_args)) => {
+                assert_eq!(eval_args.file.to_str(), Some("eval.yml"));
+                assert_eq!(eval_args.repeat, 1);
+                assert_eq!(eval_args.format, EvalFormat::Text);
+            }
+            _ => panic!("expected the eval subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_eval_subcommand_with_repeat_and_json_format() {
+        let cli = Cli::try_parse_from([
+            "lait", "eval", "--repeat", "5", "--format", "json", "eval.yml",
+        ])
+        .expect("valid eval subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Eval(eval_args)) => {
+                assert_eq!(eval_args.repeat, 5);
+                assert_eq!(eval_args.format, EvalFormat::Json);
+            }
+            _ => panic!("expected the eval subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn eval_subcommand_requires_a_file() {
+        assert!(Cli::try_parse_from(["lait", "eval"]).is_err());
     }
 }

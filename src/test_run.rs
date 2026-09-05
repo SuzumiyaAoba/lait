@@ -173,7 +173,14 @@ async fn run_test_file_inner(
         .await
         .with_context(|| format!("workflow '{}'", workflow_path.display()))?;
 
-    let failures = assert::evaluate(&definition.assert, &outcome.output, env.cancel.clone()).await;
+    let failures = assert::evaluate(
+        &definition.assert,
+        None,
+        &outcome.output,
+        None,
+        env.cancel.clone(),
+    )
+    .await;
     Ok(failures
         .into_iter()
         .map(|failure| format!("assertion {}: {}", failure.position, failure.message))

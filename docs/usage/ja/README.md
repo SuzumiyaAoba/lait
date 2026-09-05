@@ -18,6 +18,7 @@
 - [エージェント Markdown ファイル（agent.md）](./agent.md) — frontmatter とシステムプロンプトからエージェントを定義する方法。
 - [ワークフロー／エージェントファイルの静的チェック（lint）](./lint.md) — `lait lint` で構文・参照・テンプレートを実行前に検査する方法。
 - [決定的テスト（record & replay / lait test）](./testing.md) — `lait run --record`/`--replay` と `lait test` で、API を呼ばずに制御フローを検証する方法。
+- [出力品質の評価（lait eval）](./eval.md) — ワークフロー/モデル+プロンプトを実際に実行し、contains/jq/llm_judge のアサーションで出力品質を評価する方法。
 
 ## ツール・拡張
 

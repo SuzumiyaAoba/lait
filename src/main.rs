@@ -16,6 +16,7 @@ mod docgen;
 mod doctor;
 mod dotenv;
 mod engine;
+mod eval;
 mod frontmatter;
 mod history;
 mod init;
