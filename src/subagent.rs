@@ -1,17 +1,16 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
-
-use anyhow::{Context, Result, anyhow, bail};
-use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
-use tokio::sync::OnceCell;
 
 use crate::{
     agent::{self, AgentFile},
-    async_io, config, mcp, schema,
+    async_cache::AsyncCache,
+    async_io, config, mcp, registry, schema,
 };
+use anyhow::{Context, Result, anyhow, bail};
+use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 
 /// Runs `lait agent list`: prints every configured `agents:` entry's name,
 /// path, and (when the file loads cleanly) its own `description:`.
@@ -22,21 +21,12 @@ use crate::{
 /// to parse is still listed (with a note) rather than aborting the whole
 /// command — `lait lint` is where a hard failure on a bad entry belongs.
 pub(crate) fn list(file_config: &config::ConfigFile) -> Result<()> {
-    if file_config.agents.is_empty() {
-        println!(
-            "no agents defined in {}; add an 'agents:' entry to define one",
-            config::CONFIG_FILE_NAME
-        );
-        return Ok(());
-    }
-    let mut names: Vec<&String> = file_config.agents.keys().collect();
-    names.sort_unstable();
-    for name in names {
-        let path = &file_config.agents[name];
-        let loaded = agent::load_agent(path).map(|agent_file| agent_file.description);
-        config::print_registry_entry(name, path, loaded);
-    }
-    Ok(())
+    registry::list_path_registry("agents", &file_config.agents, |_, path| {
+        (
+            path.to_owned(),
+            agent::load_agent(path).map(|agent_file| agent_file.description),
+        )
+    })
 }
 
 /// One agent file (an `agents:` entry, or a workflow node's `agent:` path),
@@ -82,16 +72,13 @@ impl LoadedAgent {
 /// for the registry's lifetime, since an agent file's content doesn't change
 /// over the course of one invocation — without this, a `for_each`/`loop`
 /// node with `agent:` set would re-read and re-parse the same file (and its
-/// `file_path:` input schema) on every iteration. Each path gets its own
-/// `OnceCell`, the same per-entry scheme `SkillCache` uses (see its doc
-/// comment): the outer `Mutex` is only ever held long enough to fetch or
-/// insert a cell, and the cell's `get_or_try_init` is what makes two
-/// concurrent `parallel:`/`for_each:` branches (or concurrent tool calls
-/// within one round — see `engine::RequestSettings::complete`) racing on the
-/// same path share one load instead of two.
+/// `file_path:` input schema) on every iteration. `AsyncCache` gives each
+/// path its own `OnceCell`, so two concurrent branches (or concurrent tool
+/// calls within one round — see `engine::RequestSettings::complete`) racing
+/// on the same path share one load instead of two.
 pub(crate) struct AgentRegistry {
     agents_map: Arc<config::AgentMap>,
-    loaded: Mutex<HashMap<PathBuf, Arc<OnceCell<Arc<LoadedAgent>>>>>,
+    loaded: AsyncCache<PathBuf, LoadedAgent>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request's
@@ -126,7 +113,7 @@ impl AgentRegistry {
     pub(crate) fn new(agents_map: Arc<config::AgentMap>) -> Self {
         Self {
             agents_map,
-            loaded: Mutex::new(HashMap::new()),
+            loaded: AsyncCache::new(),
         }
     }
 
@@ -165,61 +152,50 @@ impl AgentRegistry {
         path: &Path,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Arc<LoadedAgent>> {
-        let cell = Arc::clone(
-            self.loaded
-                .lock()
-                .expect("agent registry lock should not be poisoned")
-                .entry(path.to_path_buf())
-                .or_insert_with(|| Arc::new(OnceCell::new())),
-        );
-        // Only the caller that actually wins the race to initialize `cell`
-        // runs this closure — every other concurrent caller loading the same
-        // path just awaits its result, never reaching its own cancellation
-        // checks inside. Race the whole `get_or_try_init` against this
-        // call's own `cancellation` too (below), so a losing
-        // (non-initializing) caller can still bail out promptly on its own
-        // token instead of being stuck waiting on a load it isn't driving.
         let init_cancellation = cancellation.clone();
-        let init = cell.get_or_try_init(|| async {
-            let (file, canonical_path) = tokio::try_join!(
-                agent::load_agent_cancellable(path, init_cancellation.clone()),
-                async {
-                    async_io::canonicalize(path, init_cancellation.clone())
-                        .await
-                        .with_context(|| {
-                            format!("failed to resolve agent file path '{}'", path.display())
-                        })
-                },
-            )?;
-            let tool_parameters = match &file.input_schema {
-                Some(entry) => {
-                    schema::load_schema_value_cancellable(entry, init_cancellation).await?
-                }
-                None => serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "input": {
-                            "description": "The task or input to pass to the subagent. A string \
-                                for a plain-text task, or a JSON object/array if the subagent \
-                                expects structured input."
+        self.loaded
+            .get_or_try_init(
+                path.to_path_buf(),
+                cancellation,
+                || async {
+                    let (file, canonical_path) = tokio::try_join!(
+                        agent::load_agent_cancellable(path, init_cancellation.clone()),
+                        async {
+                            async_io::canonicalize(path, init_cancellation.clone())
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "failed to resolve agent file path '{}'",
+                                        path.display()
+                                    )
+                                })
+                        },
+                    )?;
+                    let tool_parameters = match &file.input_schema {
+                        Some(entry) => {
+                            schema::load_schema_value_cancellable(entry, init_cancellation).await?
                         }
-                    },
-                    "required": ["input"],
-                }),
-            };
-            Ok::<_, anyhow::Error>(Arc::new(LoadedAgent {
-                file,
-                canonical_path,
-                tool_parameters,
-            }))
-        });
-        let loaded = match async_io::await_cancellation(init, cancellation).await {
-            async_io::CancellationResult::Completed(result) => result?,
-            async_io::CancellationResult::Cancelled => {
-                bail!("subagent load was cancelled");
-            }
-        };
-        Ok(Arc::clone(loaded))
+                        None => serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "description": "The task or input to pass to the subagent. A string \
+                                        for a plain-text task, or a JSON object/array if the subagent \
+                                        expects structured input."
+                                }
+                            },
+                            "required": ["input"],
+                        }),
+                    };
+                    Ok(Arc::new(LoadedAgent {
+                        file,
+                        canonical_path,
+                        tool_parameters,
+                    }))
+                },
+                "subagent load was cancelled",
+            )
+            .await
     }
 
     /// Builds the OpenAI-shaped tool definitions for `names` (a resolved
@@ -324,6 +300,12 @@ mod tests {
             .expect("a losing waiter's own cancellation should finish promptly")
             .unwrap_err();
         assert!(result.to_string().contains("cancel"), "error: {result}");
+        assert!(
+            result
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "cancellation should remain typed: {result:#}"
+        );
 
         drop(first);
         let _ = std::fs::remove_file(path);

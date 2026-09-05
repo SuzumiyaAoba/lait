@@ -135,15 +135,7 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
         // would show for this site.
         let label = step.label_or(index + 1);
 
-        let router_count = [
-            step.switch.is_some(),
-            step.parallel.is_some(),
-            step.r#loop.is_some(),
-            step.for_each.is_some(),
-        ]
-        .into_iter()
-        .filter(|set| *set)
-        .count();
+        let router_count = step.router_count();
         if router_count > 1 {
             bail!(
                 "step '{}' can have at most one of 'switch', 'parallel', 'loop', or 'for_each'",
@@ -226,7 +218,7 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
                     node_id
                 );
             }
-            if node.write_file().is_some() && ctx.in_concurrent_for_each {
+            if node.settings().write_file.is_some() && ctx.in_concurrent_for_each {
                 bail!(
                     "step '{}' uses node '{}', which has 'write_file' set, inside a 'for_each' body \
                      with 'max_concurrency' above 1; every concurrently running item would write the \
@@ -281,20 +273,21 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
 /// need more than one field's value at once within a single variant.
 pub(super) fn validate_node(node: &NodeDefinition, node_id: &str) -> Result<()> {
     let description = format!("node '{node_id}'");
+    let settings = node.settings();
 
     validate_sampling_params(
-        node.temperature(),
-        node.top_p(),
-        node.max_tokens(),
+        settings.temperature,
+        settings.top_p,
+        settings.max_tokens,
         &description,
     )?;
-    if let Some(retry) = node.retry() {
+    if let Some(retry) = settings.retry {
         validate_retry(retry, &description)?;
     }
-    if let Some(timeout) = node.timeout() {
+    if let Some(timeout) = settings.timeout {
         validate_timeout(timeout, &description)?;
     }
-    validate_max_tool_rounds(node.max_tool_rounds(), &description)?;
+    validate_max_tool_rounds(settings.max_tool_rounds, &description)?;
 
     match node {
         NodeDefinition::Prompt(prompt) => {

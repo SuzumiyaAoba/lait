@@ -1,4 +1,5 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::de::DeserializeOwned;
 
 /// Splits `---\n<frontmatter yaml>\n---\n<body>` into the frontmatter YAML and
 /// the body. The file must start with a `---` delimiter line; the frontmatter
@@ -28,9 +29,30 @@ pub(crate) fn split<'a>(contents: &'a str, kind: &str) -> Result<(&'a str, &'a s
     Err(anyhow!("{kind} frontmatter has no closing '---' delimiter"))
 }
 
+/// Parses a document's YAML frontmatter and returns it with the trimmed body.
+///
+/// Agent and skill files share this wire format but deserialize their
+/// metadata into different types. Keeping the document framing here means
+/// each consumer only owns its domain validation and avoids subtly diverging
+/// body trimming or frontmatter error handling.
+pub(crate) fn parse<T>(contents: &str, kind: &str) -> Result<(T, String)>
+where
+    T: DeserializeOwned,
+{
+    let (frontmatter, body) = split(contents, kind)?;
+    let metadata = serde_yaml::from_str(frontmatter).context("failed to parse frontmatter")?;
+    Ok((metadata, body.trim().to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split;
+    use super::{parse, split};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Metadata {
+        name: String,
+    }
 
     #[test]
     fn splits_frontmatter_and_body() {
@@ -54,5 +76,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_metadata_and_trims_the_body() {
+        let (metadata, body) =
+            parse::<Metadata>("---\nname: x\n---\n\n body \n", "test file").unwrap();
+
+        assert_eq!(
+            metadata,
+            Metadata {
+                name: "x".to_owned()
+            }
+        );
+        assert_eq!(body, "body");
+    }
+
+    #[test]
+    fn includes_the_frontmatter_context_when_metadata_is_invalid() {
+        let error = parse::<Metadata>("---\nname: [\n---\nbody\n", "skill file").unwrap_err();
+
+        assert!(error.to_string().contains("frontmatter"));
     }
 }

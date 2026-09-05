@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    hash::Hash,
     path::{Path, PathBuf},
 };
 
@@ -104,24 +105,6 @@ fn resolve_registry_paths_in_place(config: &mut ConfigFile, config_dir: &Path) {
     }
     for path in config.skills.values_mut() {
         *path = config_dir.join(&path);
-    }
-}
-
-/// Prints one `list` line for a registry entry (`agents:`/`workflows:`/
-/// `skills:`): `name  (path): description` when `loaded` parsed cleanly and
-/// carried a description, `name  (path)` when it parsed but had none, or
-/// `name  (path)` plus a `warning:` line when it didn't parse at all — a bad
-/// entry is still listed rather than aborting the whole command, matching
-/// `lait agent list`/`lait workflow list`/`lait skill list`'s shared
-/// contract (`lait lint` is where a hard failure on a bad entry belongs).
-pub(crate) fn print_registry_entry(name: &str, path: &Path, loaded: Result<Option<String>>) {
-    match loaded {
-        Ok(Some(description)) => println!("{name}  ({}): {description}", path.display()),
-        Ok(None) => println!("{name}  ({})", path.display()),
-        Err(error) => {
-            println!("{name}  ({})", path.display());
-            println!("  warning: {error:#}");
-        }
     }
 }
 
@@ -258,6 +241,17 @@ impl ToolPolicy {
                 .iter()
                 .any(|pattern| glob_match(pattern, qualified_name))
     }
+
+    /// Merges policy layers additively. A global deny is a safety floor that
+    /// a project config cannot silently remove, while project allow rules can
+    /// add capabilities permitted by the global layer.
+    fn merge(global: Self, project: Self) -> Self {
+        let mut allow = global.allow;
+        allow.extend(project.allow);
+        let mut deny = global.deny;
+        deny.extend(project.deny);
+        Self { allow, deny }
+    }
 }
 
 /// A minimal glob: `*substring*` (contains), `prefix*` (starts-with),
@@ -342,6 +336,31 @@ pub(crate) struct DefaultSettings {
     pub(crate) cache_ttl: Option<u64>,
 }
 
+impl DefaultSettings {
+    /// Merges a lower-priority config layer with a project layer. Every
+    /// setting is independent: a project value wins when present, otherwise
+    /// the lower-priority value remains available as a fallback.
+    fn merge(global: Self, project: Self) -> Self {
+        Self {
+            model: project.model.or(global.model),
+            reasoning_effort: project.reasoning_effort.or(global.reasoning_effort),
+            system: project.system.or(global.system),
+            temperature: project.temperature.or(global.temperature),
+            top_p: project.top_p.or(global.top_p),
+            max_tokens: project.max_tokens.or(global.max_tokens),
+            mcp: project.mcp.or(global.mcp),
+            max_tool_rounds: project.max_tool_rounds.or(global.max_tool_rounds),
+            skills: project.skills.or(global.skills),
+            subagents: project.subagents.or(global.subagents),
+            tools: project.tools.or(global.tools),
+            render: project.render.or(global.render),
+            history: project.history.or(global.history),
+            cache: project.cache.or(global.cache),
+            cache_ttl: project.cache_ttl.or(global.cache_ttl),
+        }
+    }
+}
+
 /// A map of `mcp_servers:` name to its connection settings, as used by
 /// `lait.config.yml`'s top-level `mcp_servers:`.
 pub(crate) type McpServerMap = HashMap<String, McpServerConfig>;
@@ -408,16 +427,8 @@ impl McpServerConfig {
             ),
             (Some(command), None) => {
                 let command = expand_env_placeholders(command)?;
-                let args = self
-                    .args
-                    .iter()
-                    .map(|arg| expand_env_placeholders(arg))
-                    .collect::<Result<Vec<_>>>()?;
-                let env = self
-                    .env
-                    .iter()
-                    .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
-                    .collect::<Result<HashMap<_, _>>>()?;
+                let args = expand_list(&self.args)?;
+                let env = expand_map(&self.env)?;
                 let cwd = self
                     .cwd
                     .as_deref()
@@ -432,11 +443,7 @@ impl McpServerConfig {
             }
             (None, Some(url)) => {
                 let url = expand_env_placeholders(url)?;
-                let headers = self
-                    .headers
-                    .iter()
-                    .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
-                    .collect::<Result<HashMap<_, _>>>()?;
+                let headers = expand_map(&self.headers)?;
                 Ok(McpTransport::Http { url, headers })
             }
         }
@@ -495,6 +502,37 @@ pub(crate) struct ModelDefinition {
     default_temperature: Option<f64>,
     default_top_p: Option<f64>,
     default_max_tokens: Option<u32>,
+}
+
+impl ModelDefinition {
+    fn validate(&self, context: &str) -> Result<()> {
+        if self.model_id.trim().is_empty() {
+            bail!("model_id in {context} must not be empty");
+        }
+        check_api_key_source(&self.provider.api_key, &self.provider.api_key_cmd, context)
+    }
+
+    fn resolved_model(&self) -> ResolvedModel {
+        ResolvedModel {
+            model_id: self.model_id.clone(),
+            base_url: Some(self.provider.base_url.clone()),
+            api_key: self.provider.api_key.clone(),
+            api_key_cmd: self.provider.api_key_cmd.clone(),
+            reasoning_effort: self.default_reasoning_effort,
+            temperature: self.default_temperature,
+            top_p: self.default_top_p,
+            max_tokens: self.default_max_tokens,
+        }
+    }
+
+    fn fallback_candidate(&self) -> FallbackCandidate {
+        FallbackCandidate {
+            model_id: self.model_id.clone(),
+            base_url: self.provider.base_url.clone(),
+            api_key: self.provider.api_key.clone(),
+            api_key_cmd: self.provider.api_key_cmd.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -648,25 +686,10 @@ pub(crate) fn resolve_model_alias(
     let definition = definitions.first().ok_or_else(|| {
         anyhow!("model definition {model_name:?} must contain at least one entry")
     })?;
-    if definition.model_id.trim().is_empty() {
-        bail!("model_id in model definition {model_name:?} must not be empty");
-    }
-    check_api_key_source(
-        &definition.provider.api_key,
-        &definition.provider.api_key_cmd,
-        &format!("model definition {model_name:?}"),
-    )?;
+    let context = format!("model definition {model_name:?}");
+    definition.validate(&context)?;
 
-    Ok(Some(ResolvedModel {
-        model_id: definition.model_id.clone(),
-        base_url: Some(definition.provider.base_url.clone()),
-        api_key: definition.provider.api_key.clone(),
-        api_key_cmd: definition.provider.api_key_cmd.clone(),
-        reasoning_effort: definition.default_reasoning_effort,
-        temperature: definition.default_temperature,
-        top_p: definition.default_top_p,
-        max_tokens: definition.default_max_tokens,
-    }))
+    Ok(Some(definition.resolved_model()))
 }
 
 /// One `models:` alias definition beyond the first (which
@@ -704,20 +727,9 @@ pub(crate) fn resolve_model_fallbacks(
         .iter()
         .skip(1)
         .map(|definition| {
-            if definition.model_id.trim().is_empty() {
-                bail!("model_id in model definition {model_name:?} must not be empty");
-            }
-            check_api_key_source(
-                &definition.provider.api_key,
-                &definition.provider.api_key_cmd,
-                &format!("model definition {model_name:?}"),
-            )?;
-            Ok(FallbackCandidate {
-                model_id: definition.model_id.clone(),
-                base_url: definition.provider.base_url.clone(),
-                api_key: definition.provider.api_key.clone(),
-                api_key_cmd: definition.provider.api_key_cmd.clone(),
-            })
+            let context = format!("model definition {model_name:?}");
+            definition.validate(&context)?;
+            Ok(definition.fallback_candidate())
         })
         .collect()
 }
@@ -734,26 +746,20 @@ pub(crate) fn resolve_fallback_endpoint(
     candidate: &FallbackCandidate,
     file_config: &ConfigFile,
 ) -> Result<(String, String)> {
-    let base_url = expand_env_placeholders(&candidate.base_url)?;
-    let base_url = base_url.trim_end_matches('/').to_owned();
-    if base_url.is_empty() {
-        bail!("base URL must not be empty");
-    }
-    let api_key = if let Some(api_key) =
-        resolve_literal_or_cmd(candidate.api_key.as_deref(), candidate.api_key_cmd.as_ref())?
-    {
-        api_key
-    } else if let Some(api_key) = resolve_literal_or_cmd(
+    let base_url = normalize_base_url(expand_env_placeholders(&candidate.base_url)?)?;
+    let api_key = resolve_api_key(
+        None,
+        candidate.api_key.as_deref(),
+        candidate.api_key_cmd.as_ref(),
         file_config.api_key.as_deref(),
         file_config.api_key_cmd.as_ref(),
-    )? {
-        api_key
-    } else {
+    )?
+    .unwrap_or_else(|| {
         // Mirrors `resolve_request_settings`'s own dummy-key substitution —
         // async-openai always builds an Authorization header, and LM Studio
         // ignores its value.
         "lm-studio".to_owned()
-    };
+    });
     Ok((base_url, api_key))
 }
 
@@ -772,6 +778,44 @@ fn resolve_literal_or_cmd(
     } else {
         Ok(None)
     }
+}
+
+fn resolve_api_key(
+    override_value: Option<String>,
+    model_api_key: Option<&str>,
+    model_api_key_cmd: Option<&CommandSpec>,
+    config_api_key: Option<&str>,
+    config_api_key_cmd: Option<&CommandSpec>,
+) -> Result<Option<String>> {
+    if let Some(api_key) = override_value {
+        return Ok(Some(api_key));
+    }
+    if let Some(api_key) = resolve_literal_or_cmd(model_api_key, model_api_key_cmd)? {
+        return Ok(Some(api_key));
+    }
+    resolve_literal_or_cmd(config_api_key, config_api_key_cmd)
+}
+
+fn expand_list(values: &[String]) -> Result<Vec<String>> {
+    values
+        .iter()
+        .map(|value| expand_env_placeholders(value))
+        .collect()
+}
+
+fn expand_map(values: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    values
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
+        .collect()
+}
+
+fn normalize_base_url(base_url: String) -> Result<String> {
+    let base_url = base_url.trim_end_matches('/').to_owned();
+    if base_url.is_empty() {
+        bail!("base URL must not be empty");
+    }
+    Ok(base_url)
 }
 
 pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
@@ -847,26 +891,20 @@ pub(crate) fn resolve_endpoint(
         .or(model_base_url)
         .or(config_base_url)
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
-    let base_url = base_url.trim_end_matches('/').to_owned();
-    if base_url.is_empty() {
-        return Err(anyhow!("base URL must not be empty"));
-    }
+    let base_url = normalize_base_url(base_url)?;
 
     check_api_key_source(
         &file_config.api_key,
         &file_config.api_key_cmd,
         "top-level configuration",
     )?;
-    let api_key = if let Some(api_key) = api_key_override {
-        Some(api_key)
-    } else if let Some(api_key) = resolve_literal_or_cmd(model_api_key, model_api_key_cmd)? {
-        Some(api_key)
-    } else {
-        resolve_literal_or_cmd(
-            file_config.api_key.as_deref(),
-            file_config.api_key_cmd.as_ref(),
-        )?
-    };
+    let api_key = resolve_api_key(
+        api_key_override,
+        model_api_key,
+        model_api_key_cmd,
+        file_config.api_key.as_deref(),
+        file_config.api_key_cmd.as_ref(),
+    )?;
     Ok((base_url, api_key))
 }
 
@@ -925,6 +963,14 @@ pub(crate) fn global_config_path() -> Result<PathBuf> {
     Ok(xdg_config_home()?.join("lait").join("config.yml"))
 }
 
+fn merge_maps<K, V>(mut global: HashMap<K, V>, project: HashMap<K, V>) -> HashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    global.extend(project);
+    global
+}
+
 /// Merges `global` (loaded from [`global_config_path`]) with `project`
 /// (found by [`ConfigSource::Search`]'s upward walk) into the single
 /// `ConfigFile` every reader sees from here on, with `project` winning
@@ -934,9 +980,9 @@ pub(crate) fn global_config_path() -> Result<PathBuf> {
 /// way; `base_url` keeps the project value when set, else falls back to the
 /// global one. `api_key`/`api_key_cmd` merge as a single unit (whichever the
 /// project sets, of either, wins as a pair) rather than falling back field
-/// by field — see the comment inline below. `tool_policy`'s `allow`/`deny`
-/// are unioned rather than key-by-key or project-wins — see the comment at
-/// its own merge below for why. Registry paths (`workflows:`/`agents:`/
+/// by field — see `DefaultSettings::merge`. `tool_policy`'s `allow`/`deny`
+/// are unioned rather than key-by-key or project-wins — see `ToolPolicy::merge`
+/// for why. Registry paths (`workflows:`/`agents:`/
 /// `skills:`) are already absolute by this point (each was resolved by
 /// `resolve_registry_paths_in_place` right after its own file was parsed —
 /// see `parse_config_file`), so combining the two maps needs no
@@ -954,69 +1000,19 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         (global.api_key, global.api_key_cmd)
     };
 
-    let mut models = global.models;
-    models.extend(project.models);
-    let mut mcp_servers = global.mcp_servers;
-    mcp_servers.extend(project.mcp_servers);
-    let mut skills = global.skills;
-    skills.extend(project.skills);
-    let mut agents = global.agents;
-    agents.extend(project.agents);
-    let mut prompts = global.prompts;
-    prompts.extend(project.prompts);
-    let mut workflows = global.workflows;
-    workflows.extend(project.workflows);
-    let mut tools = global.tools;
-    tools.extend(project.tools);
-    // Unioned, not "whichever side is non-empty wins" (like `mcp_servers`'s
-    // per-name merge above, not like `api_key`'s whole-pair merge): a
-    // global `deny` is a safety floor a project should never be able to
-    // silently drop just by defining its own unrelated `allow`/`deny`
-    // entries, and a project's own `allow` is naturally additive on top of
-    // whatever the global config already permits.
-    let mut tool_policy_allow = global.tool_policy.allow;
-    tool_policy_allow.extend(project.tool_policy.allow);
-    let mut tool_policy_deny = global.tool_policy.deny;
-    tool_policy_deny.extend(project.tool_policy.deny);
-
     ConfigFile {
         base_url: project.base_url.or(global.base_url),
         api_key,
         api_key_cmd,
-        default: DefaultSettings {
-            model: project.default.model.or(global.default.model),
-            reasoning_effort: project
-                .default
-                .reasoning_effort
-                .or(global.default.reasoning_effort),
-            system: project.default.system.or(global.default.system),
-            temperature: project.default.temperature.or(global.default.temperature),
-            top_p: project.default.top_p.or(global.default.top_p),
-            max_tokens: project.default.max_tokens.or(global.default.max_tokens),
-            mcp: project.default.mcp.or(global.default.mcp),
-            max_tool_rounds: project
-                .default
-                .max_tool_rounds
-                .or(global.default.max_tool_rounds),
-            skills: project.default.skills.or(global.default.skills),
-            subagents: project.default.subagents.or(global.default.subagents),
-            tools: project.default.tools.or(global.default.tools),
-            render: project.default.render.or(global.default.render),
-            history: project.default.history.or(global.default.history),
-            cache: project.default.cache.or(global.default.cache),
-            cache_ttl: project.default.cache_ttl.or(global.default.cache_ttl),
-        },
-        models,
-        mcp_servers,
-        skills,
-        agents,
-        prompts,
-        workflows,
-        tool_policy: ToolPolicy {
-            allow: tool_policy_allow,
-            deny: tool_policy_deny,
-        },
-        tools,
+        default: DefaultSettings::merge(global.default, project.default),
+        models: merge_maps(global.models, project.models),
+        mcp_servers: merge_maps(global.mcp_servers, project.mcp_servers),
+        skills: merge_maps(global.skills, project.skills),
+        agents: merge_maps(global.agents, project.agents),
+        prompts: merge_maps(global.prompts, project.prompts),
+        workflows: merge_maps(global.workflows, project.workflows),
+        tool_policy: ToolPolicy::merge(global.tool_policy, project.tool_policy),
+        tools: merge_maps(global.tools, project.tools),
     }
 }
 
@@ -1107,8 +1103,9 @@ fn load_global_config() -> Result<Option<ConfigFile>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigFile, McpServerConfig, McpTransport, ShellToolDefinition, ToolPolicy,
-        check_shell_tool_definition, expand_with, resolve_model,
+        ConfigFile, DefaultSettings, McpServerConfig, McpTransport, ShellToolDefinition,
+        ToolPolicy, check_shell_tool_definition, expand_with, normalize_base_url, resolve_api_key,
+        resolve_model,
     };
     use std::collections::HashMap;
 
@@ -1189,6 +1186,26 @@ mod tests {
     }
 
     #[test]
+    fn default_settings_merge_keeps_unset_global_fallbacks() {
+        let merged = DefaultSettings::merge(
+            DefaultSettings {
+                model: Some("global-model".to_owned()),
+                temperature: Some(0.2),
+                ..DefaultSettings::default()
+            },
+            DefaultSettings {
+                model: Some("project-model".to_owned()),
+                top_p: Some(0.8),
+                ..DefaultSettings::default()
+            },
+        );
+
+        assert_eq!(merged.model.as_deref(), Some("project-model"));
+        assert_eq!(merged.temperature, Some(0.2));
+        assert_eq!(merged.top_p, Some(0.8));
+    }
+
+    #[test]
     fn check_shell_tool_definition_rejects_an_empty_command() {
         let definition = ShellToolDefinition {
             description: None,
@@ -1236,6 +1253,41 @@ mod tests {
         let resolved = resolve_model("some-model".to_owned(), &config).unwrap();
         assert_eq!(resolved.model_id, "some-model");
         assert!(resolved.base_url.is_none());
+    }
+
+    #[test]
+    fn normalize_base_url_removes_trailing_slashes() {
+        assert_eq!(
+            normalize_base_url("https://example.com///".to_owned()).unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_rejects_an_empty_value() {
+        assert!(normalize_base_url("///".to_owned()).is_err());
+    }
+
+    #[test]
+    fn resolve_api_key_uses_the_first_available_layer() {
+        assert_eq!(
+            resolve_api_key(None, Some("model-key"), None, Some("config-key"), None,)
+                .unwrap()
+                .as_deref(),
+            Some("model-key")
+        );
+        assert_eq!(
+            resolve_api_key(
+                Some("override-key".to_owned()),
+                Some("model-key"),
+                None,
+                Some("config-key"),
+                None,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("override-key")
+        );
     }
 
     fn lookup_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

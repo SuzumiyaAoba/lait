@@ -1437,11 +1437,13 @@ lait graph workflow.yml --format dot
 ```sh
 lait run workflow.yml "本文" --checkpoint
 # ステップ3で失敗した場合、stderr に次のような行が出力されます:
-#   note: run checkpointed as '20260903-141233-0a1b'; resume with `lait run workflow.yml --resume 20260903-141233-0a1b`
+#   note: run checkpointed as '20260903-141233-123456789-12345-0'; resume with `lait run workflow.yml --resume 20260903-141233-123456789-12345-0`
 
 # 原因を直して再実行（PROMPT は不要 ―― チェックポイントに記録された値を使います）
-lait run workflow.yml --resume 20260903-141233-0a1b
+lait run workflow.yml --resume 20260903-141233-123456789-12345-0
 ```
+
+stderr に表示された `run-id` は加工せず、そのまま `--resume` や `lait runs show` に渡してください。以前の形式で作成されたチェックポイントも再開できます。
 
 - 再開できるのはトップレベルの `steps:` の単位のみです。`switch`/`parallel`/`loop`/
   `for_each` はチェックポイントの粒度より内側にあるため、それらを含むステップが
@@ -1477,5 +1479,5 @@ lait run workflow.yml --resume 20260903-141233-0a1b
 
 ```sh
 lait runs list
-lait runs show 20260903-141233-0a1b
+lait runs show 20260903-141233-123456789-12345-0
 ```

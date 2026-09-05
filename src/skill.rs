@@ -1,14 +1,12 @@
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use tokio::sync::OnceCell;
 
-use crate::{async_io, config, frontmatter};
+use crate::{async_cache::AsyncCache, async_io, config, error::Interrupted, frontmatter, registry};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,25 +51,14 @@ fn resolve_skill_file_path(configured_path: &Path) -> PathBuf {
 /// to parse is still listed (with a note) rather than aborting the whole
 /// command — `lait lint` is where a hard failure on a bad entry belongs.
 pub(crate) fn list(file_config: &config::ConfigFile) -> Result<()> {
-    if file_config.skills.is_empty() {
-        println!(
-            "no skills defined in {}; add a 'skills:' entry to define one",
-            config::CONFIG_FILE_NAME
-        );
-        return Ok(());
-    }
-    let mut names: Vec<&String> = file_config.skills.keys().collect();
-    names.sort_unstable();
-    for name in names {
-        let configured_path = &file_config.skills[name];
+    registry::list_path_registry("skills", &file_config.skills, |name, configured_path| {
         let path = resolve_skill_file_path(configured_path);
         let loaded = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read skill file '{}'", path.display()))
             .and_then(|contents| parse_skill(name, &contents))
             .map(|skill| skill.description);
-        config::print_registry_entry(name, &path, loaded);
-    }
-    Ok(())
+        (path, loaded)
+    })
 }
 
 async fn load_skill(
@@ -120,13 +107,11 @@ async fn load_skill(
 }
 
 fn parse_skill(name: &str, contents: &str) -> Result<SkillFile> {
-    let (frontmatter, body) = frontmatter::split(contents, "skill file")?;
-    let frontmatter: SkillFrontmatter =
-        serde_yaml::from_str(frontmatter).context("failed to parse frontmatter")?;
+    let (frontmatter, body) = frontmatter::parse::<SkillFrontmatter>(contents, "skill file")?;
     Ok(SkillFile {
         name: frontmatter.name.unwrap_or_else(|| name.to_owned()),
         description: frontmatter.description,
-        body: body.trim().to_owned(),
+        body,
     })
 }
 
@@ -147,26 +132,21 @@ fn format_skill(skill: &SkillFile) -> String {
 /// course of one `lait run`/`lait agent run`/chat invocation, so every
 /// `render()` call after the first for a given name reuses this instead of
 /// re-reading and re-parsing the file (which a `for_each`/`loop` node with
-/// `skills:` set would otherwise do on every iteration). Each name gets its
-/// own `OnceCell`: the outer `Mutex` is only ever held long enough to fetch
-/// or insert that cell (never across an await), and the cell's own
-/// `get_or_try_init` — not a check-then-insert on the map — is what makes
-/// concurrent `parallel:`/`for_each:` branches requesting the same name for
-/// the first time share one load instead of two racing ones. The cached
-/// value is an `Arc<String>` rather than a bare `String` so a cache hit is a
-/// refcount bump, not a clone of the skill's Markdown body; `Arc` (not `Rc`)
-/// because a `SkillCache` is shared across `tokio::spawn`ed tasks (`parallel`/
-/// concurrent `for_each` — see `engine::AppContext`), which requires `Send`.
+/// `skills:` set would otherwise do on every iteration). `AsyncCache` gives
+/// each name its own `OnceCell`, so concurrent branches requesting the same
+/// name share one load while different names can load independently. The
+/// cached value is an `Arc<String>` rather than a bare `String`, so a cache
+/// hit is a refcount bump instead of a clone of the skill's Markdown body.
 pub(crate) struct SkillCache {
     skills_map: Arc<config::SkillMap>,
-    sections: Mutex<HashMap<String, Arc<OnceCell<Arc<String>>>>>,
+    sections: AsyncCache<String, String>,
 }
 
 impl SkillCache {
     pub(crate) fn new(skills_map: Arc<config::SkillMap>) -> Self {
         Self {
             skills_map,
-            sections: Mutex::new(HashMap::new()),
+            sections: AsyncCache::new(),
         }
     }
 
@@ -197,7 +177,7 @@ impl SkillCache {
             .as_ref()
             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
-            anyhow::bail!("skill rendering was cancelled");
+            anyhow::bail!(Interrupted::cancelled("skill rendering was cancelled"));
         }
         let sections = futures_util::future::try_join_all(
             names
@@ -218,51 +198,33 @@ impl SkillCache {
         name: &str,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Arc<String>> {
-        if cancellation
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-        {
-            anyhow::bail!("skill rendering was cancelled");
-        }
-        let cell = Arc::clone(
-            self.sections
-                .lock()
-                .expect("skill cache lock should not be poisoned")
-                .entry(name.to_owned())
-                .or_insert_with(|| Arc::new(OnceCell::new())),
-        );
-        // Only the caller that actually wins the race to initialize `cell`
-        // runs this closure — every other concurrent caller for the same
-        // name just awaits its result, never reaching its own cancellation
-        // checks below. Race the whole `get_or_try_init` against this call's
-        // own `cancellation` too, so a losing (non-initializing) caller can
-        // still bail out promptly on its own token instead of being stuck
-        // waiting on a load it isn't driving.
         let init_cancellation = cancellation.clone();
-        let init = cell.get_or_try_init(|| async {
-            let configured_path = self.skills_map.get(name).ok_or_else(|| {
-                anyhow!(
-                    "unknown skill '{name}'; define it under 'skills:' in {}",
-                    config::CONFIG_FILE_NAME
-                )
-            })?;
-            let read_cancellation = init_cancellation.clone();
-            let skill = load_skill(name, configured_path, init_cancellation).await?;
-            if read_cancellation
-                .as_ref()
-                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-            {
-                anyhow::bail!("skill rendering was cancelled");
-            }
-            Ok::<_, anyhow::Error>(Arc::new(format_skill(&skill)))
-        });
-        let section = match async_io::await_cancellation(init, cancellation).await {
-            async_io::CancellationResult::Completed(result) => result?,
-            async_io::CancellationResult::Cancelled => {
-                anyhow::bail!("skill rendering was cancelled");
-            }
-        };
-        Ok(Arc::clone(section))
+        let section = self
+            .sections
+            .get_or_try_init(
+                name.to_owned(),
+                cancellation,
+                || async {
+                    let configured_path = self.skills_map.get(name).ok_or_else(|| {
+                        anyhow!(
+                            "unknown skill '{name}'; define it under 'skills:' in {}",
+                            config::CONFIG_FILE_NAME
+                        )
+                    })?;
+                    let read_cancellation = init_cancellation.clone();
+                    let skill = load_skill(name, configured_path, init_cancellation).await?;
+                    if read_cancellation
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                    {
+                        anyhow::bail!(Interrupted::cancelled("skill rendering was cancelled"));
+                    }
+                    Ok(Arc::new(format_skill(&skill)))
+                },
+                "skill rendering was cancelled",
+            )
+            .await?;
+        Ok(section)
     }
 }
 
@@ -362,6 +324,12 @@ mod tests {
             .expect("FIFO skill cancellation should finish promptly")
             .unwrap_err();
         assert!(result.to_string().contains("cancel"), "error: {result}");
+        assert!(
+            result
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "cancellation should remain typed: {result:#}"
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -410,6 +378,12 @@ mod tests {
             .expect("a losing waiter's own cancellation should finish promptly")
             .unwrap_err();
         assert!(result.to_string().contains("cancel"), "error: {result}");
+        assert!(
+            result
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "cancellation should remain typed: {result:#}"
+        );
 
         drop(first);
         let _ = fs::remove_file(path);

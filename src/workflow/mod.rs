@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::{config::ConfigFile, jq};
+use crate::{config::ConfigFile, jq, registry};
 
 #[cfg(test)]
 use crate::template;
@@ -67,21 +67,12 @@ pub(crate) fn resolve_run_target(argument: &Path, file_config: &ConfigFile) -> P
 /// (with a note) rather than aborting the whole command — `lait lint` is
 /// where a hard failure on a bad entry belongs.
 pub(crate) fn list(file_config: &ConfigFile) -> Result<()> {
-    if file_config.workflows.is_empty() {
-        println!(
-            "no workflows defined in {}; add a 'workflows:' entry to define one",
-            crate::config::CONFIG_FILE_NAME
-        );
-        return Ok(());
-    }
-    let mut names: Vec<&String> = file_config.workflows.keys().collect();
-    names.sort_unstable();
-    for name in names {
-        let path = &file_config.workflows[name];
-        let loaded = load_workflow(path).map(|wf| wf.description);
-        crate::config::print_registry_entry(name, path, loaded);
-    }
-    Ok(())
+    registry::list_path_registry("workflows", &file_config.workflows, |_, path| {
+        (
+            path.to_owned(),
+            load_workflow(path).map(|workflow| workflow.description),
+        )
+    })
 }
 
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {

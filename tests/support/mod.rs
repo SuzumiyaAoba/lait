@@ -324,6 +324,10 @@ pub(crate) fn test_command() -> Command {
         "XDG_CONFIG_HOME",
         std::env::temp_dir().join("lait-test-no-global-config"),
     );
+    // History is enabled by default for successful calls. Keep incidental
+    // records out of the developer's home and isolate commands from each other.
+    // Tests for persistence explicitly override this with an owned fixture.
+    command.env("XDG_DATA_HOME", next_temp_path("lait-test-data", ""));
     command
 }
 

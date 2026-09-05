@@ -35,6 +35,21 @@ pub(crate) fn unique_temp_path(prefix: &str, suffix: &str) -> std::path::PathBuf
 /// module, which is why this lives here instead of as a private per-module
 /// helper.
 pub(crate) fn in_temp_dir<T>(label: &str, body: impl FnOnce() -> T) -> T {
+    struct DirectoryGuard {
+        original: std::path::PathBuf,
+        temporary: std::path::PathBuf,
+    }
+
+    impl Drop for DirectoryGuard {
+        fn drop(&mut self) {
+            // Restore even when the test panics, before releasing the shared
+            // lock. Otherwise one failure changes the environment of later tests.
+            if std::env::set_current_dir(&self.original).is_ok() {
+                let _ = std::fs::remove_dir_all(&self.temporary);
+            }
+        }
+    }
+
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -42,8 +57,9 @@ pub(crate) fn in_temp_dir<T>(label: &str, body: impl FnOnce() -> T) -> T {
     std::fs::create_dir_all(&dir).unwrap();
     let original = std::env::current_dir().unwrap();
     std::env::set_current_dir(&dir).unwrap();
-    let result = body();
-    std::env::set_current_dir(original).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    result
+    let _directory = DirectoryGuard {
+        original,
+        temporary: dir,
+    };
+    body()
 }
