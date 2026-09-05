@@ -67,6 +67,9 @@ pub(crate) struct LlmJudgeContext<'a> {
     /// The model an `llm_judge` assertion calls when it doesn't set its own
     /// `model:` — typically the eval target's own model, when it has one.
     pub(crate) default_model: Option<&'a str>,
+    /// The input that produced `output`, shown to the judge model alongside
+    /// it — `lait eval`'s own case input.
+    pub(crate) input: Option<&'a str>,
 }
 
 /// Converts a workflow/model's final output text into the JSON text a jq
@@ -112,7 +115,6 @@ struct JudgeScore {
 async fn run_llm_judge(
     judge: &LlmJudgeContext<'_>,
     criteria: &str,
-    input: Option<&str>,
     output: &str,
     model_override: Option<&str>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
@@ -139,7 +141,8 @@ async fn run_llm_judge(
 
     let response_format = schema::build_json_schema(llm_judge_schema(), "llm_judge_score")?;
 
-    let input_section = input
+    let input_section = judge
+        .input
         .map(|input| format!("Original input:\n{input}\n\n"))
         .unwrap_or_default();
     let prompt = format!(
@@ -164,19 +167,17 @@ async fn run_llm_judge(
     Ok(parsed.score)
 }
 
-/// Evaluates every entry in `assertions` against `output` (produced from
-/// `input`, when the caller has one — only used by `llm_judge`) in order,
-/// returning one [`AssertionFailure`] per entry that didn't hold (empty when
-/// every assertion passed). A `jq` expression's own evaluation error (bad
-/// syntax, a filter that doesn't produce exactly one value) and an
-/// `llm_judge` call's own failure (no judge context, a model error, an
-/// unparseable score) are both reported as a failure of that assertion
-/// rather than aborting the rest.
+/// Evaluates every entry in `assertions` against `output` in order, returning
+/// one [`AssertionFailure`] per entry that didn't hold (empty when every
+/// assertion passed). A `jq` expression's own evaluation error (bad syntax, a
+/// filter that doesn't produce exactly one value) and an `llm_judge` call's
+/// own failure (no judge context, a model error, an unparseable score) are
+/// both reported as a failure of that assertion rather than aborting the
+/// rest.
 pub(crate) async fn evaluate(
     assertions: &[Assertion],
-    input: Option<&str>,
-    output: &str,
     judge: Option<&LlmJudgeContext<'_>>,
+    output: &str,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Vec<AssertionFailure> {
     let input_json = normalize_jq_input(output);
@@ -238,7 +239,6 @@ pub(crate) async fn evaluate(
                     match run_llm_judge(
                         judge_context,
                         criteria,
-                        input,
                         output,
                         model.as_deref(),
                         cancellation.clone(),
@@ -284,11 +284,7 @@ mod tests {
         let assertions = vec![Assertion::Equals {
             value: "hello".to_owned(),
         }];
-        assert!(
-            evaluate(&assertions, None, "hello", None, None)
-                .await
-                .is_empty()
-        );
+        assert!(evaluate(&assertions, None, "hello", None).await.is_empty());
     }
 
     #[tokio::test]
@@ -296,7 +292,7 @@ mod tests {
         let assertions = vec![Assertion::Equals {
             value: "hello".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "goodbye", None, None).await;
+        let failures = evaluate(&assertions, None, "goodbye", None).await;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].position, 1);
     }
@@ -307,7 +303,7 @@ mod tests {
             value: "結論".to_owned(),
         }];
         assert!(
-            evaluate(&assertions, None, "これは結論です", None, None)
+            evaluate(&assertions, None, "これは結論です", None)
                 .await
                 .is_empty()
         );
@@ -318,7 +314,7 @@ mod tests {
         let assertions = vec![Assertion::Contains {
             value: "結論".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "まだ途中です", None, None).await;
+        let failures = evaluate(&assertions, None, "まだ途中です", None).await;
         assert_eq!(failures.len(), 1);
     }
 
@@ -328,7 +324,7 @@ mod tests {
             expr: "contains(\"結論\")".to_owned(),
         }];
         assert!(
-            evaluate(&assertions, None, "これは結論です", None, None)
+            evaluate(&assertions, None, "これは結論です", None)
                 .await
                 .is_empty()
         );
@@ -339,7 +335,7 @@ mod tests {
         let assertions = vec![Assertion::Jq {
             expr: "contains(\"結論\")".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "まだ途中です", None, None).await;
+        let failures = evaluate(&assertions, None, "まだ途中です", None).await;
         assert_eq!(failures.len(), 1);
     }
 
@@ -349,7 +345,7 @@ mod tests {
             expr: ".title | length > 0".to_owned(),
         }];
         assert!(
-            evaluate(&assertions, None, r#"{"title": "hello"}"#, None, None)
+            evaluate(&assertions, None, r#"{"title": "hello"}"#, None)
                 .await
                 .is_empty()
         );
@@ -360,7 +356,7 @@ mod tests {
         let assertions = vec![Assertion::Jq {
             expr: "not valid jq (((".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "anything", None, None).await;
+        let failures = evaluate(&assertions, None, "anything", None).await;
         assert_eq!(failures.len(), 1);
     }
 
@@ -374,7 +370,7 @@ mod tests {
                 expr: "contains(\"never\")".to_owned(),
             },
         ];
-        let failures = evaluate(&assertions, None, "actual", None, None).await;
+        let failures = evaluate(&assertions, None, "actual", None).await;
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].position, 1);
         assert_eq!(failures[1].position, 2);
@@ -387,7 +383,7 @@ mod tests {
             model: None,
             threshold: None,
         }];
-        let failures = evaluate(&assertions, None, "anything", None, None).await;
+        let failures = evaluate(&assertions, None, "anything", None).await;
         assert_eq!(failures.len(), 1);
         assert!(failures[0].message.contains("not supported"));
     }

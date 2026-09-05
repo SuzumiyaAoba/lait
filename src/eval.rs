@@ -157,11 +157,16 @@ fn load_target(target: &EvalTarget, base_dir: &Path, file_config: &ConfigFile) -
     }
 }
 
-/// One repeat's outcome for one case: whether every `assert:` entry passed,
-/// and (when not) each failed assertion's reason.
+/// One repeat's outcome for one case: each failed assertion's reason (empty
+/// when every `assert:` entry passed).
 struct RunResult {
-    passed: bool,
     failures: Vec<String>,
+}
+
+impl RunResult {
+    fn passed(&self) -> bool {
+        self.failures.is_empty()
+    }
 }
 
 struct CaseOutcome {
@@ -173,7 +178,7 @@ struct CaseOutcome {
 
 impl CaseOutcome {
     fn passed_count(&self) -> usize {
-        self.runs.iter().filter(|run| run.passed).count()
+        self.runs.iter().filter(|run| run.passed()).count()
     }
 
     fn success_rate(&self) -> f64 {
@@ -198,17 +203,11 @@ async fn run_case(
                 env,
                 file_config,
                 default_model,
+                input: Some(case.input.as_str()),
             };
-            let failures = assert::evaluate(
-                &case.assert,
-                Some(case.input.as_str()),
-                &output,
-                Some(&judge),
-                env.cancel.clone(),
-            )
-            .await;
+            let failures =
+                assert::evaluate(&case.assert, Some(&judge), &output, env.cancel.clone()).await;
             RunResult {
-                passed: failures.is_empty(),
                 failures: failures
                     .into_iter()
                     .map(|failure| format!("assertion {}: {}", failure.position, failure.message))
@@ -216,7 +215,6 @@ async fn run_case(
             }
         }
         Err(error) => RunResult {
-            passed: false,
             failures: vec![format!("{error:#}")],
         },
     }
@@ -263,7 +261,7 @@ fn print_json_report(cases: &[CaseOutcome]) -> Result<()> {
                 "total": case.runs.len(),
                 "success_rate": case.success_rate(),
                 "runs": case.runs.iter().map(|run| serde_json::json!({
-                    "passed": run.passed,
+                    "passed": run.passed(),
                     "failures": run.failures,
                 })).collect::<Vec<_>>(),
             })

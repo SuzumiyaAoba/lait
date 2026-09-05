@@ -177,7 +177,6 @@ async fn run_test_file_inner(
         &definition.assert,
         None,
         &outcome.output,
-        None,
         env.cancel.clone(),
     )
     .await;
