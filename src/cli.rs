@@ -122,6 +122,139 @@ pub(crate) enum Command {
     Runs(RunsCommand),
     /// Manage the response disk cache (`.lait/cache/`, see `--cache`).
     Cache(CacheCommand),
+    /// Print the JSON Schema (draft 2020-12) for workflow.yml, lait.config.yml,
+    /// or an agent file's frontmatter, for editor completion/validation (e.g.
+    /// yaml-language-server). See docs/usage/ja/schema.md.
+    Schema(SchemaArgs),
+    /// Diagnose the environment/configuration/connectivity in one pass:
+    /// lait.config.yml parsing, `${VAR}` environment variables, model
+    /// resolution, provider connectivity and authentication, whether
+    /// configured model ids exist on the server, `mcp_servers:` startup, and
+    /// `agents:`/`skills:` file references. See docs/usage/ja/troubleshooting.md.
+    Doctor(DoctorArgs),
+    /// Send the same prompt to two or more models and print each one's
+    /// response, timing, and usage side by side. See docs/usage/ja/compare.md.
+    Compare(CompareArgs),
+    /// Run test definition files (YAML: a workflow, input/vars, a `--record`ed
+    /// replay cassette directory, and assertions) with no network access,
+    /// reporting pass/fail. See docs/usage/ja/testing.md.
+    Test(TestArgs),
+    /// Run an eval definition file (YAML: a target workflow or model+prompt,
+    /// test cases, and `assert:` checks — including `llm_judge`) against a
+    /// live model connection, reporting a per-case success rate. See
+    /// docs/usage/ja/eval.md.
+    Eval(EvalArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Print machine-readable JSON instead of a human-readable report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SchemaArgs {
+    /// Which file format to print the JSON Schema for.
+    #[arg(value_enum, value_name = "KIND")]
+    pub(crate) kind: SchemaKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SchemaKind {
+    /// The schema for a workflow YAML file (`workflow.yml`).
+    Workflow,
+    /// The schema for `lait.config.yml`.
+    Config,
+    /// The schema for an agent Markdown file's YAML frontmatter (`agent.md`).
+    Agent,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CompareArgs {
+    /// A configured model name or model identifier to compare. Repeatable;
+    /// at least two are required (enforced by `app::run`, not clap, the same
+    /// way `lait run`/`lait agent run` validate PROMPT/INPUT at the app
+    /// layer rather than declaratively).
+    #[arg(long = "model", value_name = "NAME", required = true)]
+    pub(crate) models: Vec<String>,
+
+    /// The prompt sent to every model. May be omitted when input is piped
+    /// via stdin (which is then used as the prompt).
+    #[arg(value_name = "PROMPT")]
+    pub(crate) prompt: Option<String>,
+
+    /// The reasoning effort to request from every model, overriding each
+    /// model's own configured default.
+    #[arg(long, value_enum)]
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+
+    /// Sampling temperature (0.0-2.0), applied uniformly to every model
+    /// compared, overriding each model's own configured default.
+    #[arg(long)]
+    pub(crate) temperature: Option<f64>,
+
+    /// Nucleus sampling probability mass (0.0-1.0), applied uniformly to
+    /// every model compared, overriding each model's own configured default.
+    #[arg(long)]
+    pub(crate) top_p: Option<f64>,
+
+    /// An upper bound on generated tokens, applied uniformly to every model
+    /// compared, overriding each model's own configured default.
+    #[arg(long)]
+    pub(crate) max_tokens: Option<u32>,
+
+    /// Print machine-readable JSON (an array of per-model results) instead
+    /// of a human-readable report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TestArgs {
+    /// Test definition files (.yml/.yaml) and/or directories to search
+    /// recursively for them (see docs/usage/ja/testing.md).
+    #[arg(value_name = "FILE", required = true)]
+    pub(crate) paths: Vec<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = TestFormat::Text)]
+    pub(crate) format: TestFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum TestFormat {
+    /// A per-file pass/fail report with failing assertions detailed.
+    #[default]
+    Text,
+    /// A structured JSON report (one entry per test file).
+    Json,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct EvalArgs {
+    /// Path to the eval definition YAML file (see docs/usage/ja/eval.md).
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// Run every case this many times, reporting a success rate instead of a
+    /// plain pass/fail — useful for non-deterministic models/`llm_judge`.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) repeat: u32,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = EvalFormat::Text)]
+    pub(crate) format: EvalFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum EvalFormat {
+    /// A per-case success-rate report with failing assertions detailed.
+    #[default]
+    Text,
+    /// A structured JSON report (one entry per case, with every repeat's
+    /// outcome).
+    Json,
 }
 
 #[derive(Debug, Args)]
@@ -448,6 +581,22 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "RUN_ID", conflicts_with = "dry_run")]
     pub(crate) resume: Option<String>,
 
+    /// Record every LLM request/response this run makes into DIR as cassette
+    /// files (see `crate::cassette`), keyed by request content (the same
+    /// hash `--cache` uses). A later `--replay DIR` run against the same
+    /// workflow/input/vars answers each request from these cassettes instead
+    /// of the network — see `lait test`/docs/usage/ja/testing.md.
+    #[arg(long, value_name = "DIR", conflicts_with = "replay")]
+    pub(crate) record: Option<PathBuf>,
+
+    /// Replay a previously `--record`ed run from DIR instead of calling any
+    /// model: every request this run would send is matched against DIR's
+    /// cassette files by content hash, and the recorded response is returned
+    /// with no network access at all. A request that has no matching
+    /// cassette is an error (see `crate::cassette::load`).
+    #[arg(long, value_name = "DIR", conflicts_with = "record")]
+    pub(crate) replay: Option<PathBuf>,
+
     #[command(flatten)]
     pub(crate) var: VarArgs,
 
@@ -495,11 +644,33 @@ pub(crate) struct AgentRunArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct LintArgs {
-    /// Paths to workflow YAML files (.yml/.yaml) and/or agent Markdown files
-    /// (.md) to check. Every file is checked even if an earlier one has
-    /// errors.
-    #[arg(value_name = "FILE", required = true)]
+    /// Paths to workflow YAML files (.yml/.yaml), agent Markdown files
+    /// (.md), and/or directories to search recursively for such files.
+    /// Every file is checked even if an earlier one has errors. Inside a
+    /// directory, a '.md' file is only checked when it starts with a '---'
+    /// frontmatter delimiter (other Markdown is skipped); dot-directories
+    /// (e.g. '.git'), 'target/', and 'node_modules/' are never descended
+    /// into.
+    #[arg(value_name = "PATH", required = true)]
     pub(crate) files: Vec<PathBuf>,
+
+    /// Output format: 'text' (default, human-readable, one report per
+    /// file), 'json' (a structured file/line/severity/message record per
+    /// finding, for editor/CI tooling), or 'github' (GitHub Actions
+    /// '::error file=...,line=...::'/'::warning ...::' annotations, so a
+    /// finding is shown directly on the PR diff).
+    #[arg(long, value_enum, default_value_t = LintFormat::Text)]
+    pub(crate) format: LintFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LintFormat {
+    /// Human-readable per-file report (the default).
+    Text,
+    /// A JSON array of `{file, line, severity, message}` records.
+    Json,
+    /// GitHub Actions `::error`/`::warning` annotation lines.
+    Github,
 }
 
 /// The chat options shared by single-shot chat (`ChatArgs`, flattened at the
@@ -689,7 +860,7 @@ pub(crate) enum ReasoningEffort {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentAction, AgentCommand, Cli, Command, ReasoningEffort};
+    use super::{AgentAction, AgentCommand, Cli, Command, EvalFormat, ReasoningEffort, TestFormat};
     use clap::Parser;
 
     #[test]
@@ -906,6 +1077,57 @@ mod tests {
     }
 
     #[test]
+    fn parses_run_subcommand_with_record() {
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml", "hello", "--record", "dir"])
+            .expect("valid run subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Run(run_args)) => {
+                assert_eq!(
+                    run_args.record.as_deref(),
+                    Some(std::path::Path::new("dir"))
+                );
+                assert!(run_args.replay.is_none());
+            }
+            _ => panic!("expected the run subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_run_subcommand_with_replay() {
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml", "hello", "--replay", "dir"])
+            .expect("valid run subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Run(run_args)) => {
+                assert_eq!(
+                    run_args.replay.as_deref(),
+                    Some(std::path::Path::new("dir"))
+                );
+                assert!(run_args.record.is_none());
+            }
+            _ => panic!("expected the run subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn rejects_run_subcommand_with_both_record_and_replay() {
+        assert!(
+            Cli::try_parse_from([
+                "lait",
+                "run",
+                "workflow.yml",
+                "hello",
+                "--record",
+                "a",
+                "--replay",
+                "b",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_agent_run_subcommand() {
         let cli = Cli::try_parse_from(["lait", "agent", "run", "agent.md", "hello"])
             .expect("valid agent run subcommand arguments should parse");
@@ -1028,5 +1250,163 @@ mod tests {
             .expect("global flags should be accepted after subcommand arguments");
 
         assert!(cli.no_config);
+    }
+
+    #[test]
+    fn parses_doctor_subcommand() {
+        let cli =
+            Cli::try_parse_from(["lait", "doctor"]).expect("valid doctor arguments should parse");
+
+        match cli.command {
+            Some(Command::Doctor(doctor_args)) => assert!(!doctor_args.json),
+            _ => panic!("expected the doctor subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_doctor_subcommand_with_json() {
+        let cli = Cli::try_parse_from(["lait", "doctor", "--json"])
+            .expect("valid doctor arguments should parse");
+
+        match cli.command {
+            Some(Command::Doctor(doctor_args)) => assert!(doctor_args.json),
+            _ => panic!("expected the doctor subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_compare_subcommand_with_repeated_model_flags() {
+        let cli = Cli::try_parse_from(["lait", "compare", "--model", "a", "--model", "b", "hello"])
+            .expect("valid compare subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Compare(compare_args)) => {
+                assert_eq!(compare_args.models, vec!["a".to_owned(), "b".to_owned()]);
+                assert_eq!(compare_args.prompt.as_deref(), Some("hello"));
+                assert!(!compare_args.json);
+            }
+            _ => panic!("expected the compare subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn compare_subcommand_prompt_is_optional_for_app_level_validation() {
+        // PROMPT is optional at the clap level so it can come from piped
+        // stdin instead; app-level code enforces that one of the two exists
+        // (see `app::resolve_input_with_stdin`).
+        let cli = Cli::try_parse_from(["lait", "compare", "--model", "a", "--model", "b"])
+            .expect("prompt-less compare should still parse");
+        match cli.command {
+            Some(Command::Compare(compare_args)) => assert!(compare_args.prompt.is_none()),
+            _ => panic!("expected the compare subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn compare_subcommand_requires_at_least_one_model_flag() {
+        // clap only enforces "at least one"; `app::compare::run` enforces
+        // the real "at least two" requirement at the app layer.
+        assert!(Cli::try_parse_from(["lait", "compare", "hello"]).is_err());
+    }
+
+    #[test]
+    fn parses_compare_subcommand_with_json_and_sampling_overrides() {
+        let cli = Cli::try_parse_from([
+            "lait",
+            "compare",
+            "--model",
+            "a",
+            "--model",
+            "b",
+            "--json",
+            "--temperature",
+            "0.5",
+            "--max-tokens",
+            "128",
+            "hello",
+        ])
+        .expect("valid compare subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Compare(compare_args)) => {
+                assert!(compare_args.json);
+                assert_eq!(compare_args.temperature, Some(0.5));
+                assert_eq!(compare_args.max_tokens, Some(128));
+            }
+            _ => panic!("expected the compare subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_test_subcommand_with_multiple_paths() {
+        let cli = Cli::try_parse_from(["lait", "test", "tests/", "one.yml"])
+            .expect("valid test subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Test(test_args)) => {
+                assert_eq!(
+                    test_args
+                        .paths
+                        .iter()
+                        .filter_map(|path| path.to_str())
+                        .collect::<Vec<_>>(),
+                    vec!["tests/", "one.yml"]
+                );
+                assert_eq!(test_args.format, TestFormat::Text);
+            }
+            _ => panic!("expected the test subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn test_subcommand_requires_at_least_one_path() {
+        assert!(Cli::try_parse_from(["lait", "test"]).is_err());
+    }
+
+    #[test]
+    fn parses_test_subcommand_with_json_format() {
+        let cli = Cli::try_parse_from(["lait", "test", "--format", "json", "tests/"])
+            .expect("valid test subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Test(test_args)) => assert_eq!(test_args.format, TestFormat::Json),
+            _ => panic!("expected the test subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_eval_subcommand_with_defaults() {
+        let cli = Cli::try_parse_from(["lait", "eval", "eval.yml"])
+            .expect("valid eval subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Eval(eval_args)) => {
+                assert_eq!(eval_args.file.to_str(), Some("eval.yml"));
+                assert_eq!(eval_args.repeat, 1);
+                assert_eq!(eval_args.format, EvalFormat::Text);
+            }
+            _ => panic!("expected the eval subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_eval_subcommand_with_repeat_and_json_format() {
+        let cli = Cli::try_parse_from([
+            "lait", "eval", "--repeat", "5", "--format", "json", "eval.yml",
+        ])
+        .expect("valid eval subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Eval(eval_args)) => {
+                assert_eq!(eval_args.repeat, 5);
+                assert_eq!(eval_args.format, EvalFormat::Json);
+            }
+            _ => panic!("expected the eval subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn eval_subcommand_requires_a_file() {
+        assert!(Cli::try_parse_from(["lait", "eval"]).is_err());
     }
 }

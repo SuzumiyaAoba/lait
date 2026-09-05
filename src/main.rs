@@ -3,15 +3,20 @@ use clap::Parser;
 
 mod agent;
 mod app;
+mod assert;
 mod async_io;
 mod attachment;
 mod cache;
+mod cassette;
 mod checkpoint;
 mod cli;
+mod compare;
 mod config;
 mod docgen;
+mod doctor;
 mod dotenv;
 mod engine;
+mod eval;
 mod frontmatter;
 mod history;
 mod init;
@@ -37,6 +42,7 @@ mod signal;
 mod skill;
 mod subagent;
 mod template;
+mod test_run;
 #[cfg(test)]
 mod test_support;
 mod usage;

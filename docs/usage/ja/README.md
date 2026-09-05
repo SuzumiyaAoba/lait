@@ -1,20 +1,41 @@
 # lait 利用ガイド（日本語）
 
-`lait` の機能ごとの詳細ドキュメントです。まずは [はじめに](./getting-started.md) から読むことをおすすめします。
+`lait` を初めて使う人は [はじめに](./getting-started.md) から、設定や自動化を始める人は目的に合うページから読んでください。
 
-- [はじめに](./getting-started.md) — 必要な環境、LM Studio の準備、CLI 引数と環境変数、標準入力からのプロンプト（パイプ対応）、`--system`/`--show-usage`/`-o`/`--quiet`、`lait models`/`lait init`/`lait completions`/`lait man`、ビルドと実行、認証あり／なし、Ctrl-C（SIGINT）による中断
-- [設定ファイル](./config.md) — `lait.config.yml`、モデル定義と alias、設定値の優先順位、`${VAR_NAME}` による環境変数参照、`.env` の自動読み込み、`workflows:`/`agents:`/`skills:` の登録と `lait workflow list`/`lait agent list`/`lait skill list`
-- [ワークフロー（workflow.yml）](./workflow.md) — `nodes:`（何をするか）と `steps:`（どう繋ぐか）の分離とノードの再利用、ワークフロー内でのモデル定義、JSON 出力と `jq` による加工、ファイルへの出力（`write_file`）、ファイル・画像の添付（`files`/`images`）、任意コマンドの実行（`command`）、ステップ間の値の受け渡し（`{{ steps.<id> }}`/`$steps`）、追加パラメータの受け渡し（`lait run --var`/`{{ vars.<key> }}`/`$vars`）、エラー処理（`retry`/`timeout`/`on_error`、ワークフロー全体の既定値、`default.workflow_timeout`）、条件分岐（`when`/`switch`）、並列実行（`parallel`）、条件ループ（`loop`）、配列反復（`for_each`）、早期終了（`stop`/`break`）、サブワークフロー呼び出し（`workflow`）、対話的ユーザー入力（`type: ask`）、実行計画の表示（`lait run --dry-run`）、グラフ出力（`lait graph`）、実行の再開（`lait run --checkpoint`/`--resume`、`lait runs list`/`show`）
-- [エージェント Markdown ファイル（agent.md）](./agent.md) — frontmatter によるエージェント定義、ワークフローからの利用
-- [ワークフロー／エージェントファイルの静的チェック（lint）](./lint.md) — `lait lint`、未使用ノードや jq/テンプレート構文エラー、`mcp`/`skills`/`agent`/`workflow` 参照や `schema_name` の事前検出
-- [MCP サーバーのツールを使う](./mcp.md) — `mcp_servers:` の登録、チャット／agent／workflow での `mcp:` 指定、ツール名の修飾、`structured_output`/`--stream` との関係、`max_tool_rounds`
-- [スキルを使う](./skills.md) — `skills:` の登録、agent／workflow での `skills:` 指定、システムプロンプトへの追記のされ方、`mcp`/`--stream`/`structured_output` との違い
-- [サブエージェントを使う](./subagents.md) — `agents:` の登録、チャット／agent／workflow での `subagents:` 指定、ツール名とツール引数の扱い、サブエージェントの入れ子、`agent:`/`workflow:` ノードとの違い
-- [カスタムシェルツールを使う](./tools.md) — `tools:` の登録、引数のテンプレート展開、チャット／agent／workflow での `tools:` 指定、ツール名の修飾、`tool_policy`/`--approve-tools` との関係、エラー処理
-- [出力例](./output.md) — 標準出力、`--stream`、`--json-schema`、`--json`、`--render`
-- [ファイル・画像の添付](./attachments.md) — `--file` によるファイル内容の添付、`--image` による vision モデル向け画像入力
-- [会話セッションと対話モード（lait chat）](./chat.md) — `lait chat` REPL、`--session`/`lait sessions` による会話の保存と再開
-- [名前付きプロンプトテンプレート（prompts）](./prompts.md) — `prompts:` の登録、`-p`/`lait prompt`、`--var`
-- [実行履歴（lait history）](./history.md) — `lait history`/`show`/`search`、`--no-history`/`default.history`
-- [トラブルシュート](./troubleshooting.md) — よくあるエラーと対処法
-- [開発](./development.md) — テスト、フォーマット、Lint、ビルド
+## まず読む
+
+- [はじめに](./getting-started.md) — インストール、最短手順、接続先の準備、主要な CLI オプション。
+
+## 設定
+
+- [設定ファイル](./config.md) — `lait.config.yml`、モデル alias、優先順位、`.env`、各種レジストリの登録。
+- [名前付きプロンプトテンプレート（prompts）](./prompts.md) — 繰り返し使うプロンプトと `--var` の定義・実行。
+- [JSON Schema でエディタ補完（lait schema）](./schema.md) — `workflow.yml`/`lait.config.yml`/agent frontmatter の JSON Schema と yaml-language-server 連携。
+
+## ワークフロー
+
+- [ワークフロー（workflow.yml）](./workflow.md) — ノードとステップ、分岐・ループ・並列実行、JSON/jq、チェックポイント。
+- [エージェント Markdown ファイル（agent.md）](./agent.md) — frontmatter とシステムプロンプトからエージェントを定義する方法。
+- [ワークフロー／エージェントファイルの静的チェック（lint）](./lint.md) — `lait lint` で構文・参照・テンプレートを実行前に検査する方法。
+- [決定的テスト（record & replay / lait test）](./testing.md) — `lait run --record`/`--replay` と `lait test` で、API を呼ばずに制御フローを検証する方法。
+- [出力品質の評価（lait eval）](./eval.md) — ワークフロー/モデル+プロンプトを実際に実行し、contains/jq/llm_judge のアサーションで出力品質を評価する方法。
+
+## ツール・拡張
+
+- [MCP サーバーのツールを使う](./mcp.md) — MCP サーバーの登録、ツール制限、チャット・agent・workflow からの利用。
+- [スキルを使う](./skills.md) — Markdown スキルの登録と、agent／workflow のシステムプロンプトへの追加。
+- [サブエージェントを使う](./subagents.md) — agent Markdown をモデルから呼び出せるツールとして公開する方法。
+- [カスタムシェルツールを使う](./tools.md) — ローカルコマンドを MCP なしのモデル呼び出しツールとして公開する方法。
+- [ファイル・画像の添付](./attachments.md) — `--file` と `--image` で入力にファイルや画像を添付する方法。
+
+## 運用・診断
+
+- [出力例](./output.md) — 通常出力、ストリーミング、JSON、Structured Outputs、Markdown 表示。
+- [モデル比較（lait compare）](./compare.md) — 同一プロンプトを複数モデルへ並行送信し、応答・所要時間・usage を比較する方法。
+- [会話セッションと対話モード（lait chat）](./chat.md) — REPL と `--session` による会話の保存・再開。
+- [実行履歴（lait history）](./history.md) — 実行履歴の一覧、表示、検索、無効化。
+- [トラブルシュート](./troubleshooting.md) — `lait doctor` による環境・設定・接続の一括診断、接続・認証・モデル・終了コード・詳細ログの確認。
+
+## 開発
+
+- [開発](./development.md) — テスト、フォーマット、Lint、ビルドの手順。

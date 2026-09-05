@@ -365,3 +365,200 @@ fn lint_flags_a_model_definition_with_both_api_key_and_api_key_cmd() {
         "stdout: {stdout}"
     );
 }
+
+/// A temporary directory tree for `lait lint <DIR>` recursion tests, cleaned
+/// up on drop. Distinct from `ConfigDirectory` (which always writes
+/// `lait.config.yml`) — this one is just an empty directory the test fills
+/// in itself.
+struct TempLintDir {
+    path: std::path::PathBuf,
+}
+
+impl TempLintDir {
+    fn new() -> Self {
+        let path = next_temp_path("lait-test-lint-dir", "");
+        std::fs::create_dir(&path).expect("failed to create temp lint directory");
+        Self { path }
+    }
+
+    fn write(&self, relative: &str, contents: &str) {
+        let full_path = self.path.join(relative);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).expect("failed to create nested lint directory");
+        }
+        std::fs::write(&full_path, contents).expect("failed to write lint fixture file");
+    }
+}
+
+impl Drop for TempLintDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn lint_recurses_into_a_directory_argument() {
+    let dir = TempLintDir::new();
+    dir.write(
+        "sub/workflow.yml",
+        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
+    );
+    dir.write("sub/agent.md", "---\nname: city-fact\n---\nbody\n");
+    dir.write("sub/README.md", "# not an agent file, no frontmatter\n");
+
+    let output = run_lait_lint(&[&dir.path]);
+
+    assert!(output.status.success(), "lait lint failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("workflow.yml"), "stdout: {stdout}");
+    assert!(stdout.contains("agent.md"), "stdout: {stdout}");
+    assert!(!stdout.contains("README.md"), "stdout: {stdout}");
+}
+
+#[test]
+fn lint_directory_recursion_skips_target_and_node_modules() {
+    let dir = TempLintDir::new();
+    dir.write(
+        "top.yml",
+        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
+    );
+    // Deliberately invalid, so an accidental descent into either directory
+    // would flip the overall exit code and show up in stdout.
+    dir.write("target/build.yml", "steps: []\n");
+    dir.write("node_modules/pkg/ci.yml", "steps: []\n");
+
+    let output = run_lait_lint(&[&dir.path]);
+
+    assert!(
+        output.status.success(),
+        "expected 'target'/'node_modules' to be skipped: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("build.yml"), "stdout: {stdout}");
+    assert!(!stdout.contains("ci.yml"), "stdout: {stdout}");
+}
+
+#[test]
+fn lint_format_json_reports_a_structured_error_finding() {
+    let workflow = WorkflowFile::new("steps: []\n");
+
+    let output = test_command()
+        .arg("lint")
+        .arg(&workflow.path)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to execute lait lint --format json");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let findings: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("not valid JSON: {error}\n{stdout}"));
+    let findings = findings.as_array().expect("expected a JSON array");
+    assert!(!findings.is_empty(), "stdout: {stdout}");
+    let finding = &findings[0];
+    assert_eq!(
+        finding["file"].as_str(),
+        workflow.path.to_str(),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        finding["severity"].as_str(),
+        Some("error"),
+        "stdout: {stdout}"
+    );
+    assert!(finding["message"].is_string(), "stdout: {stdout}");
+}
+
+#[test]
+fn lint_format_json_guesses_a_line_number_for_an_unused_node() {
+    let workflow = WorkflowFile::new(
+        "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
+    );
+
+    let output = test_command()
+        .arg("lint")
+        .arg(&workflow.path)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to execute lait lint --format json");
+
+    assert!(output.status.success(), "lait lint failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let findings: serde_json::Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    let findings = findings.as_array().expect("expected a JSON array");
+    let finding = findings
+        .iter()
+        .find(|finding| finding["message"].as_str().unwrap_or("").contains("unused"))
+        .unwrap_or_else(|| panic!("no 'unused' finding: {stdout}"));
+    // `unused:` is declared on line 5 of the fixture above (1-based).
+    assert_eq!(finding["line"].as_u64(), Some(5), "stdout: {stdout}");
+}
+
+#[test]
+fn lint_format_github_reports_error_annotations() {
+    let workflow = WorkflowFile::new("steps: []\n");
+
+    let output = test_command()
+        .arg("lint")
+        .arg(&workflow.path)
+        .arg("--format")
+        .arg("github")
+        .output()
+        .expect("failed to execute lait lint --format github");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected_prefix = format!("::error file={}", workflow.path.display());
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with(&expected_prefix)),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn lint_format_json_reports_config_registry_errors_with_a_null_line() {
+    let config =
+        ConfigDirectory::new("workflows:\n  missing: /nonexistent/lait-lint-missing.yml\n");
+    let workflow =
+        WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n");
+
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("lint")
+        .arg(&workflow.path)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to execute lait lint --format json");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let findings: serde_json::Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    let findings = findings.as_array().expect("expected a JSON array");
+    let finding = findings
+        .iter()
+        .find(|finding| {
+            finding["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("missing")
+        })
+        .unwrap_or_else(|| panic!("no registry finding: {stdout}"));
+    // Compared canonicalized: on macOS, `TMPDIR`'s `/var/folders/...` is a
+    // symlink lait's own `std::env::current_dir()`-based path resolution
+    // (unlike this test's own `next_temp_path`) resolves through, to
+    // `/private/var/folders/...`.
+    let expected = std::fs::canonicalize(config.config_path())
+        .expect("failed to canonicalize the test config path");
+    let actual = std::path::PathBuf::from(
+        finding["file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("finding has no 'file': {stdout}")),
+    );
+    assert_eq!(actual, expected, "stdout: {stdout}");
+    assert!(finding["line"].is_null(), "stdout: {stdout}");
+}

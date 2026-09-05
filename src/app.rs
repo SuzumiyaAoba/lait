@@ -9,13 +9,13 @@ use crate::{
     cli::{AgentRunArgs, GraphArgs, GraphFormat, PromptRunArgs, SharedChatArgs},
     cli::{SkillAction, WorkflowAction},
     config::{self, ConfigFile, ConfigSource, ModelMap},
-    docgen,
+    docgen, doctor,
     engine::{
         AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
         agent_file_settings, call_agent, resolve_request_settings,
     },
     history, lint, prompt, repl, report, response, schema, session, skill, subagent, template,
-    usage,
+    test_run, usage,
     workflow::{
         self, WorkflowScope,
         exec::{Flow, RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
@@ -40,7 +40,7 @@ fn read_stdin_text() -> Result<String> {
 /// is the whole input when no argument is given, or is appended to the
 /// argument as context when one is. Returns `Ok(None)` when there is no
 /// input from either source — each caller reports that with its own message.
-fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
+pub(crate) fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
     use std::io::IsTerminal;
 
     if positional.as_deref() == Some("-") {
@@ -163,6 +163,13 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Skill(_)) => bail!("internal error: `skill list` must run on the sync path"),
         Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
         Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
+        Some(Command::Schema(_)) => bail!("internal error: `schema` must run on the sync path"),
+        Some(Command::Doctor(doctor_args)) => doctor::run(doctor_args, config_source).await,
+        Some(Command::Compare(compare_args)) => {
+            crate::compare::run(compare_args, config_source, cache_override, cancel).await
+        }
+        Some(Command::Test(test_args)) => test_run::run(test_args, config_source, cancel).await,
+        Some(Command::Eval(eval_args)) => crate::eval::run(eval_args, config_source, cancel).await,
         None => {
             run_chat_or_repl(
                 cli.chat,
@@ -279,7 +286,8 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
             | Command::Workflow(_)
             | Command::Skill(_)
             | Command::Runs(_)
-            | Command::Cache(_),
+            | Command::Cache(_)
+            | Command::Schema(_),
         ) => false,
         Some(Command::Models(models_args)) => models_args.remote,
         Some(Command::Prompt(prompt_command)) => {
@@ -288,7 +296,15 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
         Some(Command::Agent(agent_command)) => {
             matches!(agent_command.action, AgentAction::Run(_))
         }
-        Some(Command::Run(_) | Command::Chat(_)) | None => true,
+        Some(
+            Command::Run(_)
+            | Command::Chat(_)
+            | Command::Doctor(_)
+            | Command::Compare(_)
+            | Command::Test(_)
+            | Command::Eval(_),
+        )
+        | None => true,
     }
 }
 
@@ -333,7 +349,16 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         },
         Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
         Some(Command::Cache(cache_command)) => crate::cache::run(cache_command),
-        Some(Command::Run(_) | Command::Chat(_)) | None => {
+        Some(Command::Schema(schema_args)) => crate::schema::run(schema_args),
+        Some(
+            Command::Run(_)
+            | Command::Chat(_)
+            | Command::Doctor(_)
+            | Command::Compare(_)
+            | Command::Test(_)
+            | Command::Eval(_),
+        )
+        | None => {
             bail!("internal error: an async command reached run_blocking")
         }
     }
@@ -863,7 +888,8 @@ async fn run_workflow(
         .with_vars(vars.clone())
         .with_cancel(run_cancel)
         .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools);
+        .with_approve_tools(approve_tools)
+        .with_record_replay(run_args.record.clone(), run_args.replay.clone());
     // Builds one checkpoint snapshot, filling in the fields that stay the
     // same for this whole run (`run_id`/`workflow_path`/`initial_prompt`/
     // `vars`/`top_level_labels`) so each of this run's three save sites below

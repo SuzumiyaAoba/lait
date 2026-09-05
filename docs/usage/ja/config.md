@@ -8,12 +8,14 @@ CLI 引数や環境変数で指定していない値は、`lait.config.yml` か�
 （プロジェクトのサブディレクトリから実行しても見つかります）。`--config <PATH>`
 で読み込むファイルを明示的に指定することもでき、この場合は探索を行わず、
 指定したファイルが存在しなければエラーになります。`--no-config` を指定すると
-探索・読み込み自体を行いません。設定できる基本項目は次のとおりです。
+探索・読み込み自体を行いません。まずはモデルと接続先だけを指定した、次の最小構成から始められます。
+
+エディタで補完・検証を効かせたい場合は [`lait schema config`](./schema.md) が出力する
+JSON Schema を使えます。
 
 ```yaml
 # lait.config.yml
 base_url: http://localhost:1234/v1
-api_key: lm-studio
 default:
   model: local-model
   reasoning_effort: medium
@@ -23,6 +25,8 @@ default:
   system: あなたは有能なアシスタントです。
 ```
 
+認証を必要としない LM Studio では `api_key` を省略できます。認証が必要な接続先では、平文のキーを置かず `${VAR_NAME}`（[環境変数参照](#var_name-による環境変数参照)）または `api_key_cmd` を使ってください。
+
 `default:` には `model`/`reasoning_effort` に加えて、サンプリングパラメータ `temperature`
 （`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）も指定できます。
 `system` はチャットモードの既定システムプロンプトで、CLI の `--system`/`--system-file` が
@@ -30,8 +34,8 @@ default:
 `--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独立してフォールバックします
 （`reasoning_effort` と同じ仕組みで、`retry` のようなブロック単位のフォールバックではありません）。
 
-`default:` にはこの他、`mcp:`/`skills:`/`subagents:`（後述の各節を参照）、`max_tool_rounds:`
-（既定 8）、および次の 2 項目も指定できます。
+`default:` にはこの他、`mcp:`/`skills:`/`subagents:`/`tools:`（後述の各節を参照）、
+`max_tool_rounds:`（既定 8）、および次の 2 項目も指定できます。
 
 - `render: true` — `--render` を渡さなくても応答を Markdown として端末表示します。
   チャット・`lait run`・`lait agent run`・`lait prompt run` のいずれにも効きます
@@ -39,7 +43,7 @@ default:
 - `history: false` — `--no-history` を渡さなくても `lait history` への記録を止めます
   （[実行履歴](./history.md) を参照）。
 
-いずれも CLI フラグ（`--render`/`--no-history`）が指定されればそちらが優先されます。
+`history: false` は `--no-history` が指定されていないときの既定値です。`--no-history` は常に履歴を無効にします。`render: true` は `--render` と同じく Markdown 表示を有効にします。現在は `default.render: true` だけを CLI で無効にする `--no-render` はありません。
 
 ## グローバル設定ファイル
 
@@ -52,13 +56,17 @@ default:
 （`--config`/`--no-config` のどちらも指定しなかった場合）でのみ行われ、見つかった
 プロジェクト設定とマージされます。マージ規則は次のとおりです。
 
-- `models:`/`mcp_servers:`/`skills:`/`agents:`/`prompts:`/`workflows:` は
+- `models:`/`mcp_servers:`/`skills:`/`agents:`/`prompts:`/`workflows:`/`tools:` は
   キー単位でマージします。同じ名前がグローバルとプロジェクトの両方にあれば
   プロジェクト側が勝ちます。
 - `default:` は項目単位でマージします（`default.model` はプロジェクトが指定して
   いればそれを使い、未指定ならグローバルの値にフォールバックします）。
-- `base_url`/`api_key` はプロジェクトが指定していればそちらを使い、未指定なら
-  グローバルの値にフォールバックします。
+- `base_url` はプロジェクトが指定していればそちらを使い、未指定ならグローバルの値に
+  フォールバックします。`api_key` と `api_key_cmd` は API キーの取得方法を表す一組として
+  扱い、プロジェクト側でどちらか一方が指定されていれば、もう一方を含めてプロジェクト側の
+  組を使います。
+- `tool_policy.allow` と `tool_policy.deny` はグローバルとプロジェクトの値を結合します。
+  `deny` は安全側の制約として残り、`allow` は追加されます。
 
 `workflows:`/`agents:`/`skills:` の登録エントリの相対パスは、それを定義した設定ファイル
 自身のディレクトリを起点に解決されます（グローバル設定内のエントリなら
@@ -71,7 +79,7 @@ default:
 
 複数の呼び出しモデルを設定ファイルに定義し、alias で使い回せます。`models` は alias をキー、
 モデル定義の配列を値にするマップです。各要素には `provider.base_url` と `model_id` を指定し、
-`provider.api_key`・`default_reasoning_effort`・`default_temperature`・`default_top_p`・
+`provider.api_key`（または `provider.api_key_cmd`）・`default_reasoning_effort`・`default_temperature`・`default_top_p`・
 `default_max_tokens` は任意で指定できます。プロバイダーのキーは正式名称の `provider` を
 使用してください。
 
@@ -86,7 +94,7 @@ models:
   cloud:
     - provider:
         base_url: https://api.example.com/v1
-        api_key: your-api-key
+        api_key: "${CLOUD_API_KEY}"
       model_id: cloud-model
       default_reasoning_effort: high
       default_temperature: 0.7
@@ -143,26 +151,22 @@ models:
 
 ## 設定値の優先順位
 
-`base_url`/`api_key` は、次の優先順位で解決されます。CLI 引数と環境変数の間では CLI 引数が優先されます。
+接続先と API キーは、CLI 引数・環境変数を最優先に、次の順で解決されます。
 
-`CLI 引数 > 環境変数 > モデル定義（provider.*） > トップレベル設定（base_url/api_key） > 組み込み既定値`
+| 値 | 高い順の解決元 |
+| --- | --- |
+| `base_url` | `--base-url` → `OPENAI_BASE_URL` → モデル alias の `provider.base_url` → トップレベル `base_url` → `http://localhost:1234/v1` |
+| API キー | `--api-key` → `OPENAI_API_KEY` → モデル alias の `provider.api_key` / `provider.api_key_cmd` → トップレベル `api_key` / `api_key_cmd` |
 
-たとえば alias のモデル定義が `provider.base_url` を持つ場合、その値はトップレベルの `base_url`
-より優先されます。CLI の `--base-url` や `OPENAI_BASE_URL` を指定した場合は、それらがモデル定義を
-上書きします。`provider.api_key` と `default_reasoning_effort` を省略した場合は、対応する
-トップレベルの `api_key`、`default.reasoning_effort` がフォールバックとして使用されます。
+`api_key` と `api_key_cmd` は同じ設定層で同時に指定できません。API キーを指定しない場合、認証なしのサーバーでも実行できるよう内部的にダミー値が使われます。モデル alias を使わない場合は、トップレベルの接続先設定が使われます。
 
-`model`/`reasoning_effort`/サンプリングパラメータ/`mcp`/`skills`/`subagents`/`max_tool_rounds` の
-解決順は、**呼び出し経路によって異なる 2 系統**があります（`base_url`/`api_key` とは別のチェーン
-です）。
+モデル、サンプリングパラメータ、ツール関連の値は、呼び出し方によって次のように解決されます。値は各項目ごとに独立してフォールバックします。
 
-- **チャット／`lait prompt`／`-p`**: `CLI 引数（環境変数フォールバック込み） > 名前付きプロンプト
-  の値（`prompts.<name>.model` など） > default: の値 > 組み込み既定値`
-- **`lait agent run`／ワークフローノード**: `ノード自身（またはエージェント Markdown の
-  frontmatter）の値 > エージェント Markdown の値（ノードが `agent:` を指す場合） >
-  ワークフローファイルの `default:` > lait.config.yml の `default:` > 組み込み既定値`
+- **通常のチャット（`lait [OPTIONS] PROMPT`）と `-p/--prompt-name`**: CLI 引数（環境変数のフォールバックを含む） → 名前付きプロンプトの値 → モデル alias の既定値 → `lait.config.yml` の `default:` → 組み込み既定値。
+- **`lait prompt run <NAME>`**: `prompts.<name>.model` → `lait.config.yml` の `default.model`。この入口は `--model` や `--stream` などのチャット用上書きを受け付けません。
+- **`lait agent run`／ワークフローノード**: ノード自身（または agent Markdown の frontmatter） → agent Markdown の値 → ワークフローの `default:` → `lait.config.yml` の `default:` → 組み込み既定値。
 
-どちらの経路でも、`lait.config.yml` の `default:` が最終手前のフォールバック層になります。
+`default:` は、呼び出し側で指定していない値を補うための共通の既定値です。ワークフロー固有の設定については [ワークフロー](./workflow.md)、agent 固有の設定については [agent](./agent.md) を参照してください。
 
 `base_url`、`api_key` はトップレベルの項目として、フォールバック用の `model`、`reasoning_effort`、
 `temperature`、`top_p`、`max_tokens` は `default:` の配下にまとめて指定します。設定ファイルの自動読込を
@@ -249,8 +253,9 @@ default:
 - ヒットした場合は API を呼ばず、その旨を `note:` として標準エラー出力に注記します
   （`--show-usage` の集計にもキャッシュヒット分は含まれません — 実際にはリクエストを
   送っていないためです）。
-- MCP/サブエージェントのツール呼び出しを含むラウンドは、各ラウンドのリクエスト単位で
-  キャッシュされます。
+- MCP・サブエージェント・カスタムシェルツールの呼び出しを含むラウンドも、各ラウンドの
+  リクエスト単位でキャッシュされます。ツールループ全体を一つの結果として保存するものでは
+  ありません。
 - **`--stream` によるストリーミング応答はキャッシュの対象外です。**
 - `--no-cache` を指定するとキャッシュの参照・書き込みの両方を無効にします
   （`default.cache: true` を上書きします）。`--cache`/`--no-cache` は同時に指定できません。
@@ -321,7 +326,7 @@ mcp_servers:
 トップレベルの `tool_policy:` は、MCP サーバー・サブエージェント・[カスタムシェルツール](#カスタムシェルツール)
 を横断してツール呼び出しを名前ベースで許可/拒否します。`--approve-tools` は呼び出し直前に対話的に
 確認します。詳しくは
-[MCP サーバーのツールを使う](./mcp.md#tool_policyallowdeny-と---approve-tools対話的承認) を
+[MCP サーバーのツールを使う](./mcp.md#tool_policyallowdenyと---approve-tools対話的承認) を
 参照してください。
 
 ```yaml
@@ -371,8 +376,9 @@ skills:
 - 値はスキル Markdown ファイルへのパス、またはそのファイルを含むディレクトリへのパスです。
   ディレクトリを指定した場合は、その直下の `SKILL.md` が使われます（Anthropic の Agent Skills の
   慣習に合わせたもので、既存の `.claude/skills/<name>/` のようなディレクトリをそのまま指せます）。
-- パスは、`mcp_servers:` とは異なり、その場では接続を持たず、実際に使われるたびにファイルを
-  読み直します。
+- パスは、`mcp_servers:` とは異なり、その場では接続を持ちません。実際に使う最初の時点で
+  ファイルを読み込み、その内容は一回の `lait` 実行中（workflow の反復を含む）キャッシュされます。
+  実行中にファイルを変更しても、次の実行まで反映されません。
 
 ## サブエージェント
 
@@ -393,7 +399,9 @@ agents:
 
 - 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
   そのまま名前を付けて登録します）。
-- パスは、`skills:` と同じく、その場では接続を持たず、実際に使われるたびにファイルを読み直します。
+- パスは、`skills:` と同じく、その場では接続を持ちません。実際に使う最初の時点で
+  Markdown を読み込み、一回の `lait` 実行中は同じ内容をキャッシュします。実行中にファイルを
+  変更しても、次の実行まで反映されません。
 
 ## カスタムシェルツール
 
@@ -423,7 +431,7 @@ tools:
   引数を `input` として handlebars テンプレート展開されます（`{{ input.<field> }}`）。
 - `parameters`（省略可、JSON オブジェクトである必要があります）はモデルに渡す JSON Schema です。
   省略時は引数なしのツールとして扱われます。
-- ツール名は `tool__<名前>` に修飾されます。[`tool_policy`](#tool_policyツール呼び出しの-allowdeny-と---approve-tools)
+- ツール名は `tool__<名前>` に修飾されます。[`tool_policy`](#tool_policyツール呼び出しの-allowdenyと---approve-tools)
   や `--approve-tools` の対象です。
 
 ## ワークフローの登録と一覧表示
@@ -445,14 +453,9 @@ lait run summarize "本文"
 - `lait run <ARG>` の `<ARG>` がファイルとして存在する場合はそちらが優先されます(`workflows:`
   に同名のエントリがあっても無視され、その旨が標準エラー出力に注記されます)。ファイルとして
   存在しない場合にだけ `workflows:` から名前解決されます。
-- `lait run <NAME>`/`lait workflow list`/`lait agent list`/`lait skill list` はいずれも、
-  `workflows:`/`agents:`/`skills:` のパスを、現在の作業ディレクトリではなく、その登録を
-  定義した `lait.config.yml` 自身のあるディレクトリからの相対パスとして解決します。これは
-  この節の冒頭で説明した `lait.config.yml` 自体のディレクトリ探索と同じ理由で、
-  サブディレクトリから実行しても常に同じファイルが解決されるようにするためです。ただし
-  `agents:`/`skills:` を実際に**使う**とき(`--subagent`/`skills:` 経由でモデル呼び出しに
-  渡すとき)は、まだ現在の作業ディレクトリからの相対パスとして解決されます — 一覧表示と
-  実際の利用でパスの基準が異なるのは既知の非対称で、グローバル設定(#48)で解消される予定です。
+- `lait run <NAME>`/`lait workflow list`/`lait agent list`/`lait skill list` と、実際に
+  `workflows:`/`agents:`/`skills:` を使う処理は、登録を定義した `lait.config.yml` 自身の
+  ディレクトリを基準にパスを解決します。サブディレクトリから実行しても同じファイルが使われます。
 - `lait workflow list`/`lait agent list`/`lait skill list` は、それぞれ `workflows:`/
   `agents:`/`skills:` に登録された名前・パス・説明(ワークフローの `description:`/
   エージェント・スキル Markdown ファイルの frontmatter の `description:`)を一覧表示します。

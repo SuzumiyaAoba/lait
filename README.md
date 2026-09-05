@@ -55,19 +55,30 @@ makers run -- --model <MODEL_ID> "プロンプト"
 
 ## ドキュメント
 
-詳細な使い方は [docs/usage/ja](./docs/usage/ja/README.md) にまとまっています。
+詳細な使い方の正本は [日本語利用ガイド](./docs/usage/ja/README.md) です。目的別の入口は次のとおりです。
 
-- [はじめに](./docs/usage/ja/getting-started.md) — 必要な環境、LM Studio の準備、CLI 引数と環境変数、標準入力からのプロンプト（パイプ対応）、`--system`/`--show-usage`/`-o`/`--quiet`、`lait models`/`lait init`/`lait completions`/`lait man`、ビルドと実行、認証あり／なし
-- [設定ファイル](./docs/usage/ja/config.md) — `lait.config.yml`、モデル定義と alias、設定値の優先順位、`${VAR_NAME}` による環境変数参照、`.env` の自動読み込み
-- [ワークフロー（workflow.yml）](./docs/usage/ja/workflow.md) — `nodes:`（何をするか）と `steps:`（どう繋ぐか）の分離とノードの再利用、ワークフロー内でのモデル定義、JSON 出力と `jq` による加工、ファイルへの出力（`write_file`）、ステップ間の値の受け渡し（`{{ steps.<id> }}`/`$steps`）、エラー処理（`retry`/`timeout`/`on_error`、ワークフロー全体の既定値）、条件分岐（`when`/`switch`）、並列実行（`parallel`）、条件ループ（`loop`）、配列反復（`for_each`）、早期終了（`stop`/`break`）、サブワークフロー呼び出し（`workflow`）
-- [エージェント Markdown ファイル（agent.md）](./docs/usage/ja/agent.md) — frontmatter によるエージェント定義、ワークフローからの利用
-- [ワークフロー／エージェントファイルの静的チェック（lint）](./docs/usage/ja/lint.md) — `lait lint`、未使用ノードや jq/テンプレート構文エラー、`mcp`/`skills`/`agent`/`workflow` 参照や `schema_name` の事前検出
-- [MCP サーバーのツールを使う](./docs/usage/ja/mcp.md) — `mcp_servers:` の登録、チャット／agent／workflow での `mcp:` 指定、ツール名の修飾、`structured_output`/`--stream` との関係、`max_tool_rounds`
-- [スキルを使う](./docs/usage/ja/skills.md) — `skills:` の登録、agent／workflow での `skills:` 指定、システムプロンプトへの追記のされ方
-- [サブエージェントを使う](./docs/usage/ja/subagents.md) — `agents:` の登録、チャット／agent／workflow での `subagents:` 指定、モデル自身によるサブエージェント呼び出し（tool loop）、サブエージェントの入れ子
-- [出力例](./docs/usage/ja/output.md) — 標準出力、`--stream`、`--json-schema`、`--json`
-- [トラブルシュート](./docs/usage/ja/troubleshooting.md) — よくあるエラーと対処法
-- [開発](./docs/usage/ja/development.md) — テスト、フォーマット、Lint、ビルド
+### まず読む
+
+- [はじめに](./docs/usage/ja/getting-started.md) — インストール、最短手順、主要な CLI オプション。
+- [トラブルシュート](./docs/usage/ja/troubleshooting.md) — `lait doctor` による一括診断、接続・認証・モデル・ログの確認。
+
+### 設定・自動化
+
+- [設定ファイル](./docs/usage/ja/config.md) — モデル alias、`.env`、ツールやレジストリの登録。
+- [ワークフロー（workflow.yml）](./docs/usage/ja/workflow.md) — 複数ステップの自動化、分岐、ループ、並列実行。
+- [エージェント Markdown ファイル（agent.md）](./docs/usage/ja/agent.md) — agent の定義と実行。
+- [JSON Schema でエディタ補完（lait schema）](./docs/usage/ja/schema.md) — workflow/config/agent の JSON Schema と yaml-language-server 連携。
+- [決定的テスト（record & replay / lait test）](./docs/usage/ja/testing.md) — API を呼ばずにワークフローの制御フローを検証する方法。
+- [出力品質の評価（lait eval）](./docs/usage/ja/eval.md) — 実際のモデルに対してテストケースを実行し、contains/jq/llm_judge で出力品質を評価する方法。
+
+### ツール・運用
+
+- [MCP サーバーのツールを使う](./docs/usage/ja/mcp.md) — 外部ツールをモデルから呼び出す方法。
+- [カスタムシェルツールを使う](./docs/usage/ja/tools.md) — ローカルコマンドをツールとして公開する方法。
+- [出力例](./docs/usage/ja/output.md) — 通常出力、ストリーミング、JSON、Markdown 表示。
+- [モデル比較（lait compare）](./docs/usage/ja/compare.md) — 同一プロンプトを複数モデルへ並行送信して比較する方法。
+
+全ページの一覧は [日本語利用ガイドの目次](./docs/usage/ja/README.md) を参照してください。
 
 ## ライセンス
 

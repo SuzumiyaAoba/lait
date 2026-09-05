@@ -90,7 +90,7 @@ nodes:
 
 ## `tool_policy`/`--approve-tools` との関係
 
-シェルツールも [`tool_policy`（allow/deny）と `--approve-tools`（対話的承認）](./mcp.md#tool_policyallowdeny-と---approve-tools対話的承認)
+シェルツールも [`tool_policy`（allow/deny）と `--approve-tools`（対話的承認）](./mcp.md#tool_policyallowdenyと---approve-tools対話的承認)
 の対象です。修飾済みツール名（`tool__ripgrep` など）でパターンを書いてください。
 
 ```yaml

@@ -4,11 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
-    cli::LintArgs,
+    cli::{LintArgs, LintFormat},
     config::{self, ConfigFile, ConfigSource},
     jq,
     nesting::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
@@ -39,6 +39,15 @@ impl fmt::Display for Severity {
 pub(crate) struct LintIssue {
     pub(crate) severity: Severity,
     pub(crate) message: String,
+    /// The 1-based source line this issue was found at, when known. Only
+    /// ever set directly for a YAML parse failure (from
+    /// `serde_yaml::Error::location`, via `yaml_error_line`) — every other
+    /// check site leaves this `None` at construction time. `--format
+    /// json`/`--format github` fill in a best-effort line for those by
+    /// searching the file's raw text for the first quoted identifier in the
+    /// message (see `guess_line`), rather than threading a locator through
+    /// every individual check.
+    pub(crate) line: Option<usize>,
 }
 
 impl LintIssue {
@@ -46,6 +55,7 @@ impl LintIssue {
         Self {
             severity: Severity::Error,
             message,
+            line: None,
         }
     }
 
@@ -53,7 +63,13 @@ impl LintIssue {
         Self {
             severity: Severity::Warning,
             message,
+            line: None,
         }
+    }
+
+    fn with_line(mut self, line: Option<usize>) -> Self {
+        self.line = line;
+        self
     }
 }
 
@@ -95,16 +111,105 @@ pub(crate) fn lint_file(path: &Path, config: Option<&ConfigFile>) -> Result<Lint
     }
 }
 
-/// Runs `lait lint <FILES>...`: statically checks every file in
-/// `lint_args.files` (see [`lint_file`]) and prints a per-file report to
-/// stdout. Synchronous, like `history::run`/`session::run` — every check is
-/// a local file read/parse, none of it needs the async runtime `app::run`
-/// otherwise sets up for a model request (see `app::needs_async_runtime`).
-/// Unlike `run_workflow`/`run_agent`, one bad file doesn't stop the rest:
-/// every file is linted and reported before this returns `Err` (which only
-/// happens if at least one file has an `Error`-level issue, so CI can rely
-/// on the exit code).
+/// Directory names `lait lint <DIR>` never descends into, even though they
+/// don't start with `.` (dot-directories, e.g. `.git`, are always skipped
+/// too) — scanning them would be slow, and their `.yml`/`.md` files
+/// (dependency manifests, changelogs, CI configs belonging to a vendored
+/// package, ...) are never lait workflow/agent files.
+const SKIPPED_DIR_NAMES: &[&str] = &["target", "node_modules"];
+
+/// Expands `paths` (files and/or directories, as `lait lint` accepts) into
+/// the sorted, deduplicated list of files to actually lint: a file entry is
+/// kept as-is (even one with an extension `lint_file` will go on to reject,
+/// so that error is still reported per file); a directory entry is searched
+/// recursively for `.yml`/`.yaml` files and `.md` files that start with a
+/// `---` frontmatter delimiter (see `has_frontmatter_delimiter`), skipping
+/// `SKIPPED_DIR_NAMES` and dot-directories along the way.
+fn expand_lint_targets(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            collect_lintable_files(path, &mut files)?;
+        } else {
+            files.push(path.clone());
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn collect_lintable_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory '{}'", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read directory '{}'", dir.display()))?;
+    // Deterministic traversal order, so directory expansion is stable across
+    // runs/platforms (relied on by tests, and generally friendlier for CI
+    // diffs than filesystem-dependent order).
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect '{}'", path.display()))?;
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name.as_ref()) {
+                continue;
+            }
+            collect_lintable_files(&path, out)?;
+        } else if file_type.is_file() {
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("yml") | Some("yaml") => out.push(path),
+                Some("md") if has_frontmatter_delimiter(&path)? => out.push(path),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cheaply sniffs whether `path` starts with the `---` frontmatter
+/// delimiter `frontmatter::split` requires, without fully parsing it as an
+/// agent file — only the first line is read. Used by directory expansion to
+/// skip ordinary (non-agent) Markdown files like a README.
+fn has_frontmatter_delimiter(path: &Path) -> Result<bool> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let mut first_line = String::new();
+    std::io::BufReader::new(file)
+        .read_line(&mut first_line)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    Ok(first_line.trim_end_matches(['\n', '\r']) == "---")
+}
+
+/// Runs `lait lint <PATHS>...`: statically checks every file `expand_lint_targets`
+/// resolves `lint_args.files` to (see [`lint_file`]) and reports the result
+/// in `lint_args.format`. Synchronous, like `history::run`/`session::run` —
+/// every check is a local file read/parse, none of it needs the async
+/// runtime `app::run` otherwise sets up for a model request (see
+/// `app::needs_async_runtime`). Unlike `run_workflow`/`run_agent`, one bad
+/// file doesn't stop the rest: every file is linted and reported before
+/// this returns `Err` (which only happens if at least one file has an
+/// `Error`-level issue, so CI can rely on the exit code, regardless of
+/// format).
 pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
+    match lint_args.format {
+        LintFormat::Text => run_text(lint_args, config_source),
+        LintFormat::Json | LintFormat::Github => run_structured(lint_args, config_source),
+    }
+}
+
+/// `--format text` (the default): the original, human-readable report —
+/// unchanged from before directory/`--format` support existed, aside from
+/// linting whatever `expand_lint_targets` resolves `lint_args.files` to
+/// instead of `lint_args.files` directly.
+fn run_text(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
     // Unlike `config::load_config`, which returns an empty `ConfigFile` both
     // when `lait.config.yml` is absent/not found and when `--no-config` was
     // passed, the linter needs to tell "absent/skipped" apart from "present
@@ -118,6 +223,7 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     let config_present = config_path.is_some() || global_config_present;
     let file_config = config::load_config(&config_source)?;
     let config = config_present.then_some(&file_config);
+    let files = expand_lint_targets(&lint_args.files)?;
 
     let mut failed_files = 0usize;
     let registry_ok = if file_config.workflows.is_empty() {
@@ -127,11 +233,11 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     };
     let api_key_sources_ok = check_provider_api_key_sources(&file_config);
     let shell_tool_definitions_ok = check_shell_tool_definitions(&file_config);
-    for file in &lint_args.files {
+    for file in &files {
         // `lint_file` only ever returns `Err` for a file whose type it can't
         // determine (an unrecognized extension) — treated here as one more
         // failure to report, not a reason to stop linting the rest of
-        // `lint_args.files`.
+        // `files`.
         let report = match lint_file(file, config) {
             Ok(report) => report,
             Err(error) => {
@@ -157,7 +263,7 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     if failed_files > 0 || !registry_ok || !api_key_sources_ok || !shell_tool_definitions_ok {
         bail!(
             "{failed_files} of {} file(s) had errors{}{}{}",
-            lint_args.files.len(),
+            files.len(),
             if registry_ok {
                 String::new()
             } else {
@@ -182,6 +288,206 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
         );
     }
     Ok(())
+}
+
+/// One `--format json`/`--format github` record: a finding attributed to a
+/// file (an actual linted file, or `lait.config.yml`'s display path for a
+/// config-level check) and, when it could be worked out, a 1-based line.
+struct Finding {
+    file: String,
+    line: Option<usize>,
+    severity: Severity,
+    message: String,
+}
+
+impl Finding {
+    fn config(config_display: &str, severity: Severity, message: String) -> Self {
+        Self {
+            file: config_display.to_owned(),
+            line: None,
+            severity,
+            message,
+        }
+    }
+}
+
+/// `--format json`/`--format github`: same checks as `run_text`, but
+/// collected into flat `Finding`s and printed as structured records instead
+/// of a per-file human-readable report. Kept as an independent
+/// implementation (rather than a shared core both formats funnel through)
+/// so `run_text`'s exact wording — pinned by its existing tests — can never
+/// drift just because this format gained a new check.
+fn run_structured(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
+    let config_path = config::resolve_config_path(&config_source)?;
+    let global_config_present =
+        matches!(config_source, ConfigSource::Search) && config::global_config_path()?.is_file();
+    let config_present = config_path.is_some() || global_config_present;
+    let file_config = config::load_config(&config_source)?;
+    let config = config_present.then_some(&file_config);
+    let config_display = config_path
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| config::CONFIG_FILE_NAME.to_owned());
+    let files = expand_lint_targets(&lint_args.files)?;
+
+    let mut findings = Vec::new();
+    let mut has_errors = false;
+
+    for file in &files {
+        match lint_file(file, config) {
+            Ok(report) => {
+                // Only read when there is at least one issue that still
+                // needs a line guessed — `run_text`'s file-only tests, and
+                // any other file with no line-less issue, never pay for
+                // this read.
+                let mut source: Option<String> = None;
+                let file_display = report.file.display().to_string();
+                for issue in &report.issues {
+                    if issue.severity == Severity::Error {
+                        has_errors = true;
+                    }
+                    let line = issue.line.or_else(|| {
+                        let text = source.get_or_insert_with(|| {
+                            std::fs::read_to_string(file).unwrap_or_default()
+                        });
+                        guess_line(text, &issue.message)
+                    });
+                    findings.push(Finding {
+                        file: file_display.clone(),
+                        line,
+                        severity: issue.severity,
+                        message: issue.message.clone(),
+                    });
+                }
+            }
+            Err(error) => {
+                has_errors = true;
+                findings.push(Finding {
+                    file: file.display().to_string(),
+                    line: None,
+                    severity: Severity::Error,
+                    message: format!("{error:#}"),
+                });
+            }
+        }
+    }
+
+    if !file_config.workflows.is_empty() {
+        let mut names: Vec<&String> = file_config.workflows.keys().collect();
+        names.sort_unstable();
+        for name in names {
+            let resolved = &file_config.workflows[name];
+            if !resolved.is_file() {
+                has_errors = true;
+                findings.push(Finding::config(
+                    &config_display,
+                    Severity::Error,
+                    format!(
+                        "workflows.{name} resolves to '{}', which does not exist",
+                        resolved.display()
+                    ),
+                ));
+            }
+        }
+    }
+    for message in config::check_provider_api_key_sources(&file_config) {
+        has_errors = true;
+        findings.push(Finding::config(&config_display, Severity::Error, message));
+    }
+    for message in config::check_shell_tool_definitions(&file_config) {
+        has_errors = true;
+        findings.push(Finding::config(&config_display, Severity::Error, message));
+    }
+
+    match lint_args.format {
+        LintFormat::Json => print_json_findings(&findings)?,
+        LintFormat::Github => print_github_findings(&findings),
+        LintFormat::Text => unreachable!("dispatched to run_text in `run`"),
+    }
+
+    if has_errors {
+        bail!(
+            "lint found {} error(s) across {} finding(s) in {} file(s)",
+            findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error)
+                .count(),
+            findings.len(),
+            files.len(),
+        );
+    }
+    Ok(())
+}
+
+fn print_json_findings(findings: &[Finding]) -> Result<()> {
+    let records: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|finding| {
+            serde_json::json!({
+                "file": finding.file,
+                "line": finding.line,
+                "severity": match finding.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                },
+                "message": finding.message,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&records).context("failed to serialize lint findings")?
+    );
+    Ok(())
+}
+
+fn print_github_findings(findings: &[Finding]) {
+    for finding in findings {
+        let level = match finding.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        let message = escape_github_annotation(&finding.message);
+        match finding.line {
+            Some(line) => println!("::{level} file={},line={line}::{message}", finding.file),
+            None => println!("::{level} file={}::{message}", finding.file),
+        }
+    }
+}
+
+/// Escapes a message for a GitHub Actions workflow command
+/// (`::error ...::<message>`), per GitHub's documented `%`/CR/LF escaping —
+/// otherwise a message containing one of these could corrupt the annotation
+/// or be misread as a second command.
+fn escape_github_annotation(message: &str) -> String {
+    message
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// Best-effort line lookup for an issue that has no line of its own (i.e.
+/// everything except a YAML parse failure — see `yaml_error_line`): most
+/// lint messages name the offending thing in single quotes (`node 'x'`,
+/// `unknown MCP server 'y'`, ...), which is usually also how it appears
+/// literally in the source (a YAML mapping key, a list entry, ...). Returns
+/// the 1-based line of the first line containing that quoted text, or `None`
+/// when the message has no quoted identifier or nothing in `source` matches
+/// it. A heuristic, not a real position — good enough for an editor/CI
+/// annotation to land a reader in the right neighborhood, not a guarantee.
+fn guess_line(source: &str, message: &str) -> Option<usize> {
+    let needle = first_quoted_identifier(message)?;
+    source
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|index| index + 1)
+}
+
+fn first_quoted_identifier(message: &str) -> Option<&str> {
+    let start = message.find('\'')? + 1;
+    let end = message[start..].find('\'')?;
+    let candidate = &message[start..start + end];
+    (!candidate.is_empty()).then_some(candidate)
 }
 
 /// Prints one `  error: {error}` line per entry under a `{CONFIG_FILE_NAME}
@@ -262,12 +568,28 @@ impl<'a> LintCtx<'a> {
     }
 }
 
+/// The 1-based line a YAML parse failure happened at, when `error`'s chain
+/// contains a `serde_yaml::Error` that reports one (see
+/// `serde_yaml::Error::location`). Unlike `guess_line`'s message-text
+/// heuristic (used for every other kind of issue), this is an exact
+/// position straight from the parser.
+fn yaml_error_line(error: &anyhow::Error) -> Option<usize> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<serde_yaml::Error>())
+        .and_then(|error| error.location())
+        .map(|location| location.line())
+}
+
 fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
     let mut issues = Vec::new();
     let mut ctx = LintCtx::new(config);
 
     match workflow::load_workflow(path) {
-        Err(error) => issues.push(LintIssue::error(format!("{error:#}"))),
+        Err(error) => {
+            let line = yaml_error_line(&error);
+            issues.push(LintIssue::error(format!("{error:#}")).with_line(line));
+        }
         Ok(wf) => {
             // Seeded with this file's own canonical path so a `workflow:`
             // chain that loops back to it is caught the same way
@@ -304,7 +626,10 @@ fn lint_agent_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
     let mut ctx = LintCtx::new(config);
 
     match agent::load_agent(path) {
-        Err(error) => issues.push(LintIssue::error(format!("{error:#}"))),
+        Err(error) => {
+            let line = yaml_error_line(&error);
+            issues.push(LintIssue::error(format!("{error:#}")).with_line(line));
+        }
         Ok(agent_file) => lint_agent_contents("the agent", &agent_file, &mut ctx, &mut issues),
     }
 
@@ -1341,5 +1666,93 @@ mod tests {
     #[test]
     fn lint_file_rejects_an_unrecognized_extension() {
         assert!(lint_file(Path::new("thing.txt"), Some(&empty_config())).is_err());
+    }
+
+    #[test]
+    fn first_quoted_identifier_extracts_the_first_single_quoted_span() {
+        assert_eq!(
+            first_quoted_identifier("node 'extract': unknown skill 'nope'"),
+            Some("extract")
+        );
+    }
+
+    #[test]
+    fn first_quoted_identifier_is_none_without_quotes() {
+        assert_eq!(first_quoted_identifier("no quotes here"), None);
+    }
+
+    #[test]
+    fn guess_line_finds_the_line_containing_the_quoted_identifier() {
+        let source = "nodes:\n  extract:\n    type: prompt\n    prompt: hi\n";
+        assert_eq!(guess_line(source, "node 'extract' is unused"), Some(2));
+    }
+
+    #[test]
+    fn guess_line_is_none_when_nothing_matches() {
+        let source = "nodes:\n  extract:\n    type: prompt\n";
+        assert_eq!(guess_line(source, "node 'missing' is unused"), None);
+    }
+
+    #[test]
+    fn has_frontmatter_delimiter_detects_agent_style_files() {
+        crate::test_support::in_temp_dir("lait-test-lint-frontmatter", || {
+            std::fs::write("agent.md", "---\nname: x\n---\nbody\n").unwrap();
+            std::fs::write("plain.md", "# Just a heading\n\nbody\n").unwrap();
+
+            assert!(has_frontmatter_delimiter(Path::new("agent.md")).unwrap());
+            assert!(!has_frontmatter_delimiter(Path::new("plain.md")).unwrap());
+        });
+    }
+
+    #[test]
+    fn expand_lint_targets_recurses_into_directories_and_skips_non_agent_markdown() {
+        crate::test_support::in_temp_dir("lait-test-lint-expand", || {
+            std::fs::create_dir_all("sub").unwrap();
+            std::fs::write("sub/workflow.yml", "steps: []\n").unwrap();
+            std::fs::write("sub/agent.md", "---\n---\nbody\n").unwrap();
+            std::fs::write("sub/README.md", "# not an agent file\n").unwrap();
+            std::fs::write("sub/notes.txt", "irrelevant\n").unwrap();
+
+            let files = expand_lint_targets(&[PathBuf::from(".")]).unwrap();
+
+            assert_eq!(
+                files,
+                vec![
+                    PathBuf::from("./sub/agent.md"),
+                    PathBuf::from("./sub/workflow.yml"),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn expand_lint_targets_skips_target_and_node_modules_and_dot_directories() {
+        crate::test_support::in_temp_dir("lait-test-lint-expand-skip", || {
+            std::fs::write("top.yml", "steps: []\n").unwrap();
+            std::fs::create_dir_all("target").unwrap();
+            std::fs::write("target/build.yml", "steps: []\n").unwrap();
+            std::fs::create_dir_all("node_modules/pkg").unwrap();
+            std::fs::write("node_modules/pkg/ci.yml", "steps: []\n").unwrap();
+            std::fs::create_dir_all(".git").unwrap();
+            std::fs::write(".git/config.yml", "steps: []\n").unwrap();
+
+            let files = expand_lint_targets(&[PathBuf::from(".")]).unwrap();
+
+            assert_eq!(files, vec![PathBuf::from("./top.yml")]);
+        });
+    }
+
+    #[test]
+    fn expand_lint_targets_passes_through_explicit_files_unchanged() {
+        let files = expand_lint_targets(&[PathBuf::from("a.yml"), PathBuf::from("b.md")]).unwrap();
+        assert_eq!(files, vec![PathBuf::from("a.yml"), PathBuf::from("b.md")]);
+    }
+
+    #[test]
+    fn yaml_error_line_reports_the_parser_location() {
+        let error = serde_yaml::from_str::<workflow::WorkflowFile>("steps: [\n")
+            .expect_err("malformed YAML should fail to parse");
+        let line = yaml_error_line(&anyhow::Error::new(error));
+        assert!(line.is_some(), "expected a line number from the parser");
     }
 }

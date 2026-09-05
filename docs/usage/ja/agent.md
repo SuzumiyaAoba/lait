@@ -4,7 +4,8 @@
 
 `lait agent run <FILE> <INPUT>` サブコマンドで、Markdown ファイル1つでエージェントを定義・
 実行できます。ファイルは YAML の frontmatter（`---` で区切られたブロック）とそれに続く
-Markdown 本文で構成され、本文がシステムプロンプトのテンプレートになります。
+Markdown 本文で構成され、本文がシステムプロンプトのテンプレートになります。frontmatter の
+補完・検証には [`lait schema agent`](./schema.md) が出力する JSON Schema を使えます。
 
 ```markdown
 ---
@@ -41,39 +42,65 @@ schema_name: city_fact
 cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人です。"}'
 ```
 
-- ファイルは1行目が必ず `---` で始まり、次に現れる `---` 行までが frontmatter（YAML）、
-  それ以降が本文（システムプロンプトのテンプレート）になります。
-- `agent:`（ノード）や `file_path:`（`json_schemas:`/`input_schema:`/`output_schema:`）に書く
-  パスは、既存の `--json-schema <FILE>` や `lait.config.yml` の探索と同じく、常にコマンドを
-  実行したディレクトリ（カレントディレクトリ）からの相対パスとして解決されます。エージェント
-  ファイルや `workflow.yml` 自体の場所からの相対パスではないため、`workflow.yml` を別ディレクトリから
-  実行する場合は注意してください。
-- `model` / `reasoning_effort` / `temperature` / `top_p` / `max_tokens` は省略可能で、
-  `lait.config.yml` の `default:` にフォールバックします。CLI から `--model` 等で上書きすること
-  はできません。`temperature`（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）は
-  範囲外の値を指定するとファイルの読み込み時点でエラーになります。
-- `input_schema` / `output_schema` は、`json_schemas:` と同じ形式で、スキーマ本体を直接書く
-  `schema:` と外部ファイルを指す `file_path:` のどちらか一方を指定します。
-- `structured_output: true` を指定する場合は `output_schema` が必須です（逆に `output_schema`
-  だけ指定して `structured_output` を省略/false にするのはエラーです）。`schema_name` は
-  `structured_output: true` のときだけ使われ、省略時は `structured_output` になります。
-- `input_schema` を指定すると、`INPUT` が JSON オブジェクトであること、
-  `input_schema.schema.required` に列挙したフィールドがすべて存在すること、さらに
-  `properties`/`items` で宣言したフィールドの `type`/`enum` やネストしたオブジェクト・配列の
-  中身までを実行前に再帰的に検証します（`format`・`pattern`・数値の範囲・
-  `additionalProperties`・`oneOf`/`anyOf`/`allOf`・`$ref` は検証しません）。検証に失敗すると
-  モデルを呼び出さずにエラーになります。
-- `INPUT` はまず JSON としてパースを試み、成功すればそのオブジェクト/配列/値がシステム
-  プロンプトのテンプレートに渡され、失敗すれば文字列としてそのまま渡されます。
-- システムプロンプトのテンプレートは handlebars 構文です。`{{ input.city }}` のようにドット
-  区切りでフィールドにアクセスできます。オブジェクトや配列全体を JSON テキストとして埋め込む
-  には `{{ json input }}` / `{{ json input.field }}` を使います。`{{ input }}` は `INPUT` が
-  文字列/数値/真偽値のときだけ使え、オブジェクト/配列のときに `{{ input }}` を書くとエラーに
-  なります（handlebars はオブジェクト/配列を既定では `[object]`/`[array]` という文字列に
-  してしまうため、それをモデルに送ってしまう前にエラーとして止めています。`{{ json input }}`
-  を使ってください）。テンプレート中の未定義の変数を参照した場合もエラーになります。
-- レンダリングされた本文は system ロールのメッセージとして送信され、`INPUT`（元の生テキスト）
-  は別途 user ロールのメッセージとして送信されます。
+## ファイルの構成とパス
+
+ファイルは1行目が必ず `---` で始まり、次に現れる `---` 行までが frontmatter（YAML）、
+それ以降が本文（システムプロンプトのテンプレート）になります。
+
+`agent:`（ノード）や `file_path:`（`json_schemas:`/`input_schema:`/`output_schema:`）に書く
+パスは、既存の `--json-schema <FILE>` や `lait.config.yml` の探索と同じく、常にコマンドを
+実行したディレクトリ（カレントディレクトリ）からの相対パスとして解決されます。エージェント
+ファイルや `workflow.yml` 自体の場所からの相対パスではないため、`workflow.yml` を別ディレクトリから
+実行する場合は注意してください。
+
+`model` / `reasoning_effort` / `temperature` / `top_p` / `max_tokens` は省略可能で、
+`lait.config.yml` の `default:` にフォールバックします。直接 `lait agent run` を実行する場合、
+CLI の `--model` などでエージェントファイルの値を上書きすることはできません。
+`temperature`（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）は、範囲外の値を
+指定するとファイルの読み込み時点でエラーになります。
+
+## 入力の渡し方
+
+`INPUT` はまず JSON としてパースされます。パースに成功した場合はオブジェクト・配列・値が
+テンプレートに渡され、失敗した場合は文字列としてそのまま渡されます。レンダリングされた本文は
+system ロールのメッセージとして送信され、`INPUT`（元の生テキスト）は別途 user ロールの
+メッセージとして送信されます。
+
+## 入力の検証（`input_schema`）
+
+`input_schema` / `output_schema` は、`json_schemas:` と同じ形式で、スキーマ本体を直接書く
+`schema:` と外部ファイルを指す `file_path:` のどちらか一方を指定します。
+
+`input_schema` を指定すると、`INPUT` が JSON オブジェクトであること、
+`input_schema.schema.required` に列挙したフィールドがすべて存在すること、さらに
+`properties`/`items` で宣言したフィールドの `type`/`enum` やネストしたオブジェクト・配列の
+中身までを実行前に再帰的に検証します。`format`・`pattern`・数値の範囲・`additionalProperties`・
+`oneOf`/`anyOf`/`allOf`・`$ref` は検証しません。検証に失敗するとモデルを呼び出さずにエラーになります。
+
+## テンプレートの書き方
+
+本文のシステムプロンプトは handlebars 構文です。
+
+- `{{ input.city }}` のようにドット区切りでフィールドにアクセスできます。
+- オブジェクトや配列全体を JSON テキストとして埋め込むには、`{{ json input }}` または
+  `{{ json input.field }}` を使います。
+- `{{ input }}` は `INPUT` が文字列・数値・真偽値のときに使えます。オブジェクト・配列に
+  使うとエラーになるため、`{{ json input }}` またはフィールドアクセスを使ってください。
+- テンプレート中の未定義の変数を参照した場合もエラーになります。
+
+## 構造化出力（`structured_output` / `output_schema`）
+
+`output_schema` と `structured_output` は、次の組み合わせで指定します。
+
+| 指定 | 結果 |
+| --- | --- |
+| どちらも省略 | 通常のテキスト応答になります。 |
+| `structured_output: true` と `output_schema` | Structured Outputs を要求します。`output_schema` は必須です。 |
+| `structured_output: true` のみ | エラーになります。 |
+| `output_schema` のみ、または `structured_output: false` | エラーになります。 |
+
+`output_schema` は `schema:`（本体を直接記述）または `file_path:`（外部ファイル）で指定します。
+`schema_name` は `structured_output: true` のときだけ使われ、省略時は `structured_output` になります。
 
 ## MCP ツールの利用
 
@@ -178,7 +205,7 @@ frontmatter → ワークフローの `default:` の順に、それぞれ独立�
 も `{{ steps.<id> }}` として参照できます（詳細は
 [ワークフロー（workflow.yml）](./workflow.md#ステップ間の値の受け渡し-stepsid---steps) を参照）。
 同様に `lait run --var KEY=VALUE` で渡した値も `{{ vars.<key> }}` として参照できます（詳細は
-[ワークフロー（workflow.yml）](./workflow.md#追加パラメータの受け渡し-lait-run---var--vars-key---vars) を参照）。
+[ワークフロー（workflow.yml）](./workflow.md#追加パラメータの受け渡しlait-run---var---varskey---vars) を参照）。
 これはワークフローのステップとして呼び出された場合に限ります（`lait agent run` から直接
 実行したときや、サブエージェントとして呼び出されたときは `vars` は空です）。
 
