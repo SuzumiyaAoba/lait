@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 
 use crate::{
     agent::AgentFile,
-    async_io, cache,
+    async_io, cache, cassette,
     cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
     llm, mcp, nesting, process, response, schema, shell_tool, skill, subagent, template, usage,
@@ -98,6 +98,19 @@ pub(crate) struct AppContext {
     /// AppContext` — `execute_tool_calls` only ever holds a shared `&
     /// AppContext`, the same as every other tool-loop call.
     pub(crate) always_approved_tools: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `lait run --record <DIR>` (see `crate::cassette`): when set,
+    /// `complete_recorded` saves every non-streamed request/response it
+    /// sends into this directory as a cassette file, keyed by the same
+    /// content hash `--cache` uses. Mutually exclusive with `replay_dir` at
+    /// the CLI level (`RunArgs::record`/`RunArgs::replay` `conflicts_with`
+    /// each other).
+    pub(crate) record_dir: Option<PathBuf>,
+    /// `lait run --replay <DIR>` / `lait test` (see `crate::cassette`): when
+    /// set, `complete_recorded` answers every non-streamed request from this
+    /// directory's cassette files instead of calling `llm::complete` at
+    /// all — a request with no matching cassette is a hard error, never a
+    /// silent fall-through to the network.
+    pub(crate) replay_dir: Option<PathBuf>,
 }
 
 impl AppContext {
@@ -119,6 +132,8 @@ impl AppContext {
             cache_ttl: None,
             approve_tools: false,
             always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
+            record_dir: None,
+            replay_dir: None,
         }
     }
 
@@ -155,6 +170,20 @@ impl AppContext {
     /// invocation.
     pub(crate) fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Sets this context's `record_dir`/`replay_dir` (see the field docs) —
+    /// `app::run_workflow` calls this from `RunArgs::record`/`RunArgs::replay`,
+    /// and `test_run` calls it with `replay_dir` set from a test definition's
+    /// `replay:` and `record_dir` left `None`.
+    pub(crate) fn with_record_replay(
+        mut self,
+        record_dir: Option<PathBuf>,
+        replay_dir: Option<PathBuf>,
+    ) -> Self {
+        self.record_dir = record_dir;
+        self.replay_dir = replay_dir;
         self
     }
 
@@ -914,19 +943,44 @@ impl RequestSettings {
         tools: &[ChatCompletionTools],
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
-        let cache_key = if env.cache_enabled {
-            Some(cache::key(
-                &self.base_url,
-                &self.resolved_model.model_id,
-                self.sampling,
-                &messages,
-                tools,
-                response_format.as_ref(),
-            )?)
-        } else {
-            None
-        };
-        if let Some(cache_key) = &cache_key {
+        // The same content hash serves three purposes below (response cache,
+        // `--record` cassette filename, `--replay` cassette lookup) —
+        // computed once whenever any of the three is in play, always from
+        // the *primary* endpoint (see this method's doc comment on why the
+        // cache key ignores which fallback candidate actually answers).
+        let content_key =
+            if env.cache_enabled || env.record_dir.is_some() || env.replay_dir.is_some() {
+                Some(cache::key(
+                    &self.base_url,
+                    &self.resolved_model.model_id,
+                    self.sampling,
+                    &messages,
+                    tools,
+                    response_format.as_ref(),
+                )?)
+            } else {
+                None
+            };
+
+        // `--replay` never touches the network or the response cache: every
+        // request is answered from `replay_dir`'s cassettes, or the run
+        // fails outright (see `cassette::load`).
+        if let Some(replay_dir) = &env.replay_dir {
+            let key = content_key
+                .as_deref()
+                .expect("content_key is computed above whenever replay_dir is set");
+            let response = cassette::load(replay_dir, key, &self.resolved_model.model_id)?;
+            env.usage.record_response(&self.usage_label, &response);
+            return Ok(response);
+        }
+
+        // A cache hit would otherwise skip the network call `--record` needs
+        // to actually observe, so cache lookup (not the later cache *save*,
+        // which stays harmless) is skipped while recording.
+        if env.cache_enabled && env.record_dir.is_none() {
+            let cache_key = content_key
+                .as_deref()
+                .expect("content_key is computed above whenever cache_enabled is set");
             match cache::load(cache_key, env.cache_ttl) {
                 Ok(Some(response)) => {
                     eprintln!("note: cache hit for {}", self.usage_label);
@@ -955,10 +1009,26 @@ impl RequestSettings {
             match llm::complete(request).await {
                 Ok(response) => {
                     env.usage.record_response(&self.usage_label, &response);
-                    if let Some(cache_key) = &cache_key
+                    if env.cache_enabled
+                        && let Some(cache_key) = &content_key
                         && let Err(error) = cache::save(cache_key, &response)
                     {
                         tracing::debug!(error = %error, "failed to write response cache entry");
+                    }
+                    if let Some(record_dir) = &env.record_dir {
+                        let key = content_key
+                            .as_deref()
+                            .expect("content_key is computed above whenever record_dir is set");
+                        cassette::save(
+                            record_dir,
+                            key,
+                            &endpoint.base_url,
+                            &endpoint.model_id,
+                            &messages,
+                            tools,
+                            response_format.as_ref(),
+                            &response,
+                        )?;
                     }
                     return Ok(response);
                 }

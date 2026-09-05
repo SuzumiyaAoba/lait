@@ -15,7 +15,7 @@ use crate::{
         agent_file_settings, call_agent, resolve_request_settings,
     },
     history, lint, prompt, repl, report, response, schema, session, skill, subagent, template,
-    usage,
+    test_run, usage,
     workflow::{
         self, WorkflowScope,
         exec::{Flow, RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
@@ -168,6 +168,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Compare(compare_args)) => {
             crate::compare::run(compare_args, config_source, cache_override, cancel).await
         }
+        Some(Command::Test(test_args)) => test_run::run(test_args, config_source, cancel).await,
         None => {
             run_chat_or_repl(
                 cli.chat,
@@ -294,7 +295,13 @@ pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
         Some(Command::Agent(agent_command)) => {
             matches!(agent_command.action, AgentAction::Run(_))
         }
-        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_) | Command::Compare(_))
+        Some(
+            Command::Run(_)
+            | Command::Chat(_)
+            | Command::Doctor(_)
+            | Command::Compare(_)
+            | Command::Test(_),
+        )
         | None => true,
     }
 }
@@ -341,7 +348,13 @@ pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
         Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
         Some(Command::Cache(cache_command)) => crate::cache::run(cache_command),
         Some(Command::Schema(schema_args)) => crate::schema::run(schema_args),
-        Some(Command::Run(_) | Command::Chat(_) | Command::Doctor(_) | Command::Compare(_))
+        Some(
+            Command::Run(_)
+            | Command::Chat(_)
+            | Command::Doctor(_)
+            | Command::Compare(_)
+            | Command::Test(_),
+        )
         | None => {
             bail!("internal error: an async command reached run_blocking")
         }
@@ -872,7 +885,8 @@ async fn run_workflow(
         .with_vars(vars.clone())
         .with_cancel(run_cancel)
         .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools);
+        .with_approve_tools(approve_tools)
+        .with_record_replay(run_args.record.clone(), run_args.replay.clone());
     // Builds one checkpoint snapshot, filling in the fields that stay the
     // same for this whole run (`run_id`/`workflow_path`/`initial_prompt`/
     // `vars`/`top_level_labels`) so each of this run's three save sites below

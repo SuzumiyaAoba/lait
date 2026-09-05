@@ -135,6 +135,10 @@ pub(crate) enum Command {
     /// Send the same prompt to two or more models and print each one's
     /// response, timing, and usage side by side. See docs/usage/ja/compare.md.
     Compare(CompareArgs),
+    /// Run test definition files (YAML: a workflow, input/vars, a `--record`ed
+    /// replay cassette directory, and assertions) with no network access,
+    /// reporting pass/fail. See docs/usage/ja/testing.md.
+    Test(TestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -199,6 +203,27 @@ pub(crate) struct CompareArgs {
     /// of a human-readable report.
     #[arg(long)]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TestArgs {
+    /// Test definition files (.yml/.yaml) and/or directories to search
+    /// recursively for them (see docs/usage/ja/testing.md).
+    #[arg(value_name = "FILE", required = true)]
+    pub(crate) paths: Vec<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = TestFormat::Text)]
+    pub(crate) format: TestFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum TestFormat {
+    /// A per-file pass/fail report with failing assertions detailed.
+    #[default]
+    Text,
+    /// A structured JSON report (one entry per test file).
+    Json,
 }
 
 #[derive(Debug, Args)]
@@ -525,6 +550,22 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "RUN_ID", conflicts_with = "dry_run")]
     pub(crate) resume: Option<String>,
 
+    /// Record every LLM request/response this run makes into DIR as cassette
+    /// files (see `crate::cassette`), keyed by request content (the same
+    /// hash `--cache` uses). A later `--replay DIR` run against the same
+    /// workflow/input/vars answers each request from these cassettes instead
+    /// of the network — see `lait test`/docs/usage/ja/testing.md.
+    #[arg(long, value_name = "DIR", conflicts_with = "replay")]
+    pub(crate) record: Option<PathBuf>,
+
+    /// Replay a previously `--record`ed run from DIR instead of calling any
+    /// model: every request this run would send is matched against DIR's
+    /// cassette files by content hash, and the recorded response is returned
+    /// with no network access at all. A request that has no matching
+    /// cassette is an error (see `crate::cassette::load`).
+    #[arg(long, value_name = "DIR", conflicts_with = "record")]
+    pub(crate) replay: Option<PathBuf>,
+
     #[command(flatten)]
     pub(crate) var: VarArgs,
 
@@ -788,7 +829,7 @@ pub(crate) enum ReasoningEffort {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentAction, AgentCommand, Cli, Command, ReasoningEffort};
+    use super::{AgentAction, AgentCommand, Cli, Command, ReasoningEffort, TestFormat};
     use clap::Parser;
 
     #[test]
@@ -1005,6 +1046,57 @@ mod tests {
     }
 
     #[test]
+    fn parses_run_subcommand_with_record() {
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml", "hello", "--record", "dir"])
+            .expect("valid run subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Run(run_args)) => {
+                assert_eq!(
+                    run_args.record.as_deref(),
+                    Some(std::path::Path::new("dir"))
+                );
+                assert!(run_args.replay.is_none());
+            }
+            _ => panic!("expected the run subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_run_subcommand_with_replay() {
+        let cli = Cli::try_parse_from(["lait", "run", "workflow.yml", "hello", "--replay", "dir"])
+            .expect("valid run subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Run(run_args)) => {
+                assert_eq!(
+                    run_args.replay.as_deref(),
+                    Some(std::path::Path::new("dir"))
+                );
+                assert!(run_args.record.is_none());
+            }
+            _ => panic!("expected the run subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn rejects_run_subcommand_with_both_record_and_replay() {
+        assert!(
+            Cli::try_parse_from([
+                "lait",
+                "run",
+                "workflow.yml",
+                "hello",
+                "--record",
+                "a",
+                "--replay",
+                "b",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_agent_run_subcommand() {
         let cli = Cli::try_parse_from(["lait", "agent", "run", "agent.md", "hello"])
             .expect("valid agent run subcommand arguments should parse");
@@ -1211,6 +1303,43 @@ mod tests {
                 assert_eq!(compare_args.max_tokens, Some(128));
             }
             _ => panic!("expected the compare subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn parses_test_subcommand_with_multiple_paths() {
+        let cli = Cli::try_parse_from(["lait", "test", "tests/", "one.yml"])
+            .expect("valid test subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Test(test_args)) => {
+                assert_eq!(
+                    test_args
+                        .paths
+                        .iter()
+                        .filter_map(|path| path.to_str())
+                        .collect::<Vec<_>>(),
+                    vec!["tests/", "one.yml"]
+                );
+                assert_eq!(test_args.format, TestFormat::Text);
+            }
+            _ => panic!("expected the test subcommand to be selected"),
+        }
+    }
+
+    #[test]
+    fn test_subcommand_requires_at_least_one_path() {
+        assert!(Cli::try_parse_from(["lait", "test"]).is_err());
+    }
+
+    #[test]
+    fn parses_test_subcommand_with_json_format() {
+        let cli = Cli::try_parse_from(["lait", "test", "--format", "json", "tests/"])
+            .expect("valid test subcommand arguments should parse");
+
+        match cli.command {
+            Some(Command::Test(test_args)) => assert_eq!(test_args.format, TestFormat::Json),
+            _ => panic!("expected the test subcommand to be selected"),
         }
     }
 }

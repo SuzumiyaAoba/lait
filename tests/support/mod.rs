@@ -246,6 +246,60 @@ impl Drop for GlobalConfigDirectory {
     }
 }
 
+/// A scratch directory a test fully controls the layout of — for
+/// `--record`/`--replay`/`lait test` fixtures, where a test definition file,
+/// its target workflow, and a cassette directory must all sit at specific
+/// paths relative to each other. Distinct from `ConfigDirectory` (always a
+/// single `lait.config.yml`) and `WorkflowFile` (a single file at a random
+/// path with no fixed relationship to anything else).
+pub(crate) struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    pub(crate) fn new() -> Self {
+        let mut path = None;
+        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
+            let candidate = next_temp_path("lait-test-scratch", "");
+            match fs::create_dir(&candidate) {
+                Ok(()) => {
+                    path = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to create test scratch directory: {error}"),
+            }
+        }
+        let path = path.unwrap_or_else(|| {
+            panic!(
+                "failed to create a unique test scratch directory after {MAX_TEMP_PATH_ATTEMPTS} attempts"
+            )
+        });
+        Self { path }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Writes `contents` to `relative_path` under this directory, creating
+    /// any missing parent directories, and returns the full path written.
+    pub(crate) fn write(&self, relative_path: &str, contents: &str) -> PathBuf {
+        let full_path = self.path.join(relative_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create scratch subdirectory");
+        }
+        fs::write(&full_path, contents).expect("failed to write scratch file");
+        full_path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 pub(crate) fn test_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lait"));
     for variable in [
