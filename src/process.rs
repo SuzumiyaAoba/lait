@@ -426,8 +426,8 @@ pub(crate) async fn run_command(
                 read_stderr.abort();
                 let _ = read_stdout.await;
                 let _ = read_stderr.await;
-                cleanup_result.with_context(|| format!("command '{program}' was cancelled"))?;
-                bail!("command '{program}' was cancelled");
+                cleanup_result.with_context(|| crate::error::Interrupted::cancelled(format!("command '{program}' was cancelled")))?;
+                bail!(crate::error::Interrupted::cancelled(format!("command '{program}' was cancelled")));
             }
         }
     } else {
@@ -468,11 +468,9 @@ pub(crate) async fn run_command(
                     let _ = read_stdout.await;
                     let _ = read_stderr.await;
                     if let Err(error) = tree_kill_result {
-                        bail!(
-                            "command '{program}' was cancelled; failed to terminate its process tree: {error}"
-                        );
+                        bail!(crate::error::Interrupted::cancelled(format!("command '{program}' was cancelled; failed to terminate its process tree: {error}")));
                     }
-                    bail!("command '{program}' was cancelled");
+                    bail!(crate::error::Interrupted::cancelled(format!("command '{program}' was cancelled")));
                 }
             }
             if let Some(stdout) = stdout_bytes.take() {

@@ -3,7 +3,7 @@
 //! `.lait/runs/<run-id>.json` after every top-level step completes, letting
 //! `lait run <FILE> --resume <RUN_ID>` continue a failed run from its last
 //! completed top-level step instead of re-running the whole workflow from
-//! scratch. See `app::run_workflow` (the only writer/reader of these besides
+//! scratch. See `app::workflow_run` (the only writer/reader of these besides
 //! `run` below) and docs/usage/ja/workflow.md.
 //!
 //! Resume only ever replays *top-level* steps: a router step (`switch`/
@@ -19,7 +19,7 @@
 //! `jsonl.rs`'s primitives are all append-shaped and deliberately not
 //! extended for this (see its own module doc's reasoning for not
 //! generalizing further). A checkpoint write instead goes through a plain
-//! temp-file-then-`rename` (atomic on the same filesystem) below; existence
+//! atomic snapshot write (`storage::write_atomic`); existence
 //! checks and directory listing still reuse `jsonl`'s symlink-safe
 //! relative-path primitives, since those shapes already fit.
 
@@ -78,7 +78,7 @@ pub(crate) struct Checkpoint {
     #[serde(default)]
     pub(crate) vars: serde_json::Map<String, serde_json::Value>,
     /// Every top-level step's label, by position — see
-    /// `app::top_level_step_labels` for how this differs from a step's
+    /// `app::workflow_run::top_level_step_labels` for how this differs from a step's
     /// runtime progress label. Used only to detect whether the workflow's
     /// step sequence changed since this checkpoint was written.
     pub(crate) top_level_labels: Vec<String>,
@@ -100,19 +100,18 @@ fn run_path(run_id: &str) -> Result<PathBuf> {
     Ok(Path::new(RUNS_DIR).join(format!("{run_id}.json")))
 }
 
-/// A run id that sorts chronologically by creation time and satisfies
-/// `session::validate_name`'s charset — an RFC 3339 timestamp's `:` would
-/// not, so this rolls its own compact format instead:
-/// `YYYYMMDD-HHMMSS-<4 hex digits from the current nanosecond>`. The hex
-/// suffix only guards against two runs starting in the same second; it is
-/// not a real uniqueness guarantee, which matters little for a
-/// human-inspected filename.
+/// A time-prefixed identifier safe for filenames. Full nanoseconds, process
+/// identity, and a local counter keep simultaneous runs from sharing a file,
+/// including repeated calls on clocks with coarse resolution.
 pub(crate) fn generate_run_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = chrono::Utc::now();
     format!(
-        "{}-{:04x}",
+        "{}-{:09}-{}-{}",
         now.format("%Y%m%d-%H%M%S"),
-        now.timestamp_subsec_nanos() % 0x1_0000
+        now.timestamp_subsec_nanos(),
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -122,17 +121,9 @@ pub(crate) fn generate_run_id() -> String {
 /// half-written file.
 pub(crate) fn save(checkpoint: &Checkpoint) -> Result<()> {
     let path = run_path(&checkpoint.run_id)?;
-    let dir = path
-        .parent()
-        .expect("run_path always returns a path under RUNS_DIR");
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create directory '{}'", dir.display()))?;
     let body =
         serde_json::to_string_pretty(checkpoint).context("failed to serialize checkpoint")?;
-    let tmp_path = Path::new(RUNS_DIR).join(format!("{}.json.tmp", checkpoint.run_id));
-    std::fs::write(&tmp_path, body)
-        .with_context(|| format!("failed to write '{}'", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
+    crate::storage::write_atomic(&path, body.as_bytes())
         .with_context(|| format!("failed to save checkpoint to '{}'", path.display()))?;
     Ok(())
 }
@@ -330,5 +321,11 @@ mod tests {
     fn generate_run_id_satisfies_the_run_path_charset() {
         let id = generate_run_id();
         assert!(run_path(&id).is_ok(), "generated id '{id}' was rejected");
+    }
+
+    #[test]
+    fn run_ids_are_unique_across_rapid_calls() {
+        let ids: std::collections::HashSet<_> = (0..10_000).map(|_| generate_run_id()).collect();
+        assert_eq!(ids.len(), 10_000);
     }
 }

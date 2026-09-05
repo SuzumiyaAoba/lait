@@ -198,101 +198,181 @@ fn has_frontmatter_delimiter(path: &Path) -> Result<bool> {
 /// this returns `Err` (which only happens if at least one file has an
 /// `Error`-level issue, so CI can rely on the exit code, regardless of
 /// format).
-pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
-    match lint_args.format {
-        LintFormat::Text => run_text(lint_args, config_source),
-        LintFormat::Json | LintFormat::Github => run_structured(lint_args, config_source),
+/// A single analysis snapshot consumed by every output format.
+/// Renderers never re-run checks, so adding a check cannot make formats disagree.
+struct LintRun {
+    config_display: String,
+    registry: Vec<RegistryEntry>,
+    api_key_errors: Vec<String>,
+    tool_errors: Vec<String>,
+    reports: Vec<LintReport>,
+}
+
+struct RegistryEntry {
+    name: String,
+    path: PathBuf,
+    exists: bool,
+}
+
+impl LintRun {
+    fn collect(files: &[PathBuf], config_source: &ConfigSource) -> Result<Self> {
+        // An absent config skips capability checks; an existing empty config
+        // must still reject unknown capability names.
+        let config_path = config::resolve_config_path(config_source)?;
+        let global_config_present = matches!(config_source, ConfigSource::Search)
+            && config::global_config_path()?.is_file();
+        let file_config = config::load_config(config_source)?;
+        let config = (config_path.is_some() || global_config_present).then_some(&file_config);
+        let files = expand_lint_targets(files)?;
+        let mut registry: Vec<_> = file_config
+            .workflows
+            .iter()
+            .map(|(name, path)| RegistryEntry {
+                name: name.clone(),
+                path: path.clone(),
+                exists: path.is_file(),
+            })
+            .collect();
+        registry.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let reports = files
+            .iter()
+            .map(|file| {
+                lint_file(file, config).unwrap_or_else(|error| LintReport {
+                    file: file.clone(),
+                    issues: vec![LintIssue::error(format!("{error:#}"))],
+                })
+            })
+            .collect();
+        Ok(Self {
+            config_display: config_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| config::CONFIG_FILE_NAME.to_owned()),
+            registry,
+            api_key_errors: config::check_provider_api_key_sources(&file_config),
+            tool_errors: config::check_shell_tool_definitions(&file_config),
+            reports,
+        })
+    }
+
+    fn failed_files(&self) -> usize {
+        self.reports
+            .iter()
+            .filter(|report| report.has_errors())
+            .count()
+    }
+
+    fn registry_ok(&self) -> bool {
+        self.registry.iter().all(|entry| entry.exists)
+    }
+
+    fn has_errors(&self) -> bool {
+        self.failed_files() > 0
+            || !self.registry_ok()
+            || !self.api_key_errors.is_empty()
+            || !self.tool_errors.is_empty()
+    }
+
+    fn findings(&self) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        for report in &self.reports {
+            let mut source = None;
+            for issue in &report.issues {
+                let line = issue.line.or_else(|| {
+                    let text = source.get_or_insert_with(|| {
+                        std::fs::read_to_string(&report.file).unwrap_or_default()
+                    });
+                    guess_line(text, &issue.message)
+                });
+                findings.push(Finding {
+                    file: report.file.display().to_string(),
+                    line,
+                    severity: issue.severity,
+                    message: issue.message.clone(),
+                });
+            }
+        }
+        for entry in self.registry.iter().filter(|entry| !entry.exists) {
+            findings.push(Finding::config(
+                &self.config_display,
+                Severity::Error,
+                format!(
+                    "workflows.{} resolves to '{}', which does not exist",
+                    entry.name,
+                    entry.path.display()
+                ),
+            ));
+        }
+        for message in self.api_key_errors.iter().chain(&self.tool_errors) {
+            findings.push(Finding::config(
+                &self.config_display,
+                Severity::Error,
+                message.clone(),
+            ));
+        }
+        findings
     }
 }
 
-/// `--format text` (the default): the original, human-readable report —
-/// unchanged from before directory/`--format` support existed, aside from
-/// linting whatever `expand_lint_targets` resolves `lint_args.files` to
-/// instead of `lint_args.files` directly.
-fn run_text(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
-    // Unlike `config::load_config`, which returns an empty `ConfigFile` both
-    // when `lait.config.yml` is absent/not found and when `--no-config` was
-    // passed, the linter needs to tell "absent/skipped" apart from "present
-    // but empty" so it can skip `mcp:`/`skills:` name checks (and say why)
-    // instead of reporting every referenced name as unknown. A global config
-    // (see `config::global_config_path`) counts as "present" too — it's only
-    // ever consulted for `ConfigSource::Search`, same as the project file.
-    let config_path = config::resolve_config_path(&config_source)?;
-    let global_config_present =
-        matches!(config_source, ConfigSource::Search) && config::global_config_path()?.is_file();
-    let config_present = config_path.is_some() || global_config_present;
-    let file_config = config::load_config(&config_source)?;
-    let config = config_present.then_some(&file_config);
-    let files = expand_lint_targets(&lint_args.files)?;
+pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
+    let run = LintRun::collect(&lint_args.files, &config_source)?;
+    match lint_args.format {
+        LintFormat::Text => run_text(&run),
+        LintFormat::Json | LintFormat::Github => run_structured(&run, lint_args.format),
+    }
+}
 
-    let mut failed_files = 0usize;
-    let registry_ok = if file_config.workflows.is_empty() {
-        true
-    } else {
-        check_workflows_registry(&file_config)
-    };
-    let api_key_sources_ok = check_provider_api_key_sources(&file_config);
-    let shell_tool_definitions_ok = check_shell_tool_definitions(&file_config);
-    for file in &files {
-        // `lint_file` only ever returns `Err` for a file whose type it can't
-        // determine (an unrecognized extension) — treated here as one more
-        // failure to report, not a reason to stop linting the rest of
-        // `files`.
-        let report = match lint_file(file, config) {
-            Ok(report) => report,
-            Err(error) => {
-                println!("{}:", file.display());
-                println!("  error: {error:#}");
-                failed_files += 1;
-                continue;
+fn run_text(run: &LintRun) -> Result<()> {
+    if !run.registry.is_empty() {
+        println!("{} (workflows:):", config::CONFIG_FILE_NAME);
+        for entry in &run.registry {
+            if entry.exists {
+                println!("  {}: OK ({})", entry.name, entry.path.display());
+            } else {
+                println!(
+                    "  {}: error: no such file '{}'",
+                    entry.name,
+                    entry.path.display()
+                );
             }
-        };
-        if report.issues.is_empty() {
-            println!("{}: OK", report.file.display());
-            continue;
-        }
-        println!("{}:", report.file.display());
-        for issue in &report.issues {
-            println!("  {}: {}", issue.severity, issue.message);
-        }
-        if report.has_errors() {
-            failed_files += 1;
         }
     }
-
-    if failed_files > 0 || !registry_ok || !api_key_sources_ok || !shell_tool_definitions_ok {
-        bail!(
-            "{failed_files} of {} file(s) had errors{}{}{}",
-            files.len(),
-            if registry_ok {
-                String::new()
-            } else {
-                format!(
-                    "; {} 'workflows:' also has errors",
-                    config::CONFIG_FILE_NAME
-                )
-            },
-            if api_key_sources_ok {
-                String::new()
-            } else {
-                format!(
-                    "; {} api_key/api_key_cmd also has errors",
-                    config::CONFIG_FILE_NAME
-                )
-            },
-            if shell_tool_definitions_ok {
-                String::new()
-            } else {
-                format!("; {} 'tools:' also has errors", config::CONFIG_FILE_NAME)
+    print_config_errors("api_key/api_key_cmd:", &run.api_key_errors);
+    print_config_errors("tools:", &run.tool_errors);
+    for report in &run.reports {
+        if report.issues.is_empty() {
+            println!("{}: OK", report.file.display());
+        } else {
+            println!("{}:", report.file.display());
+            for issue in &report.issues {
+                println!("  {}: {}", issue.severity, issue.message);
             }
+        }
+    }
+    if run.has_errors() {
+        let mut suffix = String::new();
+        for (ok, section) in [
+            (run.registry_ok(), "'workflows:'"),
+            (run.api_key_errors.is_empty(), "api_key/api_key_cmd"),
+            (run.tool_errors.is_empty(), "'tools:'"),
+        ] {
+            if !ok {
+                suffix.push_str(&format!(
+                    "; {} {section} also has errors",
+                    config::CONFIG_FILE_NAME
+                ));
+            }
+        }
+        bail!(
+            "{} of {} file(s) had errors{suffix}",
+            run.failed_files(),
+            run.reports.len()
         );
     }
     Ok(())
 }
 
-/// One `--format json`/`--format github` record: a finding attributed to a
-/// file (an actual linted file, or `lait.config.yml`'s display path for a
-/// config-level check) and, when it could be worked out, a 1-based line.
+/// One machine-readable finding attributed to a file and optional source line.
 struct Finding {
     file: String,
     line: Option<usize>,
@@ -311,101 +391,14 @@ impl Finding {
     }
 }
 
-/// `--format json`/`--format github`: same checks as `run_text`, but
-/// collected into flat `Finding`s and printed as structured records instead
-/// of a per-file human-readable report. Kept as an independent
-/// implementation (rather than a shared core both formats funnel through)
-/// so `run_text`'s exact wording — pinned by its existing tests — can never
-/// drift just because this format gained a new check.
-fn run_structured(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
-    let config_path = config::resolve_config_path(&config_source)?;
-    let global_config_present =
-        matches!(config_source, ConfigSource::Search) && config::global_config_path()?.is_file();
-    let config_present = config_path.is_some() || global_config_present;
-    let file_config = config::load_config(&config_source)?;
-    let config = config_present.then_some(&file_config);
-    let config_display = config_path
-        .as_deref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| config::CONFIG_FILE_NAME.to_owned());
-    let files = expand_lint_targets(&lint_args.files)?;
-
-    let mut findings = Vec::new();
-    let mut has_errors = false;
-
-    for file in &files {
-        match lint_file(file, config) {
-            Ok(report) => {
-                // Only read when there is at least one issue that still
-                // needs a line guessed — `run_text`'s file-only tests, and
-                // any other file with no line-less issue, never pay for
-                // this read.
-                let mut source: Option<String> = None;
-                let file_display = report.file.display().to_string();
-                for issue in &report.issues {
-                    if issue.severity == Severity::Error {
-                        has_errors = true;
-                    }
-                    let line = issue.line.or_else(|| {
-                        let text = source.get_or_insert_with(|| {
-                            std::fs::read_to_string(file).unwrap_or_default()
-                        });
-                        guess_line(text, &issue.message)
-                    });
-                    findings.push(Finding {
-                        file: file_display.clone(),
-                        line,
-                        severity: issue.severity,
-                        message: issue.message.clone(),
-                    });
-                }
-            }
-            Err(error) => {
-                has_errors = true;
-                findings.push(Finding {
-                    file: file.display().to_string(),
-                    line: None,
-                    severity: Severity::Error,
-                    message: format!("{error:#}"),
-                });
-            }
-        }
-    }
-
-    if !file_config.workflows.is_empty() {
-        let mut names: Vec<&String> = file_config.workflows.keys().collect();
-        names.sort_unstable();
-        for name in names {
-            let resolved = &file_config.workflows[name];
-            if !resolved.is_file() {
-                has_errors = true;
-                findings.push(Finding::config(
-                    &config_display,
-                    Severity::Error,
-                    format!(
-                        "workflows.{name} resolves to '{}', which does not exist",
-                        resolved.display()
-                    ),
-                ));
-            }
-        }
-    }
-    for message in config::check_provider_api_key_sources(&file_config) {
-        has_errors = true;
-        findings.push(Finding::config(&config_display, Severity::Error, message));
-    }
-    for message in config::check_shell_tool_definitions(&file_config) {
-        has_errors = true;
-        findings.push(Finding::config(&config_display, Severity::Error, message));
-    }
-
-    match lint_args.format {
+fn run_structured(run: &LintRun, format: LintFormat) -> Result<()> {
+    let findings = run.findings();
+    match format {
         LintFormat::Json => print_json_findings(&findings)?,
         LintFormat::Github => print_github_findings(&findings),
-        LintFormat::Text => unreachable!("dispatched to run_text in `run`"),
+        LintFormat::Text => unreachable!("text has its own renderer"),
     }
-
-    if has_errors {
+    if run.has_errors() {
         bail!(
             "lint found {} error(s) across {} finding(s) in {} file(s)",
             findings
@@ -413,10 +406,19 @@ fn run_structured(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
                 .filter(|finding| finding.severity == Severity::Error)
                 .count(),
             findings.len(),
-            files.len(),
+            run.reports.len(),
         );
     }
     Ok(())
+}
+
+fn print_config_errors(section: &str, errors: &[String]) {
+    if !errors.is_empty() {
+        println!("{} ({section}):", config::CONFIG_FILE_NAME);
+        for error in errors {
+            println!("  error: {error}");
+        }
+    }
 }
 
 fn print_json_findings(findings: &[Finding]) -> Result<()> {
@@ -488,65 +490,6 @@ fn first_quoted_identifier(message: &str) -> Option<&str> {
     let end = message[start..].find('\'')?;
     let candidate = &message[start..start + end];
     (!candidate.is_empty()).then_some(candidate)
-}
-
-/// Prints one `  error: {error}` line per entry under a `{CONFIG_FILE_NAME}
-/// ({section}):` header, if any. Returns whether `errors` was empty.
-fn report_config_errors(section: &str, errors: Vec<String>) -> bool {
-    if errors.is_empty() {
-        return true;
-    }
-    println!("{} ({section}):", config::CONFIG_FILE_NAME);
-    for error in &errors {
-        println!("  error: {error}");
-    }
-    false
-}
-
-/// Checks the top-level and every `models:` entry's `api_key`/`api_key_cmd`
-/// pair for the both-set conflict `resolve_model_alias`/`resolve_endpoint`
-/// reject at resolve time (see `config::check_provider_api_key_sources`),
-/// printing one line per violation. Returns whether every pair was valid.
-fn check_provider_api_key_sources(file_config: &ConfigFile) -> bool {
-    report_config_errors(
-        "api_key/api_key_cmd:",
-        config::check_provider_api_key_sources(file_config),
-    )
-}
-
-/// Checks every `tools:` entry's `command`/`parameters` (see
-/// `config::check_shell_tool_definitions`), printing one line per
-/// violation. Returns whether every entry was valid.
-fn check_shell_tool_definitions(file_config: &ConfigFile) -> bool {
-    report_config_errors("tools:", config::check_shell_tool_definitions(file_config))
-}
-
-/// Checks that every `workflows:` entry in `file_config` resolves to a file
-/// that actually exists, the same way `agent`/`workflow` node references are
-/// checked for the files `lint_args.files` names directly — but this is the
-/// one check that has nothing to do with those files: it validates
-/// `lait.config.yml` itself, since nothing inside a workflow YAML ever
-/// references `workflows:` (unlike `mcp:`/`skills:`/`agent:`, which are
-/// checked per-file by `lint_workflow_contents`/`lint_agent_contents`).
-/// Registry paths are already absolute (resolved once at config-load time —
-/// see `config::load_config`), so this reports exactly the path `lait run
-/// <NAME>` (`workflow::resolve_run_target`) would actually try to read.
-/// Returns whether every entry resolved; prints one line per entry.
-fn check_workflows_registry(file_config: &ConfigFile) -> bool {
-    let mut names: Vec<&String> = file_config.workflows.keys().collect();
-    names.sort_unstable();
-    let mut ok = true;
-    println!("{} (workflows:):", config::CONFIG_FILE_NAME);
-    for name in names {
-        let resolved = &file_config.workflows[name];
-        if resolved.is_file() {
-            println!("  {name}: OK ({})", resolved.display());
-        } else {
-            println!("  {name}: error: no such file '{}'", resolved.display());
-            ok = false;
-        }
-    }
-    ok
 }
 
 /// Threaded through every check in one `lint_file` call: `config` is looked
@@ -804,14 +747,15 @@ fn lint_node(
     visited: &mut Vec<PathBuf>,
 ) {
     let node_context = format!("node '{node_id}'");
+    let settings = node.settings();
 
-    if let Some(filter) = node.jq() {
+    if let Some(filter) = settings.jq {
         check_jq(filter, &format!("{node_context}: 'jq'"), issues);
     }
-    check_mcp_names(&node_context, node.mcp(), ctx, issues);
-    check_skill_names(&node_context, node.skills(), ctx, issues);
-    check_subagent_names(&node_context, node.subagents(), ctx, issues);
-    check_tool_names(&node_context, node.tools(), ctx, issues);
+    check_mcp_names(&node_context, settings.mcp, ctx, issues);
+    check_skill_names(&node_context, settings.skills, ctx, issues);
+    check_subagent_names(&node_context, settings.subagents, ctx, issues);
+    check_tool_names(&node_context, settings.tools, ctx, issues);
 
     match node {
         workflow::NodeDefinition::Prompt(prompt) => {

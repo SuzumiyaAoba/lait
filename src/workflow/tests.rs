@@ -1,4 +1,4 @@
-use super::{NodeDefinition, StepOutputs, eval_when, parse_workflow};
+use super::{NodeDefinition, NodeKind, StepOutputs, eval_when, parse_workflow};
 use crate::schema::JsonSchemaEntry;
 
 #[test]
@@ -29,7 +29,44 @@ steps:
     assert_eq!(workflow.default.model.as_deref(), Some("local"));
     assert_eq!(workflow.steps.len(), 2);
     assert_eq!(workflow.steps[0].label(), Some("summarize"));
-    assert_eq!(workflow.nodes["translate"].model(), Some("cloud"));
+    assert_eq!(workflow.nodes["translate"].settings().model, Some("cloud"));
+}
+
+#[test]
+fn node_settings_view_preserves_model_and_output_settings() {
+    let workflow = parse_workflow(
+        r#"
+nodes:
+  call:
+    type: prompt
+    model: local
+    temperature: 0.4
+    mcp: [filesystem]
+    jq: '.answer'
+    write_file: result.json
+    timeout: 10
+    retry:
+      max_attempts: 2
+    prompt: '{{ input }}'
+steps:
+  - use: call
+"#,
+    )
+    .expect("prompt node with shared settings should parse");
+
+    let node = &workflow.nodes["call"];
+    let settings = node.settings();
+    assert_eq!(node.kind(), NodeKind::Prompt);
+    assert_eq!(settings.model, Some("local"));
+    assert_eq!(settings.temperature, Some(0.4));
+    assert_eq!(settings.mcp, Some(["filesystem".to_owned()].as_slice()));
+    assert_eq!(settings.jq, Some(".answer"));
+    assert_eq!(
+        settings.write_file.and_then(|path| path.to_str()),
+        Some("result.json")
+    );
+    assert_eq!(settings.timeout, Some(10));
+    assert_eq!(settings.retry.and_then(|retry| retry.max_attempts), Some(2));
 }
 
 #[test]
@@ -411,7 +448,7 @@ steps:
     )
     .expect("a jq-only node should parse");
 
-    assert_eq!(workflow.nodes["transform"].jq(), Some(".answer"));
+    assert_eq!(workflow.nodes["transform"].settings().jq, Some(".answer"));
 }
 
 #[test]
@@ -1671,8 +1708,8 @@ steps:
     .expect("workflow with retry/timeout/on_error should parse");
 
     let node = &workflow.nodes["call"];
-    assert_eq!(node.timeout(), Some(30));
-    let retry = node.retry().unwrap();
+    assert_eq!(node.settings().timeout, Some(30));
+    let retry = node.settings().retry.unwrap();
     assert_eq!(retry.max_attempts, Some(3));
     assert_eq!(retry.delay_seconds, Some(1));
     assert_eq!(retry.backoff, Some(2.0));
@@ -1747,9 +1784,9 @@ steps:
     )
     .expect("workflow should parse");
 
-    assert_eq!(workflow.nodes["n"].temperature(), Some(0.7));
-    assert_eq!(workflow.nodes["n"].top_p(), Some(0.9));
-    assert_eq!(workflow.nodes["n"].max_tokens(), Some(256));
+    assert_eq!(workflow.nodes["n"].settings().temperature, Some(0.7));
+    assert_eq!(workflow.nodes["n"].settings().top_p, Some(0.9));
+    assert_eq!(workflow.nodes["n"].settings().max_tokens, Some(256));
 }
 
 #[test]
@@ -1914,7 +1951,7 @@ steps:
     .expect("workflow with write_file should parse");
 
     assert_eq!(
-        workflow.nodes["n"].write_file(),
+        workflow.nodes["n"].settings().write_file,
         Some(std::path::Path::new("out.txt"))
     );
 }

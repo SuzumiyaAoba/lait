@@ -669,10 +669,10 @@ impl McpRegistry {
                 // in a remote/stdio server, so close and evict this service
                 // before any retry can reuse it.
                 self.invalidate_connection(server_name, &connection).await;
-                return Err(anyhow!(
+                return Err(anyhow!(crate::error::Interrupted::timed_out(format!(
                     "MCP server '{server_name}' timed out after {}s while running tool '{tool_name}'",
                     MCP_IO_TIMEOUT.as_secs()
-                ));
+                ))));
             }
             CancellationResult::Cancelled => {
                 // Dropping only the call future does not stop a stdio
@@ -680,9 +680,9 @@ impl McpRegistry {
                 // connection so a later call cannot reuse that service and
                 // accidentally duplicate a side effect.
                 self.invalidate_connection(server_name, &connection).await;
-                return Err(anyhow!(
+                return Err(anyhow!(crate::error::Interrupted::cancelled(format!(
                     "MCP server '{server_name}' was cancelled while running tool '{tool_name}'"
-                ));
+                ))));
             }
         };
 
@@ -735,7 +735,9 @@ impl McpRegistry {
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return Err(anyhow!("MCP operation was cancelled"));
+            return Err(anyhow!(crate::error::Interrupted::cancelled(
+                "MCP operation was cancelled"
+            )));
         }
 
         loop {
@@ -788,7 +790,9 @@ impl McpRegistry {
                     if cancelled {
                         connection.shutdown().await;
                         self.remove_connection_cell(name, &cell).await;
-                        return Err(anyhow!("MCP operation was cancelled"));
+                        return Err(anyhow!(crate::error::Interrupted::cancelled(
+                            "MCP operation was cancelled"
+                        )));
                     }
                     if connection.is_closing() {
                         connection.wait_closed().await;
@@ -825,21 +829,19 @@ where
         biased;
         result = &mut serve => {
             if cancellation.is_cancelled() {
-                return Err(anyhow!("MCP operation was cancelled"));
+                return Err(anyhow!(crate::error::Interrupted::cancelled("MCP operation was cancelled")));
             }
             result.map_err(|error| anyhow!("failed to initialize MCP server '{name}': {error}"))
         }
         _ = tokio::time::sleep(MCP_IO_TIMEOUT) => {
             cancellation.cancel();
             let _ = serve.await;
-            Err(anyhow!(
-                "timed out after {}s while initializing MCP server '{name}'",
-                MCP_IO_TIMEOUT.as_secs()
-            ))
+            Err(anyhow!(crate::error::Interrupted::timed_out(format!("timed out after {}s while initializing MCP server '{name}'",
+                MCP_IO_TIMEOUT.as_secs()))))
         }
         _ = cancellation.cancelled() => {
             let _ = serve.await;
-            Err(anyhow!("MCP operation was cancelled"))
+            Err(anyhow!(crate::error::Interrupted::cancelled("MCP operation was cancelled")))
         }
     }
 }
@@ -1370,7 +1372,9 @@ async fn connect(
     cancellation: CancellationToken,
 ) -> Result<McpConnection> {
     if cancellation.is_cancelled() {
-        return Err(anyhow!("MCP operation was cancelled"));
+        return Err(anyhow!(crate::error::Interrupted::cancelled(
+            "MCP operation was cancelled"
+        )));
     }
     match transport {
         config::McpTransport::Stdio {
@@ -1543,13 +1547,15 @@ async fn list_all_tools(
         {
             CancellationResult::Completed(Ok(result)) => result,
             CancellationResult::Completed(Err(error)) => {
-                return Err(anyhow!(
+                return Err(anyhow!(crate::error::Interrupted::timed_out(format!(
                     "MCP server timed out after {}s while listing tools (page {pages}): {error}",
                     MCP_IO_TIMEOUT.as_secs()
-                ));
+                ))));
             }
             CancellationResult::Cancelled => {
-                return Err(anyhow!("MCP operation was cancelled while listing tools"));
+                return Err(anyhow!(crate::error::Interrupted::cancelled(
+                    "MCP operation was cancelled while listing tools"
+                )));
             }
         };
         let result = result.map_err(|error| anyhow!("{error}"))?;

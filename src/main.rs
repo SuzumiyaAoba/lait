@@ -1,9 +1,9 @@
-use async_openai::error::OpenAIError;
 use clap::Parser;
 
 mod agent;
 mod app;
 mod assert;
+mod async_cache;
 mod async_io;
 mod attachment;
 mod cache;
@@ -16,6 +16,7 @@ mod docgen;
 mod doctor;
 mod dotenv;
 mod engine;
+mod error;
 mod eval;
 mod frontmatter;
 mod history;
@@ -30,6 +31,7 @@ mod models;
 mod nesting;
 mod process;
 mod prompt;
+mod registry;
 mod render;
 mod repl;
 mod report;
@@ -40,6 +42,7 @@ mod session;
 mod shell_tool;
 mod signal;
 mod skill;
+mod storage;
 mod subagent;
 mod template;
 mod test_run;
@@ -72,8 +75,7 @@ fn main() {
     let cli = cli::Cli::parse();
     logging::init(cli.verbose);
     // Captured before `cli` is moved into `run_blocking`/`run` below — the
-    // one classification `classify_error` can't reliably do from the
-    // rendered message alone (see `ExitKind::Validation`'s doc).
+    // command-specific exit policy: all lint failures are validation errors.
     let is_lint = matches!(cli.command, Some(cli::Command::Lint(_)));
 
     // The purely local subcommands (completions/man/init/lint/local models)
@@ -102,72 +104,14 @@ fn main() {
     }
 }
 
-/// The exit codes the design plan's B-3 defines. 0 (success) and 2 (a clap
-/// usage/parse error, or `--help`/`--version`) never reach this type: clap's
-/// own `Cli::parse()` above already exits with those before this file's code
-/// ever sees a `Result`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExitKind {
-    /// Anything not classified below.
-    General = 1,
-    /// A `lait lint` finding, or a workflow/agent file that failed to parse
-    /// (`serde_yaml::Error` in the error chain — the same type
-    /// `workflow::parse_workflow`/`agent::load_agent` already propagate via
-    /// `?`, so this needs no source changes to detect).
-    Validation = 3,
-    /// An HTTP/auth/rate-limit failure from the model endpoint.
-    /// `async_openai::error::OpenAIError` already flows through
-    /// `llm::complete`/`complete_stream`/the streamed-chunk path untouched,
-    /// so downcasting for it costs nothing extra at the call sites either.
-    ModelApi = 4,
-    /// A step/request timeout, or a cancelled run (Ctrl+C).
-    Interrupted = 5,
-}
-
-/// Classifies `error` for [`ExitKind`]. `is_lint` is passed separately
-/// (`main`'s only caller checks `cli.command` before it's moved into
-/// `run_blocking`/`run`) because a `lait lint` failure is `Validation` by
-/// definition, regardless of what its message says — the other three
-/// non-`General` kinds below are detected from `error` itself.
-///
-/// Timeout/cancellation (`async_io.rs`/`mcp.rs`/`llm.rs`/`workflow/exec.rs`,
-/// around forty call sites) are still plain `anyhow!`/`bail!` strings, not a
-/// typed error — giving every one of them a dedicated type is a bigger,
-/// separate refactor than this lightweight classifier justifies (see the
-/// design plan's own "no `thiserror` rewrite" call for B-3). They all
-/// consistently say "cancelled" or "timed out", so `Interrupted` is
-/// detected from the rendered message instead; a future message that stops
-/// saying either of those falls back to `General` rather than
-/// misclassifying as something worse.
-fn classify_error(error: &anyhow::Error, is_lint: bool) -> ExitKind {
-    if is_lint {
-        return ExitKind::Validation;
-    }
-    if error.chain().any(|cause| cause.is::<OpenAIError>()) {
-        return ExitKind::ModelApi;
-    }
-    let rendered = format!("{error:#}");
-    if rendered.contains("cancelled") || rendered.contains("timed out") {
-        return ExitKind::Interrupted;
-    }
-    if error.chain().any(|cause| cause.is::<serde_yaml::Error>()) {
-        return ExitKind::Validation;
-    }
-    ExitKind::General
-}
-
 fn exit_with_error(error: anyhow::Error, is_lint: bool) -> ! {
     eprintln!("lait: {error:#}");
-    // A graceful (single) Ctrl-C cancels the same way a step's own
-    // `timeout:` does — both render as "cancelled"/"timed out" and would
-    // otherwise both land on `ExitKind::Interrupted`'s generic 5 — so a real
-    // user interrupt is detected out-of-band (`signal::received`) and given
-    // the conventional SIGINT exit code instead. A *second* Ctrl-C never
-    // reaches here at all: `signal::spawn_handler` exits directly.
+    // An explicit SIGINT keeps the conventional shell exit code; execution
+    // deadlines and programmatic cancellation use the typed error policy.
     let code = if signal::received() {
         signal::SIGINT_EXIT_CODE
     } else {
-        classify_error(&error, is_lint) as i32
+        error::classify(&error, is_lint) as i32
     };
     std::process::exit(code);
 }

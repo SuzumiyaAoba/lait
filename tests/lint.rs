@@ -1,5 +1,30 @@
 mod support;
 
+#[test]
+fn all_formats_report_file_and_config_errors_from_the_same_analysis() {
+    let config = support::ConfigDirectory::new(
+        "api_key: first\napi_key_cmd: [echo, second]\nworkflows:\n  missing: nonexistent.yml\n",
+    );
+    let workflow = support::WorkflowFile::new("steps: []\n");
+    for format in ["text", "json", "github"] {
+        let output = support::test_command()
+            .current_dir(config.path())
+            .args(["lint", "--format", format])
+            .arg(&workflow.path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{format}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in ["missing", "api_key", "step"] {
+            assert!(stdout.contains(expected), "{format}: {stdout}");
+        }
+        if format == "json" {
+            let findings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(findings.as_array().unwrap().len() >= 3, "{findings}");
+        }
+    }
+}
+
 use support::{
     AgentMarkdownFile, ConfigDirectory, WorkflowFile, next_temp_path, run_lait_lint, test_command,
 };

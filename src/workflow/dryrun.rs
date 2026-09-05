@@ -239,10 +239,11 @@ fn print_node(
         }
     }
 
-    if let Some(filter) = node.jq() {
+    let settings = node.settings();
+    if let Some(filter) = settings.jq {
         println!("{inner}jq: {filter}");
     }
-    if let Some(path) = node.write_file() {
+    if let Some(path) = settings.write_file {
         println!("{inner}write_file: {}", path.display());
     }
 

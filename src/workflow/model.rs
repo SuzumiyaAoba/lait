@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -55,7 +58,7 @@ pub(crate) struct WorkflowFile {
 /// fallback as `lait.config.yml`'s `default:` (see
 /// `config::DefaultSettings`), plus a workflow-only `retry`/`timeout`
 /// fallback applied to any step that calls a model (`prompt`/`agent`) and
-/// doesn't set its own (see `NodeDefinition::retry`/`timeout`). Kept as its
+/// doesn't set its own (see `NodeDefinition::settings`). Kept as its
 /// own type rather than reusing `config::DefaultSettings` (`#[serde(flatten)]`
 /// is documented as incompatible with `#[serde(deny_unknown_fields)]`, which
 /// both this and `DefaultSettings` rely on to reject typos).
@@ -153,10 +156,10 @@ impl WorkflowDefaults {
 /// `flatten` is documented as incompatible with `deny_unknown_fields` (see
 /// `WorkflowDefaults`'s doc comment, which hit the same constraint first),
 /// and losing the typo-rejection this DSL leans on for every field would
-/// cost far more than the duplication does. `NodeDefinition`'s own methods
-/// below (`model`/`jq`/`retry`/... ) read through to whichever variant has
-/// that field, `None` for one that doesn't, so most call sites outside
-/// `workflow::validate`/`workflow::exec` never have to match on the variant
+/// cost far more than the duplication does. `NodeDefinition::settings` below
+/// exposes whichever shared fields a variant has as a borrowed view, with
+/// `None` for fields that do not apply, so generic consumers outside the
+/// variant-specific execution branches never have to match on the variant
 /// themselves.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -167,6 +170,69 @@ pub(crate) enum NodeDefinition {
     Command(CommandNode),
     Transform(TransformNode),
     Ask(AskNode),
+}
+
+/// The action kind encoded by a node's `type:` field.
+///
+/// Keeping this classification separate from [`NodeDefinition`] lets callers
+/// ask questions about a node's behavior without repeating a variant match.
+/// The variants still carry the parsed fields; this enum only represents the
+/// stable, field-independent part of the node contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeKind {
+    Prompt,
+    Agent,
+    Workflow,
+    Command,
+    Transform,
+    Ask,
+}
+
+impl NodeKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Agent => "agent",
+            Self::Workflow => "workflow",
+            Self::Command => "command",
+            Self::Transform => "transform",
+            Self::Ask => "ask",
+        }
+    }
+
+    pub(crate) const fn calls_model(self) -> bool {
+        matches!(self, Self::Prompt | Self::Agent)
+    }
+
+    pub(crate) const fn requires_interactive_stdin(self) -> bool {
+        matches!(self, Self::Ask)
+    }
+}
+
+/// Borrowed settings shared by node execution, validation, and presentation.
+///
+/// The YAML structs intentionally keep their fields variant-specific so
+/// `deny_unknown_fields` can reject a setting on the wrong `type:`. This view
+/// provides the opposite side of that boundary: consumers that only need
+/// effective node metadata can read one uniform shape without repeating a
+/// six-variant match for every field. Fields that do not apply to a variant
+/// are represented as `None`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NodeSettings<'a> {
+    pub(crate) model: Option<&'a str>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) max_tokens: Option<u32>,
+    pub(crate) mcp: Option<&'a [String]>,
+    pub(crate) max_tool_rounds: Option<usize>,
+    pub(crate) skills: Option<&'a [String]>,
+    pub(crate) subagents: Option<&'a [String]>,
+    pub(crate) tools: Option<&'a [String]>,
+    pub(crate) retry: Option<&'a RetryDefinition>,
+    pub(crate) timeout: Option<u64>,
+    pub(crate) jq: Option<&'a str>,
+    pub(crate) write_file: Option<&'a Path>,
 }
 
 /// `type: prompt` — sends `prompt` (rendered as a handlebars template) and/or
@@ -403,6 +469,18 @@ pub(crate) struct AskNode {
 }
 
 impl NodeDefinition {
+    /// Returns the stable action kind represented by this node.
+    pub(crate) fn kind(&self) -> NodeKind {
+        match self {
+            Self::Prompt(_) => NodeKind::Prompt,
+            Self::Agent(_) => NodeKind::Agent,
+            Self::Workflow(_) => NodeKind::Workflow,
+            Self::Command(_) => NodeKind::Command,
+            Self::Transform(_) => NodeKind::Transform,
+            Self::Ask(_) => NodeKind::Ask,
+        }
+    }
+
     /// Whether this node's action is a model call that participates in the
     /// node > agent file > workflow `default:` sampling/capability/retry/
     /// timeout fallback chain (see `workflow::exec::resolve_step_settings`) —
@@ -413,181 +491,79 @@ impl NodeDefinition {
     /// still set its own `retry`/`timeout` explicitly — they just never
     /// inherit the workflow's `default.retry`/`default.timeout`.
     pub(crate) fn calls_model(&self) -> bool {
-        matches!(self, NodeDefinition::Prompt(_) | NodeDefinition::Agent(_))
+        self.kind().calls_model()
     }
 
-    pub(crate) fn model(&self) -> Option<&str> {
+    /// Returns the settings visible to generic node consumers. The view is
+    /// borrowed from this definition and therefore does not clone any model
+    /// aliases, capability lists, retry policy, or output paths.
+    pub(crate) fn settings(&self) -> NodeSettings<'_> {
         match self {
-            NodeDefinition::Prompt(node) => node.model.as_deref(),
-            NodeDefinition::Agent(node) => node.model.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        match self {
-            NodeDefinition::Prompt(node) => node.reasoning_effort,
-            NodeDefinition::Agent(node) => node.reasoning_effort,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn temperature(&self) -> Option<f64> {
-        match self {
-            NodeDefinition::Prompt(node) => node.temperature,
-            NodeDefinition::Agent(node) => node.temperature,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn top_p(&self) -> Option<f64> {
-        match self {
-            NodeDefinition::Prompt(node) => node.top_p,
-            NodeDefinition::Agent(node) => node.top_p,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn max_tokens(&self) -> Option<u32> {
-        match self {
-            NodeDefinition::Prompt(node) => node.max_tokens,
-            NodeDefinition::Agent(node) => node.max_tokens,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn mcp(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.mcp.as_deref(),
-            NodeDefinition::Agent(node) => node.mcp.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn max_tool_rounds(&self) -> Option<usize> {
-        match self {
-            NodeDefinition::Prompt(node) => node.max_tool_rounds,
-            NodeDefinition::Agent(node) => node.max_tool_rounds,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn skills(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.skills.as_deref(),
-            NodeDefinition::Agent(node) => node.skills.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn subagents(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.subagents.as_deref(),
-            NodeDefinition::Agent(node) => node.subagents.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn tools(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.tools.as_deref(),
-            NodeDefinition::Agent(node) => node.tools.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    /// `retry`/`timeout` have no fallback of their own (unlike sampling/
-    /// capability knobs above): `Workflow` has neither field at all, and
-    /// `Command`/`Transform` may set their own but never inherit
-    /// `default.retry`/`default.timeout` (see `calls_model`'s doc comment).
-    pub(crate) fn retry(&self) -> Option<&RetryDefinition> {
-        match self {
-            NodeDefinition::Prompt(node) => node.retry.as_ref(),
-            NodeDefinition::Agent(node) => node.retry.as_ref(),
-            NodeDefinition::Workflow(_) => None,
-            NodeDefinition::Command(node) => node.retry.as_ref(),
-            NodeDefinition::Transform(node) => node.retry.as_ref(),
-            NodeDefinition::Ask(node) => node.retry.as_ref(),
-        }
-    }
-
-    pub(crate) fn timeout(&self) -> Option<u64> {
-        match self {
-            NodeDefinition::Prompt(node) => node.timeout,
-            NodeDefinition::Agent(node) => node.timeout,
-            NodeDefinition::Workflow(_) => None,
-            NodeDefinition::Command(node) => node.timeout,
-            NodeDefinition::Transform(node) => node.timeout,
-            NodeDefinition::Ask(node) => node.timeout,
-        }
-    }
-
-    /// A jq filter applied to this node's output, common to every variant.
-    pub(crate) fn jq(&self) -> Option<&str> {
-        match self {
-            NodeDefinition::Prompt(node) => node.jq.as_deref(),
-            NodeDefinition::Agent(node) => node.jq.as_deref(),
-            NodeDefinition::Workflow(node) => node.jq.as_deref(),
-            NodeDefinition::Command(node) => node.jq.as_deref(),
-            NodeDefinition::Transform(node) => node.jq.as_deref(),
-            NodeDefinition::Ask(node) => node.jq.as_deref(),
-        }
-    }
-
-    /// Where this node's output (after `jq`, if set) is written, common to
-    /// every variant.
-    pub(crate) fn write_file(&self) -> Option<&std::path::Path> {
-        match self {
-            NodeDefinition::Prompt(node) => node.write_file.as_deref(),
-            NodeDefinition::Agent(node) => node.write_file.as_deref(),
-            NodeDefinition::Workflow(node) => node.write_file.as_deref(),
-            NodeDefinition::Command(node) => node.write_file.as_deref(),
-            NodeDefinition::Transform(node) => node.write_file.as_deref(),
-            NodeDefinition::Ask(node) => node.write_file.as_deref(),
+            Self::Prompt(node) => NodeSettings {
+                model: node.model.as_deref(),
+                reasoning_effort: node.reasoning_effort,
+                temperature: node.temperature,
+                top_p: node.top_p,
+                max_tokens: node.max_tokens,
+                mcp: node.mcp.as_deref(),
+                max_tool_rounds: node.max_tool_rounds,
+                skills: node.skills.as_deref(),
+                subagents: node.subagents.as_deref(),
+                tools: node.tools.as_deref(),
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+            },
+            Self::Agent(node) => NodeSettings {
+                model: node.model.as_deref(),
+                reasoning_effort: node.reasoning_effort,
+                temperature: node.temperature,
+                top_p: node.top_p,
+                max_tokens: node.max_tokens,
+                mcp: node.mcp.as_deref(),
+                max_tool_rounds: node.max_tool_rounds,
+                skills: node.skills.as_deref(),
+                subagents: node.subagents.as_deref(),
+                tools: node.tools.as_deref(),
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+            },
+            Self::Workflow(node) => NodeSettings {
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
+            Self::Command(node) => NodeSettings {
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
+            Self::Transform(node) => NodeSettings {
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
+            Self::Ask(node) => NodeSettings {
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
         }
     }
 
     /// This variant's `type:` name as it appears in a workflow YAML file
     /// (and in `lait run --dry-run`/`lait graph` output).
     pub(crate) fn type_name(&self) -> &'static str {
-        match self {
-            NodeDefinition::Prompt(_) => "prompt",
-            NodeDefinition::Agent(_) => "agent",
-            NodeDefinition::Workflow(_) => "workflow",
-            NodeDefinition::Command(_) => "command",
-            NodeDefinition::Transform(_) => "transform",
-            NodeDefinition::Ask(_) => "ask",
-        }
+        self.kind().as_str()
     }
 
     /// Whether this node reads from the process's own stdin when it runs —
@@ -598,7 +574,7 @@ impl NodeDefinition {
     /// `validate::validate_steps`'s concurrency-safety checks, which reject
     /// this the same way they reject a concurrent `write_file`).
     pub(crate) fn requires_interactive_stdin(&self) -> bool {
-        matches!(self, NodeDefinition::Ask(_))
+        self.kind().requires_interactive_stdin()
     }
 }
 
@@ -690,6 +666,14 @@ impl FlowStep {
 /// The step kinds that route to nested `steps` instead of acting directly on
 /// their own input, borrowed out of whichever of `FlowStep::switch`/
 /// `parallel`/`loop`/`for_each` is set. See `FlowStep::router`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouterKind {
+    Switch,
+    Parallel,
+    Loop,
+    ForEach,
+}
+
 pub(crate) enum Router<'a> {
     Switch(&'a SwitchDefinition),
     Parallel(&'a ParallelDefinition),
@@ -698,24 +682,51 @@ pub(crate) enum Router<'a> {
 }
 
 impl FlowStep {
-    /// Which router kind this site is, if any. `validate::validate_steps`
-    /// checks `switch`/`parallel`/`loop`/`for_each` are not set together
-    /// before ever calling this (see its `router_count` check), so checking
-    /// them in a fixed order here is safe; called on a site that hasn't been
-    /// through that check, it would silently prefer the first one set.
+    /// Returns the configured router kind, if this step has one.
+    ///
+    /// This is the single source of truth for router presence. An ambiguous
+    /// step (more than one router field set) returns `None`, so callers cannot
+    /// accidentally execute whichever router happens to come first. Validation
+    /// uses [`Self::router_count`] to report that malformed shape explicitly.
+    pub(crate) fn router_kind(&self) -> Option<RouterKind> {
+        if self.router_count() != 1 {
+            return None;
+        }
+        if self.switch.is_some() {
+            return Some(RouterKind::Switch);
+        }
+        if self.parallel.is_some() {
+            return Some(RouterKind::Parallel);
+        }
+        if self.r#loop.is_some() {
+            return Some(RouterKind::Loop);
+        }
+        self.for_each.as_ref().map(|_| RouterKind::ForEach)
+    }
+
+    /// Counts router fields set on this step. A valid step has zero or one;
+    /// the count is exposed so validation does not duplicate the field list
+    /// that `router_kind()` owns.
+    pub(crate) fn router_count(&self) -> usize {
+        usize::from(self.switch.is_some())
+            + usize::from(self.parallel.is_some())
+            + usize::from(self.r#loop.is_some())
+            + usize::from(self.for_each.is_some())
+    }
+
+    /// Which router kind this site is, if exactly one router field is set.
+    /// `validate::validate_steps` reports the more useful field-level error
+    /// before execution, while this method remains safe for any caller that
+    /// receives an unvalidated `FlowStep`.
     /// `validate_steps` and `run_steps` both match on this so a new router
     /// kind requires updating both.
     pub(crate) fn router(&self) -> Option<Router<'_>> {
-        if let Some(switch) = &self.switch {
-            return Some(Router::Switch(switch));
+        match self.router_kind()? {
+            RouterKind::Switch => self.switch.as_ref().map(Router::Switch),
+            RouterKind::Parallel => self.parallel.as_ref().map(Router::Parallel),
+            RouterKind::Loop => self.r#loop.as_ref().map(Router::Loop),
+            RouterKind::ForEach => self.for_each.as_ref().map(Router::ForEach),
         }
-        if let Some(parallel) = &self.parallel {
-            return Some(Router::Parallel(parallel));
-        }
-        if let Some(loop_def) = &self.r#loop {
-            return Some(Router::Loop(loop_def));
-        }
-        self.for_each.as_ref().map(Router::ForEach)
     }
 }
 
