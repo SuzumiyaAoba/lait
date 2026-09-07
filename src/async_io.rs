@@ -499,6 +499,9 @@ pub(crate) fn read_file_with_budget(
     }
 
     #[cfg(not(unix))]
+    let _ = wait_for_fifo_writer;
+
+    #[cfg(not(unix))]
     let mut file = File::open(path)?;
 
     #[cfg(not(unix))]
@@ -518,13 +521,18 @@ fn read_from_file(
     max_bytes: usize,
     budget: &ReadBudget,
 ) -> Result<Vec<u8>> {
+    #[cfg(not(unix))]
+    let _ = (wait_for_fifo_writer, fifo_path);
+
     const CHUNK_SIZE: usize = 64 * 1024;
     let mut contents = Vec::new();
-    // `poll` reports POLLHUP on a non-blocking FIFO while no writer exists.
-    // Keep that state separate from the post-connection EOF state: after a
-    // writer has been observed, an empty FIFO must finish with EOF exactly as
-    // a blocking read would.
+    // A nonblocking reader can see EOF before any writer connects. Keep that
+    // initial state separate from EOF after an observed writer or data, so
+    // waiting reads do not incorrectly return an empty file at startup.
+    #[cfg(unix)]
     let mut fifo_writer_seen = !wait_for_fifo_writer;
+    #[cfg(not(unix))]
+    let fifo_writer_seen = true;
     let mut buffer = [0_u8; CHUNK_SIZE];
 
     loop {
@@ -824,7 +832,7 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let file = OpenOptions::new().write(true).create(true).open(path)?;
+        let mut file = OpenOptions::new().write(true).create(true).open(path)?;
         if !file.metadata()?.file_type().is_file() {
             bail!(
                 "refusing to write non-regular output path '{}'",
@@ -910,9 +918,11 @@ fn write_nonblocking_special_file(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::read_file_wait_for_fifo_writer;
     use super::{
-        ReadBudget, acquire_path_lock, read_file, read_file_wait_for_fifo_writer,
-        run_blocking_with_path_lock, run_blocking_with_pool, write_output_file,
+        ReadBudget, acquire_path_lock, read_file, run_blocking_with_path_lock,
+        run_blocking_with_pool, write_output_file,
     };
     use std::{
         fs::{self, OpenOptions},
@@ -1374,9 +1384,9 @@ mod tests {
             .expect("mkfifo should be available on Unix");
         assert!(status.success());
 
-        // Keep a reader open without consuming anything. The first writer
-        // therefore fills the pipe and remains blocked, which makes a
-        // detached writer observable when the retry starts.
+        // Keep the reader open for the whole test. It pauses after observing
+        // the first byte so the first writer fills the pipe, but it never
+        // treats an EOF gap between writers as the end of the test.
         let reader = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -1384,59 +1394,132 @@ mod tests {
             .expect("FIFO reader should open without a writer");
         let first_output = "x".repeat(512 * 1024);
         let retry_output = "y".repeat(512 * 1024);
-        let cancel_token = CancellationToken::new();
-        let first_path = path.clone();
-        let first_output_for_task = first_output.clone();
-        let first_token = cancel_token.clone();
-        let first = tokio::spawn(async move {
-            write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cancel_token.cancel();
-        let first_result = tokio::time::timeout(Duration::from_secs(1), first)
-            .await
-            .expect("cancelling the first FIFO writer should finish promptly")
-            .unwrap();
-        assert!(first_result.is_err());
-
-        // Start the retry while the reader is still paused. If the first
-        // writer was not joined above, both writers will eventually publish
-        // their complete payload into the same FIFO.
-        let second_path = path.clone();
-        let second_output = retry_output.clone();
-        let second =
-            tokio::spawn(
-                async move { write_output_file(&second_path, &second_output, None).await },
-            );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let (read_done, read_result) = mpsc::channel();
+        let reader_may_drain = Arc::new(AtomicBool::new(false));
+        let retry_done = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let reader_may_drain_flag = Arc::clone(&reader_may_drain);
+        let reader_retry_done = Arc::clone(&retry_done);
+        let reader_stop = Arc::clone(&stop_reader);
+        let (reader_done, reader_result) = mpsc::channel();
+        let (first_byte_sender, first_byte_receiver) = tokio::sync::oneshot::channel();
         let reader_thread = std::thread::spawn(move || {
             let mut reader = reader;
             let mut received = Vec::new();
             let mut buffer = [0_u8; 16 * 1024];
-            loop {
+            let mut first_byte_reported = false;
+            let mut first_byte_sender = Some(first_byte_sender);
+            let result = loop {
+                if reader_stop.load(Ordering::Acquire) {
+                    break Ok(received);
+                }
                 match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => received.extend_from_slice(&buffer[..read]),
+                    Ok(0) => {
+                        if reader_retry_done.load(Ordering::Acquire) {
+                            break Ok(received);
+                        }
+                        // A FIFO reports EOF while the first writer has
+                        // closed and before the retry writer opens it. Keep
+                        // the descriptor alive until the retry is known done.
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(read) => {
+                        received.extend_from_slice(&buffer[..read]);
+                        if !first_byte_reported {
+                            first_byte_reported = true;
+                            let _ = first_byte_sender
+                                .take()
+                                .expect("first-byte notification sender is live")
+                                .send(());
+                            // Pause after the handshake byte. This leaves the
+                            // first writer blocked in the FIFO, making the
+                            // cancellation boundary deterministic.
+                            while !reader_may_drain_flag.load(Ordering::Acquire)
+                                && !reader_stop.load(Ordering::Acquire)
+                            {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        }
+                    }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
                     }
-                    Err(error) => panic!("failed to read retry FIFO: {error}"),
+                    Err(error) => break Err(format!("failed to read retry FIFO: {error}")),
                 }
-            }
-            read_done.send(received).unwrap();
+            };
+            reader_done
+                .send(result)
+                .expect("reader result receiver is live");
         });
 
-        tokio::time::timeout(Duration::from_secs(2), second)
+        let cancel_token = CancellationToken::new();
+        let first_path = path.clone();
+        let first_output_for_task = first_output.clone();
+        let first_token = cancel_token.clone();
+        let mut first = tokio::spawn(async move {
+            write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
+        });
+
+        let first_started = tokio::time::timeout(Duration::from_secs(1), first_byte_receiver)
             .await
-            .expect("the retry writer should finish after the reader drains the FIFO")
-            .unwrap()
-            .expect("the retry writer should succeed");
-        reader_thread.join().unwrap();
-        let received = read_result
-            .recv_timeout(Duration::from_secs(1))
-            .expect("FIFO reader should observe EOF after the retry writer closes");
+            .is_ok_and(|result| result.is_ok());
+        if !first_started {
+            stop_reader.store(true, Ordering::Release);
+            reader_may_drain.store(true, Ordering::Release);
+            first.abort();
+            let _ = first.await;
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            panic!("first FIFO writer did not publish the handshake byte");
+        }
+        cancel_token.cancel();
+        let first_result = tokio::time::timeout(Duration::from_secs(1), &mut first)
+            .await
+            .map(|result| result.expect("first FIFO writer task should join"));
+        if first_result.is_err() || first_result.as_ref().is_ok_and(|result| result.is_ok()) {
+            stop_reader.store(true, Ordering::Release);
+            reader_may_drain.store(true, Ordering::Release);
+            if first_result.is_err() {
+                first.abort();
+                let _ = first.await;
+            }
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            panic!("cancelling the first FIFO writer did not produce the expected failure");
+        }
+
+        // Start the retry while the reader is still open. It may now drain,
+        // but a transient EOF cannot terminate it before this writer reports
+        // completion.
+        reader_may_drain.store(true, Ordering::Release);
+        let second_path = path.clone();
+        let second_output = retry_output.clone();
+        let mut second =
+            tokio::spawn(
+                async move { write_output_file(&second_path, &second_output, None).await },
+            );
+
+        let second_result = tokio::time::timeout(Duration::from_secs(2), &mut second)
+            .await
+            .map(|result| result.expect("retry FIFO writer task should join"));
+        retry_done.store(true, Ordering::Release);
+        if second_result.is_err() {
+            stop_reader.store(true, Ordering::Release);
+            second.abort();
+            let _ = second.await;
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            panic!("the retry FIFO writer timed out");
+        }
+        if second_result.as_ref().is_ok_and(|result| result.is_err()) {
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            panic!("the retry FIFO writer failed");
+        }
+        let _ = reader_thread.join();
+        let received = reader_result
+            .recv()
+            .expect("FIFO reader should report after the retry writer closes")
+            .expect("FIFO reader should finish without an I/O error");
 
         assert!(
             received.len() >= retry_output.len(),

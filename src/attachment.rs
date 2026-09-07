@@ -252,10 +252,9 @@ fn longest_backtick_run(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        fenced_block, longest_backtick_run, read_file_attachments,
-        read_file_attachments_cancellable, resolve_image_urls,
-    };
+    #[cfg(unix)]
+    use super::read_file_attachments_cancellable;
+    use super::{fenced_block, longest_backtick_run, read_file_attachments, resolve_image_urls};
     use std::path::Path;
 
     #[tokio::test]

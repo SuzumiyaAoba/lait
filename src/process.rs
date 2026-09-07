@@ -888,7 +888,10 @@ pub(crate) fn strip_one_trailing_line_ending(mut output: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_COMMAND_OUTPUT_BYTES, run_bounded_command, run_command};
+    use super::run_command;
+    #[cfg(unix)]
+    use super::{MAX_COMMAND_OUTPUT_BYTES, run_bounded_command};
+    #[cfg(unix)]
     use std::time::Duration;
 
     #[tokio::test]

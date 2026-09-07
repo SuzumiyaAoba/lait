@@ -231,7 +231,9 @@ impl SkillCache {
 #[cfg(test)]
 mod tests {
     use super::{SkillCache, parse_skill};
-    use std::{collections::HashMap, fs, sync::Arc, time::Duration};
+    #[cfg(unix)]
+    use std::time::Duration;
+    use std::{collections::HashMap, fs, sync::Arc};
 
     #[test]
     fn parses_frontmatter_and_body() {
