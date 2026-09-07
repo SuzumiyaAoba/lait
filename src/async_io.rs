@@ -28,6 +28,8 @@ use std::os::unix::fs::FileTypeExt;
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 
+use crate::file_lock;
+
 /// A filesystem operation gets one dedicated OS thread, rather than occupying
 /// Tokio's shared blocking pool.  Keep the number of such threads bounded,
 /// though: a caller can provide a large attachment list and a slow filesystem
@@ -129,12 +131,78 @@ pub(crate) async fn acquire_path_lock(
     path: &Path,
     cancellation: Option<&CancellationToken>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let path = path.to_owned();
+    let key = run_blocking(
+        move |cancelled| output_path_identity(&path, cancelled),
+        cancellation.cloned(),
+    )
+    .await?;
     acquire_permit(
-        path_lock(path),
+        path_lock(&key),
         cancellation,
         "output path is still owned by a previous write",
     )
     .await
+}
+
+/// Resolve aliases before entering the lock table. Outputs need not exist yet;
+/// in that case normalize their parent and also follow a dangling final symlink.
+/// Filesystem resolution runs on the same bounded, cancellable worker pool as I/O.
+fn output_path_identity(path: &Path, cancelled: &AtomicBool) -> Result<PathBuf> {
+    let mut current = path.to_owned();
+    let mut suffix = Vec::new();
+    let mut links = 0;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            bail!(crate::error::Interrupted::cancelled(
+                "output path resolution was cancelled"
+            ));
+        }
+        match std::fs::canonicalize(&current) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to resolve output path '{}'", path.display())
+                });
+            }
+        }
+        if std::fs::symlink_metadata(&current)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            if links >= 40 {
+                bail!(
+                    "too many symbolic links in output path '{}'",
+                    path.display()
+                );
+            }
+            links += 1;
+            let target = std::fs::read_link(&current).with_context(|| {
+                format!("failed to read output symlink '{}'", current.display())
+            })?;
+            current = if target.is_absolute() {
+                target
+            } else {
+                current.parent().unwrap_or(Path::new(".")).join(target)
+            };
+            continue;
+        }
+        let name = current
+            .file_name()
+            .with_context(|| format!("invalid output path '{}'", path.display()))?
+            .to_owned();
+        suffix.push(name);
+        current = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_owned();
+    }
 }
 
 /// Runs a blocking operation while holding the ownership lease for `path`.
@@ -192,7 +260,7 @@ async fn acquire_permit(
             permit.context("blocking I/O permit owner was closed")
         }
         () = cancellation.cancelled() => {
-            bail!("blocking I/O was cancelled");
+            bail!(crate::error::Interrupted::cancelled("blocking I/O was cancelled"));
         }
         () = tokio::time::sleep(BLOCKING_WORKER_ACQUIRE_TIMEOUT) => {
             bail!("{saturated_message}");
@@ -241,7 +309,9 @@ where
         .is_some_and(CancellationToken::is_cancelled)
     {
         drop(permit);
-        bail!("blocking I/O was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "blocking I/O was cancelled"
+        ));
     }
 
     let (sender, mut receiver) = tokio::sync::oneshot::channel();
@@ -279,7 +349,7 @@ where
         biased;
         () = cancellation.cancelled() => {
             cancel_worker(&cancelled, &mut receiver).await;
-            bail!("blocking I/O was cancelled");
+            bail!(crate::error::Interrupted::cancelled("blocking I/O was cancelled"));
         }
         result = &mut receiver => {
             let result = result.context("blocking I/O worker was cancelled")??;
@@ -397,7 +467,9 @@ pub(crate) fn read_file_with_budget(
     wait_for_fifo_writer: bool,
 ) -> Result<Vec<u8>> {
     if cancelled.load(Ordering::Acquire) {
-        bail!("file read was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "file read was cancelled"
+        ));
     }
 
     #[cfg(unix)]
@@ -427,6 +499,9 @@ pub(crate) fn read_file_with_budget(
     }
 
     #[cfg(not(unix))]
+    let _ = wait_for_fifo_writer;
+
+    #[cfg(not(unix))]
     let mut file = File::open(path)?;
 
     #[cfg(not(unix))]
@@ -446,18 +521,25 @@ fn read_from_file(
     max_bytes: usize,
     budget: &ReadBudget,
 ) -> Result<Vec<u8>> {
+    #[cfg(not(unix))]
+    let _ = (wait_for_fifo_writer, fifo_path);
+
     const CHUNK_SIZE: usize = 64 * 1024;
     let mut contents = Vec::new();
-    // `poll` reports POLLHUP on a non-blocking FIFO while no writer exists.
-    // Keep that state separate from the post-connection EOF state: after a
-    // writer has been observed, an empty FIFO must finish with EOF exactly as
-    // a blocking read would.
+    // A nonblocking reader can see EOF before any writer connects. Keep that
+    // initial state separate from EOF after an observed writer or data, so
+    // waiting reads do not incorrectly return an empty file at startup.
+    #[cfg(unix)]
     let mut fifo_writer_seen = !wait_for_fifo_writer;
+    #[cfg(not(unix))]
+    let fifo_writer_seen = true;
     let mut buffer = [0_u8; CHUNK_SIZE];
 
     loop {
         if cancelled.load(Ordering::Acquire) {
-            bail!("file read was cancelled");
+            bail!(crate::error::Interrupted::cancelled(
+                "file read was cancelled"
+            ));
         }
 
         #[cfg(unix)]
@@ -515,6 +597,7 @@ fn read_from_file(
                 budget.claim(read)?;
                 contents.extend_from_slice(&buffer[..read]);
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -539,63 +622,50 @@ fn wait_for_fifo_event(file: &mut File, path: &Path) -> Result<FifoEvent> {
         events: libc::POLLIN | libc::POLLERR,
         revents: 0,
     };
-    loop {
-        // A short poll interval lets the cancellation check in the caller
-        // run even while no FIFO writer exists. `poll` itself is bounded and
-        // therefore cannot recreate the old uninterruptible worker problem.
-        let result = unsafe { libc::poll(&mut pollfd, 1, 10) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                pollfd.revents = 0;
-                continue;
-            }
-            return Err(anyhow::anyhow!(
-                "polling FIFO '{}' failed: {error}",
-                path.display()
-            ));
+    // A short poll interval lets the cancellation check in the caller run
+    // even while no FIFO writer exists. `poll` itself is bounded and therefore
+    // cannot recreate the old uninterruptible worker problem.
+    let result = unsafe { libc::poll(&mut pollfd, 1, 10) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            // Return to the outer read loop so it can observe the shared
+            // cancellation flag before polling again. Re-entering this loop
+            // would let a signal storm postpone cancellation indefinitely.
+            return Ok(FifoEvent::NoWriter);
         }
-
-        // POSIX does not expose a FIFO's writer count. In particular, macOS
-        // reports no poll event for both "no writer" and "writer connected,
-        // no data". Temporarily opening a non-blocking write descriptor and
-        // then probing the reader distinguishes those states without leaving
-        // a synthetic writer attached: EOF means the probe was the only
-        // writer, WouldBlock means a real writer is still connected, and a
-        // byte is retained for the normal read loop.
-        return probe_fifo_writer(file, path);
+        return Err(anyhow::anyhow!(
+            "polling FIFO '{}' failed: {error}",
+            path.display()
+        ));
     }
+
+    // On systems exposing POLLHUP, this also observes a writer that connected
+    // and closed without leaving any bytes between our polls.
+    if pollfd.revents & libc::POLLHUP != 0 {
+        return Ok(FifoEvent::WriterConnected);
+    }
+    probe_fifo_reader(file)
 }
 
 #[cfg(unix)]
-fn probe_fifo_writer(file: &mut File, path: &Path) -> Result<FifoEvent> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    match OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(probe) => drop(probe),
-        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-            return Ok(FifoEvent::NoWriter);
-        }
-        Err(error) => return Err(error.into()),
-    }
-
+fn probe_fifo_reader(file: &mut File) -> Result<FifoEvent> {
+    // Reading an empty nonblocking FIFO returns EOF when no writer exists,
+    // and WouldBlock when a writer is connected. Do not manufacture a writer:
+    // that changes FIFO state, requires write permission, and its descriptor
+    // can be inherited transiently by concurrent process creation.
     let mut byte = [0_u8; 1];
     match file.read(&mut byte) {
         Ok(0) => {
-            // The probe was the only writer. Avoid a tight loop while waiting
-            // for a real writer to arrive (poll can return immediately for a
-            // FIFO in this state on some platforms).
             std::thread::sleep(Duration::from_millis(10));
             Ok(FifoEvent::NoWriter)
         }
         Ok(1) => Ok(FifoEvent::Data(byte[0])),
         Ok(read) => bail!("FIFO probe read an unexpected number of bytes: {read}"),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(FifoEvent::WriterConnected),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => probe_fifo_writer(file, path),
+        // Return to the outer cancellation check instead of recursively
+        // probing under a sustained stream of signals.
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(FifoEvent::NoWriter),
         Err(error) => Err(error.into()),
     }
 }
@@ -664,7 +734,11 @@ pub(crate) async fn canonicalize(
 /// this cleanup cannot itself get stuck. Regular files use the same direct
 /// create/truncate/write behavior as `fs::write`, with cancellation checks
 /// between bounded chunks so existing inode, permission, hard-link, and
-/// symlink semantics remain intact.
+/// symlink semantics remain intact. After opening a regular file, an advisory
+/// descriptor lease from [`crate::file_lock`] is held through the write so
+/// hard-link aliases and path replacement after canonicalization are serialized
+/// when the cooperating writers use the same lease. External writers that do
+/// not take an advisory lease remain outside this guarantee.
 pub(crate) async fn write_output_file(
     path: &Path,
     output: &str,
@@ -698,15 +772,19 @@ pub(crate) async fn write_output_file(
 /// attempting to write a device, named pipe, or reparse point.
 fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "output file write was cancelled"
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let file = loop {
+        let mut file = loop {
             if cancelled.load(Ordering::Acquire) {
-                bail!("output file write was cancelled");
+                bail!(crate::error::Interrupted::cancelled(
+                    "output file write was cancelled"
+                ));
             }
             match OpenOptions::new()
                 .write(true)
@@ -729,7 +807,12 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
             return write_nonblocking_special_file(file, output, cancelled);
         }
 
-        write_regular_output_file(file, output, cancelled)
+        // The canonical path lease above serializes aliases we can resolve by
+        // name. This second, advisory descriptor lease covers hard links and
+        // symlink replacement after path resolution. It is acquired before
+        // truncate and held through the entire regular-file write.
+        let _lease = file_lock::ExclusiveLease::acquire(&file, cancelled)?;
+        write_regular_output_file(&mut file, output, cancelled)
     }
 
     #[cfg(not(unix))]
@@ -750,23 +833,29 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let file = OpenOptions::new().write(true).create(true).open(path)?;
+        let mut file = OpenOptions::new().write(true).create(true).open(path)?;
         if !file.metadata()?.file_type().is_file() {
             bail!(
                 "refusing to write non-regular output path '{}'",
                 path.display()
             );
         }
-        write_regular_output_file(file, output, cancelled)
+        // Keep the descriptor lease on the opened regular file until the
+        // write returns; this also covers every failure path before/after
+        // truncation without relying on the path name remaining stable.
+        let _lease = file_lock::ExclusiveLease::acquire(&file, cancelled)?;
+        write_regular_output_file(&mut file, output, cancelled)
     }
 }
 
 /// Writes an ordinary file directly, preserving the target inode and the
 /// overwrite/permission behavior of `fs::write`. Chunking only exists to give
 /// a timed worker a bounded opportunity to observe cancellation.
-fn write_regular_output_file(mut file: File, output: &str, cancelled: &AtomicBool) -> Result<()> {
+fn write_regular_output_file(file: &mut File, output: &str, cancelled: &AtomicBool) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "output file write was cancelled"
+        ));
     }
     // Truncate only after the handle has been classified as a regular file.
     // A timeout after this point intentionally leaves an empty/partial file:
@@ -777,13 +866,17 @@ fn write_regular_output_file(mut file: File, output: &str, cancelled: &AtomicBoo
     file.set_len(0)?;
     for chunk in output.as_bytes().chunks(64 * 1024) {
         if cancelled.load(Ordering::Acquire) {
-            bail!("output file write was cancelled");
+            bail!(crate::error::Interrupted::cancelled(
+                "output file write was cancelled"
+            ));
         }
         file.write_all(chunk)?;
     }
     file.flush()?;
     if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "output file write was cancelled"
+        ));
     }
     Ok(())
 }
@@ -803,31 +896,64 @@ fn write_nonblocking_special_file(
     let mut offset = 0;
     while offset < bytes.len() {
         if cancelled.load(Ordering::Acquire) {
-            bail!("output file write was cancelled");
+            bail!(crate::error::Interrupted::cancelled(
+                "output file write was cancelled"
+            ));
         }
         match file.write(&bytes[offset..]) {
             Ok(0) => bail!("output file write made no progress"),
             Ok(written) => offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+                wait_for_writable(&file)?;
             }
             Err(error) => return Err(error.into()),
         }
     }
     if cancelled.load(Ordering::Acquire) {
-        bail!("output file write was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "output file write was cancelled"
+        ));
     }
     Ok(())
 }
 
+#[cfg(unix)]
+fn wait_for_writable(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut pollfd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
+        revents: 0,
+    };
+    // Keep the poll bounded so the caller can re-check its cancellation flag
+    // between waits. When the reader drains the FIFO, POLLOUT wakes this
+    // worker immediately instead of adding another fixed sleep.
+    let result = unsafe { libc::poll(&mut pollfd, 1, 10) };
+    if result >= 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::Interrupted {
+        // Return to the writer loop so it can check cancellation before
+        // attempting another write. This keeps the poll wait bounded even
+        // when signals repeatedly interrupt poll(2).
+        return Ok(());
+    }
+    Err(error).context("polling output file for writability failed")
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::read_file_wait_for_fifo_writer;
     use super::{
-        ReadBudget, acquire_path_lock, read_file, read_file_wait_for_fifo_writer,
-        run_blocking_with_path_lock, run_blocking_with_pool, write_output_file,
+        ReadBudget, acquire_path_lock, read_file, run_blocking_with_path_lock,
+        run_blocking_with_pool, write_output_file,
     };
     use std::{
-        fs,
+        fs::{self, OpenOptions},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1045,9 +1171,15 @@ mod tests {
             )));
         }
 
+        let mut successful_tasks = 0;
         for task in tasks {
-            task.await.unwrap().unwrap();
+            match task.await.unwrap() {
+                Ok(()) => successful_tasks += 1,
+                Err(error) if error.to_string().contains("saturated") => {}
+                Err(error) => panic!("unexpected worker failure: {error:#}"),
+            }
         }
+        assert!(successful_tasks > 0, "at least one worker must be admitted");
         assert!(
             maximum.load(Ordering::Acquire) <= super::MAX_BLOCKING_WORKERS,
             "too many blocking workers ran concurrently: {}",
@@ -1204,6 +1336,71 @@ mod tests {
         assert_eq!(contents, "original");
     }
 
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn hardlink_writers_publish_one_complete_payload() {
+        let dir = crate::test_support::unique_temp_path("lait-hardlink-writers", "");
+        fs::create_dir(&dir).unwrap();
+        let first_path = dir.join("first.txt");
+        let second_path = dir.join("second.txt");
+        fs::write(&first_path, "seed").unwrap();
+        fs::hard_link(&first_path, &second_path).unwrap();
+
+        let first_output = "A".repeat(2 * 1024 * 1024);
+        let second_output = "B".repeat(2 * 1024 * 1024);
+        let (first, second) = tokio::join!(
+            write_output_file(&first_path, &first_output, None),
+            write_output_file(&second_path, &second_output, None),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let written = fs::read(&first_path).unwrap();
+        assert!(
+            written == first_output.as_bytes() || written == second_output.as_bytes(),
+            "hardlink writes must not interleave"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cancelling_a_hardlink_writer_before_its_lease_keeps_original_contents() {
+        let dir = crate::test_support::unique_temp_path("lait-hardlink-cancel", "");
+        fs::create_dir(&dir).unwrap();
+        let first_path = dir.join("first.txt");
+        let second_path = dir.join("second.txt");
+        fs::write(&first_path, "original").unwrap();
+        fs::hard_link(&first_path, &second_path).unwrap();
+
+        let held_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&first_path)
+            .unwrap();
+        let held_cancelled = AtomicBool::new(false);
+        let _held_lease =
+            crate::file_lock::ExclusiveLease::acquire(&held_file, &held_cancelled).unwrap();
+
+        let cancellation = CancellationToken::new();
+        let writer_path = second_path.clone();
+        let writer_cancellation = cancellation.clone();
+        let writer = tokio::spawn(async move {
+            write_output_file(&writer_path, "replacement", Some(writer_cancellation)).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("a contended hardlink writer should cancel promptly")
+            .unwrap();
+        assert!(result.is_err());
+        drop(_held_lease);
+        drop(held_file);
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), "original");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cancelled_fifo_write_is_joined_before_a_retry_can_write() {
@@ -1221,9 +1418,9 @@ mod tests {
             .expect("mkfifo should be available on Unix");
         assert!(status.success());
 
-        // Keep a reader open without consuming anything. The first writer
-        // therefore fills the pipe and remains blocked, which makes a
-        // detached writer observable when the retry starts.
+        // Keep the reader open for the whole test. It pauses after observing
+        // the first byte so the first writer fills the pipe, but it never
+        // treats an EOF gap between writers as the end of the test.
         let reader = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -1231,59 +1428,143 @@ mod tests {
             .expect("FIFO reader should open without a writer");
         let first_output = "x".repeat(512 * 1024);
         let retry_output = "y".repeat(512 * 1024);
-        let cancel_token = CancellationToken::new();
-        let first_path = path.clone();
-        let first_output_for_task = first_output.clone();
-        let first_token = cancel_token.clone();
-        let first = tokio::spawn(async move {
-            write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cancel_token.cancel();
-        let first_result = tokio::time::timeout(Duration::from_secs(1), first)
-            .await
-            .expect("cancelling the first FIFO writer should finish promptly")
-            .unwrap();
-        assert!(first_result.is_err());
-
-        // Start the retry while the reader is still paused. If the first
-        // writer was not joined above, both writers will eventually publish
-        // their complete payload into the same FIFO.
-        let second_path = path.clone();
-        let second_output = retry_output.clone();
-        let second =
-            tokio::spawn(
-                async move { write_output_file(&second_path, &second_output, None).await },
-            );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let (read_done, read_result) = mpsc::channel();
+        let reader_may_drain = Arc::new(AtomicBool::new(false));
+        let retry_done = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let reader_may_drain_flag = Arc::clone(&reader_may_drain);
+        let reader_retry_done = Arc::clone(&retry_done);
+        let reader_stop = Arc::clone(&stop_reader);
+        let (reader_done, reader_result) = mpsc::channel();
+        let (first_byte_sender, first_byte_receiver) = tokio::sync::oneshot::channel();
         let reader_thread = std::thread::spawn(move || {
             let mut reader = reader;
             let mut received = Vec::new();
             let mut buffer = [0_u8; 16 * 1024];
-            loop {
+            let mut first_byte_reported = false;
+            let mut first_byte_sender = Some(first_byte_sender);
+            let result = loop {
+                if reader_stop.load(Ordering::Acquire) {
+                    break Ok(received);
+                }
                 match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => received.extend_from_slice(&buffer[..read]),
+                    Ok(0) => {
+                        if reader_retry_done.load(Ordering::Acquire) {
+                            break Ok(received);
+                        }
+                        // A FIFO reports EOF while the first writer has
+                        // closed and before the retry writer opens it. Keep
+                        // the descriptor alive until the retry is known done.
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(read) => {
+                        received.extend_from_slice(&buffer[..read]);
+                        if !first_byte_reported {
+                            first_byte_reported = true;
+                            let _ = first_byte_sender
+                                .take()
+                                .expect("first-byte notification sender is live")
+                                .send(());
+                            // Pause after the handshake byte. This leaves the
+                            // first writer blocked in the FIFO, making the
+                            // cancellation boundary deterministic.
+                            while !reader_may_drain_flag.load(Ordering::Acquire)
+                                && !reader_stop.load(Ordering::Acquire)
+                            {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
                     }
-                    Err(error) => panic!("failed to read retry FIFO: {error}"),
+                    Err(error) => break Err(format!("failed to read retry FIFO: {error}")),
                 }
-            }
-            read_done.send(received).unwrap();
+            };
+            reader_done
+                .send(result)
+                .expect("reader result receiver is live");
         });
 
-        tokio::time::timeout(Duration::from_secs(2), second)
+        let cancel_token = CancellationToken::new();
+        let first_path = path.clone();
+        let first_output_for_task = first_output.clone();
+        let first_token = cancel_token.clone();
+        let mut first = tokio::spawn(async move {
+            write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
+        });
+
+        let first_started = tokio::time::timeout(Duration::from_secs(1), first_byte_receiver)
             .await
-            .expect("the retry writer should finish after the reader drains the FIFO")
-            .unwrap()
-            .expect("the retry writer should succeed");
-        reader_thread.join().unwrap();
-        let received = read_result
-            .recv_timeout(Duration::from_secs(1))
-            .expect("FIFO reader should observe EOF after the retry writer closes");
+            .is_ok_and(|result| result.is_ok());
+        if !first_started {
+            stop_reader.store(true, Ordering::Release);
+            reader_may_drain.store(true, Ordering::Release);
+            first.abort();
+            let _ = first.await;
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            panic!("first FIFO writer did not publish the handshake byte");
+        }
+        cancel_token.cancel();
+        let first_result = tokio::time::timeout(Duration::from_secs(1), &mut first)
+            .await
+            .map(|result| result.expect("first FIFO writer task should join"));
+        if first_result.is_err() || first_result.as_ref().is_ok_and(|result| result.is_ok()) {
+            stop_reader.store(true, Ordering::Release);
+            reader_may_drain.store(true, Ordering::Release);
+            if first_result.is_err() {
+                first.abort();
+                let _ = first.await;
+            }
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            panic!("cancelling the first FIFO writer did not produce the expected failure");
+        }
+
+        // Start the retry while the reader is still open. It may now drain,
+        // but a transient EOF cannot terminate it before this writer reports
+        // completion.
+        reader_may_drain.store(true, Ordering::Release);
+        let second_path = path.clone();
+        let second_output = retry_output.clone();
+        let mut second =
+            tokio::spawn(
+                async move { write_output_file(&second_path, &second_output, None).await },
+            );
+
+        let second_result = tokio::time::timeout(Duration::from_secs(2), &mut second)
+            .await
+            .map(|result| result.expect("retry FIFO writer task should join"));
+        retry_done.store(true, Ordering::Release);
+        if second_result.is_err() {
+            stop_reader.store(true, Ordering::Release);
+            second.abort();
+            let _ = second.await;
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            let reader_diagnostic = match reader_result.recv_timeout(Duration::from_secs(1)) {
+                Ok(Ok(bytes)) => format!(
+                    "reader received {} bytes (x={}, y={})",
+                    bytes.len(),
+                    bytes.iter().filter(|byte| **byte == b'x').count(),
+                    bytes.iter().filter(|byte| **byte == b'y').count(),
+                ),
+                Ok(Err(error)) => format!("reader failed: {error}"),
+                Err(error) => format!("reader result unavailable: {error}"),
+            };
+            panic!("the retry FIFO writer timed out; {reader_diagnostic}");
+        }
+        if second_result.as_ref().is_ok_and(|result| result.is_err()) {
+            let _ = reader_thread.join();
+            let _ = std::fs::remove_file(&path);
+            panic!("the retry FIFO writer failed");
+        }
+        let _ = reader_thread.join();
+        let received = reader_result
+            .recv()
+            .expect("FIFO reader should report after the retry writer closes")
+            .expect("FIFO reader should finish without an I/O error");
 
         assert!(
             received.len() >= retry_output.len(),
@@ -1304,6 +1585,83 @@ mod tests {
             "the cancelled writer's bytes must precede the retry payload"
         );
         assert_eq!(&received[first_prefix_len..], retry_output.as_bytes());
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn output_path_aliases_share_the_same_lease_before_and_after_creation() {
+        let dir = crate::test_support::unique_temp_path("lait-output-alias", "");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("output.txt");
+        let alias = dir.join(".").join("output.txt");
+        let lease = acquire_path_lock(&path, None).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&alias, None))
+                .await
+                .is_err()
+        );
+        std::fs::write(&path, "created while holding the lease").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&alias, None))
+                .await
+                .is_err()
+        );
+        drop(lease);
+        let _next = tokio::time::timeout(Duration::from_secs(1), acquire_path_lock(&alias, None))
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dangling_output_symlink_and_its_target_share_a_lease() {
+        let dir = crate::test_support::unique_temp_path("lait-output-symlink", "");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("output.txt");
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink("output.txt", &link).unwrap();
+        let lease = acquire_path_lock(&link, None).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&path, None))
+                .await
+                .is_err()
+        );
+        drop(lease);
+        let _next = tokio::time::timeout(Duration::from_secs(1), acquire_path_lock(&path, None))
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn waiting_for_a_fifo_writer_needs_only_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = crate::test_support::unique_temp_path("lait-read-only-fifo", "");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut read = Box::pin(super::read_to_string_cancellable(
+            &path,
+            Some(cancellation.clone()),
+            1024,
+        ));
+        tokio::select! {
+            result = &mut read => panic!("reader returned before any writer: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => cancellation.cancel(),
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.downcast_ref::<crate::error::Interrupted>().is_some());
         std::fs::remove_file(path).unwrap();
     }
 }

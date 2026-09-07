@@ -1,5 +1,13 @@
-use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+
+mod render;
+mod stream;
+
+pub(crate) use render::{render_response, render_text_json};
+pub(crate) use stream::{
+    ChatCompletionStreamChunk, StreamToolCallAccumulator, stream_chunk_deltas,
+    stream_chunk_tool_call_deltas,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ChatCompletionResponse {
@@ -85,212 +93,6 @@ pub(crate) struct ToolCallFunction {
     pub(crate) arguments: String,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonOutput<'a> {
-    content: &'a str,
-    reasoning: Option<&'a str>,
-    /// Always present in `--json` output (as `null` when the server did not
-    /// report usage), so scripts can rely on the key existing.
-    usage: Option<Usage>,
-}
-
-/// A single `chat.completion.chunk` from a streamed (`stream: true`)
-/// response, deserialized the same way `ChatCompletionResponse` is: only the
-/// fields `--stream` needs to render, tolerant of whatever else a given
-/// server includes.
-#[derive(Debug, Deserialize)]
-pub(crate) struct ChatCompletionStreamChunk {
-    #[serde(default)]
-    choices: Vec<ChatCompletionStreamChoice>,
-    /// Set only on the final, choiceless chunk when the request asked for
-    /// `stream_options: {"include_usage": true}` (see
-    /// `llm::CompletionRequest::stream_include_usage`).
-    #[serde(default)]
-    pub(crate) usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionStreamChoice {
-    delta: ChatCompletionStreamDelta,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ChatCompletionStreamDelta {
-    content: Option<String>,
-    reasoning: Option<String>,
-    reasoning_content: Option<String>,
-    /// Index-keyed tool-call fragments — a streamed `tool_calls` field
-    /// arrives split across many chunks (each naming which call it belongs
-    /// to via `index`, since several calls can interleave), unlike the
-    /// non-streamed response's already-complete `ToolCall` list. See
-    /// `StreamToolCallAccumulator`, which reassembles them.
-    #[serde(default)]
-    tool_calls: Option<Vec<StreamToolCallDelta>>,
-}
-
-/// One fragment of a streamed tool call, keyed by `index` (stable across the
-/// whole call, not a `Vec` position — a chunk may carry fragments for
-/// several in-progress calls, or skip an index that isn't updated this
-/// chunk). `id`/`function.name` are only ever set once, on the fragment that
-/// starts a given `index`; `function.arguments` arrives incrementally and
-/// must be concatenated in order. See `StreamToolCallAccumulator::push`.
-#[derive(Debug, Deserialize)]
-pub(crate) struct StreamToolCallDelta {
-    pub(crate) index: usize,
-    #[serde(default)]
-    pub(crate) id: Option<String>,
-    #[serde(default)]
-    pub(crate) function: Option<StreamToolCallFunctionDelta>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct StreamToolCallFunctionDelta {
-    #[serde(default)]
-    pub(crate) name: Option<String>,
-    #[serde(default)]
-    pub(crate) arguments: Option<String>,
-}
-
-/// Reassembles a streamed `tool_calls` field's index-keyed fragments (see
-/// `StreamToolCallDelta`) into the same `Vec<ToolCall>` shape a non-streamed
-/// response carries, so `engine::RequestSettings::complete_stream`'s tool
-/// loop can hand them to the same dispatch/execution path
-/// `complete`'s does. Fragments are collected in a `BTreeMap` keyed by
-/// `index` so `finish` reconstructs them in the order the server first
-/// introduced each call, matching how a non-streamed response's `tool_calls`
-/// array is already ordered.
-#[derive(Debug, Default)]
-pub(crate) struct StreamToolCallAccumulator {
-    by_index: std::collections::BTreeMap<usize, PartialToolCall>,
-}
-
-#[derive(Debug, Default)]
-struct PartialToolCall {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-}
-
-impl StreamToolCallAccumulator {
-    /// Folds one chunk's tool-call fragments in. Call once per chunk that
-    /// carries any (`ChatCompletionStreamChunk`'s first choice `delta.
-    /// tool_calls`).
-    pub(crate) fn push(&mut self, deltas: &[StreamToolCallDelta]) {
-        for delta in deltas {
-            let partial = self.by_index.entry(delta.index).or_default();
-            if let Some(id) = &delta.id {
-                partial.id = Some(id.clone());
-            }
-            if let Some(function) = &delta.function {
-                if let Some(name) = &function.name {
-                    partial.name = Some(name.clone());
-                }
-                if let Some(arguments) = &function.arguments {
-                    partial.arguments.push_str(arguments);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.by_index.is_empty()
-    }
-
-    /// Reconstructs every accumulated call, in `index` order. Errors if a
-    /// call never received an `id` or a `function.name` fragment — a
-    /// malformed or truncated stream, since a well-formed one always sets
-    /// both on that call's first fragment.
-    pub(crate) fn finish(self) -> Result<Vec<ToolCall>> {
-        self.by_index
-            .into_values()
-            .map(|partial| {
-                let id = partial
-                    .id
-                    .ok_or_else(|| anyhow!("a streamed tool call never received an 'id'"))?;
-                let name = partial.name.ok_or_else(|| {
-                    anyhow!("a streamed tool call never received a function 'name'")
-                })?;
-                Ok(ToolCall {
-                    id,
-                    function: ToolCallFunction {
-                        name,
-                        arguments: partial.arguments,
-                    },
-                })
-            })
-            .collect()
-    }
-}
-
-/// The content-delta and reasoning-delta text carried by a chunk's first
-/// choice (chat completions only ever stream one choice for a single-turn
-/// request), applying the same current-field/legacy-`reasoning_content`
-/// fallback as `response_reasoning`. Either can be `None`: a chunk may carry
-/// no choices at all (e.g. the final `usage`-only chunk), and most chunks set
-/// only one of `content`/`reasoning` (e.g. the first chunk sets only `role`).
-pub(crate) fn stream_chunk_deltas(
-    chunk: &ChatCompletionStreamChunk,
-) -> (Option<&str>, Option<&str>) {
-    let Some(choice) = chunk.choices.first() else {
-        return (None, None);
-    };
-    let content = choice
-        .delta
-        .content
-        .as_deref()
-        .filter(|text| !text.is_empty());
-    let reasoning = non_blank_or(
-        choice.delta.reasoning.as_deref(),
-        choice.delta.reasoning_content.as_deref(),
-        |text| !text.is_empty(),
-    );
-    (content, reasoning)
-}
-
-/// The tool-call delta fragments carried by a chunk's first choice, if any —
-/// see `StreamToolCallAccumulator::push`, which this feeds. `None` for the
-/// vast majority of chunks (plain content/reasoning deltas, or a choiceless
-/// usage-only final chunk).
-pub(crate) fn stream_chunk_tool_call_deltas(
-    chunk: &ChatCompletionStreamChunk,
-) -> Option<&[StreamToolCallDelta]> {
-    chunk.choices.first()?.delta.tool_calls.as_deref()
-}
-
-pub(crate) fn render_response(
-    response: &ChatCompletionResponse,
-    as_json: bool,
-    show_reasoning: bool,
-) -> Result<String> {
-    let content = response_content(response).map_err(anyhow::Error::msg)?;
-    let reasoning = response_reasoning(response);
-
-    if as_json {
-        Ok(serde_json::to_string(&JsonOutput {
-            content,
-            reasoning,
-            usage: response.usage,
-        })?)
-    } else {
-        Ok(format_response(content, reasoning, show_reasoning))
-    }
-}
-
-/// The `--json` shape for a run that has no `ChatCompletionResponse` to draw
-/// on — `lait agent run`/`lait run`, whose output is already-extracted text
-/// (an agent's tool-loop result, or a workflow's post-`jq` final step
-/// output). Uses the same `{content, reasoning, usage}` keys as
-/// [`render_response`]'s `--json` (`reasoning` always `null` here, since
-/// neither has a single model turn to draw reasoning from) so `--json`
-/// means one shape everywhere it appears.
-pub(crate) fn render_text_json(content: &str, usage: Option<Usage>) -> Result<String> {
-    Ok(serde_json::to_string(&JsonOutput {
-        content,
-        reasoning: None,
-        usage,
-    })?)
-}
-
 /// The first choice's message, for callers (the tool loop in `app.rs`) that
 /// need to inspect `tool_calls`/raw `content` before deciding whether a lack
 /// of `content` is even an error — unlike `response_content`, this never
@@ -356,21 +158,12 @@ fn non_blank_or<'a>(
         .or_else(|| legacy.filter(|text| is_present(text)))
 }
 
-fn format_response(content: &str, reasoning: Option<&str>, show_reasoning: bool) -> String {
-    match (show_reasoning, reasoning) {
-        (true, Some(reasoning)) if !reasoning.trim().is_empty() => {
-            format!("Reasoning:\n{reasoning}\n\n{content}")
-        }
-        _ => content.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::render::format_response;
     use super::{
         ChatCompletionResponse, ChatCompletionStreamChunk, StreamToolCallAccumulator, Usage,
-        format_response, response_content, response_reasoning, stream_chunk_deltas,
-        stream_chunk_tool_call_deltas,
+        response_content, response_reasoning, stream_chunk_deltas, stream_chunk_tool_call_deltas,
     };
 
     #[test]

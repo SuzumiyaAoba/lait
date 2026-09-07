@@ -19,8 +19,8 @@ use crate::{
     cli::{EvalArgs, EvalFormat},
     config::{self, ConfigFile, ConfigSource, ModelMap},
     engine::{
-        AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
-        resolve_request_settings,
+        AppServices, CapabilityOverrides, PromptTurn, RequestSettings, RunContext,
+        SamplingOverrides, resolve_request_settings,
     },
     response, signal, template,
     workflow::{
@@ -87,9 +87,10 @@ impl Target {
         }
     }
 
-    async fn run(&self, env: &AppContext, input: &str) -> Result<String> {
+    async fn run(&self, env: &RunContext, input: &str) -> Result<String> {
         match self {
             Target::Workflow { wf, scope } => {
+                let operation = Some(env.operation_token());
                 let outcome = run_steps(
                     &wf.steps,
                     input.to_owned(),
@@ -99,7 +100,8 @@ impl Target {
                         env,
                         start_counter: 0,
                         progress_prefix: "",
-                        cancellation: env.cancel.clone(),
+                        cancellation: operation.clone(),
+                        placement: Default::default(),
                     },
                 )
                 .await?;
@@ -118,7 +120,7 @@ impl Target {
                         &[],
                         PromptTurn::simple(None, &rendered),
                         None,
-                        env.cancel.clone(),
+                        Some(env.operation_token()),
                     )
                     .await?;
                 Ok(response::content_text(&response).to_owned())
@@ -127,12 +129,18 @@ impl Target {
     }
 }
 
-fn load_target(target: &EvalTarget, base_dir: &Path, file_config: &ConfigFile) -> Result<Target> {
+async fn load_target(
+    target: &EvalTarget,
+    base_dir: &Path,
+    file_config: &ConfigFile,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Target> {
     match target {
         EvalTarget::Workflow { workflow } => {
             let workflow_path = base_dir.join(workflow);
-            let mut wf = workflow::load_workflow(&workflow_path)?;
-            let scope = WorkflowScope::top_level(&mut wf, &workflow_path)?;
+            let mut wf =
+                workflow::load_workflow_cancellable(&workflow_path, cancellation.clone()).await?;
+            let scope = WorkflowScope::top_level(&mut wf, &workflow_path, cancellation).await?;
             Ok(Target::Workflow {
                 wf: Box::new(wf),
                 scope,
@@ -192,7 +200,7 @@ impl CaseOutcome {
 
 async fn run_case(
     target: &Target,
-    env: &AppContext,
+    env: &RunContext,
     case: &EvalCase,
     default_model: Option<&str>,
     file_config: &ConfigFile,
@@ -205,8 +213,13 @@ async fn run_case(
                 default_model,
                 input: Some(case.input.as_str()),
             };
-            let failures =
-                assert::evaluate(&case.assert, Some(&judge), &output, env.cancel.clone()).await;
+            let failures = assert::evaluate(
+                &case.assert,
+                Some(&judge),
+                &output,
+                Some(env.operation_token()),
+            )
+            .await;
             RunResult {
                 failures: failures
                     .into_iter()
@@ -277,21 +290,34 @@ pub(crate) async fn run(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let contents = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("failed to read eval definition '{}'", args.file.display()))?;
+    let contents = crate::async_io::read_to_string_cancellable(
+        &args.file,
+        Some(cancel.clone()),
+        crate::async_io::MAX_READ_BYTES,
+    )
+    .await
+    .with_context(|| format!("failed to read eval definition '{}'", args.file.display()))?;
     let definition: EvalDefinition = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse eval definition '{}'", args.file.display()))?;
     let base_dir = args.file.parent().unwrap_or_else(|| Path::new("."));
 
-    let target = load_target(&definition.target, base_dir, &file_config)?;
+    let target = load_target(
+        &definition.target,
+        base_dir,
+        &file_config,
+        Some(cancel.clone()),
+    )
+    .await?;
     let default_model = target.default_model(&file_config);
 
-    let env = AppContext::new(Arc::clone(&file_config)).with_cancel(cancel);
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel);
     let repeat = args.repeat.max(1);
 
-    let cases: Vec<CaseOutcome> = env
+    let cases: Vec<CaseOutcome> = services
         .finish(async {
             let mut outcomes = Vec::with_capacity(definition.cases.len());
             for (index, case) in definition.cases.iter().enumerate() {

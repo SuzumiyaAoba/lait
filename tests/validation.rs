@@ -1,5 +1,16 @@
 mod support;
 
+#[test]
+fn a_missing_file_named_cancelled_is_not_an_interrupted_run() {
+    let directory = support::ConfigDirectory::empty();
+    let output = support::test_command()
+        .current_dir(directory.path())
+        .args(["run", "cancelled.yml", "input"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+}
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use support::{

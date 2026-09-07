@@ -403,13 +403,33 @@ where
 {
     match crate::async_io::await_cancellation(future, cancellation).await {
         crate::async_io::CancellationResult::Completed(result) => Ok(result?),
-        crate::async_io::CancellationResult::Cancelled => bail!("LLM completion was cancelled"),
+        crate::async_io::CancellationResult::Cancelled => bail!(
+            crate::error::Interrupted::cancelled("LLM completion was cancelled")
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_sampling_params;
+    use super::{await_cancellation, validate_sampling_params};
+    use async_openai::error::OpenAIError;
+
+    #[tokio::test]
+    async fn cancellation_is_reported_as_a_typed_interruption() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let error = await_cancellation(
+            std::future::pending::<std::result::Result<(), OpenAIError>>(),
+            Some(cancellation),
+        )
+        .await
+        .expect_err("cancelled completion should fail");
+
+        assert!(
+            error.downcast_ref::<crate::error::Interrupted>().is_some(),
+            "{error}"
+        );
+    }
 
     #[test]
     fn accepts_unset_or_in_range_values() {

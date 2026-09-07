@@ -12,21 +12,26 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use async_openai::{
-    error::OpenAIError,
-    types::chat::{ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat},
-};
-use futures_util::StreamExt;
-
 use crate::{
     agent::AgentFile,
     async_io, cache, cassette,
     cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
-    llm, mcp, nesting, process, response, schema, shell_tool, skill, subagent, template, usage,
-    workflow,
+    llm, mcp, nesting, process, response, schema, shell_tool, skill, subagent, template, workflow,
 };
+use anyhow::{Context, Result, anyhow, bail};
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat},
+};
+
+mod context;
+mod stream;
+mod tool_loop;
+
+pub(crate) use context::{AppServices, RunContext};
+use stream::{StreamOutcome, stream_response};
+use tool_loop::ToolLoop;
 
 /// The maximum number of tool-call round trips a single completion request
 /// may take (see `RequestSettings::complete`) before lait gives up and
@@ -34,170 +39,6 @@ use crate::{
 /// Overridable per CLI invocation/agent file/workflow node/`default:` via
 /// `max_tool_rounds`.
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
-
-/// The loaded config file, the MCP registry, the skill cache, the subagent
-/// registry, and the run's top-level cancellation source for the whole
-/// `lait`/`lait agent run`/`lait run` invocation — unlike `WorkflowScope`,
-/// none of these change at a `workflow:` nesting boundary, so the same
-/// `&AppContext` flows unchanged through every
-/// `run_steps`/`execute_step_with_retry`/`execute_step` call (and, for
-/// `call_agent`/`RequestSettings::complete`, through a subagent call's own
-/// recursive completion too — see `call_subagent_tool`). Bundled into one
-/// struct (rather than five parameters) purely to keep those functions'
-/// argument counts under clippy's `too_many_arguments` threshold. Owns
-/// everything (an `Arc<ConfigFile>`, not a borrow) rather than borrowing
-/// `file_config` for a lifetime, so an `Arc<AppContext>` clone can move into
-/// a `tokio::spawn`ed task for `parallel`/concurrent `for_each` (see
-/// `workflow::exec::run_steps`) without that task's future needing to
-/// outlive a borrow.
-pub(crate) struct AppContext {
-    pub(crate) file_config: Arc<ConfigFile>,
-    pub(crate) registry: mcp::McpRegistry,
-    pub(crate) skill_cache: skill::SkillCache,
-    pub(crate) agent_registry: subagent::AgentRegistry,
-    /// Every completion request's server-reported token usage, recorded by
-    /// `RequestSettings::complete` and summarized when `--show-usage` asks
-    /// for it.
-    pub(crate) usage: usage::UsageTally,
-    /// This invocation's own cancellation source, if any — the value every
-    /// top-level `run_steps`/`complete` call seeds its own cancellation
-    /// chain from (a node's own `timeout`/nested `workflow:` call then
-    /// derives further child tokens off of that seed, see
-    /// `execute_step_with_retry`). Set via `with_cancel` by every async
-    /// command handler in `app.rs`/`repl.rs`, from the process-wide token
-    /// `signal::spawn_handler` cancels on Ctrl-C — `None` only for a caller
-    /// that never calls `with_cancel` (none currently; kept `Option` so a
-    /// future non-interactive caller, e.g. a library embedding, can still
-    /// opt out).
-    pub(crate) cancel: Option<tokio_util::sync::CancellationToken>,
-    /// `lait run --var KEY=VALUE` overrides (see `cli::VarArgs`), exposed to
-    /// workflow templates as `{{ vars.<key> }}` and to jq filters as
-    /// `$vars.<key>`. Empty for every caller but `app::run_workflow` — see
-    /// `with_vars`.
-    pub(crate) vars: serde_json::Map<String, serde_json::Value>,
-    /// Whether `complete_recorded` should check/populate the response disk
-    /// cache (`--cache`/`default.cache`, see `crate::cache`) for this
-    /// invocation. `false` (the default) for a caller that never calls
-    /// `with_cache` — resolved once per invocation, from the same CLI/config
-    /// precedence for every caller (`app::run`), so a workflow's subagent
-    /// calls and a nested `workflow:` call all inherit it unchanged, the
-    /// same way `cancel` does.
-    pub(crate) cache_enabled: bool,
-    /// How many seconds a cache hit stays valid, when `cache_enabled`. `None`
-    /// means cached responses never expire on their own. See `crate::cache`.
-    pub(crate) cache_ttl: Option<u64>,
-    /// Whether `execute_tool_calls` should interactively confirm each tool
-    /// call on stdin/stderr before running it (`--approve-tools`), in
-    /// addition to (never instead of) `file_config.tool_policy`'s allow/deny
-    /// gate. `false` for a caller that never calls `with_approve_tools`.
-    pub(crate) approve_tools: bool,
-    /// Qualified tool names (see `mcp::qualify_tool_name`) the user has
-    /// answered `a` for under `--approve-tools`, so `execute_tool_calls`
-    /// stops asking about that name for the rest of this run. A `Mutex`
-    /// (like `usage`'s own interior mutability) rather than requiring `&mut
-    /// AppContext` — `execute_tool_calls` only ever holds a shared `&
-    /// AppContext`, the same as every other tool-loop call.
-    pub(crate) always_approved_tools: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// `lait run --record <DIR>` (see `crate::cassette`): when set,
-    /// `complete_recorded` saves every non-streamed request/response it
-    /// sends into this directory as a cassette file, keyed by the same
-    /// content hash `--cache` uses. Mutually exclusive with `replay_dir` at
-    /// the CLI level (`RunArgs::record`/`RunArgs::replay` `conflicts_with`
-    /// each other).
-    pub(crate) record_dir: Option<PathBuf>,
-    /// `lait run --replay <DIR>` / `lait test` (see `crate::cassette`): when
-    /// set, `complete_recorded` answers every non-streamed request from this
-    /// directory's cassette files instead of calling `llm::complete` at
-    /// all — a request with no matching cassette is a hard error, never a
-    /// silent fall-through to the network.
-    pub(crate) replay_dir: Option<PathBuf>,
-}
-
-impl AppContext {
-    /// Builds the registries/cache over `file_config`'s named entries. Cheap:
-    /// each registry gets its own `Arc` clone of just the map it needs (MCP
-    /// connections, skill files, and agent files are all loaded lazily on
-    /// first use, so cloning the (typically small) name/path maps up front
-    /// costs far less than any of that).
-    pub(crate) fn new(file_config: Arc<ConfigFile>) -> Self {
-        Self {
-            registry: mcp::McpRegistry::new(Arc::new(file_config.mcp_servers.clone())),
-            skill_cache: skill::SkillCache::new(Arc::new(file_config.skills.clone())),
-            agent_registry: subagent::AgentRegistry::new(Arc::new(file_config.agents.clone())),
-            file_config,
-            usage: usage::UsageTally::default(),
-            cancel: None,
-            vars: serde_json::Map::new(),
-            cache_enabled: false,
-            cache_ttl: None,
-            approve_tools: false,
-            always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
-            record_dir: None,
-            replay_dir: None,
-        }
-    }
-
-    /// Sets this context's `vars` (see the field doc), returning `self` for
-    /// use in a builder chain at the call site (`app::run_workflow`).
-    pub(crate) fn with_vars(mut self, vars: serde_json::Map<String, serde_json::Value>) -> Self {
-        self.vars = vars;
-        self
-    }
-
-    /// Sets this context's `cache_enabled`/`cache_ttl` (see the field docs) —
-    /// every async command handler in `app.rs`/`repl.rs` calls this once,
-    /// right where it builds the context, with the value `app::run` resolved
-    /// from `--cache`/`--no-cache`/`default.cache`/`default.cache_ttl`.
-    pub(crate) fn with_cache(mut self, enabled: bool, ttl: Option<u64>) -> Self {
-        self.cache_enabled = enabled;
-        self.cache_ttl = ttl;
-        self
-    }
-
-    /// Sets this context's `approve_tools` (see the field doc) — every async
-    /// command handler in `app.rs`/`repl.rs` calls this once, with the value
-    /// `app::run` resolved from `--approve-tools`.
-    pub(crate) fn with_approve_tools(mut self, approve_tools: bool) -> Self {
-        self.approve_tools = approve_tools;
-        self
-    }
-
-    /// Sets this context's `cancel` (see the field doc) — the process-wide
-    /// token `signal::spawn_handler` cancels on Ctrl-C, so every
-    /// `run_steps`/`complete`/blocking-I/O call downstream of this context
-    /// observes it. Every async command handler in `app.rs` (and
-    /// `repl::run`) calls this with the token `app::run` builds once per
-    /// invocation.
-    pub(crate) fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
-        self.cancel = Some(cancel);
-        self
-    }
-
-    /// Sets this context's `record_dir`/`replay_dir` (see the field docs) —
-    /// `app::run_workflow` calls this from `RunArgs::record`/`RunArgs::replay`,
-    /// and `test_run` calls it with `replay_dir` set from a test definition's
-    /// `replay:` and `record_dir` left `None`.
-    pub(crate) fn with_record_replay(
-        mut self,
-        record_dir: Option<PathBuf>,
-        replay_dir: Option<PathBuf>,
-    ) -> Self {
-        self.record_dir = record_dir;
-        self.replay_dir = replay_dir;
-        self
-    }
-
-    /// Drives `fut` to completion, then unconditionally shuts down the MCP
-    /// registry before handing back `fut`'s result — on success or failure
-    /// alike, so callers don't have to re-derive that ordering themselves.
-    /// Every top-level `lait`/`lait agent run`/`lait run` invocation must
-    /// call this once, at the end, instead of awaiting its work directly.
-    pub(crate) async fn finish<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
-        let result = fut.await;
-        self.registry.shutdown().await;
-        result
-    }
-}
 
 /// The reasoning-effort/temperature/top_p/max_tokens knobs a caller (CLI
 /// invocation, agent file, or workflow step) may set for a single completion
@@ -291,11 +132,15 @@ impl<'a> PromptTurn<'a> {
     }
 }
 
-/// The model/base-URL/API-key/sampling settings for a single completion
-/// request, after resolving aliases and applying every fallback layer.
+/// The model/base-URL/API-key-source/sampling settings for a single completion
+/// request, after resolving aliases and applying every fallback layer. An
+/// API-key command remains inert until the request boundary.
 pub(crate) struct RequestSettings {
     pub(crate) base_url: String,
-    pub(crate) api_key: String,
+    /// The selected key source is kept inert until a request is sent. This
+    /// keeps settings resolution safe for dry-run/lint and avoids running a
+    /// secrets command for a request that is served from replay/cache.
+    pub(crate) api_key: config::ApiKeySource,
     pub(crate) resolved_model: config::ResolvedModel,
     /// Further `models:` alias definitions to fall back to, in order, when
     /// the primary endpoint above fails with a retryable error (a
@@ -354,7 +199,7 @@ fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<C
 }
 
 /// One tool call's pre-dispatch decision — made for every call in a round
-/// before any of them actually run, see `execute_tool_calls`'s own doc
+/// before any of them actually run, see `ToolLoop::append_tool_calls`'s own doc
 /// comment on why this has to happen sequentially and up front rather than
 /// inside the concurrent dispatch below.
 enum ToolDecision {
@@ -362,8 +207,8 @@ enum ToolDecision {
     Deny(String),
 }
 
-/// Checks `qualified_name` against `env.file_config.tool_policy` (see
-/// `config::ToolPolicy`) and, when `env.approve_tools` is set and the policy
+/// Checks `qualified_name` against `env.services.file_config.tool_policy` (see
+/// `config::ToolPolicy`) and, when `env.policy.approve_tools` is set and the policy
 /// didn't already deny it, interactively confirms the call — `y`/`n`/`a`,
 /// via `prompt_tool_approval`. This is the *only* place either gate is
 /// enforced; `McpRegistry::call`'s own `allowed_tools` check still applies
@@ -377,52 +222,108 @@ enum ToolDecision {
 /// outright, approval isn't enabled for, or is already in
 /// `always_approved_tools`.
 async fn tool_decision(
-    env: &AppContext,
+    env: &RunContext,
     qualified_name: &str,
     arguments: &str,
     command_preview: impl FnOnce() -> Option<String>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ToolDecision> {
-    if !env.file_config.tool_policy.allows(qualified_name) {
+    if !env.services.file_config.tool_policy.allows(qualified_name) {
         return Ok(ToolDecision::Deny(format!(
             "denied by 'tool_policy' in {}",
             config::CONFIG_FILE_NAME
         )));
     }
-    if !env.approve_tools {
+    if !env.policy.approve_tools {
         return Ok(ToolDecision::Allow);
     }
-    if env
-        .always_approved_tools
-        .lock()
-        .expect("always_approved_tools lock poisoned")
-        .contains(qualified_name)
-    {
+
+    // Tool loops from parallel workflow branches and separate compare jobs
+    // share one process stdin. Keep the gate until the blocking reader worker
+    // has finished, even when the async owner is cancelled; the lease is
+    // moved into that worker by `prompt_tool_approval` below.
+    let Some(approval_lease) =
+        acquire_approval_slot(env, qualified_name, cancellation.as_ref()).await?
+    else {
         return Ok(ToolDecision::Allow);
-    }
+    };
     let command_preview = command_preview();
-    match prompt_tool_approval(
+    let (answer, approval_lease) = prompt_tool_approval(
         qualified_name,
         arguments,
         command_preview.as_deref(),
+        approval_lease,
         cancellation,
     )
-    .await?
-    {
+    .await?;
+    match answer {
         ToolApprovalAnswer::Once => Ok(ToolDecision::Allow),
         ToolApprovalAnswer::Always => {
             env.always_approved_tools
                 .lock()
                 .expect("always_approved_tools lock poisoned")
                 .insert(qualified_name.to_owned());
+            // Keep the lease through the cache update so a concurrent caller
+            // cannot observe the old cache state and prompt a second time.
+            drop(approval_lease);
             Ok(ToolDecision::Allow)
         }
-        ToolApprovalAnswer::Deny => Ok(ToolDecision::Deny(
-            "denied interactively (--approve-tools)".to_owned(),
-        )),
+        ToolApprovalAnswer::Deny => {
+            drop(approval_lease);
+            Ok(ToolDecision::Deny(
+                "denied interactively (--approve-tools)".to_owned(),
+            ))
+        }
     }
 }
 
+fn always_approved(env: &RunContext, qualified_name: &str) -> bool {
+    env.always_approved_tools
+        .lock()
+        .expect("always_approved_tools lock poisoned")
+        .contains(qualified_name)
+}
+
+type ApprovalGateLease = tokio::sync::OwnedMutexGuard<()>;
+
+async fn acquire_approval_gate(
+    env: &RunContext,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ApprovalGateLease> {
+    let gate = Arc::clone(&env.approval_gate);
+    match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    Err(crate::error::Interrupted::cancelled(
+                        "tool approval was cancelled",
+                    ).into())
+                }
+                lease = gate.lock_owned() => Ok(lease),
+            }
+        }
+        None => Ok(gate.lock_owned().await),
+    }
+}
+
+/// Acquires the process-wide approval gate and rechecks the `always` cache
+/// while holding it. The second check closes the race where another tool loop
+/// approved this name while this caller was waiting for stdin ownership.
+async fn acquire_approval_slot(
+    env: &RunContext,
+    qualified_name: &str,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Option<ApprovalGateLease>> {
+    let approval_lease = acquire_approval_gate(env, cancellation).await?;
+    if always_approved(env, qualified_name) {
+        drop(approval_lease);
+        return Ok(None);
+    }
+    Ok(Some(approval_lease))
+}
+
+#[derive(Debug)]
 enum ToolApprovalAnswer {
     Once,
     Always,
@@ -441,8 +342,9 @@ async fn prompt_tool_approval(
     name: &str,
     arguments: &str,
     command_preview: Option<&str>,
+    approval_lease: ApprovalGateLease,
     cancellation: Option<tokio_util::sync::CancellationToken>,
-) -> Result<ToolApprovalAnswer> {
+) -> Result<(ToolApprovalAnswer, ApprovalGateLease)> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         bail!(
@@ -462,8 +364,26 @@ async fn prompt_tool_approval(
     }
     eprint!("allow this call? [y(es)/n(o)/a(lways for this tool)] ");
     let name = name.to_owned();
+    read_tool_approval_with_lease(approval_lease, cancellation, move || {
+        read_tool_approval_answer(&name)
+    })
+    .await
+}
+
+/// Runs one approval reader while transferring the gate lease into the
+/// worker. `run_blocking` may return a cancellation error before that worker
+/// exits; in that case the worker still owns the lease and remains the sole
+/// reader of stdin until its blocking read completes.
+async fn read_tool_approval_with_lease<R>(
+    approval_lease: ApprovalGateLease,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    reader: R,
+) -> Result<(ToolApprovalAnswer, ApprovalGateLease)>
+where
+    R: FnOnce() -> Result<ToolApprovalAnswer> + Send + 'static,
+{
     async_io::run_blocking(
-        move |_cancelled| read_tool_approval_answer(&name),
+        move |_cancelled| Ok((reader()?, approval_lease)),
         cancellation,
     )
     .await
@@ -523,131 +443,6 @@ fn check_tool_name_collisions(
     Ok(())
 }
 
-/// Appends one round's tool-call turn to `messages`: an `assistant` message
-/// carrying `tool_calls` (plus whatever `content` preceded them, if any),
-/// then the `tool`-role results of actually running each call — against
-/// `mcp_tool_set`, `subagent_tool_set`, or `shell_tool_set`, whichever
-/// qualifies the call's name (see `mcp::qualify_tool_name`). Shared by
-/// `complete`'s non-streamed
-/// tool loop and `complete_stream`'s streamed one (see
-/// `response::StreamToolCallAccumulator`, which reassembles a streamed
-/// round's fragments into the same `&[response::ToolCall]` shape a
-/// non-streamed response already carries, so both loops converge on this one
-/// dispatch).
-///
-/// Every call is checked against `tool_policy`/`--approve-tools` (see
-/// `tool_decision`) *before* any of them run, one at a time in call order —
-/// deliberately not folded into the concurrent dispatch below, because
-/// `--approve-tools` prompts on stderr/stdin and concurrent prompts for
-/// several calls in the same round would interleave into something
-/// unreadable (and unanswerable). A denied call never reaches
-/// `McpRegistry::call`/`call_subagent_tool` at all; it gets a `tool`-role
-/// message carrying the denial reason instead, so the model sees it as a
-/// failed call and the tool loop continues rather than the whole request
-/// failing.
-///
-/// A model turn's *allowed* calls are independent by construction (it
-/// couldn't have seen one call's result before deciding on another), so
-/// they're run concurrently rather than one at a time; `try_join_all`
-/// preserves `tool_calls`' order regardless of completion order, so the
-/// appended `tool`-role messages stay in a stable, deterministic order.
-#[allow(clippy::too_many_arguments)]
-async fn execute_tool_calls(
-    tool_calls: &[response::ToolCall],
-    content: Option<&str>,
-    messages: &mut Vec<ChatCompletionRequestMessage>,
-    mcp_tool_set: &mcp::ToolSet,
-    subagent_tool_set: &subagent::ToolSet,
-    shell_tool_set: &shell_tool::ToolSet,
-    env: &AppContext,
-    active_agent_paths: &[PathBuf],
-    round: usize,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
-) -> Result<()> {
-    messages.push(llm::assistant_tool_call_message(tool_calls, content)?);
-
-    let mut decisions = Vec::with_capacity(tool_calls.len());
-    for tool_call in tool_calls {
-        // A shell tool call's `command:` template can render to something
-        // quite different from its raw JSON arguments — see
-        // `tool_decision`'s `command_preview` parameter — so look up the
-        // definition and render a preview whenever this call qualifies to a
-        // shell tool. `None` for MCP/subagent calls, and for a shell tool
-        // whose arguments/template can't be rendered right now (the actual
-        // failure, if any, surfaces from `shell_tool::call` itself once the
-        // call is allowed to run). `tool_decision` only invokes this closure
-        // on the path that actually reaches its interactive
-        // `--approve-tools` prompt, so it's free on every other path.
-        let command_preview = || {
-            shell_tool_set
-                .tool_name(&tool_call.function.name)
-                .and_then(|name| env.file_config.tools.get(name))
-                .and_then(|definition| {
-                    shell_tool::preview_argv(definition, &tool_call.function.arguments)
-                })
-        };
-        decisions.push(
-            tool_decision(
-                env,
-                &tool_call.function.name,
-                &tool_call.function.arguments,
-                command_preview,
-                cancellation.clone(),
-            )
-            .await?,
-        );
-    }
-
-    let tool_messages = futures_util::future::try_join_all(tool_calls.iter().zip(decisions).map(
-        |(tool_call, decision)| async {
-            let name = &tool_call.function.name;
-            if let ToolDecision::Deny(reason) = decision {
-                tracing::debug!(tool = %name, round, reason = %reason, "tool call denied");
-                return llm::tool_result_message(&tool_call.id, reason);
-            }
-            tracing::debug!(
-                tool = %name,
-                arguments = %tool_call.function.arguments,
-                round,
-                "calling tool",
-            );
-            let result = if mcp_tool_set.contains(name) {
-                env.registry
-                    .call(
-                        mcp_tool_set,
-                        name,
-                        &tool_call.function.arguments,
-                        cancellation.clone(),
-                    )
-                    .await?
-            } else if let Some(subagent_name) = subagent_tool_set.subagent_name(name) {
-                call_subagent_tool(
-                    subagent_name,
-                    &tool_call.function.arguments,
-                    env,
-                    active_agent_paths,
-                    cancellation.clone(),
-                )
-                .await?
-            } else if let Some(tool_name) = shell_tool_set.tool_name(name) {
-                let definition = &env.file_config.tools[tool_name];
-                shell_tool::call(
-                    definition,
-                    &tool_call.function.arguments,
-                    cancellation.clone(),
-                )
-                .await?
-            } else {
-                bail!("model called unknown tool '{name}'");
-            };
-            llm::tool_result_message(&tool_call.id, result)
-        },
-    ))
-    .await?;
-    messages.extend(tool_messages);
-    Ok(())
-}
-
 /// Classifies whether `error` is worth falling back from, for
 /// `RequestSettings::complete_recorded`/`complete_stream`'s
 /// `advance_to_next_candidate`: a connection failure/timeout, or an API
@@ -685,7 +480,7 @@ fn is_fallback_eligible(error: &anyhow::Error) -> bool {
 /// clippy's `too_many_arguments` threshold.
 struct EndpointAttempt {
     base_url: String,
-    api_key: String,
+    api_key: config::ApiKeySource,
     model_id: String,
 }
 
@@ -716,6 +511,7 @@ impl RequestSettings {
     fn request<'a>(
         &'a self,
         endpoint: &'a EndpointAttempt,
+        api_key: &'a str,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &'a [ChatCompletionTools],
@@ -723,7 +519,7 @@ impl RequestSettings {
     ) -> llm::CompletionRequest<'a> {
         llm::CompletionRequest {
             base_url: &endpoint.base_url,
-            api_key: &endpoint.api_key,
+            api_key,
             model_id: &endpoint.model_id,
             reasoning_effort: self.sampling.reasoning_effort,
             temperature: self.sampling.temperature,
@@ -737,18 +533,17 @@ impl RequestSettings {
         }
     }
 
-    /// Advances `(base_url, api_key, model_id)` past a failed attempt to the
-    /// next `self.fallback_candidates` entry, resolving that candidate's own
-    /// endpoint (and running its `api_key_cmd`, if it has one) right now —
-    /// never earlier, so a candidate that's never attempted never runs its
-    /// command. Returns `Ok(false)` (leaving the three unchanged) once
+    /// Advances `(base_url, api_key_source, model_id)` past a failed attempt
+    /// to the next `self.fallback_candidates` entry, selecting that
+    /// candidate's endpoint data but leaving any `api_key_cmd` inert. Returns
+    /// `Ok(false)` (leaving the three unchanged) once
     /// `candidates` is exhausted, telling the caller to give up and return
     /// its original error instead. Shared by `complete_recorded`/
     /// `complete_stream`'s otherwise-identical fallback loops — see
     /// `is_fallback_eligible` for what actually triggers a call to this.
     fn advance_to_next_candidate(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         candidates: &mut std::slice::Iter<'_, config::FallbackCandidate>,
         endpoint: &mut EndpointAttempt,
         error: &anyhow::Error,
@@ -767,10 +562,10 @@ impl RequestSettings {
             error = %error,
             "falling back to the next model definition entry",
         );
-        let (next_base_url, next_api_key) =
-            config::resolve_fallback_endpoint(candidate, &env.file_config)?;
-        endpoint.base_url = next_base_url;
-        endpoint.api_key = next_api_key;
+        let next_endpoint =
+            config::resolve_fallback_endpoint(candidate, &env.services.file_config)?;
+        endpoint.base_url = next_endpoint.base_url;
+        endpoint.api_key = next_endpoint.api_key;
         endpoint.model_id = candidate.model_id.clone();
         Ok(true)
     }
@@ -778,7 +573,7 @@ impl RequestSettings {
     /// Sends a completion request built from these settings, driving a
     /// tool-call loop when `self.mcp`/`self.subagents` names at least one MCP
     /// server or subagent: each round sends the growing message history to
-    /// the model, and if it comes back with `tool_calls`, `env.registry`
+    /// the model, and if it comes back with `tool_calls`, `env.services.registry`
     /// (for an MCP tool) or `call_subagent_tool` (for a subagent tool)
     /// executes them and their results are appended as `tool`-role messages
     /// before the next round. Ends either when a round produces no
@@ -792,7 +587,7 @@ impl RequestSettings {
     /// all, which would silently stop tools from ever firing. See
     /// `docs/usage/ja/mcp.md`.
     ///
-    /// `self.skills` (resolved against `env.skill_cache`, `lait.config.yml`'s
+    /// `self.skills` (resolved against `env.services.skill_cache`, `lait.config.yml`'s
     /// top-level `skills:`) is appended to `system_prompt` before either path
     /// below ever sees it — see `with_skills`. `active_agent_paths` is every
     /// subagent file currently executing on this call stack (canonicalized);
@@ -807,14 +602,18 @@ impl RequestSettings {
     /// feature existed — see `llm::initial_messages`.
     pub(crate) async fn complete(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
         let system_prompt = self
-            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, cancellation.clone())
+            .system_prompt_with_skills(
+                &env.services.skill_cache,
+                turn.system_prompt,
+                cancellation.clone(),
+            )
             .await?;
         let system_prompt = system_prompt.as_deref();
 
@@ -826,24 +625,22 @@ impl RequestSettings {
                 .await;
         }
 
-        let (mcp_tool_set, subagent_tool_set, shell_tool_set, tools) =
-            self.assemble_tool_sets(env, cancellation.clone()).await?;
-
-        let mut messages =
+        let messages =
             llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
-
-        let mut round = 0usize;
+        let mut tool_loop = self
+            .assemble_tool_loop(env, messages, cancellation.clone())
+            .await?;
         loop {
-            round += 1;
-            if round > self.max_tool_rounds {
-                bail!(
-                    "tool loop exceeded max_tool_rounds ({}) without the model producing a final response",
-                    self.max_tool_rounds
-                );
-            }
+            tool_loop.next_round(self.max_tool_rounds)?;
 
             let response = self
-                .complete_recorded(env, None, messages.clone(), &tools, cancellation.clone())
+                .complete_recorded(
+                    env,
+                    None,
+                    tool_loop.messages_snapshot(),
+                    tool_loop.tools(),
+                    cancellation.clone(),
+                )
                 .await?;
 
             let tool_calls = response::first_message(&response)
@@ -858,24 +655,26 @@ impl RequestSettings {
                 // once more with `response_format` attached, now that doing
                 // so can no longer suppress a tool call.
                 return self
-                    .complete_recorded(env, response_format, messages, &[], cancellation.clone())
+                    .complete_recorded(
+                        env,
+                        response_format,
+                        tool_loop.into_messages(),
+                        &[],
+                        cancellation.clone(),
+                    )
                     .await;
             };
 
             let content = response::first_message(&response).and_then(|message| message.content());
-            execute_tool_calls(
-                tool_calls,
-                content,
-                &mut messages,
-                &mcp_tool_set,
-                &subagent_tool_set,
-                &shell_tool_set,
-                env,
-                active_agent_paths,
-                round,
-                cancellation.clone(),
-            )
-            .await?;
+            tool_loop
+                .append_tool_calls(
+                    tool_calls,
+                    content,
+                    env,
+                    active_agent_paths,
+                    cancellation.clone(),
+                )
+                .await?;
         }
     }
 
@@ -894,7 +693,7 @@ impl RequestSettings {
     /// handled separately above.
     async fn assemble_tool_sets(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(
         mcp::ToolSet,
@@ -903,11 +702,12 @@ impl RequestSettings {
         Vec<ChatCompletionTools>,
     )> {
         let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
-            env.registry.tools(&self.mcp, cancellation.clone()),
-            env.agent_registry
+            env.services.registry.tools(&self.mcp, cancellation.clone()),
+            env.services
+                .agent_registry
                 .tools_cancellable(&self.subagents, cancellation.clone()),
         )?;
-        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.file_config.tools)?;
+        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.services.file_config.tools)?;
         check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
         // Only `.contains()`/`.subagent_name()`/`.tool_name()` (which read
         // `.index`, not `.tools`) are used by callers below, so `.tools`
@@ -919,8 +719,29 @@ impl RequestSettings {
         Ok((mcp_tool_set, subagent_tool_set, shell_tool_set, tools))
     }
 
+    /// Builds the stateful tool loop used by either completion transport.
+    /// Keeping assembly and state construction together prevents the streamed
+    /// and non-streamed paths from drifting apart as a new tool source is
+    /// added.
+    async fn assemble_tool_loop(
+        &self,
+        env: &RunContext,
+        messages: Vec<ChatCompletionRequestMessage>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<ToolLoop> {
+        let (mcp_tool_set, subagent_tool_set, shell_tool_set, tools) =
+            self.assemble_tool_sets(env, cancellation.clone()).await?;
+        Ok(ToolLoop::new(
+            messages,
+            mcp_tool_set,
+            subagent_tool_set,
+            shell_tool_set,
+            tools,
+        ))
+    }
+
     /// The one way `complete` sends a request: checks the response disk
-    /// cache first when `env.cache_enabled` (see `crate::cache` and
+    /// cache first when `env.policy.cache.enabled()` (see `crate::cache` and
     /// `docs/usage/ja/config.md`'s キャッシュ section — a hit skips the
     /// network entirely and is *not* recorded in `--show-usage`, since no
     /// request was actually sent), otherwise builds the request via
@@ -937,7 +758,7 @@ impl RequestSettings {
     /// happened to answer it.
     async fn complete_recorded(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
@@ -948,24 +769,26 @@ impl RequestSettings {
         // computed once whenever any of the three is in play, always from
         // the *primary* endpoint (see this method's doc comment on why the
         // cache key ignores which fallback candidate actually answers).
-        let content_key =
-            if env.cache_enabled || env.record_dir.is_some() || env.replay_dir.is_some() {
-                Some(cache::key(
-                    &self.base_url,
-                    &self.resolved_model.model_id,
-                    self.sampling,
-                    &messages,
-                    tools,
-                    response_format.as_ref(),
-                )?)
-            } else {
-                None
-            };
+        let content_key = if env.policy.cache.enabled()
+            || env.policy.cassette.record_dir().is_some()
+            || env.policy.cassette.replay_dir().is_some()
+        {
+            Some(cache::key(
+                &self.base_url,
+                &self.resolved_model.model_id,
+                self.sampling,
+                &messages,
+                tools,
+                response_format.as_ref(),
+            )?)
+        } else {
+            None
+        };
 
         // `--replay` never touches the network or the response cache: every
         // request is answered from `replay_dir`'s cassettes, or the run
         // fails outright (see `cassette::load`).
-        if let Some(replay_dir) = &env.replay_dir {
+        if let Some(replay_dir) = env.policy.cassette.replay_dir() {
             let key = content_key
                 .as_deref()
                 .expect("content_key is computed above whenever replay_dir is set");
@@ -977,11 +800,11 @@ impl RequestSettings {
         // A cache hit would otherwise skip the network call `--record` needs
         // to actually observe, so cache lookup (not the later cache *save*,
         // which stays harmless) is skipped while recording.
-        if env.cache_enabled && env.record_dir.is_none() {
+        if env.policy.cache.enabled() && env.policy.cassette.record_dir().is_none() {
             let cache_key = content_key
                 .as_deref()
                 .expect("content_key is computed above whenever cache_enabled is set");
-            match cache::load(cache_key, env.cache_ttl) {
+            match cache::load(cache_key, env.policy.cache.ttl()) {
                 Ok(Some(response)) => {
                     eprintln!("note: cache hit for {}", self.usage_label);
                     tracing::debug!(cache_key = %cache_key, "response cache hit");
@@ -999,8 +822,15 @@ impl RequestSettings {
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
         loop {
+            let api_key = env
+                .services
+                .secret_resolver
+                .resolve(&endpoint.api_key, cancellation.clone())
+                .await?
+                .unwrap_or_else(|| "lm-studio".to_owned());
             let request = self.request(
                 &endpoint,
+                &api_key,
                 response_format.clone(),
                 messages.clone(),
                 tools,
@@ -1009,13 +839,13 @@ impl RequestSettings {
             match llm::complete(request).await {
                 Ok(response) => {
                     env.usage.record_response(&self.usage_label, &response);
-                    if env.cache_enabled
+                    if env.policy.cache.enabled()
                         && let Some(cache_key) = &content_key
                         && let Err(error) = cache::save(cache_key, &response)
                     {
                         tracing::debug!(error = %error, "failed to write response cache entry");
                     }
-                    if let Some(record_dir) = &env.record_dir {
+                    if let Some(record_dir) = env.policy.cassette.record_dir() {
                         let key = content_key
                             .as_deref()
                             .expect("content_key is computed above whenever record_dir is set");
@@ -1062,7 +892,7 @@ impl RequestSettings {
     /// another mid-stream.
     async fn stream_endpoint(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
@@ -1072,8 +902,15 @@ impl RequestSettings {
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
         loop {
+            let api_key = env
+                .services
+                .secret_resolver
+                .resolve(&endpoint.api_key, cancellation.clone())
+                .await?
+                .unwrap_or_else(|| "lm-studio".to_owned());
             let mut request = self.request(
                 &endpoint,
+                &api_key,
                 response_format.clone(),
                 messages.clone(),
                 tools,
@@ -1103,7 +940,7 @@ impl RequestSettings {
     /// `complete` does when `self.mcp`/`self.subagents` names at least one
     /// tool source, reassembling each round's streamed `tool_calls`
     /// fragments (see `response::StreamToolCallAccumulator`) before handing
-    /// them to the same `execute_tool_calls` dispatch `complete`'s
+    /// them to the same `ToolLoop::append_tool_calls` dispatch `complete`'s
     /// non-streamed loop uses. `self.skills` is appended to `system_prompt`
     /// the same way as in `complete`. `include_usage` asks the server for a
     /// final usage chunk on every round (see
@@ -1119,7 +956,7 @@ impl RequestSettings {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_stream(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
@@ -1129,7 +966,11 @@ impl RequestSettings {
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<StreamOutcome> {
         let system_prompt = self
-            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, cancellation.clone())
+            .system_prompt_with_skills(
+                &env.services.skill_cache,
+                turn.system_prompt,
+                cancellation.clone(),
+            )
             .await?;
         let system_prompt = system_prompt.as_deref();
 
@@ -1149,28 +990,20 @@ impl RequestSettings {
             return stream_response(stream, show_reasoning, output_path, false, cancellation).await;
         }
 
-        let (mcp_tool_set, subagent_tool_set, shell_tool_set, tools) =
-            self.assemble_tool_sets(env, cancellation.clone()).await?;
-
-        let mut messages =
+        let messages =
             llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
-
-        let mut round = 0usize;
+        let mut tool_loop = self
+            .assemble_tool_loop(env, messages, cancellation.clone())
+            .await?;
         loop {
-            round += 1;
-            if round > self.max_tool_rounds {
-                bail!(
-                    "tool loop exceeded max_tool_rounds ({}) without the model producing a final response",
-                    self.max_tool_rounds
-                );
-            }
+            let round = tool_loop.next_round(self.max_tool_rounds)?;
 
             let stream = self
                 .stream_endpoint(
                     env,
                     None,
-                    messages.clone(),
-                    &tools,
+                    tool_loop.messages_snapshot(),
+                    tool_loop.tools(),
                     include_usage,
                     cancellation.clone(),
                 )
@@ -1207,7 +1040,7 @@ impl RequestSettings {
                     .stream_endpoint(
                         env,
                         response_format,
-                        messages,
+                        tool_loop.into_messages(),
                         &[],
                         include_usage,
                         cancellation.clone(),
@@ -1220,7 +1053,7 @@ impl RequestSettings {
             // Unlike `complete_recorded` (the non-streamed tool loop's
             // single choke point, which records every round's usage as it
             // happens), this round's `StreamOutcome` is consumed by
-            // `execute_tool_calls` below and never reaches a caller — only
+            // `ToolLoop::append_tool_calls` below and never reaches a caller — only
             // the loop's *final* round is ever returned, and that's the one
             // `app::run_chat`/`repl::run_turn` record from the returned
             // `StreamOutcome`. Recording here is this round's only chance to
@@ -1236,19 +1069,15 @@ impl RequestSettings {
             } else {
                 Some(outcome.content.as_str())
             };
-            execute_tool_calls(
-                &outcome.tool_calls,
-                content,
-                &mut messages,
-                &mcp_tool_set,
-                &subagent_tool_set,
-                &shell_tool_set,
-                env,
-                active_agent_paths,
-                round,
-                cancellation.clone(),
-            )
-            .await?;
+            tool_loop
+                .append_tool_calls(
+                    &outcome.tool_calls,
+                    content,
+                    env,
+                    active_agent_paths,
+                    cancellation.clone(),
+                )
+                .await?;
         }
     }
 
@@ -1264,179 +1093,6 @@ impl RequestSettings {
         let skills_text = skill_cache.render(&self.skills, cancellation).await?;
         Ok(with_skills(system_prompt, skills_text.as_deref()))
     }
-}
-
-/// Consumes `stream`, writing each chunk's content delta to stdout as it
-/// arrives (flushed immediately, since stdout is line-buffered and a delta
-/// rarely ends in a newline). When `show_reasoning` is set, reasoning deltas
-/// are written first, formatted like `response::format_response` formats a
-/// complete response: a `Reasoning:` header before the first reasoning
-/// delta, then a blank line before the first content delta. Reasoning deltas
-/// are dropped when `show_reasoning` is unset, same as the non-streaming
-/// path. Also accumulates any streamed `tool_calls` fragments (see
-/// `response::StreamToolCallAccumulator`) — `RequestSettings::complete_stream`
-/// is the only caller that ever sees a non-empty result, since it's the only
-/// one that ever advertises tools on the request this stream answers.
-/// Fails, like `response::response_content`, if the round ends with neither
-/// content nor a tool call — a response with nothing at all to act on.
-/// Returns the accumulated content text (for `--session`/`lait history` to
-/// record — see `StreamOutcome`) alongside the usage carried by the final
-/// chunk, when the request asked for one (see
-/// `RequestSettings::complete_stream`'s `include_usage`) and the server
-/// obliged. `output_path` redirects the content to a file (`-o`): the file
-/// then holds the body alone, so reasoning deltas — normally written ahead of
-/// the content on stdout — go to stderr instead. `append` opens that file in
-/// append mode instead of truncating it — set by `complete_stream` for every
-/// round after a tool loop's first, so an earlier round's already-streamed
-/// content survives a later round's own file open; ignored when
-/// `output_path` is `None`.
-///
-/// `cancellation` is raced against each chunk (via `async_io::
-/// await_cancellation`, the same primitive `llm::complete`'s own
-/// cancellation wraps), so a stream stuck waiting on the next chunk can be
-/// abandoned instead of hanging until the server closes the connection —
-/// previously nothing watched cancellation once the stream was established
-/// (see `AppContext::cancel`'s doc comment: today's only live source is a
-/// workflow step's own `timeout`, since nothing yet wires up a process-wide
-/// source like Ctrl-C). On cancellation, a `-o` file is explicitly flushed
-/// before returning the error, so it holds whatever content arrived before
-/// the cancellation rather than being left empty by `BufWriter`'s buffering
-/// (deltas to a file are batched, not flushed per-delta, unlike stdout's —
-/// see below). A stream ending in some other error (a malformed chunk, a
-/// dropped connection) does not get this treatment and can still leave an
-/// empty `-o` file — a pre-existing gap this change doesn't address.
-async fn stream_response(
-    mut stream: llm::CompletionStream,
-    show_reasoning: bool,
-    output_path: Option<&Path>,
-    append: bool,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
-) -> Result<StreamOutcome> {
-    use tokio::io::{AsyncWrite, AsyncWriteExt};
-
-    // Opened once for the stream's whole lifetime: every delta write below
-    // reuses the same handle, and nothing else prints to the content sink
-    // while a response is streaming. `tokio::io::Stdout`/`tokio::fs::File`
-    // are used (rather than `std::io::stdout().lock()`/`std::fs::File`) so
-    // this async fn's writes never block the Tokio worker thread it runs
-    // on — each is dispatched to Tokio's own blocking-I/O thread pool
-    // internally.
-    let mut stdout_writer;
-    let mut file_writer;
-    // Whether reasoning shares the content sink (the stdout presentation:
-    // a `Reasoning:` header, then a blank line before the content).
-    let reasoning_inline = output_path.is_none();
-    let content_sink: &mut (dyn AsyncWrite + Unpin) = match output_path {
-        None => {
-            stdout_writer = tokio::io::stdout();
-            &mut stdout_writer
-        }
-        Some(path) => {
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(append)
-                .truncate(!append)
-                .open(path)
-                .await
-                .with_context(|| format!("failed to create output file '{}'", path.display()))?;
-            file_writer = tokio::io::BufWriter::new(file);
-            &mut file_writer
-        }
-    };
-    let mut wrote_reasoning = false;
-    let mut wrote_content = false;
-    let mut last_usage = None;
-    let mut content_text = String::new();
-    let mut tool_calls = response::StreamToolCallAccumulator::default();
-
-    loop {
-        let chunk = match async_io::await_cancellation(stream.next(), cancellation.clone()).await {
-            async_io::CancellationResult::Cancelled => {
-                content_sink.flush().await?;
-                bail!("streamed completion was cancelled");
-            }
-            async_io::CancellationResult::Completed(None) => break,
-            async_io::CancellationResult::Completed(Some(chunk)) => chunk?,
-        };
-        tracing::trace!(chunk = ?chunk, "received stream chunk");
-        if let Some(usage) = chunk.usage {
-            last_usage = Some(usage);
-        }
-        if let Some(deltas) = response::stream_chunk_tool_call_deltas(&chunk) {
-            tool_calls.push(deltas);
-        }
-        let (content, reasoning) = response::stream_chunk_deltas(&chunk);
-        if show_reasoning && let Some(reasoning) = reasoning {
-            if reasoning_inline {
-                if !wrote_reasoning {
-                    content_sink.write_all(b"Reasoning:\n").await?;
-                }
-                content_sink.write_all(reasoning.as_bytes()).await?;
-                content_sink.flush().await?;
-            } else {
-                if !wrote_reasoning {
-                    eprintln!("Reasoning:");
-                }
-                eprint!("{reasoning}");
-            }
-            wrote_reasoning = true;
-        }
-        if let Some(content) = content {
-            if reasoning_inline && wrote_reasoning && !wrote_content {
-                content_sink.write_all(b"\n\n").await?;
-            }
-            content_sink.write_all(content.as_bytes()).await?;
-            // Only the live stdout display needs each delta pushed out
-            // immediately; a `-o` file's `BufWriter` batches until the final
-            // flush below instead of paying a syscall per delta.
-            if reasoning_inline {
-                content_sink.flush().await?;
-            }
-            wrote_content = true;
-            content_text.push_str(content);
-        }
-    }
-
-    if !wrote_content && tool_calls.is_empty() {
-        bail!("API response contained no content in its first choice");
-    }
-    if !reasoning_inline && wrote_reasoning {
-        eprintln!();
-    }
-    // A round that goes on to call a tool gets no trailing newline: its
-    // content (if any, e.g. "Looking it up... ") is not the end of the
-    // response — the next round's content is appended right after it (see
-    // `RequestSettings::complete_stream`'s `append` handling), and a
-    // newline in between would be a stray artifact splitting what the user
-    // sees as one continuous answer. Only a round with no tool calls — the
-    // actual final answer, whether reached directly or via the
-    // `response_format` re-issue round — gets the newline every non-tool
-    // `--stream` response has always ended with.
-    if wrote_content && tool_calls.is_empty() {
-        content_sink.write_all(b"\n").await?;
-    }
-    content_sink.flush().await?;
-    Ok(StreamOutcome {
-        content: content_text,
-        usage: last_usage,
-        tool_calls: tool_calls.finish()?,
-    })
-}
-
-/// What `stream_response` produced: the full response text (concatenated
-/// from every content delta, exactly as printed), the usage its final chunk
-/// carried, if any, and any streamed tool calls it reassembled (empty unless
-/// the round advertised tools and the model asked to call at least one —
-/// see `RequestSettings::complete_stream`). The content half exists for
-/// callers that need the complete text after the stream ends even though it
-/// was already written out incrementally — recording a `--session` turn or a
-/// `lait history` entry, neither of which can work from deltas alone.
-#[derive(Debug)]
-pub(crate) struct StreamOutcome {
-    pub(crate) content: String,
-    pub(crate) tool_calls: Vec<response::ToolCall>,
-    pub(crate) usage: Option<response::Usage>,
 }
 
 /// The per-call inputs to `call_agent` beyond settings/env: the JSON-parsed
@@ -1470,7 +1126,7 @@ impl<'a> AgentTurn<'a> {
 pub(crate) async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
-    env: &AppContext,
+    env: &RunContext,
     turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
@@ -1582,7 +1238,7 @@ fn subagent_tool_input(
     Ok((input_value, prompt))
 }
 
-/// Runs subagent `name` (resolved via `env.agent_registry`, an `agents:`
+/// Runs subagent `name` (resolved via `env.services.agent_registry`, an `agents:`
 /// entry) against one tool call's raw JSON `arguments`, recursively driving
 /// its own completion (and, if it declares `subagents:`/`mcp:` of its own,
 /// its own tool loop) to completion, and returns its rendered response text —
@@ -1596,7 +1252,7 @@ fn subagent_tool_input(
 pub(crate) fn call_subagent_tool<'a>(
     name: &'a str,
     arguments_json: &'a str,
-    env: &'a AppContext,
+    env: &'a RunContext,
     active_paths: &'a [PathBuf],
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
@@ -1606,6 +1262,7 @@ pub(crate) fn call_subagent_tool<'a>(
         let context = || format!("subagent '{name}'");
 
         let loaded = env
+            .services
             .agent_registry
             .load_cancellable(name, cancellation.clone())
             .await?;
@@ -1629,7 +1286,7 @@ pub(crate) fn call_subagent_tool<'a>(
             subagent_tool_input(&loaded.file, arguments_json).with_context(context)?;
         loaded.validate_input(&input).with_context(context)?;
 
-        let settings = agent_file_settings(&loaded.file, &env.file_config, Some(name))
+        let settings = agent_file_settings(&loaded.file, &env.services.file_config, Some(name))
             .with_context(context)?
             .with_usage_label(format!("subagent '{name}'"));
 
@@ -1648,6 +1305,14 @@ pub(crate) fn call_subagent_tool<'a>(
         .await
         .with_context(context)
     })
+}
+
+fn api_key_source_name(source: &config::ApiKeySource) -> &'static str {
+    match source {
+        config::ApiKeySource::Absent => "absent",
+        config::ApiKeySource::Literal(_) => "literal",
+        config::ApiKeySource::Command(_) => "command",
+    }
 }
 
 /// Resolves the settings for one completion request. `model_name` and every
@@ -1692,7 +1357,7 @@ pub(crate) fn resolve_request_settings(
         Some(resolved) => resolved,
         None => config::resolve_model(model_name, file_config)?,
     };
-    let (base_url, api_key) = config::resolve_endpoint(
+    let endpoint = config::resolve_endpoint(
         base_url_override,
         api_key_override,
         resolved_model.base_url.as_deref(),
@@ -1700,13 +1365,7 @@ pub(crate) fn resolve_request_settings(
         resolved_model.api_key_cmd.as_ref(),
         file_config,
     )?;
-    let api_key = api_key.unwrap_or_else(|| {
-        // async-openai always builds an Authorization header from its config.
-        // LM Studio ignores the value, so use a non-empty dummy key when no
-        // key was supplied instead of making local requests fail on an empty
-        // header value.
-        "lm-studio".to_owned()
-    });
+    let config::Endpoint { base_url, api_key } = endpoint;
     let sampling = SamplingOverrides {
         reasoning_effort: overrides
             .reasoning_effort
@@ -1765,7 +1424,7 @@ pub(crate) fn resolve_request_settings(
     tracing::debug!(
         model_id = %resolved_model.model_id,
         base_url = %base_url,
-        api_key = %crate::logging::mask_secret(&api_key),
+        api_key_source = %api_key_source_name(&api_key),
         reasoning_effort = ?sampling.reasoning_effort,
         temperature = ?sampling.temperature,
         top_p = ?sampling.top_p,
@@ -1848,8 +1507,19 @@ pub(crate) fn agent_file_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::stream_response;
-    use std::time::Duration;
+    use super::context::{CachePolicy, CancellationSource, CassettePolicy, RunContext};
+    use super::{
+        AppServices, ToolApprovalAnswer, acquire_approval_gate, acquire_approval_slot,
+        read_tool_approval_with_lease, stream_response,
+    };
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
     use tokio_util::sync::CancellationToken;
 
     /// A regression test for the bug `stream_response`'s cancellation
@@ -1876,6 +1546,183 @@ mod tests {
         .expect("stream_response should return promptly once cancelled, not hang");
 
         let error = result.expect_err("a cancelled stream should be reported as an error");
-        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(
+            error.downcast_ref::<crate::error::Interrupted>().is_some(),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn operation_cancellation_is_a_child_of_the_invocation_source() {
+        let root = CancellationToken::new();
+        let source = CancellationSource::new(root.clone());
+        let operation = source.operation_token();
+
+        operation.cancel();
+        assert!(!root.is_cancelled());
+
+        root.cancel();
+        assert!(source.root_token().is_cancelled());
+        assert!(operation.is_cancelled());
+    }
+
+    #[test]
+    fn cassette_policy_rejects_record_and_replay_together() {
+        let services = Arc::new(AppServices::new(Arc::new(
+            crate::config::ConfigFile::default(),
+        )));
+        let context = RunContext::new(services, CancellationToken::new());
+        let result = context
+            .with_record_replay(Some(PathBuf::from("record")), Some(PathBuf::from("replay")));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cache_and_cassette_modes_expose_only_their_valid_operations() {
+        let cache = CachePolicy::Enabled { ttl: Some(30) };
+        assert!(cache.enabled());
+        assert_eq!(cache.ttl(), Some(30));
+
+        let record = CassettePolicy::Record(PathBuf::from("record"));
+        assert!(record.record_dir().is_some());
+        assert!(record.replay_dir().is_none());
+
+        let replay = CassettePolicy::Replay(PathBuf::from("replay"));
+        assert!(replay.record_dir().is_none());
+        assert!(replay.replay_dir().is_some());
+    }
+
+    #[tokio::test]
+    async fn approval_gate_serializes_injected_readers() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let first_started = Arc::new(AtomicBool::new(false));
+        let first_answer = {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let lease = gate.clone().lock_owned().await;
+            let started = Arc::clone(&first_started);
+            let first = tokio::spawn(read_tool_approval_with_lease(lease, None, move || {
+                started.store(true, Ordering::Release);
+                receiver
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("first approval reader was closed"))?;
+                Ok(ToolApprovalAnswer::Once)
+            }));
+            (first, sender)
+        };
+        for _ in 0..100 {
+            if first_started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(first_started.load(Ordering::Acquire));
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            let started = Arc::clone(&second_started);
+            async move {
+                let lease = gate.lock_owned().await;
+                read_tool_approval_with_lease(lease, None, move || {
+                    started.store(true, Ordering::Release);
+                    Ok(ToolApprovalAnswer::Once)
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_started.load(Ordering::Acquire),
+            "a second approval reader must wait for the first reader"
+        );
+
+        first_answer.1.send(()).unwrap();
+        first_answer.0.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if second_started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(second_started.load(Ordering::Acquire));
+        assert!(matches!(
+            second.await.unwrap().unwrap().0,
+            ToolApprovalAnswer::Once
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_approval_reader_keeps_the_gate_until_the_worker_exits() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let lease = gate.clone().lock_owned().await;
+        let started = Arc::new(AtomicBool::new(false));
+        let (answer_sender, answer_receiver) = std::sync::mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let reader = tokio::spawn({
+            let started = Arc::clone(&started);
+            read_tool_approval_with_lease(lease, Some(cancellation.clone()), move || {
+                started.store(true, Ordering::Release);
+                answer_receiver
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("approval reader was closed"))?;
+                Ok(ToolApprovalAnswer::Once)
+            })
+        });
+        for _ in 0..100 {
+            if started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.load(Ordering::Acquire));
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .expect("a cancelled approval owner must return promptly")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>())
+        );
+        assert!(
+            gate.clone().try_lock_owned().is_err(),
+            "the cancelled worker must retain the approval gate while blocked"
+        );
+
+        answer_sender.send(()).unwrap();
+        let released = tokio::time::timeout(Duration::from_secs(1), gate.lock_owned())
+            .await
+            .expect("the worker must eventually release the gate");
+        drop(released);
+    }
+
+    #[tokio::test]
+    async fn always_cache_is_rechecked_after_waiting_for_the_approval_gate() {
+        let services = Arc::new(AppServices::new(Arc::new(
+            crate::config::ConfigFile::default(),
+        )));
+        let env = Arc::new(RunContext::new(services, CancellationToken::new()));
+        let held = acquire_approval_gate(&env, None).await.unwrap();
+        let waiter = tokio::spawn({
+            let env = Arc::clone(&env);
+            async move { acquire_approval_slot(&env, "tool__echo", None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+        env.always_approved_tools
+            .lock()
+            .unwrap()
+            .insert("tool__echo".to_owned());
+        drop(held);
+
+        let slot = waiter.await.unwrap().unwrap();
+        assert!(
+            slot.is_none(),
+            "always-approved calls must not prompt again"
+        );
     }
 }

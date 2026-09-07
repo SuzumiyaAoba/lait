@@ -1,5 +1,10 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::{cli::ReasoningEffort, config::ModelMap, schema::JsonSchemaMap};
@@ -13,13 +18,16 @@ pub(crate) const CURRENT_WORKFLOW_VERSION: u32 = 1;
 /// The workflow-file-scoped map of reusable action definitions, keyed by the
 /// name used in `steps[].use`. Unlike `models`/`json_schemas`, this is never
 /// merged into a nested `workflow:` step's sub-workflow scope — each file's
-/// `use:` resolves only against its own `nodes:` (see `WorkflowScope::nodes`
-/// in `app.rs`).
-pub(crate) type NodeMap = BTreeMap<String, NodeDefinition>;
+/// `use:` resolves only against its own `nodes:` during validation. Compiled
+/// call steps retain an Arc to that definition for their entire lifetime.
+pub(crate) type NodeMap = BTreeMap<String, Arc<NodeDefinition>>;
+
+pub(crate) type WorkflowFile = WorkflowDocument<FlowStep>;
+pub(super) type RawWorkflowFile = WorkflowDocument<super::raw::FlowStep>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct WorkflowFile {
+pub(crate) struct WorkflowDocument<S> {
     /// This file's schema version. `None` (the field omitted) means "the
     /// latest version this build supports" — the common case, and the only
     /// option before this field existed. An explicit version that isn't
@@ -48,14 +56,14 @@ pub(crate) struct WorkflowFile {
     /// used from more than one place in `steps`.
     #[serde(default)]
     pub(crate) nodes: NodeMap,
-    pub(crate) steps: Vec<FlowStep>,
+    pub(crate) steps: Vec<S>,
 }
 
 /// A workflow file's `default:` block: the same `model`/`reasoning_effort`
 /// fallback as `lait.config.yml`'s `default:` (see
 /// `config::DefaultSettings`), plus a workflow-only `retry`/`timeout`
 /// fallback applied to any step that calls a model (`prompt`/`agent`) and
-/// doesn't set its own (see `NodeDefinition::retry`/`timeout`). Kept as its
+/// doesn't set its own (see `NodeDefinition::settings`). Kept as its
 /// own type rather than reusing `config::DefaultSettings` (`#[serde(flatten)]`
 /// is documented as incompatible with `#[serde(deny_unknown_fields)]`, which
 /// both this and `DefaultSettings` rely on to reject typos).
@@ -153,10 +161,10 @@ impl WorkflowDefaults {
 /// `flatten` is documented as incompatible with `deny_unknown_fields` (see
 /// `WorkflowDefaults`'s doc comment, which hit the same constraint first),
 /// and losing the typo-rejection this DSL leans on for every field would
-/// cost far more than the duplication does. `NodeDefinition`'s own methods
-/// below (`model`/`jq`/`retry`/... ) read through to whichever variant has
-/// that field, `None` for one that doesn't, so most call sites outside
-/// `workflow::validate`/`workflow::exec` never have to match on the variant
+/// cost far more than the duplication does. `NodeDefinition::settings` below
+/// exposes whichever shared fields a variant has as a borrowed view, with
+/// `None` for fields that do not apply, so generic consumers outside the
+/// variant-specific execution branches never have to match on the variant
 /// themselves.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -167,6 +175,69 @@ pub(crate) enum NodeDefinition {
     Command(CommandNode),
     Transform(TransformNode),
     Ask(AskNode),
+}
+
+/// The action kind encoded by a node's `type:` field.
+///
+/// Keeping this classification separate from [`NodeDefinition`] lets callers
+/// ask questions about a node's behavior without repeating a variant match.
+/// The variants still carry the parsed fields; this enum only represents the
+/// stable, field-independent part of the node contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeKind {
+    Prompt,
+    Agent,
+    Workflow,
+    Command,
+    Transform,
+    Ask,
+}
+
+impl NodeKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Agent => "agent",
+            Self::Workflow => "workflow",
+            Self::Command => "command",
+            Self::Transform => "transform",
+            Self::Ask => "ask",
+        }
+    }
+
+    pub(crate) const fn calls_model(self) -> bool {
+        matches!(self, Self::Prompt | Self::Agent)
+    }
+
+    pub(crate) const fn requires_interactive_stdin(self) -> bool {
+        matches!(self, Self::Ask)
+    }
+}
+
+/// Borrowed settings shared by node execution, validation, and presentation.
+///
+/// The YAML structs intentionally keep their fields variant-specific so
+/// `deny_unknown_fields` can reject a setting on the wrong `type:`. This view
+/// provides the opposite side of that boundary: consumers that only need
+/// effective node metadata can read one uniform shape without repeating a
+/// six-variant match for every field. Fields that do not apply to a variant
+/// are represented as `None`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NodeSettings<'a> {
+    pub(crate) model: Option<&'a str>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) max_tokens: Option<u32>,
+    pub(crate) mcp: Option<&'a [String]>,
+    pub(crate) max_tool_rounds: Option<usize>,
+    pub(crate) skills: Option<&'a [String]>,
+    pub(crate) subagents: Option<&'a [String]>,
+    pub(crate) tools: Option<&'a [String]>,
+    pub(crate) retry: Option<&'a RetryDefinition>,
+    pub(crate) timeout: Option<u64>,
+    pub(crate) jq: Option<&'a str>,
+    pub(crate) write_file: Option<&'a Path>,
 }
 
 /// `type: prompt` — sends `prompt` (rendered as a handlebars template) and/or
@@ -403,6 +474,18 @@ pub(crate) struct AskNode {
 }
 
 impl NodeDefinition {
+    /// Returns the stable action kind represented by this node.
+    pub(crate) fn kind(&self) -> NodeKind {
+        match self {
+            Self::Prompt(_) => NodeKind::Prompt,
+            Self::Agent(_) => NodeKind::Agent,
+            Self::Workflow(_) => NodeKind::Workflow,
+            Self::Command(_) => NodeKind::Command,
+            Self::Transform(_) => NodeKind::Transform,
+            Self::Ask(_) => NodeKind::Ask,
+        }
+    }
+
     /// Whether this node's action is a model call that participates in the
     /// node > agent file > workflow `default:` sampling/capability/retry/
     /// timeout fallback chain (see `workflow::exec::resolve_step_settings`) —
@@ -413,181 +496,79 @@ impl NodeDefinition {
     /// still set its own `retry`/`timeout` explicitly — they just never
     /// inherit the workflow's `default.retry`/`default.timeout`.
     pub(crate) fn calls_model(&self) -> bool {
-        matches!(self, NodeDefinition::Prompt(_) | NodeDefinition::Agent(_))
+        self.kind().calls_model()
     }
 
-    pub(crate) fn model(&self) -> Option<&str> {
+    /// Returns the settings visible to generic node consumers. The view is
+    /// borrowed from this definition and therefore does not clone any model
+    /// aliases, capability lists, retry policy, or output paths.
+    pub(crate) fn settings(&self) -> NodeSettings<'_> {
         match self {
-            NodeDefinition::Prompt(node) => node.model.as_deref(),
-            NodeDefinition::Agent(node) => node.model.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        match self {
-            NodeDefinition::Prompt(node) => node.reasoning_effort,
-            NodeDefinition::Agent(node) => node.reasoning_effort,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn temperature(&self) -> Option<f64> {
-        match self {
-            NodeDefinition::Prompt(node) => node.temperature,
-            NodeDefinition::Agent(node) => node.temperature,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn top_p(&self) -> Option<f64> {
-        match self {
-            NodeDefinition::Prompt(node) => node.top_p,
-            NodeDefinition::Agent(node) => node.top_p,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn max_tokens(&self) -> Option<u32> {
-        match self {
-            NodeDefinition::Prompt(node) => node.max_tokens,
-            NodeDefinition::Agent(node) => node.max_tokens,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn mcp(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.mcp.as_deref(),
-            NodeDefinition::Agent(node) => node.mcp.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn max_tool_rounds(&self) -> Option<usize> {
-        match self {
-            NodeDefinition::Prompt(node) => node.max_tool_rounds,
-            NodeDefinition::Agent(node) => node.max_tool_rounds,
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn skills(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.skills.as_deref(),
-            NodeDefinition::Agent(node) => node.skills.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn subagents(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.subagents.as_deref(),
-            NodeDefinition::Agent(node) => node.subagents.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    pub(crate) fn tools(&self) -> Option<&[String]> {
-        match self {
-            NodeDefinition::Prompt(node) => node.tools.as_deref(),
-            NodeDefinition::Agent(node) => node.tools.as_deref(),
-            NodeDefinition::Workflow(_)
-            | NodeDefinition::Command(_)
-            | NodeDefinition::Transform(_)
-            | NodeDefinition::Ask(_) => None,
-        }
-    }
-
-    /// `retry`/`timeout` have no fallback of their own (unlike sampling/
-    /// capability knobs above): `Workflow` has neither field at all, and
-    /// `Command`/`Transform` may set their own but never inherit
-    /// `default.retry`/`default.timeout` (see `calls_model`'s doc comment).
-    pub(crate) fn retry(&self) -> Option<&RetryDefinition> {
-        match self {
-            NodeDefinition::Prompt(node) => node.retry.as_ref(),
-            NodeDefinition::Agent(node) => node.retry.as_ref(),
-            NodeDefinition::Workflow(_) => None,
-            NodeDefinition::Command(node) => node.retry.as_ref(),
-            NodeDefinition::Transform(node) => node.retry.as_ref(),
-            NodeDefinition::Ask(node) => node.retry.as_ref(),
-        }
-    }
-
-    pub(crate) fn timeout(&self) -> Option<u64> {
-        match self {
-            NodeDefinition::Prompt(node) => node.timeout,
-            NodeDefinition::Agent(node) => node.timeout,
-            NodeDefinition::Workflow(_) => None,
-            NodeDefinition::Command(node) => node.timeout,
-            NodeDefinition::Transform(node) => node.timeout,
-            NodeDefinition::Ask(node) => node.timeout,
-        }
-    }
-
-    /// A jq filter applied to this node's output, common to every variant.
-    pub(crate) fn jq(&self) -> Option<&str> {
-        match self {
-            NodeDefinition::Prompt(node) => node.jq.as_deref(),
-            NodeDefinition::Agent(node) => node.jq.as_deref(),
-            NodeDefinition::Workflow(node) => node.jq.as_deref(),
-            NodeDefinition::Command(node) => node.jq.as_deref(),
-            NodeDefinition::Transform(node) => node.jq.as_deref(),
-            NodeDefinition::Ask(node) => node.jq.as_deref(),
-        }
-    }
-
-    /// Where this node's output (after `jq`, if set) is written, common to
-    /// every variant.
-    pub(crate) fn write_file(&self) -> Option<&std::path::Path> {
-        match self {
-            NodeDefinition::Prompt(node) => node.write_file.as_deref(),
-            NodeDefinition::Agent(node) => node.write_file.as_deref(),
-            NodeDefinition::Workflow(node) => node.write_file.as_deref(),
-            NodeDefinition::Command(node) => node.write_file.as_deref(),
-            NodeDefinition::Transform(node) => node.write_file.as_deref(),
-            NodeDefinition::Ask(node) => node.write_file.as_deref(),
+            Self::Prompt(node) => NodeSettings {
+                model: node.model.as_deref(),
+                reasoning_effort: node.reasoning_effort,
+                temperature: node.temperature,
+                top_p: node.top_p,
+                max_tokens: node.max_tokens,
+                mcp: node.mcp.as_deref(),
+                max_tool_rounds: node.max_tool_rounds,
+                skills: node.skills.as_deref(),
+                subagents: node.subagents.as_deref(),
+                tools: node.tools.as_deref(),
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+            },
+            Self::Agent(node) => NodeSettings {
+                model: node.model.as_deref(),
+                reasoning_effort: node.reasoning_effort,
+                temperature: node.temperature,
+                top_p: node.top_p,
+                max_tokens: node.max_tokens,
+                mcp: node.mcp.as_deref(),
+                max_tool_rounds: node.max_tool_rounds,
+                skills: node.skills.as_deref(),
+                subagents: node.subagents.as_deref(),
+                tools: node.tools.as_deref(),
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+            },
+            Self::Workflow(node) => NodeSettings {
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
+            Self::Command(node) => NodeSettings {
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
+            Self::Transform(node) => NodeSettings {
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
+            Self::Ask(node) => NodeSettings {
+                retry: node.retry.as_ref(),
+                timeout: node.timeout,
+                jq: node.jq.as_deref(),
+                write_file: node.write_file.as_deref(),
+                ..NodeSettings::default()
+            },
         }
     }
 
     /// This variant's `type:` name as it appears in a workflow YAML file
     /// (and in `lait run --dry-run`/`lait graph` output).
     pub(crate) fn type_name(&self) -> &'static str {
-        match self {
-            NodeDefinition::Prompt(_) => "prompt",
-            NodeDefinition::Agent(_) => "agent",
-            NodeDefinition::Workflow(_) => "workflow",
-            NodeDefinition::Command(_) => "command",
-            NodeDefinition::Transform(_) => "transform",
-            NodeDefinition::Ask(_) => "ask",
-        }
+        self.kind().as_str()
     }
 
     /// Whether this node reads from the process's own stdin when it runs —
@@ -598,7 +579,7 @@ impl NodeDefinition {
     /// `validate::validate_steps`'s concurrency-safety checks, which reject
     /// this the same way they reject a concurrent `write_file`).
     pub(crate) fn requires_interactive_stdin(&self) -> bool {
-        matches!(self, NodeDefinition::Ask(_))
+        self.kind().requires_interactive_stdin()
     }
 }
 
@@ -606,90 +587,42 @@ impl NodeDefinition {
 /// no action of its own — `use` points at a `NodeDefinition` in the
 /// workflow's `nodes:` map, or one of `switch`/`parallel`/`loop`/`for_each`
 /// routes to nested `steps` instead.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A step whose shape and nesting have passed workflow validation.
+/// Construction is private; execution and presentation never receive wire shapes.
+#[derive(Debug)]
 pub(crate) struct FlowStep {
-    /// This site's label, used for progress output and as the key this
-    /// site's output is recorded under in `{{ steps.<id> }}`/`$steps`.
-    /// Defaults to the referenced node's id (see `FlowStep::label`). Required
-    /// to differ from any node id it does not itself reference, since node
-    /// ids and site ids share the same `$steps` namespace (see
-    /// `validate::validate_steps`).
-    pub(crate) id: Option<String>,
-    /// The id of the node (in the workflow's `nodes:` map) this site runs.
-    /// Mutually exclusive with `switch`/`parallel`/`loop`/`for_each`; exactly
-    /// one of the five, or none of them together with `stop`/`break`, is
-    /// required.
-    #[serde(rename = "use")]
-    pub(crate) r#use: Option<String>,
-    /// A jq filter evaluated against the current input (JSON-parsed, falling
-    /// back to a JSON string for plain text, like `template::parse_input`).
-    /// A falsy result (`false`/`null`) skips this site entirely, passing the
-    /// input through unchanged to the next step. Only meaningful together
-    /// with `use`.
-    pub(crate) when: Option<String>,
-    /// Runs in place of failing the workflow when this site's node (after
-    /// every `retry` attempt, if any) still fails. Only meaningful together
-    /// with `use`.
-    pub(crate) on_error: Option<OnErrorDefinition>,
-    /// Turns this site into a branch router: evaluates `cases` in order and
-    /// runs the first one whose `when` is truthy (or `else`, if none match).
-    /// Mutually exclusive with every other field except `id`.
-    pub(crate) switch: Option<SwitchDefinition>,
-    /// Turns this site into a fan-out/fan-in: runs every branch concurrently
-    /// against the same input and joins their outputs. Mutually exclusive
-    /// with every other field except `id`.
-    pub(crate) parallel: Option<ParallelDefinition>,
-    /// Turns this site into a conditional loop: re-runs `steps` while/until a
-    /// jq condition holds, threading each iteration's output into the next
-    /// iteration's `{{ input }}`. Mutually exclusive with every other field
-    /// except `id`.
-    pub(crate) r#loop: Option<LoopDefinition>,
-    /// Turns this site into an array map: runs `steps` once per element of a
-    /// jq-selected array, collecting the results (in array order) into a
-    /// JSON array. Mutually exclusive with every other field except `id`.
-    pub(crate) for_each: Option<ForEachDefinition>,
-    /// Ends the workflow successfully right after this site's node runs
-    /// (after its own action, if any), using its output as the workflow's
-    /// final result; no further steps run. Rejected inside a `parallel`
-    /// branch, where concurrently running sibling branches make "stop the
-    /// workflow" ambiguous. Mutually exclusive with `break`. May accompany
-    /// `use` (checked after the node runs and its output is recorded), or
-    /// stand alone.
-    pub(crate) stop: Option<bool>,
-    /// Exits the nearest enclosing `loop`/`for_each` body right after this
-    /// site's node runs, using its output as that iteration's result (the
-    /// loop then proceeds as if the iteration had finished normally, i.e.
-    /// checking `while`/`until` or moving to `join`). Requires an enclosing
-    /// `loop`/`for_each` reachable without crossing a `parallel` branch
-    /// boundary. Mutually exclusive with `stop`. May accompany `use`, or
-    /// stand alone.
-    pub(crate) r#break: Option<bool>,
+    id: Option<String>,
+    action: StepAction,
 }
 
-impl FlowStep {
-    /// This site's label for progress output and `$steps` recording: its own
-    /// `id` if set, else the referenced node's id (for a `use` site), else
-    /// `None` (a router site with no `id`, whose caller falls back to a
-    /// `step-N` counter label).
-    pub(crate) fn label(&self) -> Option<&str> {
-        self.id.as_deref().or(self.r#use.as_deref())
-    }
-
-    /// `label()`, falling back to `step-<fallback_n>` when this site has
-    /// neither an explicit `id` nor a `use` to name it. Shared by
-    /// `run_steps`' progress labels and `validate_steps`' error labels, so
-    /// both name a given site the same way.
-    pub(crate) fn label_or(&self, fallback_n: usize) -> String {
-        self.label()
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("step-{fallback_n}"))
-    }
+#[derive(Debug)]
+enum StepAction {
+    Call {
+        node: String,
+        definition: Arc<NodeDefinition>,
+        when: Option<String>,
+        on_error: Option<OnErrorDefinition>,
+        control: Control,
+    },
+    Switch(SwitchDefinition),
+    Parallel(ParallelDefinition),
+    Loop(LoopDefinition),
+    ForEach(ForEachDefinition),
+    Break {
+        when: Option<String>,
+    },
+    Stop {
+        when: Option<String>,
+    },
 }
 
-/// The step kinds that route to nested `steps` instead of acting directly on
-/// their own input, borrowed out of whichever of `FlowStep::switch`/
-/// `parallel`/`loop`/`for_each` is set. See `FlowStep::router`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Control {
+    Continue,
+    Break,
+    Stop,
+}
+
 pub(crate) enum Router<'a> {
     Switch(&'a SwitchDefinition),
     Parallel(&'a ParallelDefinition),
@@ -697,25 +630,206 @@ pub(crate) enum Router<'a> {
     ForEach(&'a ForEachDefinition),
 }
 
+pub(crate) struct NodeCall<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) definition: &'a NodeDefinition,
+}
+
 impl FlowStep {
-    /// Which router kind this site is, if any. `validate::validate_steps`
-    /// checks `switch`/`parallel`/`loop`/`for_each` are not set together
-    /// before ever calling this (see its `router_count` check), so checking
-    /// them in a fixed order here is safe; called on a site that hasn't been
-    /// through that check, it would silently prefer the first one set.
-    /// `validate_steps` and `run_steps` both match on this so a new router
-    /// kind requires updating both.
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+    pub(crate) fn call(&self) -> Option<NodeCall<'_>> {
+        match &self.action {
+            StepAction::Call {
+                node, definition, ..
+            } => Some(NodeCall {
+                name: node,
+                definition,
+            }),
+            _ => None,
+        }
+    }
+    pub(crate) fn node_id(&self) -> Option<&str> {
+        match &self.action {
+            StepAction::Call { node, .. } => Some(node),
+            _ => None,
+        }
+    }
+    pub(crate) fn when(&self) -> Option<&str> {
+        match &self.action {
+            StepAction::Call { when, .. }
+            | StepAction::Break { when }
+            | StepAction::Stop { when } => when.as_deref(),
+            _ => None,
+        }
+    }
+    pub(crate) fn on_error(&self) -> Option<&OnErrorDefinition> {
+        match &self.action {
+            StepAction::Call { on_error, .. } => on_error.as_ref(),
+            _ => None,
+        }
+    }
+    pub(crate) fn control(&self) -> Control {
+        match self.action {
+            StepAction::Call { control, .. } => control,
+            StepAction::Break { .. } => Control::Break,
+            StepAction::Stop { .. } => Control::Stop,
+            _ => Control::Continue,
+        }
+    }
+    pub(crate) fn label(&self) -> Option<&str> {
+        self.id().or_else(|| self.node_id())
+    }
+    pub(crate) fn label_or(&self, fallback: usize) -> String {
+        self.label()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("step-{fallback}"))
+    }
     pub(crate) fn router(&self) -> Option<Router<'_>> {
-        if let Some(switch) = &self.switch {
-            return Some(Router::Switch(switch));
+        match &self.action {
+            StepAction::Switch(router) => Some(Router::Switch(router)),
+            StepAction::Parallel(router) => Some(Router::Parallel(router)),
+            StepAction::Loop(router) => Some(Router::Loop(router)),
+            StepAction::ForEach(router) => Some(Router::ForEach(router)),
+            StepAction::Call { .. } | StepAction::Break { .. } | StepAction::Stop { .. } => None,
         }
-        if let Some(parallel) = &self.parallel {
-            return Some(Router::Parallel(parallel));
+    }
+
+    fn compile(raw: super::raw::FlowStep, nodes: &NodeMap) -> Result<Self> {
+        let control = if raw.stop == Some(true) {
+            Control::Stop
+        } else if raw.r#break == Some(true) {
+            Control::Break
+        } else {
+            Control::Continue
+        };
+        let action = if let Some(node) = raw.r#use {
+            StepAction::Call {
+                definition: Arc::clone(
+                    nodes
+                        .get(&node)
+                        .with_context(|| format!("unknown workflow node '{node}'"))?,
+                ),
+                node,
+                when: raw.when,
+                on_error: raw
+                    .on_error
+                    .map(|handler| {
+                        Ok::<_, anyhow::Error>(OnErrorDefinition {
+                            steps: compile_steps(handler.steps, nodes)?,
+                        })
+                    })
+                    .transpose()?,
+                control,
+            }
+        } else if let Some(router) = raw.switch {
+            StepAction::Switch(SwitchDefinition {
+                cases: router
+                    .cases
+                    .into_iter()
+                    .map(|case| {
+                        Ok::<_, anyhow::Error>(CaseDefinition {
+                            id: case.id,
+                            when: case.when,
+                            steps: compile_steps(case.steps, nodes)?,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+                else_steps: router
+                    .else_steps
+                    .map(|steps| compile_steps(steps, nodes))
+                    .transpose()?,
+            })
+        } else if let Some(router) = raw.parallel {
+            StepAction::Parallel(ParallelDefinition {
+                branches: router
+                    .branches
+                    .into_iter()
+                    .map(|branch| {
+                        Ok::<_, anyhow::Error>(BranchDefinition {
+                            id: branch.id,
+                            steps: compile_steps(branch.steps, nodes)?,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+                join: router.join,
+            })
+        } else if let Some(router) = raw.r#loop {
+            StepAction::Loop(LoopDefinition {
+                condition: match (router.r#while, router.until) {
+                    (Some(filter), None) => LoopCondition::While(filter),
+                    (None, Some(filter)) => LoopCondition::Until(filter),
+                    _ => anyhow::bail!("loop requires exactly one condition"),
+                },
+                max_iterations: router
+                    .max_iterations
+                    .and_then(std::num::NonZeroUsize::new)
+                    .context("loop requires a positive max_iterations")?,
+                steps: compile_steps(router.steps, nodes)?,
+            })
+        } else if let Some(router) = raw.for_each {
+            StepAction::ForEach(ForEachDefinition {
+                items: router.items,
+                steps: compile_steps(router.steps, nodes)?,
+                join: router.join,
+                max_concurrency: router.max_concurrency,
+            })
+        } else if raw.stop == Some(true) {
+            StepAction::Stop { when: raw.when }
+        } else if raw.r#break == Some(true) {
+            StepAction::Break { when: raw.when }
+        } else {
+            anyhow::bail!("step has no action or active control directive");
+        };
+        Ok(Self { id: raw.id, action })
+    }
+}
+
+fn compile_steps(steps: Vec<super::raw::FlowStep>, nodes: &NodeMap) -> Result<Vec<FlowStep>> {
+    steps
+        .into_iter()
+        .map(|step| FlowStep::compile(step, nodes))
+        .collect()
+}
+
+impl WorkflowDocument<super::raw::FlowStep> {
+    /// The only raw-to-executable conversion validates the entire document
+    /// before binding node references and compiling private action variants.
+    pub(super) fn validate(self) -> Result<WorkflowFile> {
+        if let Some(version) = self.version
+            && version != CURRENT_WORKFLOW_VERSION
+        {
+            anyhow::bail!(
+                "unsupported workflow schema 'version: {version}'; this build of lait supports \
+             version {CURRENT_WORKFLOW_VERSION} (omit 'version:' to use the latest one this \
+             build supports)"
+            );
         }
-        if let Some(loop_def) = &self.r#loop {
-            return Some(Router::Loop(loop_def));
+        if self.steps.is_empty() {
+            anyhow::bail!("workflow must contain at least one step");
         }
-        self.for_each.as_ref().map(Router::ForEach)
+        super::validate::validate_workflow_defaults(&self.default)?;
+        for (node_id, node) in &self.nodes {
+            super::validate::validate_node(node, node_id)?;
+        }
+        super::validate::validate_steps(
+            &self.steps,
+            &self.nodes,
+            super::validate::FlowContext::TOP_LEVEL,
+        )?;
+
+        let steps = compile_steps(self.steps, &self.nodes)?;
+        Ok(WorkflowDocument {
+            version: self.version,
+            name: self.name,
+            description: self.description,
+            default: self.default,
+            models: self.models,
+            json_schemas: self.json_schemas,
+            nodes: self.nodes,
+            steps,
+        })
     }
 }
 
@@ -735,46 +849,46 @@ pub(crate) struct RetryDefinition {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct OnErrorDefinition {
+pub(crate) struct OnErrorDefinition<S = FlowStep> {
     /// Run once, with the failure's `{"error": ..., "input": ...}` object as
     /// `{{ input }}`, in place of failing the workflow. `stop`/`break` are
     /// allowed here like anywhere else (subject to the same nesting rules as
     /// the failing step itself).
-    pub(crate) steps: Vec<FlowStep>,
+    pub(crate) steps: Vec<S>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SwitchDefinition {
+pub(crate) struct SwitchDefinition<S = FlowStep> {
     /// Evaluated in order; the first case whose `when` is truthy runs.
-    pub(crate) cases: Vec<CaseDefinition>,
+    pub(crate) cases: Vec<CaseDefinition<S>>,
     /// Runs when no `case` matched. Required unless the workflow author is
     /// sure `cases` is exhaustive: a `switch` with no matching case and no
     /// `else` is a runtime error rather than a silent pass-through.
     #[serde(rename = "else")]
-    pub(crate) else_steps: Option<Vec<FlowStep>>,
+    pub(crate) else_steps: Option<Vec<S>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CaseDefinition {
+pub(crate) struct CaseDefinition<S = FlowStep> {
     /// An optional label used only in progress output (like `FlowStep::id`).
     pub(crate) id: Option<String>,
     /// A jq filter evaluated against the current input; see `FlowStep::when`.
     pub(crate) when: String,
-    pub(crate) steps: Vec<FlowStep>,
+    pub(crate) steps: Vec<S>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ParallelDefinition {
+pub(crate) struct ParallelDefinition<S = FlowStep> {
     /// Every branch runs concurrently against the same input (a snapshot of
     /// `{{ input }}` as it stood when the `parallel` step started). Their
     /// outputs are collected, in `branches` declaration order (not
     /// completion order, so the join is deterministic), into a JSON object
     /// keyed by each branch's `id` (or its default label; see
     /// `BranchDefinition::label`).
-    pub(crate) branches: Vec<BranchDefinition>,
+    pub(crate) branches: Vec<BranchDefinition<S>>,
     /// A jq filter applied to that id-keyed object, the same way a node's
     /// own `jq` applies to its output. If omitted, the object itself
     /// (serialized as JSON) becomes `{{ input }}` for the next step.
@@ -783,15 +897,15 @@ pub(crate) struct ParallelDefinition {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BranchDefinition {
+pub(crate) struct BranchDefinition<S = FlowStep> {
     /// Defaults to `branch-{n}` (1-based), like `FlowStep::id`. Unlike
     /// a step or case id, this also becomes the branch's key in the joined
     /// JSON object, so it must be unique within its `parallel`.
     pub(crate) id: Option<String>,
-    pub(crate) steps: Vec<FlowStep>,
+    pub(crate) steps: Vec<S>,
 }
 
-impl BranchDefinition {
+impl<S> BranchDefinition<S> {
     /// The label used both for progress output and as the branch's key in
     /// the joined JSON object. `index` is 0-based.
     pub(crate) fn label(&self, index: usize) -> String {
@@ -801,9 +915,36 @@ impl BranchDefinition {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct LoopDefinition {
+    pub(crate) condition: LoopCondition,
+    pub(crate) max_iterations: std::num::NonZeroUsize,
+    pub(crate) steps: Vec<FlowStep>,
+}
+
+#[derive(Debug)]
+pub(crate) enum LoopCondition {
+    While(String),
+    Until(String),
+}
+
+impl LoopCondition {
+    pub(crate) fn keyword(&self) -> &'static str {
+        match self {
+            Self::While(_) => "while",
+            Self::Until(_) => "until",
+        }
+    }
+    pub(crate) fn filter(&self) -> &str {
+        match self {
+            Self::While(filter) | Self::Until(filter) => filter,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LoopDefinition {
+pub(super) struct RawLoopDefinition<S> {
     /// Checked before each iteration (including the first), against the
     /// current input; the loop runs while this is truthy, so it may run zero
     /// times. Mutually exclusive with `until`; exactly one of them is
@@ -826,12 +967,12 @@ pub(crate) struct LoopDefinition {
     /// The loop body, re-run each iteration. Each iteration's final output
     /// becomes `{{ input }}` for the next iteration (or, for the first
     /// iteration, this is the `loop` step's own incoming input).
-    pub(crate) steps: Vec<FlowStep>,
+    pub(crate) steps: Vec<S>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ForEachDefinition {
+pub(crate) struct ForEachDefinition<S = FlowStep> {
     /// A jq filter evaluated once against the current input; must produce
     /// exactly one output value, which must be a JSON array (e.g. `.items`,
     /// not a stream-producing filter like `.items[]`). Each element becomes
@@ -839,7 +980,7 @@ pub(crate) struct ForEachDefinition {
     /// cannot see anything of the surrounding input beyond that element.
     pub(crate) items: String,
     /// The loop body, run once per element of `items`, in array order.
-    pub(crate) steps: Vec<FlowStep>,
+    pub(crate) steps: Vec<S>,
     /// A jq filter applied to the JSON array of per-element outputs (in
     /// `items` order), the same way `ParallelDefinition::join` applies to
     /// the id-keyed object from a `parallel` step. If omitted, the array

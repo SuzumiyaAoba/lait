@@ -151,6 +151,52 @@ steps:
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dry_run_does_not_run_an_api_key_command() {
+    let config = ConfigDirectory::empty();
+    let marker = config.path().join("api-key-command-ran");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: http://127.0.0.1:1/v1
+        api_key_cmd: ["sh", "-c", "touch '{}' ; printf dry-run-secret"]
+      model_id: workflow-model
+nodes:
+  echo:
+    type: prompt
+    prompt: "{{{{ input }}}}"
+steps:
+  - use: echo
+"#,
+        marker.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow
+                .path
+                .to_str()
+                .expect("workflow path should be UTF-8"),
+            "hello",
+            "--dry-run",
+        ])
+        .output()
+        .expect("failed to execute lait run --dry-run");
+
+    assert!(output.status.success(), "dry-run failed: {output:?}");
+    assert!(
+        !marker.exists(),
+        "dry-run must not resolve an API-key command"
+    );
+}
+
 #[test]
 fn run_emits_json_with_the_same_shape_as_chat() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
@@ -4052,4 +4098,123 @@ steps:
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("model is required"), "stderr: {stderr}");
+}
+
+#[test]
+fn concurrent_parent_rejects_interactive_child_before_child_side_effects() {
+    let dir = support::ScratchDir::new();
+    dir.write("child.yml", "nodes:\n  first: {type: transform, jq: '.', write_file: touched.txt}\n  question: {type: ask, prompt: continue, default: yes}\nsteps: [{use: first}, {use: question}]\n");
+    let root = dir.write("root.yml", "nodes:\n  child: {type: workflow, workflow: child.yml}\nsteps:\n  - parallel:\n      branches:\n        - steps: [{use: child}]\n");
+    let output = test_command()
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(root)
+        .args(["input", "--no-config", "--no-env", "--no-history"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("concurrent") && stderr.contains("ask"),
+        "{stderr}"
+    );
+    assert!(
+        !dir.path().join("touched.txt").exists(),
+        "child effects ran before preflight"
+    );
+}
+
+#[test]
+fn concurrent_for_each_restrictions_cross_workflow_file_boundaries() {
+    let dir = support::ScratchDir::new();
+    dir.write("grandchild.yml", "nodes:\n  save: {type: transform, jq: '.', write_file: result.txt}\nsteps: [{use: save}]\n");
+    dir.write(
+        "child.yml",
+        "nodes:\n  next: {type: workflow, workflow: grandchild.yml}\nsteps: [{use: next}]\n",
+    );
+    let root = dir.write("root.yml", "nodes:\n  child: {type: workflow, workflow: child.yml}\nsteps:\n  - for_each:\n      items: '.'\n      max_concurrency: 2\n      steps: [{use: child}]\n");
+    let output = test_command()
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(root)
+        .args(["[1,2]", "--no-config", "--no-env", "--no-history"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("concurrent") && stderr.contains("write_file"),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("result.txt").exists());
+}
+
+#[test]
+fn a_child_workflow_can_stop_locally_inside_a_parallel_parent() {
+    let dir = support::ScratchDir::new();
+    dir.write("child.yml", "steps: [{stop: true}]\n");
+    let root = dir.write("root.yml", "nodes:\n  child: {type: workflow, workflow: child.yml}\nsteps:\n  - parallel:\n      branches:\n        - id: a\n          steps: [{use: child}]\n        - id: b\n          steps: [{use: child}]\n");
+    let output = test_command()
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(root)
+        .args(["input", "--no-config", "--no-env", "--no-history"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value, serde_json::json!({"a":"input", "b":"input"}));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_workflow_waiting_on_a_fifo_observes_the_workflow_deadline() {
+    let dir = support::ScratchDir::new();
+    create_fifo(&dir.path().join("child.yml"));
+    let root = dir.write("root.yml", "default: {workflow_timeout: 1}\nnodes:\n  child: {type: workflow, workflow: child.yml}\nsteps: [{use: child}]\n");
+    let (output, elapsed) = run_workflow_until_timeout(&root);
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    assert!(elapsed < Duration::from_secs(3));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_recursive_fifo_workflow_is_rejected_before_waiting_for_another_writer() {
+    use std::io::Write;
+    let dir = support::ScratchDir::new();
+    let path = dir.path().join("cycle.yml");
+    create_fifo(&path);
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .unwrap();
+        writer.write_all(b"default: {workflow_timeout: 1}\nnodes:\n  again: {type: workflow, workflow: cycle.yml}\nsteps: [{use: again}]\n").unwrap();
+    });
+    let (output, _) = run_workflow_until_timeout(&path);
+    writer.join().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("would create a cycle"), "{stderr}");
+}
+
+#[test]
+fn on_error_receives_the_underlying_cause_not_only_the_step_label() {
+    let workflow = WorkflowFile::new(
+        "nodes:\n  call: {type: command, command: [nonexistent-lait-test-executable]}\n  recover: {type: transform, jq: '.error'}\nsteps:\n  - use: call\n    on_error: {steps: [{use: recover}]}\n",
+    );
+    let output = test_command()
+        .arg("run")
+        .arg(&workflow.path)
+        .args(["input", "--no-config", "--no-env", "--no-history"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let message = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        message.contains("nonexistent-lait-test-executable"),
+        "{message}"
+    );
+    assert!(message.contains("failed to run command"), "{message}");
 }

@@ -37,6 +37,58 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+  msrv:
+    name: Rust MSRV check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install MSRV Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache MSRV Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+
+      - name: Check MSRV
+        run: cargo check --locked --all-targets
+
+  native-locks:
+    name: Native file locks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # aws-lc-sys (via rustls) assembles with NASM on MSVC targets.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: choco install nasm --yes
+
+      - name: Run file lock tests
+        run: 'cargo test --locked --bin lait file_lock::'
+
+      - name: Run cancellable filesystem tests
+        run: 'cargo test --locked --bin lait async_io::'
+
   website:
     name: Website checks
     runs-on: ubuntu-latest
@@ -50,12 +102,12 @@ jobs:
           persist-credentials: false
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 10
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm

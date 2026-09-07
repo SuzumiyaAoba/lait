@@ -10,6 +10,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::Arc,
     time::Duration,
 };
@@ -19,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::DoctorArgs,
-    config::{self, ConfigFile, ConfigSource},
+    config::{self, ApiKeySource, ConfigFile, ConfigSource},
+    engine::AppServices,
     llm, mcp,
 };
 
@@ -107,59 +109,79 @@ impl Check {
     }
 }
 
-pub(crate) async fn run(args: DoctorArgs, config_source: ConfigSource) -> Result<()> {
+pub(crate) async fn run(
+    args: DoctorArgs,
+    config_source: ConfigSource,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    let cancellation = cancellation.unwrap_or_default();
+    crate::signal::spawn_handler(cancellation.clone());
     let mut checks = Vec::new();
 
     // Mirrors `lint::run`'s own "is there a config at all" detection: unlike
     // `config::load_config`, which returns an empty `ConfigFile` both when
     // `lait.config.yml` is absent and when `--no-config` was passed, this
     // check needs to tell those two apart from "found but failed to parse".
-    let config_path = config::resolve_config_path(&config_source)?;
-    let global_config_present =
-        matches!(config_source, ConfigSource::Search) && config::global_config_path()?.is_file();
+    let config_path =
+        config::resolve_config_path_cancellable(&config_source, Some(cancellation.clone())).await?;
+    let global_config_present = matches!(config_source, ConfigSource::Search)
+        && config::global_config_exists_cancellable(Some(cancellation.clone())).await?;
     let config_present = config_path.is_some() || global_config_present;
 
-    let file_config = match config::load_config(&config_source) {
-        Ok(file_config) => {
-            if config_present {
-                checks.push(Check::ok(
+    let file_config =
+        match config::load_config_cancellable(&config_source, Some(cancellation.clone())).await {
+            Ok(file_config) => {
+                if config_present {
+                    checks.push(Check::ok(
+                        "config",
+                        config::CONFIG_FILE_NAME,
+                        "読み込み・パースに成功しました",
+                    ));
+                } else {
+                    checks.push(Check::warn(
+                        "config",
+                        config::CONFIG_FILE_NAME,
+                        "設定ファイルが見つかりません（デフォルト設定で動作します）",
+                        Some(format!(
+                            "プロジェクトルートに {} を作成するか `lait init` を実行してください",
+                            config::CONFIG_FILE_NAME
+                        )),
+                    ));
+                }
+                Some(Arc::new(file_config))
+            }
+            Err(error) => {
+                if is_interrupted(&error) {
+                    return Err(error);
+                }
+                checks.push(Check::error(
                     "config",
                     config::CONFIG_FILE_NAME,
-                    "読み込み・パースに成功しました",
-                ));
-            } else {
-                checks.push(Check::warn(
-                    "config",
-                    config::CONFIG_FILE_NAME,
-                    "設定ファイルが見つかりません（デフォルト設定で動作します）",
+                    format!("{error:#}"),
                     Some(format!(
-                        "プロジェクトルートに {} を作成するか `lait init` を実行してください",
+                        "{} の構文を確認してください",
                         config::CONFIG_FILE_NAME
                     )),
                 ));
+                None
             }
-            Some(file_config)
-        }
-        Err(error) => {
-            checks.push(Check::error(
-                "config",
-                config::CONFIG_FILE_NAME,
-                format!("{error:#}"),
-                Some(format!(
-                    "{} の構文を確認してください",
-                    config::CONFIG_FILE_NAME
-                )),
-            ));
-            None
-        }
-    };
+        };
 
     match &file_config {
         Some(file_config) => {
             check_env_placeholders(file_config, &mut checks);
             check_default_model(file_config, &mut checks);
             let uses = resolve_endpoint_uses(file_config);
-            let server_models = check_connectivity(&uses, &mut checks).await;
+            let services = Arc::new(AppServices::new(Arc::clone(file_config)));
+            let server_models = services
+                .clone()
+                .finish(check_connectivity(
+                    &uses,
+                    &services,
+                    Some(cancellation.clone()),
+                    &mut checks,
+                ))
+                .await?;
             check_models_on_server(&uses, &server_models, &mut checks);
             check_mcp_servers(file_config, &mut checks).await;
             check_registry_files(file_config, &mut checks);
@@ -340,7 +362,7 @@ struct EndpointUse {
     /// `None` for the top-level endpoint, which names no specific model.
     model_id: Option<String>,
     base_url: String,
-    api_key: Option<String>,
+    api_key: ApiKeySource,
 }
 
 /// Resolves every endpoint a real request could hit: the top-level
@@ -351,14 +373,12 @@ struct EndpointUse {
 /// by `check_env_placeholders`) is skipped here rather than reported again.
 fn resolve_endpoint_uses(file_config: &ConfigFile) -> Vec<EndpointUse> {
     let mut uses = Vec::new();
-    if let Ok((base_url, api_key)) =
-        config::resolve_endpoint(None, None, None, None, None, file_config)
-    {
+    if let Ok(endpoint) = config::resolve_endpoint(None, None, None, None, None, file_config) {
         uses.push(EndpointUse {
             label: "top-level".to_owned(),
             model_id: None,
-            base_url,
-            api_key,
+            base_url: endpoint.base_url,
+            api_key: endpoint.api_key,
         });
     }
 
@@ -368,7 +388,7 @@ fn resolve_endpoint_uses(file_config: &ConfigFile) -> Vec<EndpointUse> {
         let Ok(Some(resolved)) = config::resolve_model_alias(name, &file_config.models) else {
             continue;
         };
-        let Ok((base_url, api_key)) = config::resolve_endpoint(
+        let Ok(endpoint) = config::resolve_endpoint(
             None,
             None,
             resolved.base_url.as_deref(),
@@ -381,8 +401,8 @@ fn resolve_endpoint_uses(file_config: &ConfigFile) -> Vec<EndpointUse> {
         uses.push(EndpointUse {
             label: format!("models.{name}"),
             model_id: Some(resolved.model_id),
-            base_url,
-            api_key,
+            base_url: endpoint.base_url,
+            api_key: endpoint.api_key,
         });
     }
     uses
@@ -409,58 +429,92 @@ struct RemoteModel {
 /// to cross-reference.
 async fn check_connectivity(
     uses: &[EndpointUse],
+    services: &AppServices,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
     checks: &mut Vec<Check>,
-) -> HashMap<String, Option<HashSet<String>>> {
-    let mut ordered_base_urls: Vec<(String, Option<String>)> = Vec::new();
+) -> Result<HashMap<String, Option<HashSet<String>>>> {
+    let mut ordered_base_urls: Vec<(String, ApiKeySource)> = Vec::new();
     let mut seen = HashSet::new();
     for endpoint_use in uses {
-        if seen.insert(endpoint_use.base_url.clone()) {
+        let key = (endpoint_use.base_url.clone(), endpoint_use.api_key.clone());
+        if seen.insert(key) {
             ordered_base_urls.push((endpoint_use.base_url.clone(), endpoint_use.api_key.clone()));
         }
     }
 
     let mut results = HashMap::new();
-    for (base_url, api_key) in ordered_base_urls {
-        let model_ids = fetch_models(&base_url, api_key.as_deref(), checks).await;
+    for (base_url, api_key_source) in ordered_base_urls {
+        let api_key = match services
+            .secret_resolver
+            .resolve(&api_key_source, cancellation.clone())
+            .await
+        {
+            Ok(api_key) => api_key,
+            Err(error) => {
+                if is_interrupted(&error) {
+                    return Err(error);
+                }
+                checks.push(Check::error(
+                    "connectivity",
+                    base_url.clone(),
+                    format!("API キーの解決に失敗しました: {error:#}"),
+                    Some(
+                        "api_key/api_key_cmd の設定と secret manager の状態を確認してください"
+                            .to_owned(),
+                    ),
+                ));
+                results.insert(base_url, None);
+                continue;
+            }
+        };
+        let model_ids =
+            fetch_models(&base_url, api_key.as_deref(), cancellation.as_ref(), checks).await?;
         results.insert(base_url, model_ids);
     }
-    results
+    Ok(results)
 }
 
 async fn fetch_models(
     base_url: &str,
     api_key: Option<&str>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
     checks: &mut Vec<Check>,
-) -> Option<HashSet<String>> {
+) -> Result<Option<HashSet<String>>> {
     let url = format!("{base_url}/models");
     let mut request = llm::http_client().get(&url).timeout(CONNECTIVITY_TIMEOUT);
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
 
-    let response = match request.send().await {
+    let response = match await_with_cancellation(request.send(), cancellation).await {
         Ok(response) => response,
         Err(error) => {
+            if is_interrupted(&error) {
+                return Err(error);
+            }
             checks.push(Check::error(
                 "connectivity",
                 base_url.to_owned(),
                 format!("接続に失敗しました: {error:#}"),
                 Some("base_url とサーバーの起動状態を確認してください".to_owned()),
             ));
-            return None;
+            return Ok(None);
         }
     };
     let status = response.status();
-    let body = match response.text().await {
+    let body = match await_with_cancellation(response.text(), cancellation).await {
         Ok(body) => body,
         Err(error) => {
+            if is_interrupted(&error) {
+                return Err(error);
+            }
             checks.push(Check::error(
                 "connectivity",
                 base_url.to_owned(),
                 format!("応答の読み取りに失敗しました: {error:#}"),
                 None,
             ));
-            return None;
+            return Ok(None);
         }
     };
     if !status.is_success() {
@@ -470,7 +524,7 @@ async fn fetch_models(
             format!("GET {url} が {status} を返しました: {}", body.trim()),
             Some("base_url・API キー・サーバーの起動状態を確認してください".to_owned()),
         ));
-        return None;
+        return Ok(None);
     }
 
     match serde_json::from_str::<RemoteModelsResponse>(&body) {
@@ -481,7 +535,7 @@ async fn fetch_models(
                 base_url.to_owned(),
                 format!("接続に成功しました（{}個のモデルを確認）", ids.len()),
             ));
-            Some(ids)
+            Ok(Some(ids))
         }
         Err(_) => {
             checks.push(Check::warn(
@@ -490,8 +544,35 @@ async fn fetch_models(
                 "接続には成功しましたが、応答をモデル一覧として解釈できませんでした",
                 None,
             ));
-            None
+            Ok(None)
         }
+    }
+}
+
+fn is_interrupted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<crate::error::Interrupted>())
+}
+
+async fn await_with_cancellation<T, E>(
+    future: impl Future<Output = std::result::Result<T, E>>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(crate::error::Interrupted::cancelled(
+                    "doctor connectivity check was cancelled",
+                ).into()),
+                result = future => result.map_err(anyhow::Error::new),
+            }
+        }
+        None => future.await.map_err(anyhow::Error::new),
     }
 }
 
@@ -630,10 +711,12 @@ fn check_registry_files(file_config: &ConfigFile, checks: &mut Vec<Check>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Status, check_default_model, check_env_placeholders, check_registry_files,
-        resolve_endpoint_uses,
+        EndpointUse, Status, check_connectivity, check_default_model, check_env_placeholders,
+        check_registry_files, resolve_endpoint_uses,
     };
-    use crate::config::ConfigFile;
+    use crate::config::{ApiKeySource, CommandSpec, ConfigFile};
+    use crate::engine::AppServices;
+    use std::sync::Arc;
 
     fn parse_config(yaml: &str) -> ConfigFile {
         serde_yaml::from_str(yaml).expect("test config should parse")
@@ -778,5 +861,42 @@ models:
         assert!(uses.iter().any(|u| u.label == "models.local"
             && u.base_url == "http://localhost:5678/v1"
             && u.model_id.as_deref() == Some("test-model-id")));
+    }
+
+    #[tokio::test]
+    async fn connectivity_propagates_cancelled_secret_resolution() {
+        let services = AppServices::new(Arc::new(ConfigFile::default()));
+        let uses = vec![
+            EndpointUse {
+                label: "command".to_owned(),
+                model_id: None,
+                base_url: "http://127.0.0.1:1/v1".to_owned(),
+                api_key: ApiKeySource::Command(CommandSpec::Argv(vec![
+                    "command-must-not-run".to_owned(),
+                ])),
+            },
+            EndpointUse {
+                label: "never-reached".to_owned(),
+                model_id: None,
+                base_url: "http://127.0.0.1:2/v1".to_owned(),
+                api_key: ApiKeySource::Absent,
+            },
+        ];
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let mut checks = Vec::new();
+        let error = check_connectivity(&uses, &services, Some(cancellation), &mut checks)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>())
+        );
+        assert!(
+            checks.is_empty(),
+            "cancellation must not be absorbed as a check"
+        );
     }
 }

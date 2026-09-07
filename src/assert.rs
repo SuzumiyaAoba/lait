@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::{
     config::{ConfigFile, ModelMap},
     engine::{
-        AppContext, CapabilityOverrides, PromptTurn, SamplingOverrides, resolve_request_settings,
+        CapabilityOverrides, PromptTurn, RunContext, SamplingOverrides, resolve_request_settings,
     },
     jq, response, schema,
 };
@@ -62,7 +62,7 @@ pub(crate) struct AssertionFailure {
 /// replay-only and never calls a model), so an `llm_judge` assertion there
 /// always fails with a "not supported" message.
 pub(crate) struct LlmJudgeContext<'a> {
-    pub(crate) env: &'a AppContext,
+    pub(crate) env: &'a RunContext,
     pub(crate) file_config: &'a ConfigFile,
     /// The model an `llm_judge` assertion calls when it doesn't set its own
     /// `model:` — typically the eval target's own model, when it has one.

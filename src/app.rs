@@ -5,22 +5,22 @@ use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
     agent, attachment, checkpoint,
-    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction, RunArgs},
+    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction},
     cli::{AgentRunArgs, GraphArgs, GraphFormat, PromptRunArgs, SharedChatArgs},
     cli::{SkillAction, WorkflowAction},
     config::{self, ConfigFile, ConfigSource, ModelMap},
     docgen, doctor,
     engine::{
-        AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
-        agent_file_settings, call_agent, resolve_request_settings,
+        AgentTurn, AppServices, CapabilityOverrides, PromptTurn, RequestSettings, RunContext,
+        SamplingOverrides, agent_file_settings, call_agent, resolve_request_settings,
     },
     history, lint, prompt, repl, report, response, schema, session, skill, subagent, template,
     test_run, usage,
-    workflow::{
-        self, WorkflowScope,
-        exec::{Flow, RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
-    },
+    workflow::{self, exec::announce_named_file},
 };
+
+mod workflow_run;
+use workflow_run::run_workflow;
 
 /// Reads all of stdin into a string, trimming trailing newlines (piped text
 /// almost always ends in one, and a prompt should not).
@@ -34,28 +34,24 @@ fn read_stdin_text() -> Result<String> {
     Ok(buffer.trim_end_matches(['\n', '\r']).to_owned())
 }
 
-/// Combines a positional PROMPT/INPUT argument with piped stdin, the shared
-/// rule for chat, `lait run`, and `lait agent run`: a `-` argument reads
-/// stdin as the whole input; otherwise piped stdin (stdin not being a TTY)
-/// is the whole input when no argument is given, or is appended to the
-/// argument as context when one is. Returns `Ok(None)` when there is no
-/// input from either source — each caller reports that with its own message.
-pub(crate) fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
+/// Reads a positional prompt/input and optional piped stdin for async
+/// entry points. Reading stdin is kept on the bounded blocking-I/O worker so a
+/// FIFO or a pipe with no EOF cannot hold the Tokio runtime past Ctrl-C.
+pub(crate) async fn resolve_input_with_stdin_cancellable(
+    positional: Option<String>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Option<String>> {
     use std::io::IsTerminal;
 
-    if positional.as_deref() == Some("-") {
-        return Ok(Some(read_stdin_text()?).filter(|text| !text.trim().is_empty()));
-    }
-    let piped_text = if std::io::stdin().is_terminal() {
-        None
+    let read_stdin = positional.as_deref() == Some("-") || !std::io::stdin().is_terminal();
+    let piped_text = if read_stdin {
+        Some(crate::async_io::run_blocking(move |_| read_stdin_text(), cancellation).await?)
+            .filter(|text| !text.trim().is_empty())
     } else {
-        // An empty pipe (e.g. `< /dev/null`) counts as no input at all, not
-        // as an empty prompt.
-        Some(read_stdin_text()?).filter(|text| !text.trim().is_empty())
+        None
     };
     Ok(match (positional, piped_text) {
-        // Both given: the instruction first, then the piped text as context,
-        // separated by a blank line (e.g. `git diff | lait "review this"`).
+        (Some(argument), piped) if argument == "-" => piped,
         (Some(argument), Some(piped)) => Some(format!("{argument}\n\n{piped}")),
         (Some(argument), None) => Some(argument),
         (None, piped) => piped,
@@ -90,18 +86,10 @@ pub(crate) fn finish_chat_turn(
 }
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
-    // Built once per invocation and threaded into every async command below
-    // via `AppContext::with_cancel`; each single-shot handler
-    // (`run_workflow`/`run_agent`/`run_prompt`/`run_chat`) arms
-    // `signal::spawn_handler` itself, right where it actually starts using
-    // the token — *not* here, and deliberately never for `repl::run`. A
-    // `CancellationToken` fires once and stays cancelled forever, but the
-    // REPL reuses one `AppContext` across many turns: arming Ctrl-C
-    // process-wide would make the first Ctrl-C (meant to interrupt just the
-    // in-flight turn) silently break every turn after it, with no visible
-    // effect on the one it was pressed during. `lait chat` keeps its
-    // pre-existing Ctrl-C behavior (default disposition: an immediate kill)
-    // until the REPL has its own per-turn cancellation scope.
+    // Built once per invocation and passed as the root source to each
+    // RunContext below. Each async handler arms `signal::spawn_handler` at
+    // the point where it starts using the token; the REPL watches that root
+    // while reading and running turns so cleanup also covers Ctrl-C there.
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let config_source = ConfigSource::from(&cli);
@@ -129,7 +117,9 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             AgentAction::List => bail!("internal error: `agent list` must run on the sync path"),
         },
         Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
-        Some(Command::Models(models_args)) => crate::models::run(models_args, config_source).await,
+        Some(Command::Models(models_args)) => {
+            crate::models::run(models_args, config_source, Some(cancel)).await
+        }
         Some(Command::Completions(completions_args)) => {
             docgen::generate_completions(completions_args);
             Ok(())
@@ -138,7 +128,14 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Chat(chat_repl_args)) => {
-            repl::run(chat_repl_args, config_source, cache_override, approve_tools).await
+            repl::run(
+                chat_repl_args,
+                config_source,
+                cache_override,
+                approve_tools,
+                cancel,
+            )
+            .await
         }
         Some(Command::Prompt(prompt_command)) => match prompt_command.action {
             PromptAction::List => {
@@ -164,7 +161,9 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
         Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
         Some(Command::Schema(_)) => bail!("internal error: `schema` must run on the sync path"),
-        Some(Command::Doctor(doctor_args)) => doctor::run(doctor_args, config_source).await,
+        Some(Command::Doctor(doctor_args)) => {
+            doctor::run(doctor_args, config_source, Some(cancel)).await
+        }
         Some(Command::Compare(compare_args)) => {
             crate::compare::run(compare_args, config_source, cache_override, cancel).await
         }
@@ -201,9 +200,9 @@ fn cache_override(cache: bool, no_cache: bool) -> Option<bool> {
 /// and its TTL: `cache_override` (from `--cache`/`--no-cache`) wins when set,
 /// else `default.cache` in lait.config.yml, else off. `default.cache_ttl`
 /// applies regardless of which layer enabled the cache. Every async command
-/// handler below calls this once, right before building its `AppContext`,
+/// handler below calls this once, right before building its `RunContext`,
 /// with the same `cache_override` `app::run` resolved up front — see
-/// `AppContext::with_cache`.
+/// `RunContext::with_cache`.
 pub(crate) fn resolve_cache_settings(
     cache_override: Option<bool>,
     file_config: &ConfigFile,
@@ -214,7 +213,7 @@ pub(crate) fn resolve_cache_settings(
 
 /// The bare-invocation entry point (`lait [OPTIONS] [PROMPT]`, no
 /// subcommand): sends a single-shot chat request when a prompt is available
-/// (an argument or piped stdin — see `resolve_input_with_stdin`), or, when
+/// (an argument or piped stdin — see `resolve_input_with_stdin_cancellable`), or, when
 /// none is and stdin is an interactive terminal, starts the same REPL
 /// `lait chat` does instead of erroring. Piped-but-empty stdin (a script's
 /// `< /dev/null`, or a forgotten argument in a pipeline) still errors exactly
@@ -231,7 +230,14 @@ async fn run_chat_or_repl(
 ) -> Result<()> {
     use std::io::IsTerminal;
 
-    match resolve_input_with_stdin(chat.prompt.clone())? {
+    // The REPL installs its own listener once it starts. Every other bare
+    // invocation must install one before the cancellable initial stdin read
+    // (or before `run_chat`'s config load).
+    let enters_repl = chat.prompt.is_none() && std::io::stdin().is_terminal();
+    if !enters_repl {
+        crate::signal::spawn_handler(cancel.clone());
+    }
+    match resolve_input_with_stdin_cancellable(chat.prompt.clone(), Some(cancel.clone())).await? {
         Some(prompt) => {
             run_chat(
                 chat,
@@ -243,13 +249,6 @@ async fn run_chat_or_repl(
             )
             .await
         }
-        // `repl::run` deliberately does not receive `cancel`: a
-        // `CancellationToken` fires once and stays cancelled forever, but
-        // the REPL reuses one `AppContext` across many turns — wiring a
-        // single process-wide token in would make the *first* Ctrl-C (meant
-        // to interrupt just the in-flight turn) permanently break every
-        // turn after it. `lait chat` keeps its pre-existing Ctrl-C behavior
-        // until the REPL has its own per-turn cancellation scope.
         None if std::io::stdin().is_terminal() => {
             repl::run(
                 ChatReplArgs {
@@ -258,6 +257,7 @@ async fn run_chat_or_repl(
                 config_source,
                 cache_override,
                 approve_tools,
+                cancel,
             )
             .await
         }
@@ -475,8 +475,8 @@ async fn run_chat(
     approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    crate::signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
     // `-p`/`--prompt-name` renders a named `prompts:` template against
     // `prompt` (which, for this path, is really the template's `{{ input }}`
@@ -505,8 +505,8 @@ async fn run_chat(
     let image_urls = attachment::resolve_image_urls(&chat.images).await?;
     let session_history = load_session_history(chat.shared.session.as_deref())?;
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_cancel(cancel)
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools);
 
@@ -529,7 +529,7 @@ async fn run_chat(
     };
 
     if chat.stream {
-        let outcome = env
+        let outcome = services
             .finish(settings.complete_stream(
                 &env,
                 &[],
@@ -538,7 +538,7 @@ async fn run_chat(
                 show_usage,
                 show_reasoning,
                 output_path,
-                env.cancel.clone(),
+                Some(env.operation_token()),
             ))
             .await?;
         // Streamed usage arrives on the final chunk rather than through
@@ -562,8 +562,14 @@ async fn run_chat(
         return Ok(());
     }
 
-    let response = env
-        .finish(settings.complete(&env, &[], turn, response_format, env.cancel.clone()))
+    let response = services
+        .finish(settings.complete(
+            &env,
+            &[],
+            turn,
+            response_format,
+            Some(env.operation_token()),
+        ))
         .await?;
 
     match output_path {
@@ -618,9 +624,11 @@ async fn run_prompt(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let raw_input = resolve_input_with_stdin(args.input.clone())?
+    let raw_input = resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
+        .await?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let (prompt_text, prompt_model) =
         prompt::render_named(&args.name, &raw_input, &args.var.var, &file_config)?;
@@ -655,17 +663,17 @@ async fn run_prompt(
     .with_usage_label(format!("prompt '{}'", args.name));
 
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_cancel(cancel)
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools);
-    let response = env
+    let response = services
         .finish(settings.complete(
             &env,
             &[],
             PromptTurn::simple(None, &prompt_text),
             None,
-            env.cancel.clone(),
+            Some(env.operation_token()),
         ))
         .await?;
     let output = response::render_response(&response, false, false)?;
@@ -692,16 +700,20 @@ async fn run_agent(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let raw_input = resolve_input_with_stdin(args.input.clone())?
+    let raw_input = resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
+        .await?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
-    let agent_file = agent::load_agent(&args.file)?;
-    let canonical_agent_path = std::fs::canonicalize(&args.file).with_context(|| {
-        format!(
-            "failed to resolve agent file path '{}'",
-            args.file.display()
-        )
-    })?;
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let agent_file = agent::load_agent_cancellable(&args.file, Some(cancel.clone())).await?;
+    let canonical_agent_path = crate::async_io::canonicalize(&args.file, Some(cancel.clone()))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to resolve agent file path '{}'",
+                args.file.display()
+            )
+        })?;
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
     announce_named_file(
         "==>",
@@ -722,11 +734,11 @@ async fn run_agent(
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_cancel(cancel)
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools);
-    let output = env
+    let output = services
         .finish(call_agent(
             &agent_file,
             &settings,
@@ -734,7 +746,7 @@ async fn run_agent(
             AgentTurn::simple(&input, &raw_input),
             &workflow::StepOutputs::new(),
             std::slice::from_ref(&canonical_agent_path),
-            env.cancel.clone(),
+            Some(env.operation_token()),
         ))
         .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;
@@ -750,288 +762,5 @@ async fn run_agent(
         &file_config,
         &env.usage,
         args.reporting.show_usage,
-    )
-}
-
-/// Every top-level step's label, by position: this site's own label (see
-/// `FlowStep::label`) if set, else `step-<position>` (1-based). Deliberately
-/// *not* the same value `run_steps`' own progress-counter fallback would
-/// produce for an unlabeled router site — that counter only exists once a
-/// run is actually executing (it also counts nested steps), whereas this
-/// only needs to name each top-level position stably, before anything has
-/// run, so `checkpoint::check_resumable` can detect whether the step
-/// sequence changed since a checkpoint was written.
-fn top_level_step_labels(steps: &[workflow::FlowStep]) -> Vec<String> {
-    steps
-        .iter()
-        .enumerate()
-        .map(|(index, step)| step.label_or(index + 1))
-        .collect()
-}
-
-async fn run_workflow(
-    run_args: RunArgs,
-    config_source: ConfigSource,
-    cache_override: Option<bool>,
-    approve_tools: bool,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Result<()> {
-    crate::signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
-    let resolved_file = workflow::resolve_run_target(&run_args.file, &file_config);
-    let workflow_path = resolved_file.display().to_string();
-
-    let resumed = run_args
-        .resume
-        .as_deref()
-        .map(checkpoint::load)
-        .transpose()?;
-    if let Some(resumed) = &resumed {
-        if resumed.workflow_path != workflow_path {
-            bail!(
-                "run '{}' was checkpointed against workflow '{}', not '{workflow_path}'; pass \
-                 the same FILE to resume it",
-                resumed.run_id,
-                resumed.workflow_path,
-            );
-        }
-        if resumed.status == checkpoint::RunStatus::Completed {
-            bail!(
-                "run '{}' already completed; nothing to resume",
-                resumed.run_id
-            );
-        }
-    }
-
-    let mut wf = workflow::load_workflow(&resolved_file)?;
-    announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
-    let scope = WorkflowScope::top_level(&mut wf, &resolved_file)?;
-    let top_level_labels = top_level_step_labels(&wf.steps);
-
-    let (initial_prompt, vars, start_index, start_counter, start_input, start_steps_outputs) =
-        match &resumed {
-            Some(resumed) => {
-                checkpoint::check_resumable(&top_level_labels, resumed)?;
-                eprintln!(
-                    "==> resuming run '{}' from step {}/{}",
-                    resumed.run_id,
-                    resumed.completed_index + 1,
-                    top_level_labels.len(),
-                );
-                let vars = if run_args.var.var.is_empty() {
-                    resumed.vars.clone()
-                } else {
-                    workflow::build_vars(&run_args.var.var)?
-                };
-                (
-                    resumed.initial_prompt.clone(),
-                    vars,
-                    resumed.completed_index,
-                    resumed.counter,
-                    resumed.current_input.clone(),
-                    resumed.steps_outputs.clone(),
-                )
-            }
-            None => {
-                let prompt =
-                    resolve_input_with_stdin(run_args.prompt.clone())?.ok_or_else(|| {
-                        anyhow!("a PROMPT is required; provide one or pipe input via stdin")
-                    })?;
-                let vars = workflow::build_vars(&run_args.var.var)?;
-                (
-                    prompt.clone(),
-                    vars,
-                    0,
-                    0,
-                    prompt,
-                    workflow::StepOutputs::new(),
-                )
-            }
-        };
-    let run_id = match &resumed {
-        Some(resumed) => resumed.run_id.clone(),
-        None => checkpoint::generate_run_id(),
-    };
-
-    if run_args.dry_run {
-        return workflow::dryrun::print_plan(&wf, &scope, &file_config, &initial_prompt, &vars);
-    }
-
-    // `--resume` implies `--checkpoint`: a run started with `--checkpoint`
-    // stays checkpointed across a resume without the flag needing to be
-    // repeated.
-    let checkpointing = run_args.checkpoint || resumed.is_some();
-
-    // `default.workflow_timeout` bounds this run's total wall-clock time,
-    // distinct from a node's own `timeout:` (which bounds one step). Built
-    // as a child of the process-wide Ctrl-C token (mirroring how
-    // `execute_step_with_retry` derives a node's own timeout token from its
-    // caller's) so either source cancels the same run token every
-    // downstream call already watches — a spawned sleep-then-cancel task
-    // fires it once the budget is exhausted, same as a step's own timeout.
-    let run_cancel = cancel.child_token();
-    if let Some(seconds) = scope.defaults.workflow_timeout {
-        let timeout_cancel = run_cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-            // The step that's actually cancelled only ever sees/reports a
-            // generic "cancelled" error (the same one a Ctrl-C produces) —
-            // this is the one place that knows *why*, so it's the one place
-            // that can say so before the workflow's own error obscures it.
-            eprintln!("lait: 'default.workflow_timeout' ({seconds}s) exceeded; cancelling the run");
-            timeout_cancel.cancel();
-        });
-    }
-
-    let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_vars(vars.clone())
-        .with_cancel(run_cancel)
-        .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools)
-        .with_record_replay(run_args.record.clone(), run_args.replay.clone());
-    // Builds one checkpoint snapshot, filling in the fields that stay the
-    // same for this whole run (`run_id`/`workflow_path`/`initial_prompt`/
-    // `vars`/`top_level_labels`) so each of this run's three save sites below
-    // only has to supply what actually varies.
-    let make_checkpoint =
-        |completed_index: usize,
-         counter: usize,
-         current_input: String,
-         steps_outputs: workflow::StepOutputs,
-         status: checkpoint::RunStatus| checkpoint::Checkpoint {
-            run_id: run_id.clone(),
-            workflow_path: workflow_path.clone(),
-            initial_prompt: initial_prompt.clone(),
-            vars: vars.clone(),
-            top_level_labels: top_level_labels.clone(),
-            completed_index,
-            counter,
-            current_input,
-            steps_outputs,
-            status,
-        };
-    // `completed_index` ends at `wf.steps.len()` when the loop runs to
-    // completion, or at the position right after whichever step set
-    // `flow != Flow::Continue` (a `stop: true`) when it ends early — either
-    // way, the count of top-level steps actually executed this run. Declared
-    // outside the `async` block (mutated from within, read after it) so its
-    // final value is available for the "completed" checkpoint below without
-    // smuggling it out through the block's own `Result`.
-    let mut completed_index = start_index;
-    let run_result: Result<(String, usize, workflow::StepOutputs)> = env
-        .finish(async {
-            let mut current_input = start_input;
-            let mut steps_outputs = start_steps_outputs;
-            let mut counter = start_counter;
-            for (index, step) in wf.steps.iter().enumerate().skip(start_index) {
-                // `run_steps` takes `current_input`/`steps_outputs` by value,
-                // so a failing step leaves nothing to save afterward — clone
-                // them beforehand (they're re-recording unchanged state, plus
-                // any new `vars` this invocation brought in, since the step
-                // itself never produced a new output) rather than trying to
-                // reconstruct them post-failure.
-                let saved_state =
-                    checkpointing.then(|| (current_input.clone(), steps_outputs.clone()));
-                let step_outcome = run_steps(
-                    std::slice::from_ref(step),
-                    current_input,
-                    steps_outputs,
-                    RunStepsFrame {
-                        scope: &scope,
-                        env: &env,
-                        start_counter: counter,
-                        progress_prefix: "",
-                        cancellation: env.cancel.clone(),
-                    },
-                )
-                .await;
-                let StepsOutcome {
-                    output,
-                    counter: new_counter,
-                    flow,
-                    steps_outputs: new_steps_outputs,
-                } = match step_outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        if let Some((unchanged_input, unchanged_steps_outputs)) = saved_state {
-                            // A save failure here must not shadow `error`
-                            // (the workflow's own failure — e.g. "workflow
-                            // execution was cancelled" from a Ctrl-C, which
-                            // the caller still needs to see and propagate)
-                            // — log it to stderr and keep going instead.
-                            let save_result = checkpoint::save(&make_checkpoint(
-                                completed_index,
-                                counter,
-                                unchanged_input,
-                                unchanged_steps_outputs,
-                                checkpoint::RunStatus::Failed,
-                            ));
-                            match save_result {
-                                Ok(()) => eprintln!(
-                                    "note: run checkpointed as '{run_id}'; resume with `lait run \
-                                     {} --resume {run_id}`",
-                                    run_args.file.display(),
-                                ),
-                                Err(save_error) => eprintln!(
-                                    "warning: failed to save checkpoint for run '{run_id}': \
-                                     {save_error:#}"
-                                ),
-                            }
-                        }
-                        return Err(error);
-                    }
-                };
-                current_input = output;
-                counter = new_counter;
-                steps_outputs = new_steps_outputs;
-                completed_index = index + 1;
-                if checkpointing {
-                    checkpoint::save(&make_checkpoint(
-                        completed_index,
-                        counter,
-                        current_input.clone(),
-                        steps_outputs.clone(),
-                        checkpoint::RunStatus::Failed,
-                    ))?;
-                }
-                if flow != Flow::Continue {
-                    break;
-                }
-            }
-            Ok((current_input, counter, steps_outputs))
-        })
-        .await;
-    let (current_input, counter, steps_outputs) = run_result?;
-
-    if checkpointing {
-        checkpoint::save(&make_checkpoint(
-            completed_index,
-            counter,
-            current_input.clone(),
-            steps_outputs,
-            checkpoint::RunStatus::Completed,
-        ))?;
-    }
-
-    report::emit_run_output(
-        &current_input,
-        env.usage.total(),
-        &run_args.output,
-        &file_config,
-    )?;
-    report::finish_run(
-        // A workflow can touch several models across its steps, so no
-        // single `model` is recorded here — see `history::HistoryEntry::model`.
-        report::RunRecord {
-            kind: "workflow",
-            model: None,
-            prompt: &initial_prompt,
-            response: &current_input,
-        },
-        run_args.reporting.no_history,
-        &file_config,
-        &env.usage,
-        run_args.reporting.show_usage,
     )
 }

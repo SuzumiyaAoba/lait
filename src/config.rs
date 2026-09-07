@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    hash::Hash,
     path::{Path, PathBuf},
 };
 
@@ -8,8 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use crate::{
+    async_io,
     cli::{Cli, ReasoningEffort},
-    secret,
 };
 
 pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
@@ -107,24 +108,6 @@ fn resolve_registry_paths_in_place(config: &mut ConfigFile, config_dir: &Path) {
     }
 }
 
-/// Prints one `list` line for a registry entry (`agents:`/`workflows:`/
-/// `skills:`): `name  (path): description` when `loaded` parsed cleanly and
-/// carried a description, `name  (path)` when it parsed but had none, or
-/// `name  (path)` plus a `warning:` line when it didn't parse at all — a bad
-/// entry is still listed rather than aborting the whole command, matching
-/// `lait agent list`/`lait workflow list`/`lait skill list`'s shared
-/// contract (`lait lint` is where a hard failure on a bad entry belongs).
-pub(crate) fn print_registry_entry(name: &str, path: &Path, loaded: Result<Option<String>>) {
-    match loaded {
-        Ok(Some(description)) => println!("{name}  ({}): {description}", path.display()),
-        Ok(None) => println!("{name}  ({})", path.display()),
-        Err(error) => {
-            println!("{name}  ({})", path.display());
-            println!("  warning: {error:#}");
-        }
-    }
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigFile {
@@ -134,8 +117,8 @@ pub(crate) struct ConfigFile {
     /// of embedding it in plaintext (or requiring a pre-exported environment
     /// variable, like `${VAR}` does) — e.g. a secrets-manager CLI (1Password,
     /// pass, gopass, aws secretsmanager, ...). Mutually exclusive with
-    /// `api_key`; see `resolve_endpoint`, which enforces that and runs
-    /// whichever layer's command actually wins. See `secret::resolve`.
+    /// `api_key`; see `resolve_endpoint`, which enforces that and retains
+    /// whichever layer's command actually wins for request-time resolution.
     pub(crate) api_key_cmd: Option<CommandSpec>,
     #[serde(default)]
     pub(crate) default: DefaultSettings,
@@ -207,7 +190,8 @@ pub(crate) struct ShellToolDefinition {
     /// through a shell — no element can inject a second command via `;`/`|`/
     /// backticks, even if it's built from an untrusted rendered value.
     /// Validated non-empty at first use (see `shell_tool::tools`) and by
-    /// `lait lint`, since `process::run_command` panics on an empty argv.
+    /// `lait lint`; `process::run_command` also returns a clear error for an
+    /// empty argv instead of attempting to spawn it.
     pub(crate) command: Vec<String>,
     /// The JSON Schema describing the tool's call arguments, sent to the
     /// model verbatim as the OpenAI tool definition's `parameters`. Defaults
@@ -257,6 +241,17 @@ impl ToolPolicy {
                 .allow
                 .iter()
                 .any(|pattern| glob_match(pattern, qualified_name))
+    }
+
+    /// Merges policy layers additively. A global deny is a safety floor that
+    /// a project config cannot silently remove, while project allow rules can
+    /// add capabilities permitted by the global layer.
+    fn merge(global: Self, project: Self) -> Self {
+        let mut allow = global.allow;
+        allow.extend(project.allow);
+        let mut deny = global.deny;
+        deny.extend(project.deny);
+        Self { allow, deny }
     }
 }
 
@@ -342,6 +337,31 @@ pub(crate) struct DefaultSettings {
     pub(crate) cache_ttl: Option<u64>,
 }
 
+impl DefaultSettings {
+    /// Merges a lower-priority config layer with a project layer. Every
+    /// setting is independent: a project value wins when present, otherwise
+    /// the lower-priority value remains available as a fallback.
+    fn merge(global: Self, project: Self) -> Self {
+        Self {
+            model: project.model.or(global.model),
+            reasoning_effort: project.reasoning_effort.or(global.reasoning_effort),
+            system: project.system.or(global.system),
+            temperature: project.temperature.or(global.temperature),
+            top_p: project.top_p.or(global.top_p),
+            max_tokens: project.max_tokens.or(global.max_tokens),
+            mcp: project.mcp.or(global.mcp),
+            max_tool_rounds: project.max_tool_rounds.or(global.max_tool_rounds),
+            skills: project.skills.or(global.skills),
+            subagents: project.subagents.or(global.subagents),
+            tools: project.tools.or(global.tools),
+            render: project.render.or(global.render),
+            history: project.history.or(global.history),
+            cache: project.cache.or(global.cache),
+            cache_ttl: project.cache_ttl.or(global.cache_ttl),
+        }
+    }
+}
+
 /// A map of `mcp_servers:` name to its connection settings, as used by
 /// `lait.config.yml`'s top-level `mcp_servers:`.
 pub(crate) type McpServerMap = HashMap<String, McpServerConfig>;
@@ -408,16 +428,8 @@ impl McpServerConfig {
             ),
             (Some(command), None) => {
                 let command = expand_env_placeholders(command)?;
-                let args = self
-                    .args
-                    .iter()
-                    .map(|arg| expand_env_placeholders(arg))
-                    .collect::<Result<Vec<_>>>()?;
-                let env = self
-                    .env
-                    .iter()
-                    .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
-                    .collect::<Result<HashMap<_, _>>>()?;
+                let args = expand_list(&self.args)?;
+                let env = expand_map(&self.env)?;
                 let cwd = self
                     .cwd
                     .as_deref()
@@ -432,11 +444,7 @@ impl McpServerConfig {
             }
             (None, Some(url)) => {
                 let url = expand_env_placeholders(url)?;
-                let headers = self
-                    .headers
-                    .iter()
-                    .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
-                    .collect::<Result<HashMap<_, _>>>()?;
+                let headers = expand_map(&self.headers)?;
                 Ok(McpTransport::Http { url, headers })
             }
         }
@@ -497,6 +505,37 @@ pub(crate) struct ModelDefinition {
     default_max_tokens: Option<u32>,
 }
 
+impl ModelDefinition {
+    fn validate(&self, context: &str) -> Result<()> {
+        if self.model_id.trim().is_empty() {
+            bail!("model_id in {context} must not be empty");
+        }
+        check_api_key_source(&self.provider.api_key, &self.provider.api_key_cmd, context)
+    }
+
+    fn resolved_model(&self) -> ResolvedModel {
+        ResolvedModel {
+            model_id: self.model_id.clone(),
+            base_url: Some(self.provider.base_url.clone()),
+            api_key: self.provider.api_key.clone(),
+            api_key_cmd: self.provider.api_key_cmd.clone(),
+            reasoning_effort: self.default_reasoning_effort,
+            temperature: self.default_temperature,
+            top_p: self.default_top_p,
+            max_tokens: self.default_max_tokens,
+        }
+    }
+
+    fn fallback_candidate(&self) -> FallbackCandidate {
+        FallbackCandidate {
+            model_id: self.model_id.clone(),
+            base_url: self.provider.base_url.clone(),
+            api_key: self.provider.api_key.clone(),
+            api_key_cmd: self.provider.api_key_cmd.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderConfig {
@@ -514,12 +553,33 @@ struct ProviderConfig {
 /// pipes/quoting/subshells work the way a one-liner like `op read
 /// op://Personal/OpenAI/api-key` expects — or a literal argv list, run
 /// directly with no shell involved, for a command whose arguments should
-/// never be shell-interpreted. See `secret::resolve`.
-#[derive(Debug, Clone, Deserialize)]
+/// never be shell-interpreted. See [`crate::secret::SecretResolver`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CommandSpec {
     Shell(String),
     Argv(Vec<String>),
+}
+
+/// The selected API-key source for one endpoint. Selection and environment
+/// expansion happen in `resolve_endpoint`; a [`Command`] is intentionally
+/// retained as data so the command can be executed asynchronously only when
+/// the request is about to be sent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ApiKeySource {
+    Absent,
+    Literal(String),
+    Command(CommandSpec),
+}
+
+/// A fully selected endpoint. It is pure configuration data: resolving a
+/// command source never launches a process. `engine::RequestSettings` keeps
+/// the `api_key` source until its first actual request and asks the shared
+/// `secret::SecretResolver` to resolve it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Endpoint {
+    pub(crate) base_url: String,
+    pub(crate) api_key: ApiKeySource,
 }
 
 #[derive(Debug)]
@@ -600,7 +660,7 @@ pub(crate) fn check_provider_api_key_sources(config: &ConfigFile) -> Vec<String>
 /// Checks every `tools:` entry's `command`/`parameters` for the two things
 /// `process::run_command` and the OpenAI tool-schema wire format both
 /// require but `serde`'s own type-checking can't: a non-empty `command`
-/// (`run_command` panics on an empty argv — see
+/// (`run_command` rejects an empty argv at runtime — see
 /// `ShellToolDefinition::command`'s doc comment) and a `parameters` value
 /// that is a JSON object (a non-object `parameters` would still deserialize
 /// fine as `serde_json::Value`, but is not a valid JSON Schema object for
@@ -648,25 +708,10 @@ pub(crate) fn resolve_model_alias(
     let definition = definitions.first().ok_or_else(|| {
         anyhow!("model definition {model_name:?} must contain at least one entry")
     })?;
-    if definition.model_id.trim().is_empty() {
-        bail!("model_id in model definition {model_name:?} must not be empty");
-    }
-    check_api_key_source(
-        &definition.provider.api_key,
-        &definition.provider.api_key_cmd,
-        &format!("model definition {model_name:?}"),
-    )?;
+    let context = format!("model definition {model_name:?}");
+    definition.validate(&context)?;
 
-    Ok(Some(ResolvedModel {
-        model_id: definition.model_id.clone(),
-        base_url: Some(definition.provider.base_url.clone()),
-        api_key: definition.provider.api_key.clone(),
-        api_key_cmd: definition.provider.api_key_cmd.clone(),
-        reasoning_effort: definition.default_reasoning_effort,
-        temperature: definition.default_temperature,
-        top_p: definition.default_top_p,
-        max_tokens: definition.default_max_tokens,
-    }))
+    Ok(Some(definition.resolved_model()))
 }
 
 /// One `models:` alias definition beyond the first (which
@@ -704,74 +749,89 @@ pub(crate) fn resolve_model_fallbacks(
         .iter()
         .skip(1)
         .map(|definition| {
-            if definition.model_id.trim().is_empty() {
-                bail!("model_id in model definition {model_name:?} must not be empty");
-            }
-            check_api_key_source(
-                &definition.provider.api_key,
-                &definition.provider.api_key_cmd,
-                &format!("model definition {model_name:?}"),
-            )?;
-            Ok(FallbackCandidate {
-                model_id: definition.model_id.clone(),
-                base_url: definition.provider.base_url.clone(),
-                api_key: definition.provider.api_key.clone(),
-                api_key_cmd: definition.provider.api_key_cmd.clone(),
-            })
+            let context = format!("model definition {model_name:?}");
+            definition.validate(&context)?;
+            Ok(definition.fallback_candidate())
         })
         .collect()
 }
 
 /// Resolves `candidate`'s endpoint (`${VAR}`-expanded, trailing slash
 /// trimmed — the same normalization `resolve_endpoint` applies to the
-/// primary candidate) and API key (literal, `api_key_cmd`, or falling back
-/// to the top-level `api_key`/`api_key_cmd` — the same three-tier order
-/// `resolve_endpoint` uses for the primary candidate's own model-definition
-/// layer). Only called for a candidate `RequestSettings::complete_recorded`/
-/// `complete_stream` is actually about to attempt, so a losing candidate's
-/// `api_key_cmd` (if any) is never run — see `secret::resolve`.
+/// primary candidate) and selects its API-key source (literal,
+/// `api_key_cmd`, or falling back to the top-level `api_key`/`api_key_cmd`).
+/// Only called when a candidate is about to be attempted. It never launches
+/// an `api_key_cmd`; the returned [`ApiKeySource::Command`] is resolved by the
+/// shared asynchronous secret resolver at the actual request boundary.
 pub(crate) fn resolve_fallback_endpoint(
     candidate: &FallbackCandidate,
     file_config: &ConfigFile,
-) -> Result<(String, String)> {
-    let base_url = expand_env_placeholders(&candidate.base_url)?;
+) -> Result<Endpoint> {
+    let base_url = normalize_base_url(expand_env_placeholders(&candidate.base_url)?)?;
+    check_api_key_source(
+        &file_config.api_key,
+        &file_config.api_key_cmd,
+        "top-level configuration",
+    )?;
+    let api_key = select_api_key_source(
+        None,
+        candidate.api_key.as_deref(),
+        candidate.api_key_cmd.as_ref(),
+        file_config.api_key.as_deref(),
+        file_config.api_key_cmd.as_ref(),
+    )?;
+    Ok(Endpoint { base_url, api_key })
+}
+
+/// Selects one API-key source in precedence order. Literal values from config
+/// are expanded here, after their layer has won; command specs remain inert
+/// data for [`crate::secret::SecretResolver`] to execute asynchronously at
+/// request time.
+fn select_api_key_source(
+    override_value: Option<String>,
+    api_key: Option<&str>,
+    api_key_cmd: Option<&CommandSpec>,
+    config_api_key: Option<&str>,
+    config_api_key_cmd: Option<&CommandSpec>,
+) -> Result<ApiKeySource> {
+    if let Some(api_key) = override_value {
+        return Ok(ApiKeySource::Literal(api_key));
+    }
+    if let Some(api_key) = api_key {
+        return Ok(ApiKeySource::Literal(expand_env_placeholders(api_key)?));
+    }
+    if let Some(command) = api_key_cmd {
+        return Ok(ApiKeySource::Command(command.clone()));
+    }
+    if let Some(api_key) = config_api_key {
+        return Ok(ApiKeySource::Literal(expand_env_placeholders(api_key)?));
+    }
+    if let Some(command) = config_api_key_cmd {
+        return Ok(ApiKeySource::Command(command.clone()));
+    }
+    Ok(ApiKeySource::Absent)
+}
+
+fn expand_list(values: &[String]) -> Result<Vec<String>> {
+    values
+        .iter()
+        .map(|value| expand_env_placeholders(value))
+        .collect()
+}
+
+fn expand_map(values: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    values
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), expand_env_placeholders(value)?)))
+        .collect()
+}
+
+fn normalize_base_url(base_url: String) -> Result<String> {
     let base_url = base_url.trim_end_matches('/').to_owned();
     if base_url.is_empty() {
         bail!("base URL must not be empty");
     }
-    let api_key = if let Some(api_key) =
-        resolve_literal_or_cmd(candidate.api_key.as_deref(), candidate.api_key_cmd.as_ref())?
-    {
-        api_key
-    } else if let Some(api_key) = resolve_literal_or_cmd(
-        file_config.api_key.as_deref(),
-        file_config.api_key_cmd.as_ref(),
-    )? {
-        api_key
-    } else {
-        // Mirrors `resolve_request_settings`'s own dummy-key substitution —
-        // async-openai always builds an Authorization header, and LM Studio
-        // ignores its value.
-        "lm-studio".to_owned()
-    };
-    Ok((base_url, api_key))
-}
-
-/// Resolves one `api_key`/`api_key_cmd` layer — a literal value (`${VAR}`-
-/// expanded) or an `api_key_cmd` to run for it — the same two-source pair
-/// every layer (candidate, model-definition, top-level config) offers.
-/// `None` when neither is set.
-fn resolve_literal_or_cmd(
-    api_key: Option<&str>,
-    api_key_cmd: Option<&CommandSpec>,
-) -> Result<Option<String>> {
-    if let Some(api_key) = api_key {
-        Ok(Some(expand_env_placeholders(api_key)?))
-    } else if let Some(command) = api_key_cmd {
-        Ok(Some(secret::resolve(command)?))
-    } else {
-        Ok(None)
-    }
+    Ok(base_url)
 }
 
 pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<ResolvedModel> {
@@ -822,13 +882,12 @@ pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 /// The API key follows the same three layers, except each of the two
 /// config-sourced ones (`model_api_key`/`model_api_key_cmd`,
 /// `file_config.api_key`/`file_config.api_key_cmd`) may set a literal value
-/// *or* an `api_key_cmd` to run for it — never both (`check_api_key_source`
-/// rejects that regardless of which layer ends up winning). Only the winning
-/// layer's command, if any, is actually run — `secret::resolve` caches by
-/// command, but there is no reason to run a losing layer's command at all.
-/// The result comes back as `None` when no layer sets a key —
-/// `resolve_request_settings` substitutes its dummy key, `lait models
-/// --remote` sends no Authorization header at all.
+/// *or* an `api_key_cmd` — never both (`check_api_key_source` rejects that
+/// regardless of which layer ends up winning). The selected command is kept
+/// inert in the returned [`Endpoint`] and is resolved by the asynchronous
+/// secret resolver only when a request is sent. `ApiKeySource::Absent` means
+/// `RequestSettings` can use its dummy key for async-openai, while
+/// `lait models --remote` can omit the Authorization header.
 pub(crate) fn resolve_endpoint(
     base_url_override: Option<String>,
     api_key_override: Option<String>,
@@ -836,38 +895,38 @@ pub(crate) fn resolve_endpoint(
     model_api_key: Option<&str>,
     model_api_key_cmd: Option<&CommandSpec>,
     file_config: &ConfigFile,
-) -> Result<(String, Option<String>)> {
-    let model_base_url = model_base_url.map(expand_env_placeholders).transpose()?;
-    let config_base_url = file_config
-        .base_url
-        .as_deref()
-        .map(expand_env_placeholders)
-        .transpose()?;
-    let base_url = base_url_override
-        .or(model_base_url)
-        .or(config_base_url)
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
-    let base_url = base_url.trim_end_matches('/').to_owned();
-    if base_url.is_empty() {
-        return Err(anyhow!("base URL must not be empty"));
-    }
+) -> Result<Endpoint> {
+    // Select the source before expanding it. Apart from avoiding needless
+    // work, this is important for precedence: an unset `${VAR}` in a lower
+    // priority source must not make a request fail when an override already
+    // supplies the endpoint that will be used.
+    let base_url = match base_url_override {
+        Some(base_url) => base_url,
+        None => match model_base_url {
+            Some(base_url) => expand_env_placeholders(base_url)?,
+            None => file_config
+                .base_url
+                .as_deref()
+                .map(expand_env_placeholders)
+                .transpose()?
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
+        },
+    };
+    let base_url = normalize_base_url(base_url)?;
 
     check_api_key_source(
         &file_config.api_key,
         &file_config.api_key_cmd,
         "top-level configuration",
     )?;
-    let api_key = if let Some(api_key) = api_key_override {
-        Some(api_key)
-    } else if let Some(api_key) = resolve_literal_or_cmd(model_api_key, model_api_key_cmd)? {
-        Some(api_key)
-    } else {
-        resolve_literal_or_cmd(
-            file_config.api_key.as_deref(),
-            file_config.api_key_cmd.as_ref(),
-        )?
-    };
-    Ok((base_url, api_key))
+    let api_key = select_api_key_source(
+        api_key_override,
+        model_api_key,
+        model_api_key_cmd,
+        file_config.api_key.as_deref(),
+        file_config.api_key_cmd.as_ref(),
+    )?;
+    Ok(Endpoint { base_url, api_key })
 }
 
 /// The parsing logic behind `expand_env_placeholders`, taking a `lookup`
@@ -925,6 +984,14 @@ pub(crate) fn global_config_path() -> Result<PathBuf> {
     Ok(xdg_config_home()?.join("lait").join("config.yml"))
 }
 
+fn merge_maps<K, V>(mut global: HashMap<K, V>, project: HashMap<K, V>) -> HashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    global.extend(project);
+    global
+}
+
 /// Merges `global` (loaded from [`global_config_path`]) with `project`
 /// (found by [`ConfigSource::Search`]'s upward walk) into the single
 /// `ConfigFile` every reader sees from here on, with `project` winning
@@ -934,9 +1001,9 @@ pub(crate) fn global_config_path() -> Result<PathBuf> {
 /// way; `base_url` keeps the project value when set, else falls back to the
 /// global one. `api_key`/`api_key_cmd` merge as a single unit (whichever the
 /// project sets, of either, wins as a pair) rather than falling back field
-/// by field — see the comment inline below. `tool_policy`'s `allow`/`deny`
-/// are unioned rather than key-by-key or project-wins — see the comment at
-/// its own merge below for why. Registry paths (`workflows:`/`agents:`/
+/// by field — see `DefaultSettings::merge`. `tool_policy`'s `allow`/`deny`
+/// are unioned rather than key-by-key or project-wins — see `ToolPolicy::merge`
+/// for why. Registry paths (`workflows:`/`agents:`/
 /// `skills:`) are already absolute by this point (each was resolved by
 /// `resolve_registry_paths_in_place` right after its own file was parsed —
 /// see `parse_config_file`), so combining the two maps needs no
@@ -954,69 +1021,19 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         (global.api_key, global.api_key_cmd)
     };
 
-    let mut models = global.models;
-    models.extend(project.models);
-    let mut mcp_servers = global.mcp_servers;
-    mcp_servers.extend(project.mcp_servers);
-    let mut skills = global.skills;
-    skills.extend(project.skills);
-    let mut agents = global.agents;
-    agents.extend(project.agents);
-    let mut prompts = global.prompts;
-    prompts.extend(project.prompts);
-    let mut workflows = global.workflows;
-    workflows.extend(project.workflows);
-    let mut tools = global.tools;
-    tools.extend(project.tools);
-    // Unioned, not "whichever side is non-empty wins" (like `mcp_servers`'s
-    // per-name merge above, not like `api_key`'s whole-pair merge): a
-    // global `deny` is a safety floor a project should never be able to
-    // silently drop just by defining its own unrelated `allow`/`deny`
-    // entries, and a project's own `allow` is naturally additive on top of
-    // whatever the global config already permits.
-    let mut tool_policy_allow = global.tool_policy.allow;
-    tool_policy_allow.extend(project.tool_policy.allow);
-    let mut tool_policy_deny = global.tool_policy.deny;
-    tool_policy_deny.extend(project.tool_policy.deny);
-
     ConfigFile {
         base_url: project.base_url.or(global.base_url),
         api_key,
         api_key_cmd,
-        default: DefaultSettings {
-            model: project.default.model.or(global.default.model),
-            reasoning_effort: project
-                .default
-                .reasoning_effort
-                .or(global.default.reasoning_effort),
-            system: project.default.system.or(global.default.system),
-            temperature: project.default.temperature.or(global.default.temperature),
-            top_p: project.default.top_p.or(global.default.top_p),
-            max_tokens: project.default.max_tokens.or(global.default.max_tokens),
-            mcp: project.default.mcp.or(global.default.mcp),
-            max_tool_rounds: project
-                .default
-                .max_tool_rounds
-                .or(global.default.max_tool_rounds),
-            skills: project.default.skills.or(global.default.skills),
-            subagents: project.default.subagents.or(global.default.subagents),
-            tools: project.default.tools.or(global.default.tools),
-            render: project.default.render.or(global.default.render),
-            history: project.default.history.or(global.default.history),
-            cache: project.default.cache.or(global.default.cache),
-            cache_ttl: project.default.cache_ttl.or(global.default.cache_ttl),
-        },
-        models,
-        mcp_servers,
-        skills,
-        agents,
-        prompts,
-        workflows,
-        tool_policy: ToolPolicy {
-            allow: tool_policy_allow,
-            deny: tool_policy_deny,
-        },
-        tools,
+        default: DefaultSettings::merge(global.default, project.default),
+        models: merge_maps(global.models, project.models),
+        mcp_servers: merge_maps(global.mcp_servers, project.mcp_servers),
+        skills: merge_maps(global.skills, project.skills),
+        agents: merge_maps(global.agents, project.agents),
+        prompts: merge_maps(global.prompts, project.prompts),
+        workflows: merge_maps(global.workflows, project.workflows),
+        tool_policy: ToolPolicy::merge(global.tool_policy, project.tool_policy),
+        tools: merge_maps(global.tools, project.tools),
     }
 }
 
@@ -1035,6 +1052,170 @@ pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
         },
         ConfigSource::Explicit(_) | ConfigSource::Disabled => Ok(project),
     }
+}
+
+/// Cancellation-aware counterpart to [`load_config`] for async command entry
+/// points. Configuration files can be FIFOs or live on a slow filesystem, so
+/// both path discovery and file reads run through [`async_io::run_blocking`]
+/// rather than blocking the Tokio runtime. The synchronous loader remains the
+/// API for runtime-free commands such as `lint`, `init`, and registry listing.
+pub(crate) async fn load_config_cancellable(
+    source: &ConfigSource,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<ConfigFile> {
+    let project_path = resolve_config_path_cancellable(source, cancellation.clone()).await?;
+    let project = load_config_at_cancellable(source, project_path, cancellation.clone()).await?;
+    match source {
+        ConfigSource::Search => match load_global_config_cancellable(cancellation).await? {
+            Some(global) => Ok(merge_config(global, project)),
+            None => Ok(project),
+        },
+        ConfigSource::Explicit(_) | ConfigSource::Disabled => Ok(project),
+    }
+}
+
+/// Cancellation-aware counterpart to [`resolve_config_path`]. Search walks
+/// ancestor directories on the bounded filesystem worker so metadata checks
+/// cannot block signal handling on the Tokio runtime. Explicit and disabled
+/// sources have no filesystem work and return immediately.
+pub(crate) async fn resolve_config_path_cancellable(
+    source: &ConfigSource,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Option<PathBuf>> {
+    if cancellation
+        .as_ref()
+        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    {
+        bail!(crate::error::Interrupted::cancelled(
+            "configuration lookup was cancelled"
+        ));
+    }
+    match source {
+        ConfigSource::Disabled => Ok(None),
+        ConfigSource::Explicit(path) => Ok(Some(path.clone())),
+        ConfigSource::Search => {
+            async_io::run_blocking(
+                move |cancelled| {
+                    let cwd = std::env::current_dir()
+                        .context("failed to determine the current directory for configuration")?;
+                    find_config_upward_cancellable(&cwd, cancelled)
+                },
+                cancellation,
+            )
+            .await
+        }
+    }
+}
+
+fn find_config_upward_cancellable(
+    start: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Option<PathBuf>> {
+    use std::sync::atomic::Ordering;
+
+    for directory in start.ancestors() {
+        if cancelled.load(Ordering::Acquire) {
+            bail!(crate::error::Interrupted::cancelled(
+                "configuration lookup was cancelled"
+            ));
+        }
+        let candidate = directory.join(CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+async fn load_config_at_cancellable(
+    source: &ConfigSource,
+    path: Option<PathBuf>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<ConfigFile> {
+    let Some(path) = path else {
+        return Ok(ConfigFile::default());
+    };
+    let contents =
+        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+        {
+            Ok(contents) => contents,
+            Err(error) if !matches!(source, ConfigSource::Explicit(_)) && is_not_found(&error) => {
+                return Ok(ConfigFile::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read YAML configuration file '{}'",
+                        path.display()
+                    )
+                });
+            }
+        };
+    parse_config_file(&path, &contents)
+}
+
+async fn load_global_config_cancellable(
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Option<ConfigFile>> {
+    let path = global_config_path()?;
+    if !is_file_cancellable(&path, cancellation.clone()).await? {
+        return Ok(None);
+    }
+    let contents =
+        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+        {
+            Ok(contents) => contents,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read YAML configuration file '{}'",
+                        path.display()
+                    )
+                });
+            }
+        };
+    Ok(Some(parse_config_file(&path, &contents)?))
+}
+
+/// Reports whether the optional global config exists without performing a
+/// synchronous metadata call. `doctor` uses this to distinguish an absent
+/// global file from a parsed empty config.
+pub(crate) async fn global_config_exists_cancellable(
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    is_file_cancellable(&global_config_path()?, cancellation).await
+}
+
+async fn is_file_cancellable(
+    path: &Path,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    let path = path.to_owned();
+    async_io::run_blocking(
+        move |cancelled| {
+            use std::sync::atomic::Ordering;
+
+            if cancelled.load(Ordering::Acquire) {
+                bail!(crate::error::Interrupted::cancelled(
+                    "configuration metadata lookup was cancelled"
+                ));
+            }
+            Ok(path.is_file())
+        },
+        cancellation,
+    )
+    .await
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// Parses `contents` (already read from `path`) into a `ConfigFile` and
@@ -1107,10 +1288,41 @@ fn load_global_config() -> Result<Option<ConfigFile>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigFile, McpServerConfig, McpTransport, ShellToolDefinition, ToolPolicy,
-        check_shell_tool_definition, expand_with, resolve_model,
+        ApiKeySource, ConfigFile, ConfigSource, DefaultSettings, McpServerConfig, McpTransport,
+        ShellToolDefinition, ToolPolicy, check_shell_tool_definition, expand_with,
+        load_config_cancellable, normalize_base_url, resolve_endpoint, resolve_model,
     };
     use std::collections::HashMap;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellable_config_load_stops_waiting_for_a_fifo() {
+        let path = crate::test_support::unique_temp_path("lait-config-fifo", ".yml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo should be available on Unix");
+        assert!(status.success());
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let source = ConfigSource::Explicit(path.clone());
+        let mut load = Box::pin(load_config_cancellable(&source, Some(token.clone())));
+        tokio::select! {
+            result = &mut load => panic!("FIFO config unexpectedly loaded: {result:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => token.cancel(),
+        }
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), load)
+            .await
+            .expect("cancellable config load should finish promptly")
+            .expect_err("a config FIFO without a writer should be cancelled");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "config cancellation should remain typed: {error:#}"
+        );
+        std::fs::remove_file(path).expect("config FIFO should be removable");
+    }
 
     #[test]
     fn tool_policy_allows_everything_by_default() {
@@ -1189,6 +1401,26 @@ mod tests {
     }
 
     #[test]
+    fn default_settings_merge_keeps_unset_global_fallbacks() {
+        let merged = DefaultSettings::merge(
+            DefaultSettings {
+                model: Some("global-model".to_owned()),
+                temperature: Some(0.2),
+                ..DefaultSettings::default()
+            },
+            DefaultSettings {
+                model: Some("project-model".to_owned()),
+                top_p: Some(0.8),
+                ..DefaultSettings::default()
+            },
+        );
+
+        assert_eq!(merged.model.as_deref(), Some("project-model"));
+        assert_eq!(merged.temperature, Some(0.2));
+        assert_eq!(merged.top_p, Some(0.8));
+    }
+
+    #[test]
     fn check_shell_tool_definition_rejects_an_empty_command() {
         let definition = ShellToolDefinition {
             description: None,
@@ -1236,6 +1468,125 @@ mod tests {
         let resolved = resolve_model("some-model".to_owned(), &config).unwrap();
         assert_eq!(resolved.model_id, "some-model");
         assert!(resolved.base_url.is_none());
+    }
+
+    #[test]
+    fn normalize_base_url_removes_trailing_slashes() {
+        assert_eq!(
+            normalize_base_url("https://example.com///".to_owned()).unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_rejects_an_empty_value() {
+        assert!(normalize_base_url("///".to_owned()).is_err());
+    }
+
+    #[test]
+    fn resolve_endpoint_selects_the_first_available_api_key_source() {
+        let config = ConfigFile {
+            api_key: Some("config-key".to_owned()),
+            ..ConfigFile::default()
+        };
+        let endpoint = resolve_endpoint(
+            None,
+            None,
+            Some("https://model.example/v1"),
+            Some("model-key"),
+            None,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint.api_key,
+            ApiKeySource::Literal("model-key".to_owned())
+        );
+
+        let endpoint = resolve_endpoint(
+            None,
+            Some("override-key".to_owned()),
+            Some("https://model.example/v1"),
+            Some("model-key"),
+            None,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint.api_key,
+            ApiKeySource::Literal("override-key".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_keeps_api_key_commands_inert() {
+        let config = ConfigFile {
+            api_key_cmd: Some(super::CommandSpec::Argv(vec![
+                "command-that-must-not-run".to_owned(),
+            ])),
+            ..ConfigFile::default()
+        };
+        let endpoint = resolve_endpoint(
+            None,
+            None,
+            Some("https://model.example/v1"),
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint.api_key,
+            ApiKeySource::Command(super::CommandSpec::Argv(vec![
+                "command-that-must-not-run".to_owned(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_expands_only_the_winning_base_url_layer() {
+        let config = ConfigFile {
+            base_url: Some("${config-base-url-must-not-be-read}".to_owned()),
+            api_key: Some("${config-api-key-must-not-be-read}".to_owned()),
+            ..ConfigFile::default()
+        };
+
+        let endpoint = resolve_endpoint(
+            Some("http://override.example/v1///".to_owned()),
+            Some("override-key".to_owned()),
+            Some("${model-base-url-must-not-be-read}"),
+            Some("${model-api-key-must-not-be-read}"),
+            None,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(endpoint.base_url, "http://override.example/v1");
+        assert_eq!(
+            endpoint.api_key,
+            ApiKeySource::Literal("override-key".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_does_not_expand_config_when_model_base_url_wins() {
+        let config = ConfigFile {
+            base_url: Some("${config-base-url-must-not-be-read}".to_owned()),
+            ..ConfigFile::default()
+        };
+
+        let endpoint = resolve_endpoint(
+            None,
+            None,
+            Some("http://model.example/v1///"),
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(endpoint.base_url, "http://model.example/v1");
+        assert_eq!(endpoint.api_key, ApiKeySource::Absent);
     }
 
     fn lookup_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

@@ -4,9 +4,8 @@
 //! command runs. Everything goes to stderr — never stdout, which must stay
 //! pipe-clean for a piped `lait` answer — and ANSI color is disabled
 //! whenever stderr isn't a terminal (a redirected log file, CI). This is
-//! purely additive: the 48 pre-existing `eprintln!` call sites across the
-//! crate (`lait: `/`note: `/`warning: `/`==> ` prefixes) are untouched and
-//! keep behaving exactly as before, with or without `-v`.
+//! independent of the CLI's progress and error messages, which remain visible
+//! regardless of the selected tracing level.
 
 use std::io::IsTerminal;
 
@@ -41,33 +40,4 @@ fn default_filter(verbosity: u8) -> EnvFilter {
         _ => "lait=trace",
     };
     EnvFilter::new(directive)
-}
-
-/// Masks a secret (an API key) for a log line: keeps the first 4 characters —
-/// enough to tell two configured keys apart without revealing enough to be
-/// useful — and replaces the rest with `***`. Fewer than 4 characters masks
-/// entirely, so a short/placeholder key (e.g. the `"lm-studio"` dummy
-/// `engine::resolve_request_settings` substitutes) doesn't leak in full.
-pub(crate) fn mask_secret(secret: &str) -> String {
-    if secret.chars().count() < 4 {
-        return "***".to_owned();
-    }
-    let prefix: String = secret.chars().take(4).collect();
-    format!("{prefix}***")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::mask_secret;
-
-    #[test]
-    fn masks_everything_but_the_first_four_characters() {
-        assert_eq!(mask_secret("sk-1234567890"), "sk-1***");
-    }
-
-    #[test]
-    fn masks_a_short_secret_entirely() {
-        assert_eq!(mask_secret("abc"), "***");
-        assert_eq!(mask_secret(""), "***");
-    }
 }

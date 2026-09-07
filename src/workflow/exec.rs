@@ -19,7 +19,7 @@ use crate::{
     async_io, attachment,
     config::{self, ConfigFile},
     engine::{
-        AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
+        AgentTurn, CapabilityOverrides, PromptTurn, RequestSettings, RunContext, SamplingOverrides,
         call_agent, resolve_request_settings, value_to_input_text,
     },
     jq, response, schema, template, workflow,
@@ -78,6 +78,134 @@ pub(crate) struct StepsOutcome {
     pub(crate) steps_outputs: workflow::StepOutputs,
 }
 
+/// Mutable data threaded through one sequential step list. Keeping it
+/// separate from [`RunStepsFrame`] makes router helpers explicit about what
+/// they transform (the current value, progress counter, and named outputs)
+/// versus the read-only execution environment they borrow.
+struct StepsState {
+    output: String,
+    counter: usize,
+    steps_outputs: workflow::StepOutputs,
+}
+
+impl StepsState {
+    fn into_outcome(self, flow: Flow) -> StepsOutcome {
+        StepsOutcome {
+            output: self.output,
+            counter: self.counter,
+            flow,
+            steps_outputs: self.steps_outputs,
+        }
+    }
+}
+
+/// Physical concurrency inherited across workflow-file boundaries. Lexical
+/// break/stop scopes are validated separately within each workflow document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExecutionPlacement {
+    #[default]
+    Sequential,
+    Parallel,
+    ConcurrentItems,
+}
+
+impl ExecutionPlacement {
+    fn parallel(self) -> Self {
+        match self {
+            Self::ConcurrentItems => self,
+            Self::Sequential | Self::Parallel => Self::Parallel,
+        }
+    }
+}
+
+fn validate_node_placement(
+    node: &workflow::NodeDefinition,
+    placement: ExecutionPlacement,
+    label: &str,
+) -> Result<()> {
+    if placement != ExecutionPlacement::Sequential && node.requires_interactive_stdin() {
+        bail!(
+            "step '{label}' cannot run an 'ask' node inside concurrent execution, including a nested workflow"
+        );
+    }
+    if placement == ExecutionPlacement::ConcurrentItems && node.settings().write_file.is_some() {
+        bail!(
+            "step '{label}' has 'write_file' inside a concurrent 'for_each', including a nested workflow; move the write after the loop"
+        );
+    }
+    Ok(())
+}
+
+/// Preflights a newly loaded child before any of its actions run. References
+/// to other workflow files remain lazy; each child checks its own plan on load.
+fn validate_execution_placement(
+    steps: &[workflow::FlowStep],
+    placement: ExecutionPlacement,
+) -> Result<()> {
+    for (index, step) in steps.iter().enumerate() {
+        if let Some(call) = step.call() {
+            validate_node_placement(call.definition, placement, &step.label_or(index + 1))?;
+        }
+        if let Some(handler) = step.on_error() {
+            validate_execution_placement(&handler.steps, placement)?;
+        }
+        match step.router() {
+            Some(workflow::Router::Switch(router)) => {
+                for case in &router.cases {
+                    validate_execution_placement(&case.steps, placement)?;
+                }
+                if let Some(steps) = &router.else_steps {
+                    validate_execution_placement(steps, placement)?;
+                }
+            }
+            Some(workflow::Router::Parallel(router)) => {
+                for branch in &router.branches {
+                    validate_execution_placement(&branch.steps, placement.parallel())?;
+                }
+            }
+            Some(workflow::Router::Loop(router)) => {
+                validate_execution_placement(&router.steps, placement)?
+            }
+            Some(workflow::Router::ForEach(router)) => {
+                let inner = if router.max_concurrency.unwrap_or(1) > 1 {
+                    ExecutionPlacement::ConcurrentItems
+                } else {
+                    placement
+                };
+                validate_execution_placement(&router.steps, inner)?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Read-only context shared by all router handlers. `RunStepsFrame` keeps the
+/// caller's starting counter because it is part of the public recursive entry
+/// point; router handlers only need the invariant scope/environment/prefix and
+/// the cancellation token, so this smaller view avoids passing unrelated state
+/// through every control-structure helper.
+struct RouterContext<'a> {
+    scope: &'a WorkflowScope,
+    env: &'a RunContext,
+    placement: ExecutionPlacement,
+    progress_prefix: &'a str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl<'a> RouterContext<'a> {
+    fn frame<'b>(&'b self, start_counter: usize, progress_prefix: &'b str) -> RunStepsFrame<'b> {
+        RunStepsFrame {
+            scope: self.scope,
+            env: self.env,
+            start_counter,
+            progress_prefix,
+            cancellation: self.cancellation.clone(),
+            placement: self.placement,
+        }
+    }
+}
+
 /// Returns an error as soon as the cancellation inherited from an enclosing
 /// timed step/workflow is observed. Router frames use this check between
 /// child operations as well as passing the receiver into jq itself, so a
@@ -87,44 +215,31 @@ fn check_workflow_cancellation(
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        bail!("workflow execution was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "workflow execution was cancelled"
+        ));
     }
     Ok(())
 }
 
-/// Where in the overall run a call to `run_steps` sits, as opposed to
-/// `steps`/`current_input`/`steps_outputs` (passed to `run_steps` directly),
-/// which are what to run and the data flowing through it. Unchanged across
-/// most recursive calls — `switch`/`loop`/a sequential `for_each` item/
-/// `on_error` all reuse the caller's own frame fields — while a `parallel`
-/// branch or a concurrent `for_each` item builds itself a fresh one with
-/// `start_counter: 0` and a branch-local `progress_prefix`, and a nested
-/// `workflow:` node's own call (from `execute_step`) builds one with a new
-/// `scope` (see `WorkflowScope::nested`) and `cancellation` set to the
-/// node's own `step_cancel`.
-///
-/// `+ Send` on `run_steps`'s return type (below) means a `parallel`/
-/// concurrent `for_each` branch's future *could* run on `tokio::spawn`, but
-/// none do yet — they're still driven concurrently in-task via
-/// `try_join_all`/`.buffered()`, which interleaves I/O-bound work (the
-/// common case here) but never uses more than one OS thread. Actually
-/// spawning needs every borrow in this frame's `'a` to become `'static`,
-/// and `scope: &'a WorkflowScope`/`env: &'a AppContext` already could (both
-/// are already `Arc`-friendly), but `steps: &'a [FlowStep]` (below) can't:
-/// it's borrowed from the top-level `WorkflowFile` on `run_workflow`'s
-/// stack, reachable through `SwitchCase`/`ParallelBranch`/
-/// `LoopDefinition`/`ForEachDefinition`/`OnError`'s own `Vec<FlowStep>`
-/// fields. Making the whole step AST `Arc`-shared is a bigger change than
-/// it looks (`Arc<[FlowStep]>` doesn't `Deserialize` the way `Vec<FlowStep>`
-/// does) and lands on exactly the structs the design review's Phase B-1
-/// (`NodeDefinition` → a `type:`-tagged enum) is going to rewrite anyway —
-/// better done together than as two passes over the same types.
+/// Execution scope, cancellation, and progress for a sequence of steps.
+/// Routers inherit this frame, adjusting progress and placement for concurrent
+/// branches. Child workflows replace the scope while retaining the parent's
+/// concurrency restrictions and the calling node's cancellation token.
 pub(crate) struct RunStepsFrame<'a> {
     pub(crate) scope: &'a WorkflowScope,
-    pub(crate) env: &'a AppContext,
+    pub(crate) env: &'a RunContext,
+    pub(crate) placement: ExecutionPlacement,
     pub(crate) start_counter: usize,
     pub(crate) progress_prefix: &'a str,
     pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl<'a> RunStepsFrame<'a> {
+    fn with_placement(mut self, placement: ExecutionPlacement) -> Self {
+        self.placement = placement;
+        self
+    }
 }
 
 /// Runs a sequence of steps (the workflow's top-level `steps`, the nested
@@ -160,6 +275,7 @@ pub(crate) fn run_steps<'a>(
         start_counter,
         progress_prefix,
         cancellation,
+        placement,
     } = frame;
     Box::pin(async move {
         let mut current_input = current_input;
@@ -175,87 +291,36 @@ pub(crate) fn run_steps<'a>(
             // (which just checks them in a fixed order) can't silently
             // prefer one over another here. Matched exhaustively (no `_`
             // arm) so a new router kind fails to compile here until handled.
+            let router_context = RouterContext {
+                scope,
+                env,
+                placement,
+                progress_prefix,
+                cancellation: cancellation.clone(),
+            };
             match step.router() {
                 Some(workflow::Router::Switch(switch)) => {
                     eprintln!("{progress_prefix}[{counter}] {label}");
-
-                    let mut matched = None;
-                    for (case_index, case) in switch.cases.iter().enumerate() {
-                        if workflow::eval_when_async(
-                            &case.when,
-                            &current_input,
-                            &steps_outputs,
-                            &env.vars,
-                            cancellation.clone(),
-                        )
-                        .await
-                        .with_context(|| format!("step '{label}'"))?
-                        {
-                            let case_label = case
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| format!("case-{}", case_index + 1));
-                            eprintln!("{progress_prefix}    -> case '{case_label}' matched");
-                            matched = Some(
-                                run_steps(
-                                    &case.steps,
-                                    current_input.clone(),
-                                    steps_outputs.clone(),
-                                    RunStepsFrame {
-                                        scope,
-                                        env,
-                                        start_counter: counter,
-                                        progress_prefix,
-                                        cancellation: cancellation.clone(),
-                                    },
-                                )
-                                .await?,
-                            );
-                            break;
-                        }
-                    }
-                    let StepsOutcome {
-                        output: result,
-                        counter: new_counter,
-                        flow,
-                        steps_outputs: new_steps_outputs,
-                    } = match matched {
-                        Some(result) => result,
-                        None => match &switch.else_steps {
-                            Some(else_steps) => {
-                                eprintln!(
-                                    "{progress_prefix}    -> no case matched, running 'else'"
-                                );
-                                run_steps(
-                                    else_steps,
-                                    current_input.clone(),
-                                    steps_outputs.clone(),
-                                    RunStepsFrame {
-                                        scope,
-                                        env,
-                                        start_counter: counter,
-                                        progress_prefix,
-                                        cancellation: cancellation.clone(),
-                                    },
-                                )
-                                .await?
-                            }
-                            None => {
-                                bail!(
-                                    "step '{label}': no case matched and no 'else' branch is defined"
-                                )
-                            }
+                    let outcome = execute_switch(
+                        switch,
+                        StepsState {
+                            output: current_input,
+                            counter,
+                            steps_outputs,
                         },
-                    };
-                    current_input = result;
-                    counter = new_counter;
-                    steps_outputs = new_steps_outputs;
+                        &router_context,
+                        &label,
+                    )
+                    .await?;
+                    current_input = outcome.output;
+                    counter = outcome.counter;
+                    steps_outputs = outcome.steps_outputs;
                     record_step_output(&mut steps_outputs, step, &current_input);
-                    if flow != Flow::Continue {
+                    if outcome.flow != Flow::Continue {
                         return Ok(StepsOutcome {
                             output: current_input,
                             counter,
-                            flow,
+                            flow: outcome.flow,
                             steps_outputs,
                         });
                     }
@@ -264,335 +329,66 @@ pub(crate) fn run_steps<'a>(
 
                 Some(workflow::Router::Parallel(parallel)) => {
                     eprintln!("{progress_prefix}[{counter}] {label}");
-                    eprintln!(
-                        "{progress_prefix}    -> running {} branches concurrently",
-                        parallel.branches.len()
-                    );
-
-                    let branch_labels: Vec<String> = parallel
-                        .branches
-                        .iter()
-                        .enumerate()
-                        .map(|(index, branch)| branch.label(index))
-                        .collect();
-                    let branch_prefixes: Vec<String> = branch_labels
-                        .iter()
-                        .map(|branch_label| format!("{progress_prefix}[{branch_label}] "))
-                        .collect();
-                    let branch_futures = parallel.branches.iter().zip(&branch_prefixes).map(
-                        |(branch, branch_prefix)| {
-                            run_steps(
-                                &branch.steps,
-                                current_input.clone(),
-                                steps_outputs.clone(),
-                                RunStepsFrame {
-                                    scope,
-                                    env,
-                                    start_counter: 0,
-                                    progress_prefix: branch_prefix,
-                                    cancellation: cancellation.clone(),
-                                },
-                            )
+                    let outcome = execute_parallel(
+                        parallel,
+                        StepsState {
+                            output: current_input,
+                            counter,
+                            steps_outputs,
                         },
-                    );
-                    let branch_results = futures_util::future::try_join_all(branch_futures).await?;
-
-                    // `validate_steps` rejects `stop`/`break` anywhere inside a
-                    // `parallel` branch, so every branch always finishes with
-                    // `Flow::Continue`; only its output is used here. Each branch
-                    // got its own clone of `steps_outputs` (see this function's
-                    // doc comment), so whatever it recorded stays branch-local.
-                    let mut joined = serde_json::Map::new();
-                    for (branch_label, branch_result) in
-                        branch_labels.into_iter().zip(branch_results)
-                    {
-                        joined.insert(branch_label, template::parse_input(&branch_result.output));
-                    }
-                    let joined_json = serde_json::to_string(&serde_json::Value::Object(joined))
-                        .context("failed to serialize joined 'parallel' branch outputs")?;
-
-                    eprintln!("{progress_prefix}    -> branches joined");
-
-                    current_input = match &parallel.join {
-                        Some(filter) => jq::apply_cancellable_async(
-                            filter,
-                            &joined_json,
-                            &steps_outputs,
-                            &env.vars,
-                            cancellation.clone(),
-                        )
-                        .await
-                        .with_context(|| format!("step '{label}'"))?,
-                        None => joined_json,
-                    };
+                        &router_context,
+                        &label,
+                    )
+                    .await?;
+                    current_input = outcome.output;
+                    counter = outcome.counter;
+                    steps_outputs = outcome.steps_outputs;
                     record_step_output(&mut steps_outputs, step, &current_input);
                     continue;
                 }
 
                 Some(workflow::Router::Loop(loop_def)) => {
                     eprintln!("{progress_prefix}[{counter}] {label}");
-                    // Validated by `validate::validate_steps`: exactly one of
-                    // `while`/`until` is set, and `max_iterations` is `Some(n)` with n >= 1.
-                    let max_iterations = loop_def
-                        .max_iterations
-                        .expect("loop.max_iterations is required by validate_steps");
-
-                    let mut iteration_input = current_input.clone();
-                    // Threaded continuously across iterations (like `switch`, unlike
-                    // `parallel`'s per-branch reset): the loop body genuinely runs
-                    // sequentially, so a single growing counter reflects real execution
-                    // order.
-                    let mut loop_counter = counter;
-                    let mut iterations_run = 0usize;
-                    // One driver for both condition kinds (`validate_steps`
-                    // guarantees exactly one is set): `while` is checked before
-                    // each iteration (so the body may run zero times), `until`
-                    // after each one (so it always runs at least once). An
-                    // explicit `break: true` ends the loop like a satisfied
-                    // condition; exhausting `max_iterations` instead breaks
-                    // with `satisfied` = false, an error either way.
-                    let satisfied = loop {
-                        if let Some(while_cond) = &loop_def.r#while
-                            && !workflow::eval_when_async(
-                                while_cond,
-                                &iteration_input,
-                                &steps_outputs,
-                                &env.vars,
-                                cancellation.clone(),
-                            )
-                            .await
-                            .with_context(|| format!("step '{label}'"))?
-                        {
-                            break true;
-                        }
-                        if iterations_run >= max_iterations {
-                            break false;
-                        }
-                        iterations_run += 1;
-                        eprintln!(
-                            "{progress_prefix}    -> iteration {iterations_run}/{max_iterations}"
-                        );
-                        let StepsOutcome {
-                            output: result,
-                            counter: new_counter,
-                            flow,
-                            steps_outputs: new_steps_outputs,
-                        } = run_steps(
-                            &loop_def.steps,
-                            iteration_input.clone(),
-                            steps_outputs.clone(),
-                            RunStepsFrame {
-                                scope,
-                                env,
-                                start_counter: loop_counter,
-                                progress_prefix,
-                                cancellation: cancellation.clone(),
-                            },
-                        )
-                        .await?;
-                        iteration_input = result;
-                        loop_counter = new_counter;
-                        steps_outputs = new_steps_outputs;
-                        match flow {
-                            Flow::Continue => {}
-                            Flow::Break => break true,
-                            Flow::Stop => {
-                                return Ok(StepsOutcome {
-                                    output: iteration_input,
-                                    counter: loop_counter,
-                                    flow: Flow::Stop,
-                                    steps_outputs,
-                                });
-                            }
-                        }
-                        if let Some(until_cond) = &loop_def.until
-                            && workflow::eval_when_async(
-                                until_cond,
-                                &iteration_input,
-                                &steps_outputs,
-                                &env.vars,
-                                cancellation.clone(),
-                            )
-                            .await
-                            .with_context(|| format!("step '{label}'"))?
-                        {
-                            break true;
-                        }
-                    };
-                    if !satisfied {
-                        let condition = if loop_def.r#while.is_some() {
-                            "while"
-                        } else {
-                            "until"
-                        };
-                        bail!(
-                            "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying '{condition}'"
-                        );
+                    let outcome = execute_loop(
+                        loop_def,
+                        StepsState {
+                            output: current_input,
+                            counter,
+                            steps_outputs,
+                        },
+                        &router_context,
+                        &label,
+                    )
+                    .await?;
+                    if outcome.flow == Flow::Stop {
+                        return Ok(outcome);
                     }
-                    current_input = iteration_input;
-                    counter = loop_counter;
+                    current_input = outcome.output;
+                    counter = outcome.counter;
+                    steps_outputs = outcome.steps_outputs;
                     record_step_output(&mut steps_outputs, step, &current_input);
                     continue;
                 }
 
                 Some(workflow::Router::ForEach(for_each)) => {
                     eprintln!("{progress_prefix}[{counter}] {label}");
-                    let items_json = jq::apply_one_cancellable_async(
-                        &for_each.items,
-                        &current_input,
-                        &steps_outputs,
-                        &env.vars,
-                        cancellation.clone(),
+                    let outcome = execute_for_each(
+                        for_each,
+                        StepsState {
+                            output: current_input,
+                            counter,
+                            steps_outputs,
+                        },
+                        &router_context,
+                        &label,
                     )
-                    .await
-                    .with_context(|| format!("step '{label}'"))?;
-                    let items_value: serde_json::Value = serde_json::from_str(&items_json)
-                        .with_context(|| {
-                            format!(
-                                "step '{label}': failed to parse 'for_each.items' output as JSON"
-                            )
-                        })?;
-                    let items = items_value.as_array().cloned().ok_or_else(|| {
-                        anyhow!("step '{label}': 'for_each.items' must produce a JSON array")
-                    })?;
-
-                    let max_concurrency = for_each.max_concurrency.unwrap_or(1);
-                    let results: Vec<serde_json::Value> = if max_concurrency <= 1 {
-                        eprintln!(
-                            "{progress_prefix}    -> iterating over {} item(s)",
-                            items.len()
-                        );
-                        let mut results = Vec::with_capacity(items.len());
-                        // Threaded continuously across items, like `loop` (see its
-                        // comment above): a sequential `for_each` (the default)
-                        // runs its body one item at a time, so a single growing
-                        // counter matches real execution order.
-                        let mut for_each_counter = counter;
-                        let mut stop_result = None;
-                        for (item_index, item) in items.iter().enumerate() {
-                            eprintln!(
-                                "{progress_prefix}    -> item {}/{}",
-                                item_index + 1,
-                                items.len()
-                            );
-                            // A string item is passed through raw (like `parallel`'s
-                            // `current_input`, and the inverse of `template::parse_input`
-                            // used below for results), not re-quoted as JSON, so
-                            // `{{ input }}` sees the same unquoted text everywhere else
-                            // in the pipeline does.
-                            let item_input =
-                                value_to_input_text(item, "failed to serialize a 'for_each' item")?;
-                            let StepsOutcome {
-                                output: result,
-                                counter: new_counter,
-                                flow,
-                                steps_outputs: new_steps_outputs,
-                            } = run_steps(
-                                &for_each.steps,
-                                item_input,
-                                steps_outputs.clone(),
-                                RunStepsFrame {
-                                    scope,
-                                    env,
-                                    start_counter: for_each_counter,
-                                    progress_prefix,
-                                    cancellation: cancellation.clone(),
-                                },
-                            )
-                            .await?;
-                            for_each_counter = new_counter;
-                            steps_outputs = new_steps_outputs;
-                            if flow == Flow::Stop {
-                                stop_result = Some(result);
-                                break;
-                            }
-                            results.push(template::parse_input(&result));
-                            if flow == Flow::Break {
-                                break;
-                            }
-                        }
-                        counter = for_each_counter;
-                        if let Some(result) = stop_result {
-                            return Ok(StepsOutcome {
-                                output: result,
-                                counter,
-                                flow: Flow::Stop,
-                                steps_outputs,
-                            });
-                        }
-                        results
-                    } else {
-                        eprintln!(
-                            "{progress_prefix}    -> iterating over {} item(s), up to {max_concurrency} concurrently",
-                            items.len()
-                        );
-                        let item_inputs: Vec<String> = items
-                            .iter()
-                            .map(|item| {
-                                value_to_input_text(item, "failed to serialize a 'for_each' item")
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        let item_prefixes: Vec<String> = (0..item_inputs.len())
-                            .map(|index| format!("{progress_prefix}[item-{}] ", index + 1))
-                            .collect();
-                        // Built with an explicit loop rather than
-                        // `.zip(&item_prefixes).map(...)`: a closure handed to
-                        // `.map()` here must type-check for a fully generic
-                        // borrow lifetime, but `run_steps`'s boxed return
-                        // type ties its `Send + 'a` bound to this specific
-                        // `item_prefix`'s lifetime, which rustc's closure
-                        // inference cannot unify through a combinator ("not
-                        // general enough").
-                        let mut item_futures = Vec::with_capacity(item_prefixes.len());
-                        for (item_input, item_prefix) in item_inputs.into_iter().zip(&item_prefixes)
-                        {
-                            item_futures.push(run_steps(
-                                &for_each.steps,
-                                item_input,
-                                steps_outputs.clone(),
-                                RunStepsFrame {
-                                    scope,
-                                    env,
-                                    start_counter: 0,
-                                    progress_prefix: item_prefix,
-                                    cancellation: cancellation.clone(),
-                                },
-                            ));
-                        }
-                        // `validate_steps` rejects `stop`/`break` inside a
-                        // `for_each` body whose `max_concurrency` is above 1, for
-                        // the same reason as a `parallel` branch: concurrently
-                        // running items can't share a single well-defined "break
-                        // this loop"/"stop the workflow" target. Each item also
-                        // got its own clone of `steps_outputs` (see this
-                        // function's doc comment), so nothing it records leaks
-                        // back here.
-                        let item_results: Vec<StepsOutcome> =
-                            futures_util::stream::iter(item_futures)
-                                .buffered(max_concurrency)
-                                .try_collect()
-                                .await?;
-                        item_results
-                            .into_iter()
-                            .map(|outcome| template::parse_input(&outcome.output))
-                            .collect()
-                    };
-
-                    let results_json = serde_json::to_string(&serde_json::Value::Array(results))
-                        .context("failed to serialize 'for_each' results")?;
-
-                    current_input = match &for_each.join {
-                        Some(filter) => jq::apply_cancellable_async(
-                            filter,
-                            &results_json,
-                            &steps_outputs,
-                            &env.vars,
-                            cancellation.clone(),
-                        )
-                        .await
-                        .with_context(|| format!("step '{label}'"))?,
-                        None => results_json,
-                    };
+                    .await?;
+                    if outcome.flow == Flow::Stop {
+                        return Ok(outcome);
+                    }
+                    current_input = outcome.output;
+                    counter = outcome.counter;
+                    steps_outputs = outcome.steps_outputs;
                     record_step_output(&mut steps_outputs, step, &current_input);
                     continue;
                 }
@@ -600,7 +396,7 @@ pub(crate) fn run_steps<'a>(
                 None => {}
             }
 
-            if let Some(when) = &step.when {
+            if let Some(when) = step.when() {
                 let truthy = workflow::eval_when_async(
                     when,
                     &current_input,
@@ -617,21 +413,18 @@ pub(crate) fn run_steps<'a>(
             }
 
             eprintln!("{progress_prefix}[{counter}] {label}");
-            current_input = match &step.r#use {
+            current_input = match step.call() {
                 None => current_input,
-                Some(node_id) => {
-                    // `validate::validate_steps` guarantees every `use:` site
-                    // resolves against `scope.nodes` before execution starts.
-                    let node = scope
-                        .nodes
-                        .get(node_id)
-                        .expect("validate_steps guarantees 'use' resolves in 'nodes'");
+                Some(call) => {
+                    let node = call.definition;
+                    validate_node_placement(node, placement, &label)?;
                     let attempt_result = execute_step_with_retry(
                         node,
                         &current_input,
                         StepContext {
                             scope,
                             env,
+                            placement,
                             label: &label,
                             progress_prefix,
                             steps_outputs: &steps_outputs,
@@ -641,13 +434,13 @@ pub(crate) fn run_steps<'a>(
                     .await;
                     match attempt_result {
                         Ok(output) => output,
-                        Err(error) => match &step.on_error {
+                        Err(error) => match step.on_error() {
                             Some(on_error) => {
                                 eprintln!(
                                     "{progress_prefix}    -> step failed, running 'on_error': {error}"
                                 );
                                 let error_input = serde_json::json!({
-                                    "error": error.to_string(),
+                                    "error": format!("{error:#}"),
                                     "input": template::parse_input(&current_input),
                                 });
                                 let error_input_json = serde_json::to_string(&error_input)
@@ -667,6 +460,7 @@ pub(crate) fn run_steps<'a>(
                                         start_counter: counter,
                                         progress_prefix,
                                         cancellation: cancellation.clone(),
+                                        placement,
                                     },
                                 )
                                 .await?;
@@ -695,7 +489,7 @@ pub(crate) fn run_steps<'a>(
 
             record_step_output(&mut steps_outputs, step, &current_input);
 
-            if step.r#break == Some(true) {
+            if step.control() == crate::workflow::Control::Break {
                 return Ok(StepsOutcome {
                     output: current_input,
                     counter,
@@ -703,7 +497,7 @@ pub(crate) fn run_steps<'a>(
                     steps_outputs,
                 });
             }
-            if step.stop == Some(true) {
+            if step.control() == crate::workflow::Control::Stop {
                 return Ok(StepsOutcome {
                     output: current_input,
                     counter,
@@ -718,6 +512,446 @@ pub(crate) fn run_steps<'a>(
             flow: Flow::Continue,
             steps_outputs,
         })
+    })
+}
+
+/// Executes a switch router and returns the state produced by its selected
+/// branch. Case selection is sequential and short-circuits at the first truthy
+/// condition; the branch receives a clone of the current state just as the
+/// original inline interpreter did.
+async fn execute_switch<'a>(
+    switch: &'a workflow::SwitchDefinition,
+    state: StepsState,
+    context: &RouterContext<'a>,
+    label: &str,
+) -> Result<StepsOutcome> {
+    let StepsState {
+        output: current_input,
+        counter,
+        steps_outputs,
+    } = state;
+    let mut matched = None;
+    for (case_index, case) in switch.cases.iter().enumerate() {
+        if workflow::eval_when_async(
+            &case.when,
+            &current_input,
+            &steps_outputs,
+            &context.env.vars,
+            context.cancellation.clone(),
+        )
+        .await
+        .with_context(|| format!("step '{label}'"))?
+        {
+            let case_label = case
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("case-{}", case_index + 1));
+            eprintln!(
+                "{}    -> case '{case_label}' matched",
+                context.progress_prefix
+            );
+            matched = Some(
+                run_steps(
+                    &case.steps,
+                    current_input.clone(),
+                    steps_outputs.clone(),
+                    context.frame(counter, context.progress_prefix),
+                )
+                .await?,
+            );
+            break;
+        }
+    }
+
+    let outcome = match matched {
+        Some(outcome) => outcome,
+        None => match &switch.else_steps {
+            Some(else_steps) => {
+                eprintln!(
+                    "{}    -> no case matched, running 'else'",
+                    context.progress_prefix
+                );
+                run_steps(
+                    else_steps,
+                    current_input,
+                    steps_outputs,
+                    context.frame(counter, context.progress_prefix),
+                )
+                .await?
+            }
+            None => {
+                bail!("step '{label}': no case matched and no 'else' branch is defined")
+            }
+        },
+    };
+
+    Ok(outcome)
+}
+
+/// Executes all branches of a parallel router and joins their outputs in
+/// declaration order. Each branch gets an isolated copy of named step outputs;
+/// only the joined value is returned to the parent state.
+async fn execute_parallel<'a>(
+    parallel: &'a workflow::ParallelDefinition,
+    state: StepsState,
+    context: &RouterContext<'a>,
+    label: &str,
+) -> Result<StepsOutcome> {
+    let StepsState {
+        output: current_input,
+        counter,
+        steps_outputs,
+    } = state;
+    eprintln!(
+        "{}    -> running {} branches concurrently",
+        context.progress_prefix,
+        parallel.branches.len()
+    );
+
+    let branch_labels: Vec<String> = parallel
+        .branches
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| branch.label(index))
+        .collect();
+    let branch_prefixes: Vec<String> = branch_labels
+        .iter()
+        .map(|branch_label| format!("{}[{branch_label}] ", context.progress_prefix))
+        .collect();
+    let mut branch_futures = Vec::with_capacity(parallel.branches.len());
+    for (branch, branch_prefix) in parallel.branches.iter().zip(&branch_prefixes) {
+        branch_futures.push(run_steps(
+            &branch.steps,
+            current_input.clone(),
+            steps_outputs.clone(),
+            context
+                .frame(0, branch_prefix)
+                .with_placement(context.placement.parallel()),
+        ));
+    }
+    let branch_results = futures_util::future::try_join_all(branch_futures).await?;
+
+    let mut joined = serde_json::Map::new();
+    for (branch_label, branch_result) in branch_labels.into_iter().zip(branch_results) {
+        joined.insert(branch_label, template::parse_input(&branch_result.output));
+    }
+    let joined_json = serde_json::to_string(&serde_json::Value::Object(joined))
+        .context("failed to serialize joined 'parallel' branch outputs")?;
+
+    eprintln!("{}    -> branches joined", context.progress_prefix);
+    let output = match &parallel.join {
+        Some(filter) => jq::apply_cancellable_async(
+            filter,
+            &joined_json,
+            &steps_outputs,
+            &context.env.vars,
+            context.cancellation.clone(),
+        )
+        .await
+        .with_context(|| format!("step '{label}'"))?,
+        None => joined_json,
+    };
+
+    Ok(StepsState {
+        output,
+        counter,
+        steps_outputs,
+    }
+    .into_outcome(Flow::Continue))
+}
+
+/// Executes a loop router, threading the body output and named outputs across
+/// iterations until its condition or an explicit `break` succeeds.
+async fn execute_loop<'a>(
+    loop_def: &'a workflow::LoopDefinition,
+    state: StepsState,
+    context: &RouterContext<'a>,
+    label: &str,
+) -> Result<StepsOutcome> {
+    let StepsState {
+        output: current_input,
+        counter,
+        mut steps_outputs,
+    } = state;
+    let max_iterations = loop_def.max_iterations.get();
+
+    let mut iteration_input = current_input;
+    let mut loop_counter = counter;
+    let mut iterations_run = 0usize;
+    let satisfied = loop {
+        if let workflow::LoopCondition::While(while_cond) = &loop_def.condition
+            && !workflow::eval_when_async(
+                while_cond,
+                &iteration_input,
+                &steps_outputs,
+                &context.env.vars,
+                context.cancellation.clone(),
+            )
+            .await
+            .with_context(|| format!("step '{label}'"))?
+        {
+            break true;
+        }
+        if iterations_run >= max_iterations {
+            break false;
+        }
+        iterations_run += 1;
+        eprintln!(
+            "{}    -> iteration {iterations_run}/{max_iterations}",
+            context.progress_prefix
+        );
+        let outcome = run_steps(
+            &loop_def.steps,
+            iteration_input.clone(),
+            steps_outputs.clone(),
+            context.frame(loop_counter, context.progress_prefix),
+        )
+        .await?;
+        let StepsOutcome {
+            output: result,
+            counter: new_counter,
+            flow,
+            steps_outputs: new_steps_outputs,
+        } = outcome;
+        iteration_input = result;
+        loop_counter = new_counter;
+        steps_outputs = new_steps_outputs;
+        match flow {
+            Flow::Continue => {}
+            Flow::Break => break true,
+            Flow::Stop => {
+                return Ok(StepsState {
+                    output: iteration_input,
+                    counter: loop_counter,
+                    steps_outputs,
+                }
+                .into_outcome(Flow::Stop));
+            }
+        }
+        if let workflow::LoopCondition::Until(until_cond) = &loop_def.condition
+            && workflow::eval_when_async(
+                until_cond,
+                &iteration_input,
+                &steps_outputs,
+                &context.env.vars,
+                context.cancellation.clone(),
+            )
+            .await
+            .with_context(|| format!("step '{label}'"))?
+        {
+            break true;
+        }
+    };
+
+    if !satisfied {
+        let condition = loop_def.condition.keyword();
+        bail!(
+            "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying '{condition}'"
+        );
+    }
+
+    Ok(StepsState {
+        output: iteration_input,
+        counter: loop_counter,
+        steps_outputs,
+    }
+    .into_outcome(Flow::Continue))
+}
+
+/// Executes a for_each router. Sequential iteration preserves the parent
+/// counter and step namespace; concurrent iteration isolates both per item and
+/// joins results in item order.
+async fn execute_for_each<'a>(
+    for_each: &'a workflow::ForEachDefinition,
+    state: StepsState,
+    context: &RouterContext<'a>,
+    label: &str,
+) -> Result<StepsOutcome> {
+    let StepsState {
+        output: current_input,
+        counter,
+        mut steps_outputs,
+    } = state;
+    let items_json = jq::apply_one_cancellable_async(
+        &for_each.items,
+        &current_input,
+        &steps_outputs,
+        &context.env.vars,
+        context.cancellation.clone(),
+    )
+    .await
+    .with_context(|| format!("step '{label}'"))?;
+    let items_value: serde_json::Value = serde_json::from_str(&items_json).with_context(|| {
+        format!("step '{label}': failed to parse 'for_each.items' output as JSON")
+    })?;
+    let items = items_value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("step '{label}': 'for_each.items' must produce a JSON array"))?;
+
+    let max_concurrency = for_each.max_concurrency.unwrap_or(1);
+    let item_outcome = if max_concurrency <= 1 {
+        eprintln!(
+            "{}    -> iterating over {} item(s)",
+            context.progress_prefix,
+            items.len()
+        );
+        execute_sequential_items(for_each, items, counter, steps_outputs, context).await?
+    } else {
+        eprintln!(
+            "{}    -> iterating over {} item(s), up to {max_concurrency} concurrently",
+            context.progress_prefix,
+            items.len()
+        );
+        execute_concurrent_items(
+            for_each,
+            items,
+            counter,
+            steps_outputs,
+            max_concurrency,
+            context,
+        )
+        .await?
+    };
+
+    let ForEachItemsOutcome {
+        results,
+        counter,
+        steps_outputs: updated_steps_outputs,
+        stop_output,
+    } = item_outcome;
+    steps_outputs = updated_steps_outputs;
+    if let Some(output) = stop_output {
+        return Ok(StepsState {
+            output,
+            counter,
+            steps_outputs,
+        }
+        .into_outcome(Flow::Stop));
+    }
+
+    let results_json = serde_json::to_string(&serde_json::Value::Array(results))
+        .context("failed to serialize 'for_each' results")?;
+    let output = match &for_each.join {
+        Some(filter) => jq::apply_cancellable_async(
+            filter,
+            &results_json,
+            &steps_outputs,
+            &context.env.vars,
+            context.cancellation.clone(),
+        )
+        .await
+        .with_context(|| format!("step '{label}'"))?,
+        None => results_json,
+    };
+
+    Ok(StepsState {
+        output,
+        counter,
+        steps_outputs,
+    }
+    .into_outcome(Flow::Continue))
+}
+
+struct ForEachItemsOutcome {
+    results: Vec<serde_json::Value>,
+    counter: usize,
+    steps_outputs: workflow::StepOutputs,
+    stop_output: Option<String>,
+}
+
+async fn execute_sequential_items<'a>(
+    for_each: &'a workflow::ForEachDefinition,
+    items: Vec<serde_json::Value>,
+    counter: usize,
+    mut steps_outputs: workflow::StepOutputs,
+    context: &RouterContext<'a>,
+) -> Result<ForEachItemsOutcome> {
+    let mut results = Vec::with_capacity(items.len());
+    let mut item_counter = counter;
+    for (item_index, item) in items.iter().enumerate() {
+        eprintln!(
+            "{}    -> item {}/{}",
+            context.progress_prefix,
+            item_index + 1,
+            items.len()
+        );
+        let item_input = value_to_input_text(item, "failed to serialize a 'for_each' item")?;
+        let outcome = run_steps(
+            &for_each.steps,
+            item_input,
+            steps_outputs.clone(),
+            context.frame(item_counter, context.progress_prefix),
+        )
+        .await?;
+        let StepsOutcome {
+            output,
+            counter: new_counter,
+            flow,
+            steps_outputs: new_steps_outputs,
+        } = outcome;
+        item_counter = new_counter;
+        steps_outputs = new_steps_outputs;
+        if flow == Flow::Stop {
+            return Ok(ForEachItemsOutcome {
+                results,
+                counter: item_counter,
+                steps_outputs,
+                stop_output: Some(output),
+            });
+        }
+        results.push(template::parse_input(&output));
+        if flow == Flow::Break {
+            break;
+        }
+    }
+    Ok(ForEachItemsOutcome {
+        results,
+        counter: item_counter,
+        steps_outputs,
+        stop_output: None,
+    })
+}
+
+async fn execute_concurrent_items<'a>(
+    for_each: &'a workflow::ForEachDefinition,
+    items: Vec<serde_json::Value>,
+    counter: usize,
+    steps_outputs: workflow::StepOutputs,
+    max_concurrency: usize,
+    context: &RouterContext<'a>,
+) -> Result<ForEachItemsOutcome> {
+    let item_inputs: Vec<String> = items
+        .iter()
+        .map(|item| value_to_input_text(item, "failed to serialize a 'for_each' item"))
+        .collect::<Result<Vec<_>>>()?;
+    let item_prefixes: Vec<String> = (0..item_inputs.len())
+        .map(|index| format!("{}[item-{}] ", context.progress_prefix, index + 1))
+        .collect();
+    let mut item_futures = Vec::with_capacity(item_prefixes.len());
+    for (item_input, item_prefix) in item_inputs.into_iter().zip(&item_prefixes) {
+        item_futures.push(run_steps(
+            &for_each.steps,
+            item_input,
+            steps_outputs.clone(),
+            context
+                .frame(0, item_prefix)
+                .with_placement(ExecutionPlacement::ConcurrentItems),
+        ));
+    }
+    let item_results: Vec<StepsOutcome> = futures_util::stream::iter(item_futures)
+        .buffered(max_concurrency)
+        .try_collect()
+        .await?;
+    let results = item_results
+        .into_iter()
+        .map(|outcome| template::parse_input(&outcome.output))
+        .collect();
+    Ok(ForEachItemsOutcome {
+        results,
+        counter,
+        steps_outputs,
+        stop_output: None,
     })
 }
 
@@ -737,7 +971,8 @@ pub(crate) fn effective_retry<'a>(
     node: &'a workflow::NodeDefinition,
     scope: &'a WorkflowScope,
 ) -> Option<&'a workflow::RetryDefinition> {
-    node.retry().or(node
+    let settings = node.settings();
+    settings.retry.or(node
         .calls_model()
         .then_some(scope.defaults.retry.as_ref())
         .flatten())
@@ -749,7 +984,8 @@ pub(crate) fn effective_timeout(
     node: &workflow::NodeDefinition,
     scope: &WorkflowScope,
 ) -> Option<u64> {
-    node.timeout().or(node
+    let settings = node.settings();
+    settings.timeout.or(node
         .calls_model()
         .then_some(scope.defaults.timeout)
         .flatten())
@@ -779,6 +1015,7 @@ async fn execute_step_with_retry(
     let StepContext {
         scope,
         env,
+        placement,
         label,
         progress_prefix,
         steps_outputs,
@@ -830,6 +1067,7 @@ async fn execute_step_with_retry(
                     StepContext {
                         scope,
                         env,
+                        placement,
                         label,
                         progress_prefix,
                         steps_outputs,
@@ -842,9 +1080,9 @@ async fn execute_step_with_retry(
                     Err(_) => {
                         node_cancel.cancel();
                         let _ = execution.await;
-                        Err(anyhow!(
+                        Err(anyhow!(crate::error::Interrupted::timed_out(format!(
                             "step '{label}' timed out after {seconds}s (attempt {attempt}/{max_attempts})"
-                        ))
+                        ))))
                     }
                 }
             }
@@ -855,6 +1093,7 @@ async fn execute_step_with_retry(
                     StepContext {
                         scope,
                         env,
+                        placement,
                         label,
                         progress_prefix,
                         steps_outputs,
@@ -913,13 +1152,15 @@ async fn wait_retry_delay(
     };
     if delay.is_zero() {
         if cancellation.is_cancelled() {
-            bail!("workflow execution was cancelled");
+            bail!(crate::error::Interrupted::cancelled(
+                "workflow execution was cancelled"
+            ));
         }
         return Ok(());
     }
     tokio::select! {
         biased;
-        () = cancellation.cancelled() => bail!("workflow execution was cancelled"),
+        () = cancellation.cancelled() => bail!(crate::error::Interrupted::cancelled("workflow execution was cancelled")),
         () = tokio::time::sleep(delay) => Ok(()),
     }
 }
@@ -930,12 +1171,13 @@ async fn wait_retry_delay(
 /// attempt — the caller's own cancellation on the first attempt of a node
 /// with no `timeout`, or a child token scoped to just that attempt when a
 /// `timeout` is set (see `execute_step_with_retry`) — which is why it lives
-/// here rather than on `AppContext`: it changes across attempts and nesting
-/// depths, unlike everything on `AppContext`, which does not.
+/// here rather than on `RunContext`: it changes across attempts and nesting
+/// depths, unlike everything on `RunContext`, which does not.
 #[derive(Clone)]
 struct StepContext<'a> {
     scope: &'a WorkflowScope,
-    env: &'a AppContext,
+    env: &'a RunContext,
+    placement: ExecutionPlacement,
     label: &'a str,
     progress_prefix: &'a str,
     steps_outputs: &'a workflow::StepOutputs,
@@ -957,8 +1199,9 @@ pub(crate) fn resolve_step_settings(
     agent_file: Option<&AgentFile>,
     label: &str,
 ) -> Result<RequestSettings> {
-    let model_name = node
-        .model()
+    let node_settings = node.settings();
+    let model_name = node_settings
+        .model
         .map(str::to_owned)
         .or_else(|| agent_file.and_then(|agent_file| agent_file.model.clone()))
         .or_else(|| scope.defaults.model.clone())
@@ -976,10 +1219,10 @@ pub(crate) fn resolve_step_settings(
     // `CapabilityOverrides::fold` then pick the first layer with each field
     // set, independently per field.
     let node_sampling = SamplingOverrides {
-        reasoning_effort: node.reasoning_effort(),
-        temperature: node.temperature(),
-        top_p: node.top_p(),
-        max_tokens: node.max_tokens(),
+        reasoning_effort: node_settings.reasoning_effort,
+        temperature: node_settings.temperature,
+        top_p: node_settings.top_p,
+        max_tokens: node_settings.max_tokens,
     };
     let agent_sampling = agent_file
         .map(|agent_file| SamplingOverrides {
@@ -998,11 +1241,11 @@ pub(crate) fn resolve_step_settings(
     let overrides = SamplingOverrides::fold(&[node_sampling, agent_sampling, workflow_sampling]);
 
     let node_capability = CapabilityOverrides {
-        mcp: node.mcp().map(<[String]>::to_vec),
-        max_tool_rounds: node.max_tool_rounds(),
-        skills: node.skills().map(<[String]>::to_vec),
-        subagents: node.subagents().map(<[String]>::to_vec),
-        tools: node.tools().map(<[String]>::to_vec),
+        mcp: node_settings.mcp.map(<[String]>::to_vec),
+        max_tool_rounds: node_settings.max_tool_rounds,
+        skills: node_settings.skills.map(<[String]>::to_vec),
+        subagents: node_settings.subagents.map(<[String]>::to_vec),
+        tools: node_settings.tools.map(<[String]>::to_vec),
     };
     let agent_capability = agent_file
         .map(|agent_file| CapabilityOverrides {
@@ -1077,6 +1320,7 @@ async fn execute_step(
     let StepContext {
         scope,
         env,
+        placement,
         label,
         progress_prefix,
         steps_outputs,
@@ -1098,8 +1342,9 @@ async fn execute_step(
                     .with_context(|| format!("step '{label}'"))?;
             }
 
-            let settings = resolve_step_settings(node, scope, &env.file_config, None, label)?
-                .with_usage_label(label);
+            let settings =
+                resolve_step_settings(node, scope, &env.services.file_config, None, label)?
+                    .with_usage_label(label);
 
             let response_format = match prompt_node.output_schema.as_deref() {
                 Some(name_or_path) => {
@@ -1186,6 +1431,7 @@ async fn execute_step(
             // input schema instead of re-reading both from disk on every
             // iteration.
             let loaded = env
+                .services
                 .agent_registry
                 .load_path_cancellable(&agent_node.agent, step_cancel.clone())
                 .await
@@ -1197,9 +1443,14 @@ async fn execute_step(
                 .validate_input(&input)
                 .with_context(|| format!("step '{label}'"))?;
 
-            let settings =
-                resolve_step_settings(node, scope, &env.file_config, Some(agent_file), label)?
-                    .with_usage_label(label);
+            let settings = resolve_step_settings(
+                node,
+                scope,
+                &env.services.file_config,
+                Some(agent_file),
+                label,
+            )?
+            .with_usage_label(label);
 
             let (prompt, image_urls) = resolve_attachments(
                 agent_node.files.as_deref(),
@@ -1227,10 +1478,19 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?
         }
         workflow::NodeDefinition::Workflow(workflow_node) => {
-            let resolved_path = scope.base_dir.join(&workflow_node.workflow);
-            let mut sub_wf = workflow::load_workflow(&resolved_path)
-                .with_context(|| format!("step '{label}'"))?;
-            let sub_scope = scope.nested(&workflow_node.workflow, &mut sub_wf, label)?;
+            // Resolve cycles before opening a child file: a recursive FIFO
+            // reference must fail rather than waiting for a second writer.
+            let resolved_path = scope
+                .resolve_nested_path(&workflow_node.workflow, label, step_cancel.clone())
+                .await?;
+            let mut sub_wf =
+                workflow::load_workflow_cancellable(&resolved_path, step_cancel.clone())
+                    .await
+                    .with_context(|| format!("step '{label}'"))?;
+            validate_execution_placement(&sub_wf.steps, placement).with_context(|| {
+                format!("step '{label}': workflow '{}'", resolved_path.display())
+            })?;
+            let sub_scope = scope.nested(resolved_path, &mut sub_wf);
             announce_named_file(
                 &format!("{progress_prefix}    ->"),
                 sub_wf.name.as_deref(),
@@ -1253,6 +1513,7 @@ async fn execute_step(
                     start_counter: 0,
                     progress_prefix: &sub_progress_prefix,
                     cancellation: step_cancel.clone(),
+                    placement,
                 },
             )
             .await
@@ -1282,7 +1543,8 @@ async fn execute_step(
         }
     };
 
-    if let Some(filter) = node.jq() {
+    let settings = node.settings();
+    if let Some(filter) = settings.jq {
         step_output = apply_jq(
             filter,
             &step_output,
@@ -1294,7 +1556,7 @@ async fn execute_step(
         .with_context(|| format!("step '{label}'"))?;
     }
 
-    if let Some(path) = node.write_file() {
+    if let Some(path) = settings.write_file {
         async_io::write_output_file(path, &step_output, step_cancel)
             .await
             .with_context(|| format!("step '{label}'"))?;
@@ -1325,7 +1587,7 @@ async fn apply_jq(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppContext, RunStepsFrame, WorkflowScope, apply_jq, run_steps};
+    use super::{RunContext, RunStepsFrame, WorkflowScope, apply_jq, run_steps};
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
@@ -1367,9 +1629,14 @@ steps:
         )
         .expect("router workflow fixture should be writable");
         let mut workflow = crate::workflow::load_workflow(&path).unwrap();
-        let scope = WorkflowScope::top_level(&mut workflow, &path).unwrap();
+        let scope = WorkflowScope::top_level(&mut workflow, &path, None)
+            .await
+            .unwrap();
         let config = std::sync::Arc::new(crate::config::ConfigFile::default());
-        let env = AppContext::new(config);
+        let env = RunContext::new(
+            std::sync::Arc::new(crate::engine::AppServices::new(config)),
+            tokio_util::sync::CancellationToken::new(),
+        );
         let token = CancellationToken::new();
         let started = std::time::Instant::now();
         let execution = run_steps(
@@ -1382,6 +1649,7 @@ steps:
                 start_counter: 0,
                 progress_prefix: "",
                 cancellation: Some(token.clone()),
+                placement: Default::default(),
             },
         );
         tokio::pin!(execution);

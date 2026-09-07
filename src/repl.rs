@@ -4,20 +4,17 @@
 //! `load_session_history`/`finish_chat_turn`) stays in `app`, shared with
 //! `run_chat`'s single-shot path.
 
-use std::{
-    io::{BufRead, Write},
-    sync::Arc,
-};
+use std::{io::Write, sync::Arc};
 
 use anyhow::Result;
 use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
-    app,
+    app, async_io,
     cli::ChatReplArgs,
     config::{self, ConfigSource},
-    engine::{AppContext, PromptTurn, RequestSettings},
-    llm, response, usage,
+    engine::{AppServices, PromptTurn, RequestSettings, RunContext},
+    llm, response, signal, usage,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,7 +56,9 @@ pub(crate) fn parse_meta_command(line: &str) -> Option<MetaCommand<'_>> {
 /// sends it (plus every earlier turn this process has seen) to the model,
 /// and prints the reply, until `/exit` or end-of-input (Ctrl-D closes stdin,
 /// which a piped-stdin test also relies on to end the loop without an
-/// explicit `/exit`). See `parse_meta_command` for the `/exit`/`/clear`/
+/// explicit `/exit`). The invocation root cancellation is watched while
+/// reading and running a turn so Ctrl-C cleans up shared services and child
+/// processes. See `parse_meta_command` for the `/exit`/`/clear`/
 /// `/model`/`/system` syntax handled below. Also reached from a prompt-less,
 /// stdin-is-a-terminal bare `lait` invocation — see `app::run_chat_or_repl`.
 pub(crate) async fn run(
@@ -67,13 +66,17 @@ pub(crate) async fn run(
     config_source: ConfigSource,
     cache_override: Option<bool>,
     approve_tools: bool,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    signal::spawn_handler(cancel.clone());
     let mut shared = args.shared;
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
     let mut history = app::load_session_history(shared.session.as_deref())?;
     let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
     let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel.clone())
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools);
 
@@ -87,13 +90,20 @@ pub(crate) async fn run(
     // `/model`, which invalidates it below).
     let mut settings: Option<RequestSettings> = None;
 
-    let stdin = std::io::stdin();
     let repl = async {
         loop {
             eprint!("> ");
             std::io::stderr().flush()?;
-            let mut line = String::new();
-            if stdin.lock().read_line(&mut line)? == 0 {
+            let (bytes_read, line) = async_io::run_blocking(
+                move |_cancelled| {
+                    let mut line = String::new();
+                    let bytes_read = std::io::stdin().read_line(&mut line)?;
+                    Ok((bytes_read, line))
+                },
+                Some(cancel.clone()),
+            )
+            .await?;
+            if bytes_read == 0 {
                 break; // end-of-input (Ctrl-D)
             }
             let line = line.trim();
@@ -164,12 +174,13 @@ pub(crate) async fn run(
                 // One bad turn (a request error, a bad `/model` name that only
                 // fails once actually resolved) shouldn't end the whole session
                 // — report it and let the user try again or `/exit`.
+                Err(error) if cancel.is_cancelled() => return Err(error),
                 Err(error) => eprintln!("lait: {error:#}"),
             }
         }
         Ok::<(), anyhow::Error>(())
     };
-    env.finish(repl).await
+    services.finish(repl).await
 }
 
 /// Runs one `lait chat` turn: streams the response to stdout, driving the
@@ -183,7 +194,7 @@ pub(crate) async fn run(
 /// history` wants each entry's own usage, not the cumulative session total).
 async fn run_turn(
     settings: &RequestSettings,
-    env: &AppContext,
+    env: &RunContext,
     system_prompt: &Option<String>,
     history: &[ChatCompletionRequestMessage],
     prompt: &str,
@@ -206,7 +217,7 @@ async fn run_turn(
             show_usage,
             show_reasoning,
             None,
-            env.cancel.clone(),
+            Some(env.operation_token()),
         )
         .await?;
     if show_usage && let Some(usage) = outcome.usage {

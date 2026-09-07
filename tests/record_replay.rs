@@ -112,6 +112,73 @@ fn replay_answers_from_a_previously_recorded_cassette_without_contacting_the_net
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn replay_does_not_run_an_api_key_command() {
+    let server = MockServer::start("200 OK", OK_BODY);
+    let scratch = ScratchDir::new();
+    let marker = scratch.path().join("api-key-command-ran");
+    let workflow_path = scratch.write(
+        "workflow.yml",
+        &format!(
+            r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+        api_key_cmd: ["sh", "-c", "touch '{}' ; printf replay-secret"]
+      model_id: workflow-model
+nodes:
+  call:
+    type: prompt
+    prompt: "{{{{ input }}}}"
+steps:
+  - use: call
+"#,
+            server.base_url,
+            marker.display()
+        ),
+    );
+    let record_dir = scratch.path().join("cassettes");
+
+    let record_output = test_command()
+        .arg("run")
+        .arg(&workflow_path)
+        .arg("hello")
+        .arg("--record")
+        .arg(&record_dir)
+        .output()
+        .expect("failed to execute lait run --record");
+    server.receive_request();
+    assert!(
+        record_output.status.success(),
+        "recording run failed: {record_output:?}"
+    );
+    assert!(marker.exists(), "recording should resolve the API key");
+    std::fs::remove_file(&marker).expect("failed to reset API-key marker");
+    server.finish();
+
+    let replay_output = test_command()
+        .arg("run")
+        .arg(&workflow_path)
+        .arg("hello")
+        .arg("--replay")
+        .arg(&record_dir)
+        .output()
+        .expect("failed to execute lait run --replay");
+
+    assert!(
+        replay_output.status.success(),
+        "replay run failed: {replay_output:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "replay must not resolve an API-key command"
+    );
+}
+
 #[test]
 fn replay_fails_clearly_for_an_unrecorded_request() {
     let server = MockServer::start("200 OK", OK_BODY);

@@ -27,6 +27,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.5", features = ["derive", "env", "string"] }
 clap_complete = "4.6.9"
 clap_mangen = "0.3.3"
+fs2 = "0.4.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 handlebars = "6.4.4"
 http = "1"
@@ -37,7 +38,7 @@ jaq-json = "2.0.2"
 jaq-std = "3.0.2"
 reqwest = { version = "0.13", default-features = false }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 sha2 = "0.10"

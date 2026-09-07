@@ -68,8 +68,6 @@ pub(crate) fn save(
     response_format: Option<&ResponseFormat>,
     response: &response::ChatCompletionResponse,
 ) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create directory '{}'", dir.display()))?;
     let entry = CassetteEntryRef {
         recorded_at: chrono::Utc::now(),
         request: CassetteRequestRef {
@@ -84,10 +82,7 @@ pub(crate) fn save(
     let body =
         serde_json::to_string_pretty(&entry).context("failed to serialize cassette entry")?;
     let path = entry_path(dir, key);
-    let tmp_path = dir.join(format!("{key}.json.tmp"));
-    std::fs::write(&tmp_path, body)
-        .with_context(|| format!("failed to write '{}'", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
+    crate::storage::write_atomic(&path, body.as_bytes())
         .with_context(|| format!("failed to save cassette entry to '{}'", path.display()))?;
     Ok(())
 }

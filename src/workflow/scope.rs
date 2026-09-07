@@ -1,5 +1,5 @@
 //! The scope in effect for one workflow file's steps: its `default:` block,
-//! model aliases, JSON schemas, and `nodes:` map, plus the cycle/depth
+//! model aliases and JSON schemas, plus the cycle/depth
 //! bookkeeping for `workflow:` nesting. Read by every
 //! `resolve_step_settings`/`execute_step` call in `super::exec`.
 
@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::{config::ModelMap, nesting, schema};
+use crate::{async_io, config::ModelMap, nesting, schema};
 
-use super::model::{NodeMap, WorkflowDefaults, WorkflowFile};
+use super::model::{WorkflowDefaults, WorkflowFile};
 
 /// The default model/reasoning-effort, model aliases, and JSON schema
 /// definitions currently in effect, plus enough bookkeeping to run a nested
@@ -37,12 +37,6 @@ pub(crate) struct WorkflowScope {
     /// pays for a fresh merged map.
     pub(crate) models: Arc<ModelMap>,
     pub(crate) json_schemas: Arc<schema::JsonSchemaMap>,
-    /// This scope's own `nodes:` map, resolved by every `steps[].use` in this
-    /// file. Unlike `models`/`json_schemas`, a `workflow:` node's sub-scope
-    /// does *not* fall back to this scope's `nodes` for entries it lacks —
-    /// each workflow file's `use:` sites only ever see that file's own
-    /// `nodes:` (see `WorkflowScope::nested`).
-    pub(crate) nodes: NodeMap,
     /// Directory relative paths in this scope's workflow file (currently
     /// only `node.workflow`) are resolved against.
     pub(crate) base_dir: PathBuf,
@@ -50,17 +44,22 @@ pub(crate) struct WorkflowScope {
 }
 
 impl WorkflowScope {
-    /// The scope for the workflow file passed on the command line. Takes
-    /// every field but `wf.steps` by move (via `mem::take`) rather than
-    /// cloning it: none of them are ever read again after this call, only
-    /// `wf.steps` (see `run_workflow`).
-    pub(crate) fn top_level(wf: &mut WorkflowFile, file_path: &Path) -> Result<Self> {
-        let canonical = std::fs::canonicalize(file_path).with_context(|| {
-            format!(
-                "failed to resolve workflow file path '{}'",
-                file_path.display()
-            )
-        })?;
+    /// Moves defaults and model/schema aliases into the execution scope.
+    /// Steps already own shared references to their validated node definitions,
+    /// so node lookup does not depend on this scope's identity or mutability.
+    pub(crate) async fn top_level(
+        wf: &mut WorkflowFile,
+        file_path: &Path,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Self> {
+        let canonical = async_io::canonicalize(file_path, cancellation)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve workflow file path '{}'",
+                    file_path.display()
+                )
+            })?;
         let base_dir = canonical
             .parent()
             .map(Path::to_path_buf)
@@ -69,41 +68,30 @@ impl WorkflowScope {
             defaults: std::mem::take(&mut wf.default),
             models: Arc::new(std::mem::take(&mut wf.models)),
             json_schemas: Arc::new(std::mem::take(&mut wf.json_schemas)),
-            nodes: std::mem::take(&mut wf.nodes),
             base_dir,
             active_paths: vec![canonical],
         })
     }
 
-    /// The scope for a `workflow:` node's sub-workflow: resolves
-    /// `relative_path` (as given in the node) against this scope's
-    /// `base_dir`, merges `sub_wf`'s `default`/`models`/`json_schemas` over
-    /// this scope's (the sub-workflow's own entries win; an entry it doesn't
-    /// define falls back to this scope's), takes every `sub_wf` field but
-    /// `steps` by move (none are ever read again after this call, only
-    /// `sub_wf.steps` — `nodes` gets no fallback, see `WorkflowScope::nodes`),
-    /// and extends the cycle/depth bookkeeping. Fails if `relative_path`
-    /// resolves to a workflow file already executing (a cycle) or nesting
-    /// has reached `MAX_WORKFLOW_DEPTH`.
-    ///
-    /// When `sub_wf` defines no local `models:`/`json_schemas:` of its own
-    /// (the common case for a deeply nested `workflow:` chain), this scope's
-    /// own `Arc<ModelMap>`/`Arc<JsonSchemaMap>` are shared as-is rather than
-    /// rebuilt — avoiding the O(depth × map size) clone cost a full
-    /// re-merge at every nesting level would otherwise add.
-    pub(crate) fn nested(
+    /// Builds a nested file scope, merging its model/schema/default overrides
+    /// and checking canonical file paths for cycles and excessive nesting.
+    /// Node references remain bound to the file where the step was parsed.
+    /// Empty model/schema layers share the parent's Arc without cloning entries.
+    pub(crate) async fn resolve_nested_path(
         &self,
         relative_path: &Path,
-        sub_wf: &mut WorkflowFile,
         label: &str,
-    ) -> Result<Self> {
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<PathBuf> {
         let resolved_path = self.base_dir.join(relative_path);
-        let canonical = std::fs::canonicalize(&resolved_path).with_context(|| {
-            format!(
-                "step '{label}': failed to resolve workflow file path '{}'",
-                resolved_path.display()
-            )
-        })?;
+        let canonical = async_io::canonicalize(&resolved_path, cancellation)
+            .await
+            .with_context(|| {
+                format!(
+                    "step '{label}': failed to resolve workflow file path '{}'",
+                    resolved_path.display()
+                )
+            })?;
         if let Err(error) = nesting::check_workflow_nesting(&self.active_paths, &canonical) {
             match error {
                 nesting::NestingDepthError::Cycle => bail!(
@@ -118,6 +106,11 @@ impl WorkflowScope {
             }
         }
 
+        Ok(canonical)
+    }
+
+    /// Builds a child scope from a path already checked for cycles and depth.
+    pub(crate) fn nested(&self, canonical: PathBuf, sub_wf: &mut WorkflowFile) -> Self {
         let models = if sub_wf.models.is_empty() {
             Arc::clone(&self.models)
         } else {
@@ -145,16 +138,15 @@ impl WorkflowScope {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        Ok(Self {
+        Self {
             defaults: WorkflowDefaults::fold(&[
                 std::mem::take(&mut sub_wf.default),
                 self.defaults.clone(),
             ]),
             models,
             json_schemas,
-            nodes: std::mem::take(&mut sub_wf.nodes),
             base_dir,
             active_paths,
-        })
+        }
     }
 }

@@ -518,7 +518,9 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
 
 fn check_cancelled_opt(cancelled: Option<&AtomicBool>) -> Result<()> {
     if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-        bail!("jq evaluation was cancelled");
+        bail!(crate::error::Interrupted::cancelled(
+            "jq evaluation was cancelled"
+        ));
     }
     Ok(())
 }

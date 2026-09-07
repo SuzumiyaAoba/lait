@@ -1,9 +1,11 @@
 //! `lait test`: runs test definition YAML files (a target workflow, an
 //! input/vars, a `--record`ed replay cassette directory, and `assert:`
-//! assertions) with no network access at all, reporting pass/fail per file.
+//! assertions), without replaying LLM API requests, reporting pass/fail per
+//! file. Workflow-side tools and other I/O retain their configured behavior.
 //! See docs/usage/ja/testing.md.
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,7 +17,7 @@ use crate::{
     assert::{self, Assertion},
     cli::{TestArgs, TestFormat},
     config::{self, ConfigFile, ConfigSource},
-    engine::AppContext,
+    engine::{AppServices, RunContext},
     signal,
     workflow::{
         self, WorkflowScope,
@@ -62,47 +64,153 @@ struct TestOutcome {
     failures: Vec<String>,
 }
 
-/// Recursively collects `.yml`/`.yaml` files from `paths` (files are taken
-/// as-is; directories are searched recursively), sorted for stable output —
-/// the same directory-expansion shape `lint::run` uses for its own targets.
-fn expand_test_targets(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for path in paths {
-        collect_test_files(path, &mut files)?;
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
+/// Collects test definitions from explicit files and directories.
+///
+/// The discovery policy is deliberately stricter than the later file read:
+/// explicit targets must be regular files or directories, while a directory
+/// walk only includes regular `.yml`/`.yaml` files. Symbolic links and special
+/// files are never followed. A symlink or special file encountered below an
+/// explicit directory is skipped, whereas passing one explicitly is an error
+/// so a typo cannot silently result in zero tests. Canonical file/directory
+/// identities prevent overlapping targets from producing duplicate work, and
+/// the returned paths are sorted for stable reports.
+/// Cancellation-aware target discovery for the async `lait test` entry point.
+/// Directory traversal and canonicalization perform blocking metadata I/O, so
+/// keep the entire collector on the bounded filesystem worker.
+async fn expand_test_targets_cancellable(
+    paths: &[PathBuf],
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Vec<PathBuf>> {
+    let paths = paths.to_owned();
+    crate::async_io::run_blocking(
+        move |cancelled| expand_test_targets_with_cancellation(&paths, Some(cancelled)),
+        cancellation,
+    )
+    .await
 }
 
-fn collect_test_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("failed to read '{}'", path.display()))?;
-    if metadata.is_file() {
-        files.push(path.to_path_buf());
-        return Ok(());
+fn expand_test_targets_with_cancellation(
+    paths: &[PathBuf],
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<PathBuf>> {
+    let mut collector = TestTargetCollector::default();
+    for path in paths {
+        collector.collect_explicit(path, cancellation)?;
     }
-    let mut entries: Vec<_> = std::fs::read_dir(path)
-        .with_context(|| format!("failed to read directory '{}'", path.display()))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("failed to read directory '{}'", path.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    for entry in entries {
-        let entry_path = entry.path();
-        let file_name = entry_path.file_name().and_then(|name| name.to_str());
-        if file_name.is_some_and(|name| name.starts_with('.')) {
-            continue;
+    collector.files.sort();
+    Ok(collector.files)
+}
+
+#[derive(Default)]
+struct TestTargetCollector {
+    files: Vec<PathBuf>,
+    seen_files: HashSet<PathBuf>,
+    visited_directories: HashSet<PathBuf>,
+}
+
+impl TestTargetCollector {
+    fn collect_explicit(
+        &mut self,
+        path: &Path,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        check_discovery_cancellation(cancellation)?;
+        let file_type = std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to read test target '{}'", path.display()))?
+            .file_type();
+        if file_type.is_symlink() {
+            bail!(
+                "test target '{}' is a symbolic link; pass a regular file or directory",
+                path.display()
+            );
         }
-        if entry_path.is_dir() {
-            collect_test_files(&entry_path, files)?;
-            continue;
+        if file_type.is_file() {
+            self.add_file(path, cancellation)?;
+            return Ok(());
         }
-        if matches!(
-            entry_path.extension().and_then(|ext| ext.to_str()),
-            Some("yml") | Some("yaml")
-        ) {
-            files.push(entry_path);
+        if file_type.is_dir() {
+            self.collect_directory(path, cancellation)
+        } else {
+            bail!(
+                "test target '{}' is not a regular file or directory",
+                path.display()
+            );
         }
+    }
+
+    fn collect_directory(
+        &mut self,
+        path: &Path,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        check_discovery_cancellation(cancellation)?;
+        let identity = std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve test directory '{}'", path.display()))?;
+        if !self.visited_directories.insert(identity) {
+            return Ok(());
+        }
+
+        let mut entries: Vec<_> = std::fs::read_dir(path)
+            .with_context(|| format!("failed to read directory '{}'", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to read directory '{}'", path.display()))?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            check_discovery_cancellation(cancellation)?;
+            let entry_path = entry.path();
+            let file_name = entry_path.file_name().and_then(|name| name.to_str());
+            if file_name.is_some_and(|name| name.starts_with('.')) {
+                continue;
+            }
+
+            // `DirEntry::file_type` and `symlink_metadata` inspect the entry
+            // itself, so this branch cannot accidentally turn a symlink to a
+            // directory into a recursive walk.
+            let file_type = entry.file_type().with_context(|| {
+                format!("failed to inspect test path '{}'", entry_path.display())
+            })?;
+            if file_type.is_symlink() || (!file_type.is_file() && !file_type.is_dir()) {
+                continue;
+            }
+            if file_type.is_dir() {
+                self.collect_directory(&entry_path, cancellation)?;
+                continue;
+            }
+            if matches!(
+                entry_path.extension().and_then(|ext| ext.to_str()),
+                Some("yml") | Some("yaml")
+            ) {
+                self.add_file(&entry_path, cancellation)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_file(
+        &mut self,
+        path: &Path,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        check_discovery_cancellation(cancellation)?;
+        let identity = std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve test file '{}'", path.display()))?;
+        check_discovery_cancellation(cancellation)?;
+        if self.seen_files.insert(identity) {
+            self.files.push(path.to_path_buf());
+        }
+        Ok(())
+    }
+}
+
+fn check_discovery_cancellation(
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+        bail!(crate::error::Interrupted::cancelled(
+            "test target discovery was cancelled"
+        ));
     }
     Ok(())
 }
@@ -117,9 +225,10 @@ async fn run_test_file(
     path: &Path,
     file_config: &Arc<ConfigFile>,
     cancel: tokio_util::sync::CancellationToken,
-) -> TestOutcome {
+) -> Result<TestOutcome> {
+    let root_cancel = cancel.clone();
     match run_test_file_inner(path, file_config, cancel).await {
-        Ok(failures) => TestOutcome {
+        Ok(failures) => Ok(TestOutcome {
             file: path.to_path_buf(),
             status: if failures.is_empty() {
                 TestStatus::Pass
@@ -127,13 +236,24 @@ async fn run_test_file(
                 TestStatus::Fail
             },
             failures,
-        },
-        Err(error) => TestOutcome {
+        }),
+        Err(error) if cancel_is_active(&error, &root_cancel) => Err(error),
+        Err(error) => Ok(TestOutcome {
             file: path.to_path_buf(),
             status: TestStatus::Fail,
             failures: vec![format!("{error:#}")],
-        },
+        }),
     }
+}
+
+fn cancel_is_active(
+    error: &anyhow::Error,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> bool {
+    cancellation.is_cancelled()
+        && error
+            .chain()
+            .any(|cause| cause.is::<crate::error::Interrupted>())
 }
 
 async fn run_test_file_inner(
@@ -141,23 +261,28 @@ async fn run_test_file_inner(
     file_config: &Arc<ConfigFile>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read test definition '{}'", path.display()))?;
+    let contents = crate::async_io::read_to_string_cancellable(
+        path,
+        Some(cancel.clone()),
+        crate::async_io::MAX_READ_BYTES,
+    )
+    .await
+    .with_context(|| format!("failed to read test definition '{}'", path.display()))?;
     let definition: TestDefinition = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse test definition '{}'", path.display()))?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let workflow_path = base_dir.join(&definition.workflow);
     let replay_dir = base_dir.join(&definition.replay);
 
-    let mut wf = workflow::load_workflow(&workflow_path)?;
-    let scope = WorkflowScope::top_level(&mut wf, &workflow_path)?;
+    let mut wf = workflow::load_workflow_cancellable(&workflow_path, Some(cancel.clone())).await?;
+    let scope = WorkflowScope::top_level(&mut wf, &workflow_path, Some(cancel.clone())).await?;
 
-    let env = AppContext::new(Arc::clone(file_config))
+    let services = Arc::new(AppServices::new(Arc::clone(file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
         .with_vars(definition.vars)
-        .with_cancel(cancel)
-        .with_record_replay(None, Some(replay_dir));
+        .with_record_replay(None, Some(replay_dir))?;
 
-    let outcome = env
+    let outcome = services
         .finish(run_steps(
             &wf.steps,
             definition.input,
@@ -167,7 +292,8 @@ async fn run_test_file_inner(
                 env: &env,
                 start_counter: 0,
                 progress_prefix: "",
-                cancellation: env.cancel.clone(),
+                cancellation: Some(env.root_token()),
+                placement: Default::default(),
             },
         ))
         .await
@@ -177,7 +303,7 @@ async fn run_test_file_inner(
         &definition.assert,
         None,
         &outcome.output,
-        env.cancel.clone(),
+        Some(env.operation_token()),
     )
     .await;
     Ok(failures
@@ -232,12 +358,13 @@ pub(crate) async fn run(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     signal::spawn_handler(cancel.clone());
-    let targets = expand_test_targets(&args.paths)?;
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let targets = expand_test_targets_cancellable(&args.paths, Some(cancel.clone())).await?;
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in &targets {
-        outcomes.push(run_test_file(target, &file_config, cancel.clone()).await);
+        outcomes.push(run_test_file(target, &file_config, cancel.clone()).await?);
     }
 
     match args.format {
@@ -257,7 +384,7 @@ pub(crate) async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::expand_test_targets;
+    use super::expand_test_targets_with_cancellation;
     use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -281,7 +408,8 @@ mod tests {
         std::fs::write(dir.join("nested").join("a.yaml"), "").unwrap();
         std::fs::write(dir.join("ignored.txt"), "").unwrap();
 
-        let files = expand_test_targets(std::slice::from_ref(&dir)).unwrap();
+        let files =
+            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
         assert_eq!(files, vec![dir.join("b.yml"), dir.join("nested/a.yaml")]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -294,8 +422,90 @@ mod tests {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git").join("config.yml"), "").unwrap();
 
-        let files = expand_test_targets(std::slice::from_ref(&dir)).unwrap();
+        let files =
+            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
         assert_eq!(files, vec![dir.join("visible.yml")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deduplicates_overlapping_explicit_and_directory_targets() {
+        let dir = temp_dir("deduplicate");
+        let file = dir.join("case.yml");
+        std::fs::write(&file, "").unwrap();
+
+        let files =
+            expand_test_targets_with_cancellation(&[file.clone(), dir.clone()], None).unwrap();
+        assert_eq!(files, vec![file]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinked_files_and_directories_without_following_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("symlinks");
+        let nested = dir.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let file = nested.join("case.yml");
+        std::fs::write(&file, "").unwrap();
+
+        symlink(&dir, nested.join("cycle")).unwrap();
+        symlink(&file, dir.join("alias.yml")).unwrap();
+
+        let files =
+            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
+        assert_eq!(files, vec![file]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_an_explicit_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("explicit-symlink");
+        let file = dir.join("case.yml");
+        let link = dir.join("link.yml");
+        std::fs::write(&file, "").unwrap();
+        symlink(&file, &link).unwrap();
+
+        let error =
+            expand_test_targets_with_cancellation(std::slice::from_ref(&link), None).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_special_files_during_directory_discovery() {
+        use std::{
+            path::PathBuf,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        // Keep this fixture under /tmp so a platform-specific special-file
+        // path limit cannot interfere with the discovery assertion.
+        let dir = PathBuf::from("/tmp").join(format!(
+            "lait-test-special-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let fifo_path = dir.join("ignored.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let files =
+            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
+        assert!(files.is_empty());
+        std::fs::remove_file(&fifo_path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

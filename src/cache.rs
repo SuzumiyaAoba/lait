@@ -124,23 +124,15 @@ pub(crate) fn load(
 }
 
 /// Writes `response` to `key`'s cache entry, atomically (temp file in the
-/// same directory, then `rename` — see `checkpoint::save`).
+/// same directory, then `rename` — see `storage::write_atomic`).
 pub(crate) fn save(key: &str, response: &response::ChatCompletionResponse) -> Result<()> {
     let path = entry_path(key);
-    let dir = path
-        .parent()
-        .expect("entry_path always returns a path under CACHE_DIR");
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create directory '{}'", dir.display()))?;
     let entry = CacheEntryRef {
         created_at: chrono::Utc::now(),
         response,
     };
     let body = serde_json::to_string_pretty(&entry).context("failed to serialize cache entry")?;
-    let tmp_path = Path::new(CACHE_DIR).join(format!("{key}.json.tmp"));
-    std::fs::write(&tmp_path, body)
-        .with_context(|| format!("failed to write '{}'", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
+    crate::storage::write_atomic(&path, body.as_bytes())
         .with_context(|| format!("failed to save cache entry to '{}'", path.display()))?;
     Ok(())
 }

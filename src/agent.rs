@@ -94,9 +94,7 @@ pub(crate) async fn load_agent_cancellable(
 }
 
 fn parse_agent(contents: &str) -> Result<AgentFile> {
-    let (frontmatter, body) = frontmatter::split(contents, "agent file")?;
-    let mut agent: AgentFile =
-        serde_yaml::from_str(frontmatter).context("failed to parse frontmatter")?;
+    let (mut agent, body) = frontmatter::parse::<AgentFile>(contents, "agent file")?;
 
     if agent.structured_output && agent.output_schema.is_none() {
         bail!("'structured_output: true' requires an 'output_schema'");
@@ -112,7 +110,7 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
     )?;
     llm::validate_max_tool_rounds(agent.max_tool_rounds, "the agent file")?;
 
-    agent.system_prompt_template = body.trim().to_owned();
+    agent.system_prompt_template = body;
     Ok(agent)
 }
 

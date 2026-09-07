@@ -1,12 +1,15 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+    error::ErrorKind, parser::ValueSource,
+};
 use serde::Deserialize;
 
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "lait", version, about = "Lightweight AI Tool")]
-#[command(args_conflicts_with_subcommands = true)]
+#[command(subcommand_precedence_over_arg = true)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -36,7 +39,7 @@ pub(crate) struct Cli {
     /// resolved request settings, workflow step timing/retries, and tool
     /// calls; twice (`-vv`) to also dump full request/response JSON. Always
     /// written to stderr, never stdout, so a piped answer stays clean; API
-    /// keys are masked. `LAIT_LOG` (an `EnvFilter` directive string, e.g.
+    /// key values are omitted; only their source is logged. `LAIT_LOG` (an `EnvFilter` directive string, e.g.
     /// `debug` or `lait=trace,reqwest=info`) overrides this when set. See
     /// `crate::logging`.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
@@ -73,6 +76,65 @@ pub(crate) struct Cli {
     /// slow human — see `workflow::ask::run_ask`'s same reasoning).
     #[arg(long, global = true)]
     pub(crate) approve_tools: bool,
+}
+
+impl Cli {
+    /// Parse the command line while allowing global options on either side of
+    /// a subcommand. The root-level chat arguments remain exclusive to bare
+    /// chat mode; clap's command-wide `args_conflicts_with_subcommands` cannot
+    /// express that distinction because it also treats global options as
+    /// conflicting arguments.
+    pub(crate) fn parse() -> Self {
+        match Self::try_parse() {
+            Ok(cli) => cli,
+            Err(error) => error.exit(),
+        }
+    }
+
+    /// Parse the process arguments without exiting on an error.
+    pub(crate) fn try_parse() -> Result<Self, clap::Error> {
+        Self::try_parse_from(std::env::args_os())
+    }
+
+    /// Parse an argument iterator without exiting on an error.
+    pub(crate) fn try_parse_from<I, T>(itr: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut command = <Self as CommandFactory>::command();
+        let mut matches = command.try_get_matches_from_mut(itr)?;
+        Self::from_matches(&mut command, &mut matches)
+    }
+
+    fn from_matches(
+        command: &mut clap::Command,
+        matches: &mut ArgMatches,
+    ) -> Result<Self, clap::Error> {
+        let subcommand = matches.subcommand_name().map(str::to_owned);
+        let chat_argument = command
+            .get_arguments()
+            .filter(|argument| !argument.is_global_set())
+            .find(|argument| {
+                matches.value_source(argument.get_id().as_str()) == Some(ValueSource::CommandLine)
+            })
+            .map(|argument| argument.to_string());
+
+        let cli = <Self as FromArgMatches>::from_arg_matches_mut(matches)
+            .map_err(|error| error.format(command))?;
+
+        if cli.command.is_some()
+            && let Some(argument) = chat_argument
+        {
+            let subcommand = subcommand.as_deref().unwrap_or("<subcommand>");
+            return Err(command.error(
+                ErrorKind::ArgumentConflict,
+                format!("the argument '{argument}' cannot be used with subcommand '{subcommand}'"),
+            ));
+        }
+
+        Ok(cli)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -861,7 +923,6 @@ pub(crate) enum ReasoningEffort {
 #[cfg(test)]
 mod tests {
     use super::{AgentAction, AgentCommand, Cli, Command, EvalFormat, ReasoningEffort, TestFormat};
-    use clap::Parser;
 
     #[test]
     fn parses_prompt_and_options() {
@@ -1167,6 +1228,49 @@ mod tests {
     }
 
     #[test]
+    fn run_subcommand_accepts_global_flags_before_the_subcommand() {
+        let cli = Cli::try_parse_from(["lait", "--no-env", "--no-config", "run", "workflow.yml"])
+            .expect("global flags should be accepted before the subcommand");
+
+        assert!(cli.no_env);
+        assert!(cli.no_config);
+        assert!(matches!(cli.command, Some(Command::Run(_))));
+    }
+
+    #[test]
+    fn test_subcommand_accepts_global_flags_before_the_subcommand() {
+        let cli = Cli::try_parse_from([
+            "lait",
+            "--no-env",
+            "--no-config",
+            "test",
+            "test-definition.yml",
+        ])
+        .expect("global flags should be accepted before the subcommand");
+
+        assert!(cli.no_env);
+        assert!(cli.no_config);
+        assert!(matches!(cli.command, Some(Command::Test(_))));
+    }
+
+    #[test]
+    fn rejects_chat_arguments_before_a_subcommand() {
+        let error = Cli::try_parse_from(["lait", "--model", "local-model", "run", "workflow.yml"])
+            .expect_err("chat arguments before a subcommand should be rejected");
+        assert!(error.to_string().contains("subcommand 'run'"));
+        assert!(Cli::try_parse_from(["lait", "--stream", "run", "workflow.yml"]).is_err());
+    }
+
+    #[test]
+    fn double_dash_keeps_a_subcommand_name_as_a_chat_prompt() {
+        let cli = Cli::try_parse_from(["lait", "--", "run"])
+            .expect("a literal prompt should be accepted after '--'");
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.chat.prompt.as_deref(), Some("run"));
+    }
+
+    #[test]
     fn run_subcommand_accepts_global_config_after_its_args() {
         let cli = Cli::try_parse_from([
             "lait",
@@ -1293,7 +1397,7 @@ mod tests {
     fn compare_subcommand_prompt_is_optional_for_app_level_validation() {
         // PROMPT is optional at the clap level so it can come from piped
         // stdin instead; app-level code enforces that one of the two exists
-        // (see `app::resolve_input_with_stdin`).
+        // (see `app::resolve_input_with_stdin_cancellable`).
         let cli = Cli::try_parse_from(["lait", "compare", "--model", "a", "--model", "b"])
             .expect("prompt-less compare should still parse");
         match cli.command {

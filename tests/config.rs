@@ -72,6 +72,29 @@ fn config_completes_an_omitted_base_url_when_model_is_given_on_cli() {
 }
 
 #[test]
+fn cli_base_url_wins_without_expanding_an_unset_config_placeholder() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"cli-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config = ConfigDirectory::new(
+        "default:\n  model: cli-model\nbase_url: \"${LAIT_TEST_UNSET_CONFIG_BASE_URL}\"\napi_key: config-key\n",
+    );
+
+    let output = test_command()
+        .current_dir(config.path())
+        .env_remove("LAIT_TEST_UNSET_CONFIG_BASE_URL")
+        .args(["--base-url", server.base_url.as_str(), "hello"])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(request.target, "/v1/chat/completions");
+}
+
+#[test]
 fn cli_options_override_values_from_config() {
     let server = MockServer::start(
         "200 OK",
@@ -868,6 +891,46 @@ fn model_definition_api_key_cmd_overrides_the_top_level_api_key() {
             .contains("authorization: bearer model-secret"),
         "headers: {}",
         request.headers
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_api_key_override_does_not_run_the_losing_api_key_command() {
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"config-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
+    );
+    let config_dir = ConfigDirectory::empty();
+    let marker = config_dir.path().join("api-key-command-ran");
+    std::fs::write(
+        config_dir.config_path(),
+        format!(
+            "default:\n  model: config-model\nbase_url: \"{}\"\napi_key_cmd: [\"sh\", \"-c\", \"touch '{}' ; printf losing-secret\"]\n",
+            server.base_url,
+            marker.display()
+        ),
+    )
+    .expect("failed to write test config");
+
+    let output = test_command()
+        .current_dir(config_dir.path())
+        .args(["--api-key", "cli-key", "hello"])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cli-key")
+    );
+    assert!(
+        !marker.exists(),
+        "a losing api_key_cmd must not be executed when --api-key wins"
     );
 }
 

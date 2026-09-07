@@ -14,7 +14,8 @@ use crate::{
     cli::CompareArgs,
     config::{self, ConfigSource, ModelMap},
     engine::{
-        AppContext, CapabilityOverrides, PromptTurn, SamplingOverrides, resolve_request_settings,
+        AppServices, CapabilityOverrides, PromptTurn, RunContext, SamplingOverrides,
+        resolve_request_settings,
     },
     response, signal,
 };
@@ -41,10 +42,13 @@ pub(crate) async fn run(
     }
 
     signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let prompt = app::resolve_input_with_stdin(args.prompt.clone())?
-        .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
+    let prompt =
+        app::resolve_input_with_stdin_cancellable(args.prompt.clone(), Some(cancel.clone()))
+            .await?
+            .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
 
     let sampling = SamplingOverrides {
         reasoning_effort: args.reasoning_effort,
@@ -69,9 +73,8 @@ pub(crate) async fn run(
     }
 
     let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_cancel(cancel)
-        .with_cache(cache_enabled, cache_ttl);
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel).with_cache(cache_enabled, cache_ttl);
 
     let futures = settings_list.iter().map(|(model_name, settings)| {
         let prompt = &prompt;
@@ -80,7 +83,7 @@ pub(crate) async fn run(
             let turn = PromptTurn::simple(None, prompt);
             let started = Instant::now();
             let outcome = settings
-                .complete(env, &[], turn, None, env.cancel.clone())
+                .complete(env, &[], turn, None, Some(env.operation_token()))
                 .await;
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             match outcome {
@@ -103,7 +106,7 @@ pub(crate) async fn run(
             }
         }
     });
-    let results = env.finish(join_all(futures)).await;
+    let results = services.finish(join_all(futures)).await;
 
     let any_error = results.iter().any(|result| result.error.is_some());
 
