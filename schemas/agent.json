@@ -5,6 +5,16 @@
   "description": "The YAML frontmatter of a lait agent Markdown file (agent.md). The body after the closing '---' is the system prompt template and is not covered by this schema. See docs/usage/ja/agent.md.",
   "type": "object",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "required": ["structured_output"], "properties": { "structured_output": { "const": true } } },
+      "then": { "required": ["output_schema"] }
+    },
+    {
+      "if": { "required": ["output_schema"] },
+      "then": { "required": ["structured_output"], "properties": { "structured_output": { "const": true } } }
+    }
+  ],
   "properties": {
     "name": { "type": "string" },
     "description": { "type": "string" },
@@ -13,15 +23,15 @@
       "type": "string",
       "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
     },
-    "temperature": { "type": "number" },
-    "top_p": { "type": "number" },
-    "max_tokens": { "type": "integer" },
+    "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+    "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+    "max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
     "input_schema": { "$ref": "#/$defs/jsonSchemaEntry" },
     "output_schema": { "$ref": "#/$defs/jsonSchemaEntry" },
     "structured_output": { "type": "boolean" },
     "schema_name": { "type": "string" },
     "mcp": { "type": "array", "items": { "type": "string" } },
-    "max_tool_rounds": { "type": "integer", "minimum": 0 },
+    "max_tool_rounds": { "type": "integer", "minimum": 1 },
     "skills": { "type": "array", "items": { "type": "string" } },
     "subagents": { "type": "array", "items": { "type": "string" } },
     "tools": { "type": "array", "items": { "type": "string" } }

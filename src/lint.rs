@@ -675,13 +675,13 @@ fn walk_steps<'a>(
     issues: &mut Vec<LintIssue>,
 ) {
     for step in steps {
-        if let Some(node_id) = &step.r#use {
-            used.insert(node_id.as_str());
+        if let Some(node_id) = step.node_id() {
+            used.insert(node_id);
         }
-        if let Some(when) = &step.when {
+        if let Some(when) = step.when() {
             check_jq(when, "a step's 'when'", issues);
         }
-        if let Some(on_error) = &step.on_error {
+        if let Some(on_error) = step.on_error() {
             walk_steps(&on_error.steps, used, issues);
         }
 
@@ -708,12 +708,11 @@ fn walk_steps<'a>(
                 }
             }
             Some(workflow::Router::Loop(loop_def)) => {
-                if let Some(condition) = &loop_def.r#while {
-                    check_jq(condition, "a 'loop' step's 'while'", issues);
-                }
-                if let Some(condition) = &loop_def.until {
-                    check_jq(condition, "a 'loop' step's 'until'", issues);
-                }
+                check_jq(
+                    loop_def.condition.filter(),
+                    &format!("a 'loop' step's '{}'", loop_def.condition.keyword()),
+                    issues,
+                );
                 walk_steps(&loop_def.steps, used, issues);
             }
             Some(workflow::Router::ForEach(for_each)) => {
@@ -1173,7 +1172,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn parse_workflow_fixture(yaml: &str) -> workflow::WorkflowFile {
-        serde_yaml::from_str(yaml).expect("fixture workflow should deserialize")
+        workflow::parse_workflow(yaml).expect("fixture workflow should validate")
     }
 
     fn empty_config() -> ConfigFile {
@@ -1694,7 +1693,7 @@ mod tests {
 
     #[test]
     fn yaml_error_line_reports_the_parser_location() {
-        let error = serde_yaml::from_str::<workflow::WorkflowFile>("steps: [\n")
+        let error = serde_yaml::from_str::<serde_yaml::Value>("steps: [\n")
             .expect_err("malformed YAML should fail to parse");
         let line = yaml_error_line(&anyhow::Error::new(error));
         assert!(line.is_some(), "expected a line number from the parser");

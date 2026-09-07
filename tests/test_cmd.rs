@@ -206,3 +206,38 @@ assert:
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("no recorded cassette"), "{stdout}");
 }
+
+#[cfg(unix)]
+#[test]
+fn directory_discovery_skips_symlink_cycles_and_duplicate_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = scratch_with_recorded_cassette();
+    let cases = scratch.path().join("cases");
+    let pass = scratch.write(
+        "cases/pass.yml",
+        r#"
+workflow: ../workflow.yml
+input: "hello"
+replay: ../cassettes
+assert:
+  - type: jq
+    expr: 'contains("結論")'
+"#,
+    );
+    symlink(&cases, cases.join("cycle")).expect("failed to create a directory cycle");
+    symlink(&pass, cases.join("pass-alias.yml")).expect("failed to create a duplicate file alias");
+
+    let output = test_command()
+        .arg("test")
+        .arg(&cases)
+        .output()
+        .expect("failed to execute lait test");
+
+    assert!(output.status.success(), "lait test failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed, 0 failed, 1 total"),
+        "symlink aliases/cycles must not duplicate test files: {stdout}"
+    );
+}

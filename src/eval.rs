@@ -19,8 +19,8 @@ use crate::{
     cli::{EvalArgs, EvalFormat},
     config::{self, ConfigFile, ConfigSource, ModelMap},
     engine::{
-        AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
-        resolve_request_settings,
+        AppServices, CapabilityOverrides, PromptTurn, RequestSettings, RunContext,
+        SamplingOverrides, resolve_request_settings,
     },
     response, signal, template,
     workflow::{
@@ -87,9 +87,10 @@ impl Target {
         }
     }
 
-    async fn run(&self, env: &AppContext, input: &str) -> Result<String> {
+    async fn run(&self, env: &RunContext, input: &str) -> Result<String> {
         match self {
             Target::Workflow { wf, scope } => {
+                let operation = Some(env.operation_token());
                 let outcome = run_steps(
                     &wf.steps,
                     input.to_owned(),
@@ -99,7 +100,7 @@ impl Target {
                         env,
                         start_counter: 0,
                         progress_prefix: "",
-                        cancellation: env.cancel.clone(),
+                        cancellation: operation.clone(),
                     },
                 )
                 .await?;
@@ -118,7 +119,7 @@ impl Target {
                         &[],
                         PromptTurn::simple(None, &rendered),
                         None,
-                        env.cancel.clone(),
+                        Some(env.operation_token()),
                     )
                     .await?;
                 Ok(response::content_text(&response).to_owned())
@@ -192,7 +193,7 @@ impl CaseOutcome {
 
 async fn run_case(
     target: &Target,
-    env: &AppContext,
+    env: &RunContext,
     case: &EvalCase,
     default_model: Option<&str>,
     file_config: &ConfigFile,
@@ -205,8 +206,13 @@ async fn run_case(
                 default_model,
                 input: Some(case.input.as_str()),
             };
-            let failures =
-                assert::evaluate(&case.assert, Some(&judge), &output, env.cancel.clone()).await;
+            let failures = assert::evaluate(
+                &case.assert,
+                Some(&judge),
+                &output,
+                Some(env.operation_token()),
+            )
+            .await;
             RunResult {
                 failures: failures
                     .into_iter()
@@ -288,10 +294,11 @@ pub(crate) async fn run(
     let target = load_target(&definition.target, base_dir, &file_config)?;
     let default_model = target.default_model(&file_config);
 
-    let env = AppContext::new(Arc::clone(&file_config)).with_cancel(cancel);
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel);
     let repeat = args.repeat.max(1);
 
-    let cases: Vec<CaseOutcome> = env
+    let cases: Vec<CaseOutcome> = services
         .finish(async {
             let mut outcomes = Vec::with_capacity(definition.cases.len());
             for (index, case) in definition.cases.iter().enumerate() {

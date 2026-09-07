@@ -107,4 +107,4 @@ lait --model my-model -vv "この変更をレビューして" 2>trace.log
 - `-v` — 解決後の `model_id` / `base_url` / サンプリングパラメータ、有効な `mcp` / `skills` / `subagents` / `tools`、ワークフローのステップ開始・終了・リトライ、ツール呼び出しの名前と引数
 - `-vv` — 上記に加えてリクエスト／レスポンス JSON 全体
 
-`LAIT_LOG` 環境変数（`tracing_subscriber::EnvFilter` の書式、例: `LAIT_LOG=debug`）を設定すると `-v` / `-vv` より優先されます。ログは標準エラー出力に出るため、応答本文のパイプ利用を壊しません。API キーは先頭4文字以外をマスクして表示します。
+`LAIT_LOG` 環境変数（`tracing_subscriber::EnvFilter` の書式、例: `LAIT_LOG=debug`）を設定すると `-v` / `-vv` より優先されます。ログは標準エラー出力に出るため、応答本文のパイプ利用を壊しません。API キーの値や先頭文字は表示せず、取得元（literal / command / absent）のみを表示します。

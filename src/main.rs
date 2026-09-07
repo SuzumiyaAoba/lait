@@ -18,6 +18,7 @@ mod dotenv;
 mod engine;
 mod error;
 mod eval;
+mod file_lock;
 mod frontmatter;
 mod history;
 mod init;

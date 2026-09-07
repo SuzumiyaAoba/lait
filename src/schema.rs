@@ -903,4 +903,168 @@ tools: [echo]
             "the real agent frontmatter parser must also reject an unknown reasoning_effort"
         );
     }
+    #[test]
+    fn workflow_schema_and_parser_reject_invalid_control_shapes() {
+        let validator = compiled_schema(SchemaKind::Workflow);
+        for step in [
+            "{}",
+            "{stop: false}",
+            "{break: false}",
+            "{use: n, stop: true, break: true}",
+            "{use: n, loop: {while: 'true', max_iterations: 1, steps: [{use: n}]}}",
+            "{loop: {while: 'true', until: 'true', max_iterations: 1, steps: [{use: n}]}}",
+            "{parallel: {branches: []}}",
+            "{switch: {cases: []}}",
+            "{use: n, on_error: {steps: []}}",
+        ] {
+            let source = format!("nodes:\n  n: {{type: transform, jq: '.'}}\nsteps: [{step}]\n");
+            assert!(
+                crate::workflow::parse_workflow(&source).is_err(),
+                "parser accepted {step}"
+            );
+            assert!(
+                !validator.is_valid(&yaml_to_json(&source)),
+                "schema accepted {step}"
+            );
+        }
+    }
+    #[test]
+    fn published_schemas_reject_sampling_values_rejected_by_runtime() {
+        for settings in [
+            serde_json::json!({"temperature": -0.1}),
+            serde_json::json!({"temperature": 2.1}),
+            serde_json::json!({"top_p": -0.1}),
+            serde_json::json!({"top_p": 1.1}),
+            serde_json::json!({"max_tokens": 0}),
+            serde_json::json!({"max_tool_rounds": 0}),
+        ] {
+            assert!(
+                crate::llm::validate_sampling_params(
+                    settings
+                        .get("temperature")
+                        .and_then(serde_json::Value::as_f64),
+                    settings.get("top_p").and_then(serde_json::Value::as_f64),
+                    settings
+                        .get("max_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|v| v as u32),
+                    "schema fixture",
+                )
+                .and_then(|_| crate::llm::validate_max_tool_rounds(
+                    settings
+                        .get("max_tool_rounds")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|v| v as usize),
+                    "schema fixture",
+                ))
+                .is_err()
+            );
+            for (kind, document) in [
+                (SchemaKind::Agent, settings.clone()),
+                (SchemaKind::Config, serde_json::json!({"default": settings})),
+                (
+                    SchemaKind::Workflow,
+                    serde_json::json!({"default": settings, "steps": [{"stop": true}]}),
+                ),
+            ] {
+                assert!(
+                    !compiled_schema(kind).is_valid(&document),
+                    "schema accepted {document}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn workflow_schema_and_parser_reject_incomplete_node_actions() {
+        let validator = compiled_schema(SchemaKind::Workflow);
+        for node in [
+            "{type: prompt}",
+            "{type: prompt, prompt: hi, schema_name: answer}",
+            "{type: transform}",
+            "{type: command, command: ['  ']}",
+            "{type: ask, prompt: '  '}",
+            "{type: ask, prompt: hi, choices: []}",
+            "{type: ask, prompt: hi, choices: ['']}",
+        ] {
+            let source = format!("nodes:\n  n: {node}\nsteps: [{{use: n}}]\n");
+            assert!(
+                crate::workflow::parse_workflow(&source).is_err(),
+                "parser accepted {node}"
+            );
+            assert!(
+                !validator.is_valid(&yaml_to_json(&source)),
+                "schema accepted {node}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_schema_rejects_inconsistent_structured_output_settings() {
+        let validator = compiled_schema(SchemaKind::Agent);
+        for source in [
+            "structured_output: true\n",
+            "output_schema: {schema: {type: object}}\n",
+            "output_schema: {schema: {type: object}}\nstructured_output: false\n",
+        ] {
+            let path = temp_fixture_path("agent-structured-output", "md");
+            std::fs::write(&path, format!("---\n{source}---\nPrompt")).unwrap();
+            let parsed = crate::agent::load_agent(&path);
+            std::fs::remove_file(&path).unwrap();
+            assert!(parsed.is_err(), "parser accepted {source}");
+            assert!(
+                !validator.is_valid(&yaml_to_json(source)),
+                "schema accepted {source}"
+            );
+        }
+    }
+    #[test]
+    fn workflow_schema_matches_runtime_retry_and_deadline_constraints() {
+        let validator = compiled_schema(SchemaKind::Workflow);
+        for defaults in [
+            "{workflow_timeout: 0}",
+            "{retry: {}}",
+            "{retry: {max_attempts: 1, backoff: -1}}",
+        ] {
+            let source = format!("default: {defaults}\nsteps: [{{stop: true}}]\n");
+            assert!(crate::workflow::parse_workflow(&source).is_err());
+            assert!(
+                !validator.is_valid(&yaml_to_json(&source)),
+                "schema accepted {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_schema_rejects_ambiguous_authentication_sources() {
+        let validator = compiled_schema(SchemaKind::Config);
+        for source in [
+            "api_key: literal\napi_key_cmd: echo key\n",
+            "models:\n  n: [{model_id: n, provider: {base_url: 'http://localhost', api_key: literal, api_key_cmd: 'echo key'}}]\n",
+        ] {
+            let config = serde_yaml::from_str::<crate::config::ConfigFile>(source).unwrap();
+            assert!(!crate::config::check_provider_api_key_sources(&config).is_empty());
+            assert!(
+                !validator.is_valid(&yaml_to_json(source)),
+                "schema accepted {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_schema_requires_exactly_one_mcp_transport() {
+        let validator = compiled_schema(SchemaKind::Config);
+        for server in ["{}", "{command: server, url: 'http://localhost'}"] {
+            let source = format!("mcp_servers: {{server: {server}}}");
+            let config = serde_yaml::from_str::<crate::config::ConfigFile>(&source).unwrap();
+            assert!(
+                config.mcp_servers["server"]
+                    .resolve_transport("server")
+                    .is_err()
+            );
+            assert!(
+                !validator.is_valid(&yaml_to_json(&source)),
+                "schema accepted {source}"
+            );
+        }
+    }
 }

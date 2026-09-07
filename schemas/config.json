@@ -5,6 +5,7 @@
   "description": "lait's project/global configuration file. See docs/usage/ja/config.md.",
   "type": "object",
   "additionalProperties": false,
+  "not": { "required": ["api_key", "api_key_cmd"] },
   "properties": {
     "base_url": { "type": "string" },
     "api_key": { "type": "string" },
@@ -53,6 +54,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["base_url"],
+      "not": { "required": ["api_key", "api_key_cmd"] },
       "properties": {
         "base_url": { "type": "string" },
         "api_key": { "type": "string" },
@@ -67,9 +69,9 @@
         "provider": { "$ref": "#/$defs/providerConfig" },
         "model_id": { "type": "string" },
         "default_reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
-        "default_temperature": { "type": "number" },
-        "default_top_p": { "type": "number" },
-        "default_max_tokens": { "type": "integer" }
+        "default_temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "default_top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "default_max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
       }
     },
     "modelMap": {
@@ -87,11 +89,11 @@
         "model": { "type": "string" },
         "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
         "system": { "type": "string" },
-        "temperature": { "type": "number" },
-        "top_p": { "type": "number" },
-        "max_tokens": { "type": "integer" },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "mcp": { "type": "array", "items": { "type": "string" } },
-        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "max_tool_rounds": { "type": "integer", "minimum": 1 },
         "skills": { "type": "array", "items": { "type": "string" } },
         "subagents": { "type": "array", "items": { "type": "string" } },
         "tools": { "type": "array", "items": { "type": "string" } },
@@ -104,6 +106,7 @@
     "mcpServerConfig": {
       "type": "object",
       "additionalProperties": false,
+      "oneOf": [{ "required": ["command"] }, { "required": ["url"] }],
       "properties": {
         "command": { "type": "string" },
         "args": { "type": "array", "items": { "type": "string" } },

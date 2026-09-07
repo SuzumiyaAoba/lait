@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 
-use crate::{config, mcp, process, template};
+use crate::{config, mcp, process, schema, template};
 
 /// How long a tool's command may run before it's killed and the call fails,
 /// when its `tools:` entry sets no `timeout:` of its own.
@@ -117,15 +117,31 @@ pub(crate) fn preview_argv(
     Some(format!("{argv:?}"))
 }
 
-/// Parses a tool call's raw `arguments_json` into the JSON object `call`/
-/// `preview_argv` render against a `command:` template — treating a blank
-/// string (a call with no arguments) as `{}` rather than a parse error.
+/// Parses a tool call's raw `arguments_json` into the JSON value `call`/
+/// `preview_argv` render against a `command:` template. Blank input and JSON
+/// `null` both mean no arguments and become `{}`; every other non-object value
+/// is rejected before a command can run.
 fn parse_call_arguments(arguments_json: &str) -> Result<serde_json::Value> {
     if arguments_json.trim().is_empty() {
         Ok(serde_json::Value::Object(serde_json::Map::new()))
     } else {
-        serde_json::from_str(arguments_json).context("tool call arguments must be a JSON object")
+        let value: serde_json::Value = serde_json::from_str(arguments_json)
+            .context("tool call arguments must be a JSON object")?;
+        match value {
+            serde_json::Value::Object(_) => Ok(value),
+            serde_json::Value::Null => Ok(serde_json::Value::Object(serde_json::Map::new())),
+            other => bail!("tool call arguments must be a JSON object, got {other}"),
+        }
     }
+}
+
+fn ensure_not_cancelled(cancellation: Option<&tokio_util::sync::CancellationToken>) -> Result<()> {
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        bail!(crate::error::Interrupted::cancelled(
+            "shell tool call was cancelled"
+        ));
+    }
+    Ok(())
 }
 
 /// Runs `definition`'s command for one tool call — see `render_argv` for how
@@ -139,17 +155,28 @@ fn parse_call_arguments(arguments_json: &str) -> Result<serde_json::Value> {
 /// always turned into an `Ok` result text instead (mirroring how an MCP
 /// `tools/call` failure is rendered as text, not propagated), so neither a
 /// template mismatch nor a failed command aborts the tool loop — the model
-/// sees what went wrong and can try something else.
+/// sees what went wrong and can try something else. An intentional
+/// cancellation is propagated as an error so the enclosing request cannot
+/// continue after the run has been stopped.
 pub(crate) async fn call(
     definition: &config::ShellToolDefinition,
     arguments_json: &str,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
+    ensure_not_cancelled(cancellation.as_ref())?;
     let input = parse_call_arguments(arguments_json)?;
+    if let Err(error) = schema::validate_input_against_schema(&definition.parameters, &input) {
+        return Ok(format!("tool arguments failed validation: {error:#}"));
+    }
     let argv = match render_argv(definition, &input) {
         Ok(argv) => argv,
         Err(error) => return Ok(format!("tool command failed: {error:#}")),
     };
+    // Rendering is synchronous, so cancellation can arrive after the first
+    // check but before the child is spawned. Keep the process boundary itself
+    // cancellation-safe as well; this check also makes the intent explicit at
+    // the shell-tool call site.
+    ensure_not_cancelled(cancellation.as_ref())?;
 
     let timeout_secs = definition.timeout.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS);
     let child_cancel = cancellation
@@ -172,6 +199,13 @@ pub(crate) async fn call(
         };
     match outcome {
         Ok(output) => Ok(output),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()) =>
+        {
+            Err(error)
+        }
         Err(error) => Ok(format!("tool command failed: {error:#}")),
     }
 }
@@ -253,5 +287,99 @@ mod tests {
     fn preview_argv_is_none_when_the_template_cannot_render() {
         let definition = definition(&["echo", "{{ input.text }}"]);
         assert!(preview_argv(&definition, "{}").is_none());
+    }
+
+    #[test]
+    fn parse_call_arguments_accepts_objects_and_treats_null_as_empty() {
+        assert_eq!(
+            parse_call_arguments(r#"{"text":"hello"}"#).unwrap(),
+            serde_json::json!({"text": "hello"})
+        );
+        assert_eq!(parse_call_arguments("null").unwrap(), serde_json::json!({}));
+        assert_eq!(parse_call_arguments(" ").unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn parse_call_arguments_rejects_non_object_values() {
+        for arguments in ["[]", "\"text\"", "42", "true"] {
+            let error = parse_call_arguments(arguments).unwrap_err();
+            assert!(error.to_string().contains("JSON object"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pre_cancelled_call_does_not_spawn_its_command() {
+        let marker = crate::test_support::unique_temp_path("lait-shell-tool-cancel", ".marker");
+        let marker = marker.display().to_string();
+        let definition = definition(&["touch", &marker]);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+
+        let error = call(&definition, "{}", Some(cancellation))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "cancellation should remain typed: {error:#}"
+        );
+        assert!(
+            !std::path::Path::new(&marker).exists(),
+            "a pre-cancelled shell tool must not run its command"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_missing_required_arguments_without_running_its_command() {
+        let marker = crate::test_support::unique_temp_path("lait-shell-tool-schema", ".marker");
+        let marker = marker.display().to_string();
+        let mut definition = definition(&["touch", &marker]);
+        definition.parameters = serde_json::json!({
+            "type": "object",
+            "required": ["text"],
+            "properties": {"text": {"type": "string"}},
+        });
+
+        let result = call(&definition, "{}", None).await.unwrap();
+
+        assert!(
+            result.contains("tool arguments failed validation"),
+            "{result}"
+        );
+        assert!(
+            !std::path::Path::new(&marker).exists(),
+            "invalid tool arguments must not run the configured command"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_type_and_enum_errors_without_running_its_command() {
+        let marker =
+            crate::test_support::unique_temp_path("lait-shell-tool-schema-values", ".marker");
+        let marker = marker.display().to_string();
+        let mut definition = definition(&["touch", &marker]);
+        definition.parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["safe", "check"]},
+            },
+        });
+
+        for input in [
+            serde_json::json!({"mode": 1}),
+            serde_json::json!({"mode": "unsafe"}),
+        ] {
+            let result = call(&definition, &input.to_string(), None).await.unwrap();
+            assert!(
+                result.contains("tool arguments failed validation"),
+                "{result}"
+            );
+        }
+        assert!(
+            !std::path::Path::new(&marker).exists(),
+            "schema value errors must not run the configured command"
+        );
     }
 }

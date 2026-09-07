@@ -26,6 +26,7 @@
     },
     "steps": {
       "type": "array",
+      "minItems": 1,
       "items": { "$ref": "#/$defs/flowStep" }
     }
   },
@@ -37,10 +38,11 @@
     "retryDefinition": {
       "type": "object",
       "additionalProperties": false,
+      "required": ["max_attempts"],
       "properties": {
         "max_attempts": { "type": "integer", "minimum": 1 },
         "delay_seconds": { "type": "integer", "minimum": 0 },
-        "backoff": { "type": "number" }
+        "backoff": { "type": "number", "minimum": 0 }
       }
     },
     "commandSpec": {
@@ -54,6 +56,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["base_url"],
+      "not": { "required": ["api_key", "api_key_cmd"] },
       "properties": {
         "base_url": { "type": "string" },
         "api_key": { "type": "string" },
@@ -68,9 +71,9 @@
         "provider": { "$ref": "#/$defs/providerConfig" },
         "model_id": { "type": "string" },
         "default_reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
-        "default_temperature": { "type": "number" },
-        "default_top_p": { "type": "number" },
-        "default_max_tokens": { "type": "integer" }
+        "default_temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "default_top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "default_max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
       }
     },
     "modelMap": {
@@ -103,31 +106,33 @@
       "properties": {
         "model": { "type": "string" },
         "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
-        "temperature": { "type": "number" },
-        "top_p": { "type": "number" },
-        "max_tokens": { "type": "integer" },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "retry": { "$ref": "#/$defs/retryDefinition" },
-        "timeout": { "type": "integer", "minimum": 0 },
+        "timeout": { "type": "integer", "minimum": 1 },
         "mcp": { "type": "array", "items": { "type": "string" } },
-        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "max_tool_rounds": { "type": "integer", "minimum": 1 },
         "skills": { "type": "array", "items": { "type": "string" } },
         "subagents": { "type": "array", "items": { "type": "string" } },
         "tools": { "type": "array", "items": { "type": "string" } },
         "system_prompt": { "type": "string" },
-        "workflow_timeout": { "type": "integer", "minimum": 0 }
+        "workflow_timeout": { "type": "integer", "minimum": 1 }
       }
     },
     "promptNode": {
       "type": "object",
       "additionalProperties": false,
       "required": ["type"],
+      "anyOf": [{ "required": ["prompt"] }, { "required": ["system_prompt"] }],
+      "dependentRequired": { "schema_name": ["output_schema"] },
       "properties": {
         "type": { "const": "prompt" },
         "model": { "type": "string" },
         "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
-        "temperature": { "type": "number" },
-        "top_p": { "type": "number" },
-        "max_tokens": { "type": "integer" },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "prompt": { "type": "string" },
         "system_prompt": { "type": "string" },
         "files": { "type": "array", "items": { "type": "string" } },
@@ -138,9 +143,9 @@
         "jq": { "type": "string" },
         "write_file": { "type": "string" },
         "retry": { "$ref": "#/$defs/retryDefinition" },
-        "timeout": { "type": "integer", "minimum": 0 },
+        "timeout": { "type": "integer", "minimum": 1 },
         "mcp": { "type": "array", "items": { "type": "string" } },
-        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "max_tool_rounds": { "type": "integer", "minimum": 1 },
         "skills": { "type": "array", "items": { "type": "string" } },
         "subagents": { "type": "array", "items": { "type": "string" } },
         "tools": { "type": "array", "items": { "type": "string" } }
@@ -155,17 +160,17 @@
         "agent": { "type": "string" },
         "model": { "type": "string" },
         "reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
-        "temperature": { "type": "number" },
-        "top_p": { "type": "number" },
-        "max_tokens": { "type": "integer" },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "files": { "type": "array", "items": { "type": "string" } },
         "images": { "type": "array", "items": { "type": "string" } },
         "jq": { "type": "string" },
         "write_file": { "type": "string" },
         "retry": { "$ref": "#/$defs/retryDefinition" },
-        "timeout": { "type": "integer", "minimum": 0 },
+        "timeout": { "type": "integer", "minimum": 1 },
         "mcp": { "type": "array", "items": { "type": "string" } },
-        "max_tool_rounds": { "type": "integer", "minimum": 0 },
+        "max_tool_rounds": { "type": "integer", "minimum": 1 },
         "skills": { "type": "array", "items": { "type": "string" } },
         "subagents": { "type": "array", "items": { "type": "string" } },
         "tools": { "type": "array", "items": { "type": "string" } }
@@ -188,23 +193,24 @@
       "required": ["type", "command"],
       "properties": {
         "type": { "const": "command" },
-        "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "command": { "type": "array", "items": { "type": "string" }, "minItems": 1, "prefixItems": [{ "type": "string", "pattern": "\\S" }] },
         "jq": { "type": "string" },
         "write_file": { "type": "string" },
         "retry": { "$ref": "#/$defs/retryDefinition" },
-        "timeout": { "type": "integer", "minimum": 0 }
+        "timeout": { "type": "integer", "minimum": 1 }
       }
     },
     "transformNode": {
       "type": "object",
       "additionalProperties": false,
       "required": ["type"],
+      "anyOf": [{ "required": ["jq"] }, { "required": ["write_file"] }],
       "properties": {
         "type": { "const": "transform" },
         "jq": { "type": "string" },
         "write_file": { "type": "string" },
         "retry": { "$ref": "#/$defs/retryDefinition" },
-        "timeout": { "type": "integer", "minimum": 0 }
+        "timeout": { "type": "integer", "minimum": 1 }
       }
     },
     "askNode": {
@@ -213,14 +219,14 @@
       "required": ["type", "prompt"],
       "properties": {
         "type": { "const": "ask" },
-        "prompt": { "type": "string" },
-        "choices": { "type": "array", "items": { "type": "string" } },
+        "prompt": { "type": "string", "pattern": "\\S" },
+        "choices": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
         "multiline": { "type": "boolean" },
         "default": { "type": "string" },
         "jq": { "type": "string" },
         "write_file": { "type": "string" },
         "retry": { "$ref": "#/$defs/retryDefinition" },
-        "timeout": { "type": "integer", "minimum": 0 }
+        "timeout": { "type": "integer", "minimum": 1 }
       }
     },
     "nodeDefinition": {
@@ -238,7 +244,7 @@
       "additionalProperties": false,
       "required": ["steps"],
       "properties": {
-        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowStep" } }
       }
     },
     "caseDefinition": {
@@ -248,7 +254,7 @@
       "properties": {
         "id": { "type": "string" },
         "when": { "type": "string" },
-        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowStep" } }
       }
     },
     "switchDefinition": {
@@ -256,8 +262,8 @@
       "additionalProperties": false,
       "required": ["cases"],
       "properties": {
-        "cases": { "type": "array", "items": { "$ref": "#/$defs/caseDefinition" } },
-        "else": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+        "cases": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/caseDefinition" } },
+        "else": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowStep" } }
       }
     },
     "branchDefinition": {
@@ -266,7 +272,7 @@
       "required": ["steps"],
       "properties": {
         "id": { "type": "string" },
-        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowStep" } }
       }
     },
     "parallelDefinition": {
@@ -274,7 +280,7 @@
       "additionalProperties": false,
       "required": ["branches"],
       "properties": {
-        "branches": { "type": "array", "items": { "$ref": "#/$defs/branchDefinition" } },
+        "branches": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/branchDefinition" } },
         "join": { "type": "string" }
       }
     },
@@ -282,11 +288,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["max_iterations", "steps"],
+      "oneOf": [{ "required": ["while"] }, { "required": ["until"] }],
       "properties": {
         "while": { "type": "string" },
         "until": { "type": "string" },
         "max_iterations": { "type": "integer", "minimum": 1 },
-        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } }
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowStep" } }
       }
     },
     "forEachDefinition": {
@@ -295,7 +302,7 @@
       "required": ["items", "steps"],
       "properties": {
         "items": { "type": "string" },
-        "steps": { "type": "array", "items": { "$ref": "#/$defs/flowStep" } },
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowStep" } },
         "join": { "type": "string" },
         "max_concurrency": { "type": "integer", "minimum": 1 }
       }
@@ -303,6 +310,27 @@
     "flowStep": {
       "type": "object",
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": ["use"],
+          "propertyNames": { "enum": ["id", "use", "when", "on_error", "stop", "break"] }
+        },
+        { "required": ["switch"], "propertyNames": { "enum": ["id", "switch"] } },
+        { "required": ["parallel"], "propertyNames": { "enum": ["id", "parallel"] } },
+        { "required": ["loop"], "propertyNames": { "enum": ["id", "loop"] } },
+        { "required": ["for_each"], "propertyNames": { "enum": ["id", "for_each"] } },
+        {
+          "propertyNames": { "enum": ["id", "when", "stop", "break"] },
+          "anyOf": [
+            { "required": ["stop"], "properties": { "stop": { "const": true } } },
+            { "required": ["break"], "properties": { "break": { "const": true } } }
+          ]
+        }
+      ],
+      "not": {
+        "required": ["stop", "break"],
+        "properties": { "stop": { "const": true }, "break": { "const": true } }
+      },
       "properties": {
         "id": { "type": "string" },
         "use": { "type": "string" },

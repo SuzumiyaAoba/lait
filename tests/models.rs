@@ -1,6 +1,17 @@
 mod support;
 
+#[cfg(unix)]
+use std::{process::Stdio, time::Duration};
+
 use support::{ConfigDirectory, MockServer, test_command};
+
+#[cfg(unix)]
+fn send_sigint(pid: u32) {
+    // SAFETY: the pid belongs to the child spawned by this test.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+}
 
 const CONFIG: &str = r#"
 default:
@@ -142,4 +153,31 @@ fn remote_reports_a_server_error_with_its_status() {
         stderr.contains("500"),
         "the failure should name the HTTP status: {stderr}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_a_stalled_remote_model_request() {
+    let server = MockServer::start_delayed(
+        Duration::from_millis(500),
+        "200 OK",
+        r#"{"object":"list","data":[]}"#,
+    );
+    let child = test_command()
+        .arg("models")
+        .args(["--remote", "--base-url", &server.base_url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn lait models --remote");
+    server.receive_request();
+    send_sigint(child.id());
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for cancelled lait models --remote");
+
+    assert_eq!(output.status.code(), Some(130));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("received Ctrl-C"), "stderr: {stderr}");
 }

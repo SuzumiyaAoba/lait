@@ -11,8 +11,8 @@ use crate::{
     config::{self, ConfigFile, ConfigSource, ModelMap},
     docgen, doctor,
     engine::{
-        AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
-        agent_file_settings, call_agent, resolve_request_settings,
+        AgentTurn, AppServices, CapabilityOverrides, PromptTurn, RequestSettings, RunContext,
+        SamplingOverrides, agent_file_settings, call_agent, resolve_request_settings,
     },
     history, lint, prompt, repl, report, response, schema, session, skill, subagent, template,
     test_run, usage,
@@ -90,18 +90,10 @@ pub(crate) fn finish_chat_turn(
 }
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
-    // Built once per invocation and threaded into every async command below
-    // via `AppContext::with_cancel`; each single-shot handler
-    // (`run_workflow`/`run_agent`/`run_prompt`/`run_chat`) arms
-    // `signal::spawn_handler` itself, right where it actually starts using
-    // the token — *not* here, and deliberately never for `repl::run`. A
-    // `CancellationToken` fires once and stays cancelled forever, but the
-    // REPL reuses one `AppContext` across many turns: arming Ctrl-C
-    // process-wide would make the first Ctrl-C (meant to interrupt just the
-    // in-flight turn) silently break every turn after it, with no visible
-    // effect on the one it was pressed during. `lait chat` keeps its
-    // pre-existing Ctrl-C behavior (default disposition: an immediate kill)
-    // until the REPL has its own per-turn cancellation scope.
+    // Built once per invocation and passed as the root source to each
+    // RunContext below. Each async handler arms `signal::spawn_handler` at
+    // the point where it starts using the token; the REPL watches that root
+    // while reading and running turns so cleanup also covers Ctrl-C there.
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let config_source = ConfigSource::from(&cli);
@@ -129,7 +121,9 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             AgentAction::List => bail!("internal error: `agent list` must run on the sync path"),
         },
         Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
-        Some(Command::Models(models_args)) => crate::models::run(models_args, config_source).await,
+        Some(Command::Models(models_args)) => {
+            crate::models::run(models_args, config_source, Some(cancel)).await
+        }
         Some(Command::Completions(completions_args)) => {
             docgen::generate_completions(completions_args);
             Ok(())
@@ -138,7 +132,14 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Init(init_args)) => crate::init::run(init_args),
         Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
         Some(Command::Chat(chat_repl_args)) => {
-            repl::run(chat_repl_args, config_source, cache_override, approve_tools).await
+            repl::run(
+                chat_repl_args,
+                config_source,
+                cache_override,
+                approve_tools,
+                cancel,
+            )
+            .await
         }
         Some(Command::Prompt(prompt_command)) => match prompt_command.action {
             PromptAction::List => {
@@ -164,7 +165,9 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
         Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
         Some(Command::Schema(_)) => bail!("internal error: `schema` must run on the sync path"),
-        Some(Command::Doctor(doctor_args)) => doctor::run(doctor_args, config_source).await,
+        Some(Command::Doctor(doctor_args)) => {
+            doctor::run(doctor_args, config_source, Some(cancel)).await
+        }
         Some(Command::Compare(compare_args)) => {
             crate::compare::run(compare_args, config_source, cache_override, cancel).await
         }
@@ -201,9 +204,9 @@ fn cache_override(cache: bool, no_cache: bool) -> Option<bool> {
 /// and its TTL: `cache_override` (from `--cache`/`--no-cache`) wins when set,
 /// else `default.cache` in lait.config.yml, else off. `default.cache_ttl`
 /// applies regardless of which layer enabled the cache. Every async command
-/// handler below calls this once, right before building its `AppContext`,
+/// handler below calls this once, right before building its `RunContext`,
 /// with the same `cache_override` `app::run` resolved up front — see
-/// `AppContext::with_cache`.
+/// `RunContext::with_cache`.
 pub(crate) fn resolve_cache_settings(
     cache_override: Option<bool>,
     file_config: &ConfigFile,
@@ -243,13 +246,6 @@ async fn run_chat_or_repl(
             )
             .await
         }
-        // `repl::run` deliberately does not receive `cancel`: a
-        // `CancellationToken` fires once and stays cancelled forever, but
-        // the REPL reuses one `AppContext` across many turns — wiring a
-        // single process-wide token in would make the *first* Ctrl-C (meant
-        // to interrupt just the in-flight turn) permanently break every
-        // turn after it. `lait chat` keeps its pre-existing Ctrl-C behavior
-        // until the REPL has its own per-turn cancellation scope.
         None if std::io::stdin().is_terminal() => {
             repl::run(
                 ChatReplArgs {
@@ -258,6 +254,7 @@ async fn run_chat_or_repl(
                 config_source,
                 cache_override,
                 approve_tools,
+                cancel,
             )
             .await
         }
@@ -505,8 +502,8 @@ async fn run_chat(
     let image_urls = attachment::resolve_image_urls(&chat.images).await?;
     let session_history = load_session_history(chat.shared.session.as_deref())?;
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_cancel(cancel)
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools);
 
@@ -529,7 +526,7 @@ async fn run_chat(
     };
 
     if chat.stream {
-        let outcome = env
+        let outcome = services
             .finish(settings.complete_stream(
                 &env,
                 &[],
@@ -538,7 +535,7 @@ async fn run_chat(
                 show_usage,
                 show_reasoning,
                 output_path,
-                env.cancel.clone(),
+                Some(env.operation_token()),
             ))
             .await?;
         // Streamed usage arrives on the final chunk rather than through
@@ -562,8 +559,14 @@ async fn run_chat(
         return Ok(());
     }
 
-    let response = env
-        .finish(settings.complete(&env, &[], turn, response_format, env.cancel.clone()))
+    let response = services
+        .finish(settings.complete(
+            &env,
+            &[],
+            turn,
+            response_format,
+            Some(env.operation_token()),
+        ))
         .await?;
 
     match output_path {
@@ -655,17 +658,17 @@ async fn run_prompt(
     .with_usage_label(format!("prompt '{}'", args.name));
 
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_cancel(cancel)
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools);
-    let response = env
+    let response = services
         .finish(settings.complete(
             &env,
             &[],
             PromptTurn::simple(None, &prompt_text),
             None,
-            env.cancel.clone(),
+            Some(env.operation_token()),
         ))
         .await?;
     let output = response::render_response(&response, false, false)?;
@@ -722,11 +725,11 @@ async fn run_agent(
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
-        .with_cancel(cancel)
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools);
-    let output = env
+    let output = services
         .finish(call_agent(
             &agent_file,
             &settings,
@@ -734,7 +737,7 @@ async fn run_agent(
             AgentTurn::simple(&input, &raw_input),
             &workflow::StepOutputs::new(),
             std::slice::from_ref(&canonical_agent_path),
-            env.cancel.clone(),
+            Some(env.operation_token()),
         ))
         .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;

@@ -97,6 +97,39 @@ steps:
 }
 
 #[test]
+fn sigint_cancels_a_repl_waiting_for_input_and_runs_cleanup() {
+    let mut child = test_command()
+        .args(["chat", "--model", "test-model", "--no-config"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn lait chat");
+
+    // Keep stdin open so the REPL is blocked in its cancellable read rather
+    // than exiting naturally on EOF.
+    let _stdin = child.stdin.take().expect("chat stdin should be piped");
+    // Match the startup allowance used by the workflow SIGINT test above:
+    // cold dynamic linking and the Tokio signal listener can take over a
+    // second in the integration-test process.
+    std::thread::sleep(Duration::from_millis(2000));
+    send_sigint(child.id());
+
+    let started_waiting = Instant::now();
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for cancelled lait chat");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        started_waiting.elapsed() < Duration::from_secs(3),
+        "lait chat did not exit promptly after SIGINT (stderr: {stderr})"
+    );
+    assert_eq!(output.status.code(), Some(130), "stderr: {stderr}");
+    assert!(stderr.contains("received Ctrl-C"), "stderr: {stderr}");
+}
+
+#[test]
 fn workflow_timeout_cancels_a_run_that_exceeds_the_budget() {
     let dir = ConfigDirectory::empty();
     fs::write(

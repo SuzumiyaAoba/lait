@@ -268,7 +268,7 @@ fn allows_a_system_prompt_only_node_with_no_prompt() {
         "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    system_prompt: be terse\nsteps:\n  - use: n\n",
     )
     .expect("workflow should parse");
-    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+    let NodeDefinition::Prompt(n) = workflow.nodes["n"].as_ref() else {
         panic!("expected a prompt node");
     };
     assert!(n.prompt.is_none());
@@ -289,7 +289,7 @@ fn allows_system_prompt_on_a_prompt_node() {
         "default:\n  model: local\nnodes:\n  n:\n    type: prompt\n    prompt: hi\n    system_prompt: be terse\nsteps:\n  - use: n\n",
     )
     .expect("workflow should parse");
-    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+    let NodeDefinition::Prompt(n) = workflow.nodes["n"].as_ref() else {
         panic!("expected a prompt node");
     };
     assert_eq!(n.system_prompt.as_deref(), Some("be terse"));
@@ -325,7 +325,7 @@ steps:
     )
     .expect("workflow with output_schema and jq should parse");
 
-    let NodeDefinition::Prompt(node) = &workflow.nodes["answer"] else {
+    let NodeDefinition::Prompt(node) = workflow.nodes["answer"].as_ref() else {
         panic!("expected a prompt node");
     };
     assert_eq!(node.output_schema.as_deref(), Some("schema.json"));
@@ -363,7 +363,7 @@ steps:
         }
         JsonSchemaEntry::FilePath { .. } => panic!("expected an inline schema entry"),
     }
-    let NodeDefinition::Prompt(answer) = &workflow.nodes["answer"] else {
+    let NodeDefinition::Prompt(answer) = workflow.nodes["answer"].as_ref() else {
         panic!("expected a prompt node");
     };
     assert_eq!(answer.output_schema.as_deref(), Some("answer"));
@@ -491,7 +491,7 @@ steps:
     )
     .expect("workflow with an agent node should parse");
 
-    let NodeDefinition::Agent(extract) = &workflow.nodes["extract"] else {
+    let NodeDefinition::Agent(extract) = workflow.nodes["extract"].as_ref() else {
         panic!("expected an agent node");
     };
     assert_eq!(extract.agent.to_str(), Some("agents/extract.md"));
@@ -512,7 +512,7 @@ steps:
     )
     .expect("workflow with an input_schema should parse");
 
-    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+    let NodeDefinition::Prompt(n) = workflow.nodes["n"].as_ref() else {
         panic!("expected a prompt node");
     };
     assert_eq!(n.input_schema.as_deref(), Some("schema.json"));
@@ -534,7 +534,7 @@ steps:
     )
     .expect("workflow with a 'workflow' node should parse");
 
-    let NodeDefinition::Workflow(sub) = &workflow.nodes["sub"] else {
+    let NodeDefinition::Workflow(sub) = workflow.nodes["sub"].as_ref() else {
         panic!("expected a workflow node");
     };
     assert_eq!(sub.workflow.to_str(), Some("./shared/summarize.yml"));
@@ -632,7 +632,7 @@ steps:
     )
     .expect("workflow with a 'when' guard should parse");
 
-    assert_eq!(workflow.steps[0].when.as_deref(), Some(". != null"));
+    assert_eq!(workflow.steps[0].when(), Some(". != null"));
 }
 
 #[test]
@@ -666,10 +666,7 @@ steps:
     )
     .expect("workflow with a switch should parse");
 
-    let switch = workflow.steps[0]
-        .switch
-        .as_ref()
-        .expect("step should have a switch");
+    let switch = as_switch(&workflow.steps[0]);
     assert_eq!(switch.cases.len(), 2);
     assert_eq!(switch.cases[0].id.as_deref(), Some("high"));
     assert!(switch.else_steps.is_some());
@@ -693,14 +690,7 @@ steps:
     )
     .expect("workflow with a switch without else should parse");
 
-    assert!(
-        workflow.steps[0]
-            .switch
-            .as_ref()
-            .unwrap()
-            .else_steps
-            .is_none()
-    );
+    assert!(as_switch(&workflow.steps[0]).else_steps.is_none());
 }
 
 #[test]
@@ -852,10 +842,7 @@ steps:
     )
     .expect("workflow with a parallel step should parse");
 
-    let parallel = workflow.steps[0]
-        .parallel
-        .as_ref()
-        .expect("step should have a parallel");
+    let parallel = as_parallel(&workflow.steps[0]);
     assert_eq!(parallel.branches.len(), 2);
     assert_eq!(parallel.branches[0].id.as_deref(), Some("a"));
     assert_eq!(parallel.join.as_deref(), Some(".a + .b"));
@@ -880,7 +867,7 @@ steps:
     )
     .expect("workflow with a parallel step without join should parse");
 
-    assert!(workflow.steps[0].parallel.as_ref().unwrap().join.is_none());
+    assert!(as_parallel(&workflow.steps[0]).join.is_none());
 }
 
 #[test]
@@ -903,7 +890,7 @@ steps:
     )
     .expect("workflow with a parallel step should parse");
 
-    let branches = &workflow.steps[0].parallel.as_ref().unwrap().branches;
+    let branches = &as_parallel(&workflow.steps[0]).branches;
     assert_eq!(branches[0].label(0), "branch-1");
     assert_eq!(branches[1].label(1), "named");
 }
@@ -1045,13 +1032,11 @@ steps:
     )
     .expect("workflow with a while loop should parse");
 
-    let loop_def = workflow.steps[0]
-        .r#loop
-        .as_ref()
-        .expect("step should have a loop");
-    assert_eq!(loop_def.r#while.as_deref(), Some(".score < 3"));
-    assert!(loop_def.until.is_none());
-    assert_eq!(loop_def.max_iterations, Some(5));
+    let loop_def = as_loop(&workflow.steps[0]);
+    assert!(
+        matches!(&loop_def.condition, super::LoopCondition::While(filter) if filter == ".score < 3")
+    );
+    assert_eq!(loop_def.max_iterations.get(), 5);
 }
 
 #[test]
@@ -1072,9 +1057,10 @@ steps:
     )
     .expect("workflow with an until loop should parse");
 
-    let loop_def = workflow.steps[0].r#loop.as_ref().unwrap();
-    assert_eq!(loop_def.until.as_deref(), Some(".valid == true"));
-    assert!(loop_def.r#while.is_none());
+    let loop_def = as_loop(&workflow.steps[0]);
+    assert!(
+        matches!(&loop_def.condition, super::LoopCondition::Until(filter) if filter == ".valid == true")
+    );
 }
 
 #[test]
@@ -1220,10 +1206,7 @@ steps:
     )
     .expect("workflow with a for_each should parse");
 
-    let for_each = workflow.steps[0]
-        .for_each
-        .as_ref()
-        .expect("step should have a for_each");
+    let for_each = as_foreach(&workflow.steps[0]);
     assert_eq!(for_each.items, ".items");
     assert_eq!(for_each.join.as_deref(), Some("map(. * 2)"));
 }
@@ -1245,7 +1228,7 @@ steps:
     )
     .expect("workflow with a for_each without join should parse");
 
-    assert!(workflow.steps[0].for_each.as_ref().unwrap().join.is_none());
+    assert!(as_foreach(&workflow.steps[0]).join.is_none());
 }
 
 #[test]
@@ -1279,10 +1262,7 @@ steps:
     )
     .expect("workflow with a for_each max_concurrency should parse");
 
-    assert_eq!(
-        workflow.steps[0].for_each.as_ref().unwrap().max_concurrency,
-        Some(4)
-    );
+    assert_eq!(as_foreach(&workflow.steps[0]).max_concurrency, Some(4));
 }
 
 #[test]
@@ -1482,7 +1462,7 @@ steps:
     )
     .expect("workflow with a top-level 'stop' should parse");
 
-    assert_eq!(workflow.steps[0].stop, Some(true));
+    assert_eq!(workflow.steps[0].control(), super::Control::Stop);
 }
 
 #[test]
@@ -1505,8 +1485,8 @@ steps:
     )
     .expect("workflow with 'break' inside a loop should parse");
 
-    let loop_def = workflow.steps[0].r#loop.as_ref().unwrap();
-    assert_eq!(loop_def.steps[0].r#break, Some(true));
+    let loop_def = as_loop(&workflow.steps[0]);
+    assert_eq!(loop_def.steps[0].control(), super::Control::Break);
 }
 
 #[test]
@@ -1528,8 +1508,8 @@ steps:
     )
     .expect("workflow with 'break' inside a for_each should parse");
 
-    let for_each = workflow.steps[0].for_each.as_ref().unwrap();
-    assert_eq!(for_each.steps[0].r#break, Some(true));
+    let for_each = as_foreach(&workflow.steps[0]);
+    assert_eq!(for_each.steps[0].control(), super::Control::Break);
 }
 
 #[test]
@@ -1713,7 +1693,7 @@ steps:
     assert_eq!(retry.max_attempts, Some(3));
     assert_eq!(retry.delay_seconds, Some(1));
     assert_eq!(retry.backoff, Some(2.0));
-    assert_eq!(workflow.steps[0].on_error.as_ref().unwrap().steps.len(), 1);
+    assert_eq!(workflow.steps[0].on_error().unwrap().steps.len(), 1);
 }
 
 #[test]
@@ -1985,7 +1965,7 @@ steps:
     )
     .expect("workflow with a command node should parse");
 
-    let NodeDefinition::Command(n) = &workflow.nodes["n"] else {
+    let NodeDefinition::Command(n) = workflow.nodes["n"].as_ref() else {
         panic!("expected a command node");
     };
     assert_eq!(n.command, vec!["wc".to_owned(), "-l".to_owned()]);
@@ -2031,7 +2011,7 @@ steps:
     )
     .expect("workflow with files/images should parse");
 
-    let NodeDefinition::Prompt(n) = &workflow.nodes["n"] else {
+    let NodeDefinition::Prompt(n) = workflow.nodes["n"].as_ref() else {
         panic!("expected a prompt node");
     };
     assert_eq!(
@@ -2330,4 +2310,70 @@ fn eval_when_can_reference_a_named_step_output_via_dollar_steps() {
     let mut steps = StepOutputs::new();
     steps.insert("check".to_owned(), serde_json::json!({"ok": true}));
     assert!(eval_when("$steps.check.ok", "null", &steps).unwrap());
+}
+
+fn as_switch(step: &super::FlowStep) -> &super::SwitchDefinition {
+    match step.router() {
+        Some(super::Router::Switch(router)) => router,
+        _ => panic!("expected Switch router"),
+    }
+}
+
+fn as_parallel(step: &super::FlowStep) -> &super::ParallelDefinition {
+    match step.router() {
+        Some(super::Router::Parallel(router)) => router,
+        _ => panic!("expected Parallel router"),
+    }
+}
+
+fn as_loop(step: &super::FlowStep) -> &super::LoopDefinition {
+    match step.router() {
+        Some(super::Router::Loop(router)) => router,
+        _ => panic!("expected Loop router"),
+    }
+}
+
+fn as_foreach(step: &super::FlowStep) -> &super::ForEachDefinition {
+    match step.router() {
+        Some(super::Router::ForEach(router)) => router,
+        _ => panic!("expected ForEach router"),
+    }
+}
+
+#[test]
+fn rejects_inactive_bare_control_steps_before_execution() {
+    for fields in [
+        "stop: false",
+        "break: false",
+        "stop: false\n    break: false",
+    ] {
+        let source = format!("steps:\n  - {fields}\n");
+        assert!(
+            parse_workflow(&source).is_err(),
+            "accepted empty control action: {source}"
+        );
+    }
+}
+
+#[test]
+fn keeps_yaml_error_sources_when_explaining_missing_node_types() {
+    let error =
+        parse_workflow("nodes:\n  call:\n    prompt: hello\nsteps:\n  - use: call\n").unwrap_err();
+    assert!(error.chain().any(|cause| cause.is::<serde_yaml::Error>()));
+    assert!(error.to_string().contains("requires a 'type:'"));
+}
+
+#[test]
+fn compiled_calls_keep_their_resolved_node_after_the_source_map_is_removed() {
+    let mut workflow =
+        parse_workflow("nodes:\n  n: {type: transform, jq: '.'}\nsteps:\n  - use: n\n").unwrap();
+    let call = workflow.steps[0].call().unwrap();
+    assert!(std::ptr::eq(call.definition, workflow.nodes["n"].as_ref()));
+    workflow.nodes.clear();
+    assert_eq!(
+        workflow.steps[0].call().unwrap().definition.type_name(),
+        "transform"
+    );
+    let graph = super::graph::render(&workflow, super::graph::GraphFormat::Mermaid).unwrap();
+    assert!(graph.contains("transform"));
 }

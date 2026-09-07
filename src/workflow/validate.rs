@@ -2,9 +2,9 @@ use anyhow::{Result, bail};
 
 use crate::llm::{validate_max_tool_rounds, validate_sampling_params};
 
-use super::model::{
-    FlowStep, ForEachDefinition, LoopDefinition, NodeDefinition, NodeMap, ParallelDefinition,
-    RetryDefinition, Router, SwitchDefinition, WorkflowDefaults,
+use super::model::{NodeDefinition, NodeMap, RetryDefinition, WorkflowDefaults};
+use super::raw::{
+    FlowStep, ForEachDefinition, LoopDefinition, ParallelDefinition, Router, SwitchDefinition,
 };
 
 /// A named router-incompatible field, used by `ROUTER_INCOMPATIBLE_FIELDS`.
@@ -186,7 +186,7 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
             None => {}
         }
 
-        if step.r#use.is_none() && step.stop.is_none() && step.r#break.is_none() {
+        if step.r#use.is_none() && step.stop != Some(true) && step.r#break != Some(true) {
             bail!(
                 "step '{}' must have a 'use', a 'switch', a 'parallel', a 'loop', a \
                  'for_each', 'stop', 'break', or a combination",

@@ -8,7 +8,7 @@ use crate::{
     checkpoint,
     cli::RunArgs,
     config::{self, ConfigSource},
-    engine::AppContext,
+    engine::{AppServices, RunContext},
     report,
     workflow::{
         self, WorkflowScope,
@@ -194,12 +194,12 @@ pub(super) async fn run_workflow(
     let deadline = RunDeadline::start(scope.defaults.workflow_timeout, run_cancel.clone());
 
     let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
-    let env = AppContext::new(Arc::clone(&file_config))
+    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+    let env = RunContext::new(Arc::clone(&services), run_cancel)
         .with_vars(vars.clone())
-        .with_cancel(run_cancel)
         .with_cache(cache_enabled, cache_ttl)
         .with_approve_tools(approve_tools)
-        .with_record_replay(run_args.record.clone(), run_args.replay.clone());
+        .with_record_replay(run_args.record.clone(), run_args.replay.clone())?;
     let checkpoint = CheckpointContext {
         run_id: &run_id,
         workflow_path: &workflow_path,
@@ -207,7 +207,7 @@ pub(super) async fn run_workflow(
         vars: &vars,
         labels: &top_level_labels,
     };
-    let progress = env
+    let progress = services
         .finish(run_top_level(
             &wf.steps,
             progress,
@@ -251,7 +251,7 @@ async fn run_top_level(
     steps: &[workflow::FlowStep],
     mut progress: Progress,
     scope: &WorkflowScope,
-    env: &AppContext,
+    env: &RunContext,
     checkpoint: Option<&CheckpointContext<'_>>,
     requested_file: &std::path::Path,
 ) -> Result<Progress> {
@@ -266,7 +266,7 @@ async fn run_top_level(
                 env,
                 start_counter: progress.counter,
                 progress_prefix: "",
-                cancellation: env.cancel.clone(),
+                cancellation: Some(env.root_token()),
             },
         )
         .await;

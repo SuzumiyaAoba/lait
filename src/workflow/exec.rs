@@ -19,7 +19,7 @@ use crate::{
     async_io, attachment,
     config::{self, ConfigFile},
     engine::{
-        AgentTurn, AppContext, CapabilityOverrides, PromptTurn, RequestSettings, SamplingOverrides,
+        AgentTurn, CapabilityOverrides, PromptTurn, RequestSettings, RunContext, SamplingOverrides,
         call_agent, resolve_request_settings, value_to_input_text,
     },
     jq, response, schema, template, workflow,
@@ -106,7 +106,7 @@ impl StepsState {
 /// through every control-structure helper.
 struct RouterContext<'a> {
     scope: &'a WorkflowScope,
-    env: &'a AppContext,
+    env: &'a RunContext,
     progress_prefix: &'a str,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 }
@@ -156,7 +156,7 @@ fn check_workflow_cancellation(
 /// `try_join_all`/`.buffered()`, which interleaves I/O-bound work (the
 /// common case here) but never uses more than one OS thread. Actually
 /// spawning needs every borrow in this frame's `'a` to become `'static`,
-/// and `scope: &'a WorkflowScope`/`env: &'a AppContext` already could (both
+/// and `scope: &'a WorkflowScope`/`env: &'a RunContext` already could (both
 /// are already `Arc`-friendly), but `steps: &'a [FlowStep]` (below) can't:
 /// it's borrowed from the top-level `WorkflowFile` on `run_workflow`'s
 /// stack, reachable through `SwitchCase`/`ParallelBranch`/
@@ -168,7 +168,7 @@ fn check_workflow_cancellation(
 /// better done together than as two passes over the same types.
 pub(crate) struct RunStepsFrame<'a> {
     pub(crate) scope: &'a WorkflowScope,
-    pub(crate) env: &'a AppContext,
+    pub(crate) env: &'a RunContext,
     pub(crate) start_counter: usize,
     pub(crate) progress_prefix: &'a str,
     pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
@@ -326,7 +326,7 @@ pub(crate) fn run_steps<'a>(
                 None => {}
             }
 
-            if let Some(when) = &step.when {
+            if let Some(when) = step.when() {
                 let truthy = workflow::eval_when_async(
                     when,
                     &current_input,
@@ -343,15 +343,10 @@ pub(crate) fn run_steps<'a>(
             }
 
             eprintln!("{progress_prefix}[{counter}] {label}");
-            current_input = match &step.r#use {
+            current_input = match step.call() {
                 None => current_input,
-                Some(node_id) => {
-                    // `validate::validate_steps` guarantees every `use:` site
-                    // resolves against `scope.nodes` before execution starts.
-                    let node = scope
-                        .nodes
-                        .get(node_id)
-                        .expect("validate_steps guarantees 'use' resolves in 'nodes'");
+                Some(call) => {
+                    let node = call.definition;
                     let attempt_result = execute_step_with_retry(
                         node,
                         &current_input,
@@ -367,7 +362,7 @@ pub(crate) fn run_steps<'a>(
                     .await;
                     match attempt_result {
                         Ok(output) => output,
-                        Err(error) => match &step.on_error {
+                        Err(error) => match step.on_error() {
                             Some(on_error) => {
                                 eprintln!(
                                     "{progress_prefix}    -> step failed, running 'on_error': {error}"
@@ -421,7 +416,7 @@ pub(crate) fn run_steps<'a>(
 
             record_step_output(&mut steps_outputs, step, &current_input);
 
-            if step.r#break == Some(true) {
+            if step.control() == crate::workflow::Control::Break {
                 return Ok(StepsOutcome {
                     output: current_input,
                     counter,
@@ -429,7 +424,7 @@ pub(crate) fn run_steps<'a>(
                     steps_outputs,
                 });
             }
-            if step.stop == Some(true) {
+            if step.control() == crate::workflow::Control::Stop {
                 return Ok(StepsOutcome {
                     output: current_input,
                     counter,
@@ -603,15 +598,13 @@ async fn execute_loop<'a>(
         counter,
         mut steps_outputs,
     } = state;
-    let max_iterations = loop_def
-        .max_iterations
-        .expect("loop.max_iterations is required by validate_steps");
+    let max_iterations = loop_def.max_iterations.get();
 
     let mut iteration_input = current_input;
     let mut loop_counter = counter;
     let mut iterations_run = 0usize;
     let satisfied = loop {
-        if let Some(while_cond) = &loop_def.r#while
+        if let workflow::LoopCondition::While(while_cond) = &loop_def.condition
             && !workflow::eval_when_async(
                 while_cond,
                 &iteration_input,
@@ -660,7 +653,7 @@ async fn execute_loop<'a>(
                 .into_outcome(Flow::Stop));
             }
         }
-        if let Some(until_cond) = &loop_def.until
+        if let workflow::LoopCondition::Until(until_cond) = &loop_def.condition
             && workflow::eval_when_async(
                 until_cond,
                 &iteration_input,
@@ -676,11 +669,7 @@ async fn execute_loop<'a>(
     };
 
     if !satisfied {
-        let condition = if loop_def.r#while.is_some() {
-            "while"
-        } else {
-            "until"
-        };
+        let condition = loop_def.condition.keyword();
         bail!(
             "step '{label}': 'loop' reached max_iterations ({max_iterations}) without satisfying '{condition}'"
         );
@@ -1102,12 +1091,12 @@ async fn wait_retry_delay(
 /// attempt — the caller's own cancellation on the first attempt of a node
 /// with no `timeout`, or a child token scoped to just that attempt when a
 /// `timeout` is set (see `execute_step_with_retry`) — which is why it lives
-/// here rather than on `AppContext`: it changes across attempts and nesting
-/// depths, unlike everything on `AppContext`, which does not.
+/// here rather than on `RunContext`: it changes across attempts and nesting
+/// depths, unlike everything on `RunContext`, which does not.
 #[derive(Clone)]
 struct StepContext<'a> {
     scope: &'a WorkflowScope,
-    env: &'a AppContext,
+    env: &'a RunContext,
     label: &'a str,
     progress_prefix: &'a str,
     steps_outputs: &'a workflow::StepOutputs,
@@ -1271,8 +1260,9 @@ async fn execute_step(
                     .with_context(|| format!("step '{label}'"))?;
             }
 
-            let settings = resolve_step_settings(node, scope, &env.file_config, None, label)?
-                .with_usage_label(label);
+            let settings =
+                resolve_step_settings(node, scope, &env.services.file_config, None, label)?
+                    .with_usage_label(label);
 
             let response_format = match prompt_node.output_schema.as_deref() {
                 Some(name_or_path) => {
@@ -1359,6 +1349,7 @@ async fn execute_step(
             // input schema instead of re-reading both from disk on every
             // iteration.
             let loaded = env
+                .services
                 .agent_registry
                 .load_path_cancellable(&agent_node.agent, step_cancel.clone())
                 .await
@@ -1370,9 +1361,14 @@ async fn execute_step(
                 .validate_input(&input)
                 .with_context(|| format!("step '{label}'"))?;
 
-            let settings =
-                resolve_step_settings(node, scope, &env.file_config, Some(agent_file), label)?
-                    .with_usage_label(label);
+            let settings = resolve_step_settings(
+                node,
+                scope,
+                &env.services.file_config,
+                Some(agent_file),
+                label,
+            )?
+            .with_usage_label(label);
 
             let (prompt, image_urls) = resolve_attachments(
                 agent_node.files.as_deref(),
@@ -1499,7 +1495,7 @@ async fn apply_jq(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppContext, RunStepsFrame, WorkflowScope, apply_jq, run_steps};
+    use super::{RunContext, RunStepsFrame, WorkflowScope, apply_jq, run_steps};
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
@@ -1543,7 +1539,10 @@ steps:
         let mut workflow = crate::workflow::load_workflow(&path).unwrap();
         let scope = WorkflowScope::top_level(&mut workflow, &path).unwrap();
         let config = std::sync::Arc::new(crate::config::ConfigFile::default());
-        let env = AppContext::new(config);
+        let env = RunContext::new(
+            std::sync::Arc::new(crate::engine::AppServices::new(config)),
+            tokio_util::sync::CancellationToken::new(),
+        );
         let token = CancellationToken::new();
         let started = std::time::Instant::now();
         let execution = run_steps(

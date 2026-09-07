@@ -3,19 +3,37 @@
 //! `--remote` — asks the server itself for its available models via
 //! `GET /v1/models`.
 
+use std::{future::Future, sync::Arc};
+
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::{
     cli::ModelsArgs,
     config::{self, ConfigFile, ConfigSource, ResolvedModel},
+    engine::AppServices,
     llm,
 };
 
-pub(crate) async fn run(args: ModelsArgs, config_source: ConfigSource) -> Result<()> {
-    let file_config = config::load_config(&config_source)?;
+pub(crate) async fn run(
+    args: ModelsArgs,
+    config_source: ConfigSource,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    let file_config = Arc::new(config::load_config(&config_source)?);
     if args.remote {
-        list_remote(&args, &file_config).await
+        let cancellation = cancellation.unwrap_or_default();
+        crate::signal::spawn_handler(cancellation.clone());
+        let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
+        services
+            .clone()
+            .finish(list_remote(
+                &args,
+                &file_config,
+                &services,
+                Some(cancellation),
+            ))
+            .await
     } else {
         list_local(&args, &file_config)
     }
@@ -197,12 +215,17 @@ struct RemoteModel {
     id: String,
 }
 
-async fn list_remote(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
+async fn list_remote(
+    args: &ModelsArgs,
+    file_config: &ConfigFile,
+    services: &AppServices,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<()> {
     // The same endpoint resolution as a completion request (CLI/env >
     // config), except model aliases play no part: `--remote` asks one
     // concrete server, and no API key means no Authorization header rather
     // than the completion path's dummy key.
-    let (base_url, api_key) = crate::config::resolve_endpoint(
+    let endpoint = crate::config::resolve_endpoint(
         args.endpoint.base_url.clone(),
         args.endpoint.api_key.clone(),
         None,
@@ -210,21 +233,23 @@ async fn list_remote(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> 
         None,
         file_config,
     )?;
+    let api_key = services
+        .secret_resolver
+        .resolve(&endpoint.api_key, cancellation.clone())
+        .await?;
 
-    let url = format!("{base_url}/models");
+    let url = format!("{}/models", endpoint.base_url);
     let mut request = llm::http_client()
         .get(&url)
         .timeout(std::time::Duration::from_secs(30));
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
-    let response = request
-        .send()
+    let response = await_with_cancellation(request.send(), cancellation.as_ref())
         .await
         .with_context(|| format!("failed to request {url}"))?;
     let status = response.status();
-    let body = response
-        .text()
+    let body = await_with_cancellation(response.text(), cancellation.as_ref())
         .await
         .with_context(|| format!("failed to read the response from {url}"))?;
     if !status.is_success() {
@@ -247,4 +272,25 @@ async fn list_remote(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> 
         println!("{}", model.id);
     }
     Ok(())
+}
+
+async fn await_with_cancellation<T, E>(
+    future: impl Future<Output = std::result::Result<T, E>>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(crate::error::Interrupted::cancelled(
+                    "models remote request was cancelled",
+                ).into()),
+                result = future => result.map_err(anyhow::Error::new),
+            }
+        }
+        None => future.await.map_err(anyhow::Error::new),
+    }
 }

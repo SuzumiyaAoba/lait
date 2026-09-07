@@ -9,7 +9,6 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
 };
 
 use crate::{
@@ -17,8 +16,7 @@ use crate::{
     async_io, cache, cassette,
     cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
-    llm, mcp, nesting, process, response, schema, shell_tool, skill, subagent, template, usage,
-    workflow,
+    llm, mcp, nesting, process, response, schema, shell_tool, skill, subagent, template, workflow,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::{
@@ -26,9 +24,11 @@ use async_openai::{
     types::chat::{ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat},
 };
 
+mod context;
 mod stream;
 mod tool_loop;
 
+pub(crate) use context::{AppServices, RunContext};
 use stream::{StreamOutcome, stream_response};
 use tool_loop::ToolLoop;
 
@@ -38,170 +38,6 @@ use tool_loop::ToolLoop;
 /// Overridable per CLI invocation/agent file/workflow node/`default:` via
 /// `max_tool_rounds`.
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
-
-/// The loaded config file, the MCP registry, the skill cache, the subagent
-/// registry, and the run's top-level cancellation source for the whole
-/// `lait`/`lait agent run`/`lait run` invocation — unlike `WorkflowScope`,
-/// none of these change at a `workflow:` nesting boundary, so the same
-/// `&AppContext` flows unchanged through every
-/// `run_steps`/`execute_step_with_retry`/`execute_step` call (and, for
-/// `call_agent`/`RequestSettings::complete`, through a subagent call's own
-/// recursive completion too — see `call_subagent_tool`). Bundled into one
-/// struct (rather than five parameters) purely to keep those functions'
-/// argument counts under clippy's `too_many_arguments` threshold. Owns
-/// everything (an `Arc<ConfigFile>`, not a borrow) rather than borrowing
-/// `file_config` for a lifetime, so an `Arc<AppContext>` clone can move into
-/// a `tokio::spawn`ed task for `parallel`/concurrent `for_each` (see
-/// `workflow::exec::run_steps`) without that task's future needing to
-/// outlive a borrow.
-pub(crate) struct AppContext {
-    pub(crate) file_config: Arc<ConfigFile>,
-    pub(crate) registry: mcp::McpRegistry,
-    pub(crate) skill_cache: skill::SkillCache,
-    pub(crate) agent_registry: subagent::AgentRegistry,
-    /// Every completion request's server-reported token usage, recorded by
-    /// `RequestSettings::complete` and summarized when `--show-usage` asks
-    /// for it.
-    pub(crate) usage: usage::UsageTally,
-    /// This invocation's own cancellation source, if any — the value every
-    /// top-level `run_steps`/`complete` call seeds its own cancellation
-    /// chain from (a node's own `timeout`/nested `workflow:` call then
-    /// derives further child tokens off of that seed, see
-    /// `execute_step_with_retry`). Set via `with_cancel` by every async
-    /// command handler in `app.rs`/`repl.rs`, from the process-wide token
-    /// `signal::spawn_handler` cancels on Ctrl-C — `None` only for a caller
-    /// that never calls `with_cancel` (none currently; kept `Option` so a
-    /// future non-interactive caller, e.g. a library embedding, can still
-    /// opt out).
-    pub(crate) cancel: Option<tokio_util::sync::CancellationToken>,
-    /// `lait run --var KEY=VALUE` overrides (see `cli::VarArgs`), exposed to
-    /// workflow templates as `{{ vars.<key> }}` and to jq filters as
-    /// `$vars.<key>`. Empty for every caller but `app::run_workflow` — see
-    /// `with_vars`.
-    pub(crate) vars: serde_json::Map<String, serde_json::Value>,
-    /// Whether `complete_recorded` should check/populate the response disk
-    /// cache (`--cache`/`default.cache`, see `crate::cache`) for this
-    /// invocation. `false` (the default) for a caller that never calls
-    /// `with_cache` — resolved once per invocation, from the same CLI/config
-    /// precedence for every caller (`app::run`), so a workflow's subagent
-    /// calls and a nested `workflow:` call all inherit it unchanged, the
-    /// same way `cancel` does.
-    pub(crate) cache_enabled: bool,
-    /// How many seconds a cache hit stays valid, when `cache_enabled`. `None`
-    /// means cached responses never expire on their own. See `crate::cache`.
-    pub(crate) cache_ttl: Option<u64>,
-    /// Whether `ToolLoop::append_tool_calls` should interactively confirm each tool
-    /// call on stdin/stderr before running it (`--approve-tools`), in
-    /// addition to (never instead of) `file_config.tool_policy`'s allow/deny
-    /// gate. `false` for a caller that never calls `with_approve_tools`.
-    pub(crate) approve_tools: bool,
-    /// Qualified tool names (see `mcp::qualify_tool_name`) the user has
-    /// answered `a` for under `--approve-tools`, so `ToolLoop::append_tool_calls`
-    /// stops asking about that name for the rest of this run. A `Mutex`
-    /// (like `usage`'s own interior mutability) rather than requiring `&mut
-    /// AppContext` — `ToolLoop::append_tool_calls` only ever holds a shared `&
-    /// AppContext`, the same as every other tool-loop call.
-    pub(crate) always_approved_tools: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// `lait run --record <DIR>` (see `crate::cassette`): when set,
-    /// `complete_recorded` saves every non-streamed request/response it
-    /// sends into this directory as a cassette file, keyed by the same
-    /// content hash `--cache` uses. Mutually exclusive with `replay_dir` at
-    /// the CLI level (`RunArgs::record`/`RunArgs::replay` `conflicts_with`
-    /// each other).
-    pub(crate) record_dir: Option<PathBuf>,
-    /// `lait run --replay <DIR>` / `lait test` (see `crate::cassette`): when
-    /// set, `complete_recorded` answers every non-streamed request from this
-    /// directory's cassette files instead of calling `llm::complete` at
-    /// all — a request with no matching cassette is a hard error, never a
-    /// silent fall-through to the network.
-    pub(crate) replay_dir: Option<PathBuf>,
-}
-
-impl AppContext {
-    /// Builds the registries/cache over `file_config`'s named entries. Cheap:
-    /// each registry gets its own `Arc` clone of just the map it needs (MCP
-    /// connections, skill files, and agent files are all loaded lazily on
-    /// first use, so cloning the (typically small) name/path maps up front
-    /// costs far less than any of that).
-    pub(crate) fn new(file_config: Arc<ConfigFile>) -> Self {
-        Self {
-            registry: mcp::McpRegistry::new(Arc::new(file_config.mcp_servers.clone())),
-            skill_cache: skill::SkillCache::new(Arc::new(file_config.skills.clone())),
-            agent_registry: subagent::AgentRegistry::new(Arc::new(file_config.agents.clone())),
-            file_config,
-            usage: usage::UsageTally::default(),
-            cancel: None,
-            vars: serde_json::Map::new(),
-            cache_enabled: false,
-            cache_ttl: None,
-            approve_tools: false,
-            always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
-            record_dir: None,
-            replay_dir: None,
-        }
-    }
-
-    /// Sets this context's `vars` (see the field doc), returning `self` for
-    /// use in a builder chain at the call site (`app::run_workflow`).
-    pub(crate) fn with_vars(mut self, vars: serde_json::Map<String, serde_json::Value>) -> Self {
-        self.vars = vars;
-        self
-    }
-
-    /// Sets this context's `cache_enabled`/`cache_ttl` (see the field docs) —
-    /// every async command handler in `app.rs`/`repl.rs` calls this once,
-    /// right where it builds the context, with the value `app::run` resolved
-    /// from `--cache`/`--no-cache`/`default.cache`/`default.cache_ttl`.
-    pub(crate) fn with_cache(mut self, enabled: bool, ttl: Option<u64>) -> Self {
-        self.cache_enabled = enabled;
-        self.cache_ttl = ttl;
-        self
-    }
-
-    /// Sets this context's `approve_tools` (see the field doc) — every async
-    /// command handler in `app.rs`/`repl.rs` calls this once, with the value
-    /// `app::run` resolved from `--approve-tools`.
-    pub(crate) fn with_approve_tools(mut self, approve_tools: bool) -> Self {
-        self.approve_tools = approve_tools;
-        self
-    }
-
-    /// Sets this context's `cancel` (see the field doc) — the process-wide
-    /// token `signal::spawn_handler` cancels on Ctrl-C, so every
-    /// `run_steps`/`complete`/blocking-I/O call downstream of this context
-    /// observes it. Every async command handler in `app.rs` (and
-    /// `repl::run`) calls this with the token `app::run` builds once per
-    /// invocation.
-    pub(crate) fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
-        self.cancel = Some(cancel);
-        self
-    }
-
-    /// Sets this context's `record_dir`/`replay_dir` (see the field docs) —
-    /// `app::run_workflow` calls this from `RunArgs::record`/`RunArgs::replay`,
-    /// and `test_run` calls it with `replay_dir` set from a test definition's
-    /// `replay:` and `record_dir` left `None`.
-    pub(crate) fn with_record_replay(
-        mut self,
-        record_dir: Option<PathBuf>,
-        replay_dir: Option<PathBuf>,
-    ) -> Self {
-        self.record_dir = record_dir;
-        self.replay_dir = replay_dir;
-        self
-    }
-
-    /// Drives `fut` to completion, then unconditionally shuts down the MCP
-    /// registry before handing back `fut`'s result — on success or failure
-    /// alike, so callers don't have to re-derive that ordering themselves.
-    /// Every top-level `lait`/`lait agent run`/`lait run` invocation must
-    /// call this once, at the end, instead of awaiting its work directly.
-    pub(crate) async fn finish<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
-        let result = fut.await;
-        self.registry.shutdown().await;
-        result
-    }
-}
 
 /// The reasoning-effort/temperature/top_p/max_tokens knobs a caller (CLI
 /// invocation, agent file, or workflow step) may set for a single completion
@@ -295,11 +131,15 @@ impl<'a> PromptTurn<'a> {
     }
 }
 
-/// The model/base-URL/API-key/sampling settings for a single completion
-/// request, after resolving aliases and applying every fallback layer.
+/// The model/base-URL/API-key-source/sampling settings for a single completion
+/// request, after resolving aliases and applying every fallback layer. An
+/// API-key command remains inert until the request boundary.
 pub(crate) struct RequestSettings {
     pub(crate) base_url: String,
-    pub(crate) api_key: String,
+    /// The selected key source is kept inert until a request is sent. This
+    /// keeps settings resolution safe for dry-run/lint and avoids running a
+    /// secrets command for a request that is served from replay/cache.
+    pub(crate) api_key: config::ApiKeySource,
     pub(crate) resolved_model: config::ResolvedModel,
     /// Further `models:` alias definitions to fall back to, in order, when
     /// the primary endpoint above fails with a retryable error (a
@@ -366,8 +206,8 @@ enum ToolDecision {
     Deny(String),
 }
 
-/// Checks `qualified_name` against `env.file_config.tool_policy` (see
-/// `config::ToolPolicy`) and, when `env.approve_tools` is set and the policy
+/// Checks `qualified_name` against `env.services.file_config.tool_policy` (see
+/// `config::ToolPolicy`) and, when `env.policy.approve_tools` is set and the policy
 /// didn't already deny it, interactively confirms the call — `y`/`n`/`a`,
 /// via `prompt_tool_approval`. This is the *only* place either gate is
 /// enforced; `McpRegistry::call`'s own `allowed_tools` check still applies
@@ -381,19 +221,19 @@ enum ToolDecision {
 /// outright, approval isn't enabled for, or is already in
 /// `always_approved_tools`.
 async fn tool_decision(
-    env: &AppContext,
+    env: &RunContext,
     qualified_name: &str,
     arguments: &str,
     command_preview: impl FnOnce() -> Option<String>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ToolDecision> {
-    if !env.file_config.tool_policy.allows(qualified_name) {
+    if !env.services.file_config.tool_policy.allows(qualified_name) {
         return Ok(ToolDecision::Deny(format!(
             "denied by 'tool_policy' in {}",
             config::CONFIG_FILE_NAME
         )));
     }
-    if !env.approve_tools {
+    if !env.policy.approve_tools {
         return Ok(ToolDecision::Allow);
     }
     if env
@@ -564,7 +404,7 @@ fn is_fallback_eligible(error: &anyhow::Error) -> bool {
 /// clippy's `too_many_arguments` threshold.
 struct EndpointAttempt {
     base_url: String,
-    api_key: String,
+    api_key: config::ApiKeySource,
     model_id: String,
 }
 
@@ -595,6 +435,7 @@ impl RequestSettings {
     fn request<'a>(
         &'a self,
         endpoint: &'a EndpointAttempt,
+        api_key: &'a str,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &'a [ChatCompletionTools],
@@ -602,7 +443,7 @@ impl RequestSettings {
     ) -> llm::CompletionRequest<'a> {
         llm::CompletionRequest {
             base_url: &endpoint.base_url,
-            api_key: &endpoint.api_key,
+            api_key,
             model_id: &endpoint.model_id,
             reasoning_effort: self.sampling.reasoning_effort,
             temperature: self.sampling.temperature,
@@ -616,18 +457,17 @@ impl RequestSettings {
         }
     }
 
-    /// Advances `(base_url, api_key, model_id)` past a failed attempt to the
-    /// next `self.fallback_candidates` entry, resolving that candidate's own
-    /// endpoint (and running its `api_key_cmd`, if it has one) right now —
-    /// never earlier, so a candidate that's never attempted never runs its
-    /// command. Returns `Ok(false)` (leaving the three unchanged) once
+    /// Advances `(base_url, api_key_source, model_id)` past a failed attempt
+    /// to the next `self.fallback_candidates` entry, selecting that
+    /// candidate's endpoint data but leaving any `api_key_cmd` inert. Returns
+    /// `Ok(false)` (leaving the three unchanged) once
     /// `candidates` is exhausted, telling the caller to give up and return
     /// its original error instead. Shared by `complete_recorded`/
     /// `complete_stream`'s otherwise-identical fallback loops — see
     /// `is_fallback_eligible` for what actually triggers a call to this.
     fn advance_to_next_candidate(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         candidates: &mut std::slice::Iter<'_, config::FallbackCandidate>,
         endpoint: &mut EndpointAttempt,
         error: &anyhow::Error,
@@ -646,10 +486,10 @@ impl RequestSettings {
             error = %error,
             "falling back to the next model definition entry",
         );
-        let (next_base_url, next_api_key) =
-            config::resolve_fallback_endpoint(candidate, &env.file_config)?;
-        endpoint.base_url = next_base_url;
-        endpoint.api_key = next_api_key;
+        let next_endpoint =
+            config::resolve_fallback_endpoint(candidate, &env.services.file_config)?;
+        endpoint.base_url = next_endpoint.base_url;
+        endpoint.api_key = next_endpoint.api_key;
         endpoint.model_id = candidate.model_id.clone();
         Ok(true)
     }
@@ -657,7 +497,7 @@ impl RequestSettings {
     /// Sends a completion request built from these settings, driving a
     /// tool-call loop when `self.mcp`/`self.subagents` names at least one MCP
     /// server or subagent: each round sends the growing message history to
-    /// the model, and if it comes back with `tool_calls`, `env.registry`
+    /// the model, and if it comes back with `tool_calls`, `env.services.registry`
     /// (for an MCP tool) or `call_subagent_tool` (for a subagent tool)
     /// executes them and their results are appended as `tool`-role messages
     /// before the next round. Ends either when a round produces no
@@ -671,7 +511,7 @@ impl RequestSettings {
     /// all, which would silently stop tools from ever firing. See
     /// `docs/usage/ja/mcp.md`.
     ///
-    /// `self.skills` (resolved against `env.skill_cache`, `lait.config.yml`'s
+    /// `self.skills` (resolved against `env.services.skill_cache`, `lait.config.yml`'s
     /// top-level `skills:`) is appended to `system_prompt` before either path
     /// below ever sees it — see `with_skills`. `active_agent_paths` is every
     /// subagent file currently executing on this call stack (canonicalized);
@@ -686,14 +526,18 @@ impl RequestSettings {
     /// feature existed — see `llm::initial_messages`.
     pub(crate) async fn complete(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
         let system_prompt = self
-            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, cancellation.clone())
+            .system_prompt_with_skills(
+                &env.services.skill_cache,
+                turn.system_prompt,
+                cancellation.clone(),
+            )
             .await?;
         let system_prompt = system_prompt.as_deref();
 
@@ -773,7 +617,7 @@ impl RequestSettings {
     /// handled separately above.
     async fn assemble_tool_sets(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(
         mcp::ToolSet,
@@ -782,11 +626,12 @@ impl RequestSettings {
         Vec<ChatCompletionTools>,
     )> {
         let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
-            env.registry.tools(&self.mcp, cancellation.clone()),
-            env.agent_registry
+            env.services.registry.tools(&self.mcp, cancellation.clone()),
+            env.services
+                .agent_registry
                 .tools_cancellable(&self.subagents, cancellation.clone()),
         )?;
-        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.file_config.tools)?;
+        let mut shell_tool_set = shell_tool::tools(&self.tools, &env.services.file_config.tools)?;
         check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
         // Only `.contains()`/`.subagent_name()`/`.tool_name()` (which read
         // `.index`, not `.tools`) are used by callers below, so `.tools`
@@ -804,7 +649,7 @@ impl RequestSettings {
     /// added.
     async fn assemble_tool_loop(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         messages: Vec<ChatCompletionRequestMessage>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<ToolLoop> {
@@ -820,7 +665,7 @@ impl RequestSettings {
     }
 
     /// The one way `complete` sends a request: checks the response disk
-    /// cache first when `env.cache_enabled` (see `crate::cache` and
+    /// cache first when `env.policy.cache.enabled()` (see `crate::cache` and
     /// `docs/usage/ja/config.md`'s キャッシュ section — a hit skips the
     /// network entirely and is *not* recorded in `--show-usage`, since no
     /// request was actually sent), otherwise builds the request via
@@ -837,7 +682,7 @@ impl RequestSettings {
     /// happened to answer it.
     async fn complete_recorded(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
@@ -848,24 +693,26 @@ impl RequestSettings {
         // computed once whenever any of the three is in play, always from
         // the *primary* endpoint (see this method's doc comment on why the
         // cache key ignores which fallback candidate actually answers).
-        let content_key =
-            if env.cache_enabled || env.record_dir.is_some() || env.replay_dir.is_some() {
-                Some(cache::key(
-                    &self.base_url,
-                    &self.resolved_model.model_id,
-                    self.sampling,
-                    &messages,
-                    tools,
-                    response_format.as_ref(),
-                )?)
-            } else {
-                None
-            };
+        let content_key = if env.policy.cache.enabled()
+            || env.policy.cassette.record_dir().is_some()
+            || env.policy.cassette.replay_dir().is_some()
+        {
+            Some(cache::key(
+                &self.base_url,
+                &self.resolved_model.model_id,
+                self.sampling,
+                &messages,
+                tools,
+                response_format.as_ref(),
+            )?)
+        } else {
+            None
+        };
 
         // `--replay` never touches the network or the response cache: every
         // request is answered from `replay_dir`'s cassettes, or the run
         // fails outright (see `cassette::load`).
-        if let Some(replay_dir) = &env.replay_dir {
+        if let Some(replay_dir) = env.policy.cassette.replay_dir() {
             let key = content_key
                 .as_deref()
                 .expect("content_key is computed above whenever replay_dir is set");
@@ -877,11 +724,11 @@ impl RequestSettings {
         // A cache hit would otherwise skip the network call `--record` needs
         // to actually observe, so cache lookup (not the later cache *save*,
         // which stays harmless) is skipped while recording.
-        if env.cache_enabled && env.record_dir.is_none() {
+        if env.policy.cache.enabled() && env.policy.cassette.record_dir().is_none() {
             let cache_key = content_key
                 .as_deref()
                 .expect("content_key is computed above whenever cache_enabled is set");
-            match cache::load(cache_key, env.cache_ttl) {
+            match cache::load(cache_key, env.policy.cache.ttl()) {
                 Ok(Some(response)) => {
                     eprintln!("note: cache hit for {}", self.usage_label);
                     tracing::debug!(cache_key = %cache_key, "response cache hit");
@@ -899,8 +746,15 @@ impl RequestSettings {
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
         loop {
+            let api_key = env
+                .services
+                .secret_resolver
+                .resolve(&endpoint.api_key, cancellation.clone())
+                .await?
+                .unwrap_or_else(|| "lm-studio".to_owned());
             let request = self.request(
                 &endpoint,
+                &api_key,
                 response_format.clone(),
                 messages.clone(),
                 tools,
@@ -909,13 +763,13 @@ impl RequestSettings {
             match llm::complete(request).await {
                 Ok(response) => {
                     env.usage.record_response(&self.usage_label, &response);
-                    if env.cache_enabled
+                    if env.policy.cache.enabled()
                         && let Some(cache_key) = &content_key
                         && let Err(error) = cache::save(cache_key, &response)
                     {
                         tracing::debug!(error = %error, "failed to write response cache entry");
                     }
-                    if let Some(record_dir) = &env.record_dir {
+                    if let Some(record_dir) = env.policy.cassette.record_dir() {
                         let key = content_key
                             .as_deref()
                             .expect("content_key is computed above whenever record_dir is set");
@@ -962,7 +816,7 @@ impl RequestSettings {
     /// another mid-stream.
     async fn stream_endpoint(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
@@ -972,8 +826,15 @@ impl RequestSettings {
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
         loop {
+            let api_key = env
+                .services
+                .secret_resolver
+                .resolve(&endpoint.api_key, cancellation.clone())
+                .await?
+                .unwrap_or_else(|| "lm-studio".to_owned());
             let mut request = self.request(
                 &endpoint,
+                &api_key,
                 response_format.clone(),
                 messages.clone(),
                 tools,
@@ -1019,7 +880,7 @@ impl RequestSettings {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_stream(
         &self,
-        env: &AppContext,
+        env: &RunContext,
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
@@ -1029,7 +890,11 @@ impl RequestSettings {
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<StreamOutcome> {
         let system_prompt = self
-            .system_prompt_with_skills(&env.skill_cache, turn.system_prompt, cancellation.clone())
+            .system_prompt_with_skills(
+                &env.services.skill_cache,
+                turn.system_prompt,
+                cancellation.clone(),
+            )
             .await?;
         let system_prompt = system_prompt.as_deref();
 
@@ -1185,7 +1050,7 @@ impl<'a> AgentTurn<'a> {
 pub(crate) async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,
-    env: &AppContext,
+    env: &RunContext,
     turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
@@ -1297,7 +1162,7 @@ fn subagent_tool_input(
     Ok((input_value, prompt))
 }
 
-/// Runs subagent `name` (resolved via `env.agent_registry`, an `agents:`
+/// Runs subagent `name` (resolved via `env.services.agent_registry`, an `agents:`
 /// entry) against one tool call's raw JSON `arguments`, recursively driving
 /// its own completion (and, if it declares `subagents:`/`mcp:` of its own,
 /// its own tool loop) to completion, and returns its rendered response text —
@@ -1311,7 +1176,7 @@ fn subagent_tool_input(
 pub(crate) fn call_subagent_tool<'a>(
     name: &'a str,
     arguments_json: &'a str,
-    env: &'a AppContext,
+    env: &'a RunContext,
     active_paths: &'a [PathBuf],
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
@@ -1321,6 +1186,7 @@ pub(crate) fn call_subagent_tool<'a>(
         let context = || format!("subagent '{name}'");
 
         let loaded = env
+            .services
             .agent_registry
             .load_cancellable(name, cancellation.clone())
             .await?;
@@ -1344,7 +1210,7 @@ pub(crate) fn call_subagent_tool<'a>(
             subagent_tool_input(&loaded.file, arguments_json).with_context(context)?;
         loaded.validate_input(&input).with_context(context)?;
 
-        let settings = agent_file_settings(&loaded.file, &env.file_config, Some(name))
+        let settings = agent_file_settings(&loaded.file, &env.services.file_config, Some(name))
             .with_context(context)?
             .with_usage_label(format!("subagent '{name}'"));
 
@@ -1363,6 +1229,14 @@ pub(crate) fn call_subagent_tool<'a>(
         .await
         .with_context(context)
     })
+}
+
+fn api_key_source_name(source: &config::ApiKeySource) -> &'static str {
+    match source {
+        config::ApiKeySource::Absent => "absent",
+        config::ApiKeySource::Literal(_) => "literal",
+        config::ApiKeySource::Command(_) => "command",
+    }
 }
 
 /// Resolves the settings for one completion request. `model_name` and every
@@ -1407,7 +1281,7 @@ pub(crate) fn resolve_request_settings(
         Some(resolved) => resolved,
         None => config::resolve_model(model_name, file_config)?,
     };
-    let (base_url, api_key) = config::resolve_endpoint(
+    let endpoint = config::resolve_endpoint(
         base_url_override,
         api_key_override,
         resolved_model.base_url.as_deref(),
@@ -1415,13 +1289,7 @@ pub(crate) fn resolve_request_settings(
         resolved_model.api_key_cmd.as_ref(),
         file_config,
     )?;
-    let api_key = api_key.unwrap_or_else(|| {
-        // async-openai always builds an Authorization header from its config.
-        // LM Studio ignores the value, so use a non-empty dummy key when no
-        // key was supplied instead of making local requests fail on an empty
-        // header value.
-        "lm-studio".to_owned()
-    });
+    let config::Endpoint { base_url, api_key } = endpoint;
     let sampling = SamplingOverrides {
         reasoning_effort: overrides
             .reasoning_effort
@@ -1480,7 +1348,7 @@ pub(crate) fn resolve_request_settings(
     tracing::debug!(
         model_id = %resolved_model.model_id,
         base_url = %base_url,
-        api_key = %crate::logging::mask_secret(&api_key),
+        api_key_source = %api_key_source_name(&api_key),
         reasoning_effort = ?sampling.reasoning_effort,
         temperature = ?sampling.temperature,
         top_p = ?sampling.top_p,
@@ -1563,8 +1431,9 @@ pub(crate) fn agent_file_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::stream_response;
-    use std::time::Duration;
+    use super::context::{CachePolicy, CancellationSource, CassettePolicy, RunContext};
+    use super::{AppServices, stream_response};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
     use tokio_util::sync::CancellationToken;
 
     /// A regression test for the bug `stream_response`'s cancellation
@@ -1595,5 +1464,46 @@ mod tests {
             error.downcast_ref::<crate::error::Interrupted>().is_some(),
             "{error}"
         );
+    }
+
+    #[test]
+    fn operation_cancellation_is_a_child_of_the_invocation_source() {
+        let root = CancellationToken::new();
+        let source = CancellationSource::new(root.clone());
+        let operation = source.operation_token();
+
+        operation.cancel();
+        assert!(!root.is_cancelled());
+
+        root.cancel();
+        assert!(source.root_token().is_cancelled());
+        assert!(operation.is_cancelled());
+    }
+
+    #[test]
+    fn cassette_policy_rejects_record_and_replay_together() {
+        let services = Arc::new(AppServices::new(Arc::new(
+            crate::config::ConfigFile::default(),
+        )));
+        let context = RunContext::new(services, CancellationToken::new());
+        let result = context
+            .with_record_replay(Some(PathBuf::from("record")), Some(PathBuf::from("replay")));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cache_and_cassette_modes_expose_only_their_valid_operations() {
+        let cache = CachePolicy::Enabled { ttl: Some(30) };
+        assert!(cache.enabled());
+        assert_eq!(cache.ttl(), Some(30));
+
+        let record = CassettePolicy::Record(PathBuf::from("record"));
+        assert!(record.record_dir().is_some());
+        assert!(record.replay_dir().is_none());
+
+        let replay = CassettePolicy::Replay(PathBuf::from("replay"));
+        assert!(replay.record_dir().is_none());
+        assert!(replay.replay_dir().is_some());
     }
 }

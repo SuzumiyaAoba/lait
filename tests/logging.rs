@@ -63,7 +63,7 @@ fn dash_v_v_traces_the_request_on_stderr_without_touching_stdout() {
 }
 
 #[test]
-fn dash_v_v_masks_the_api_key_on_stderr() {
+fn dash_v_v_reports_the_api_key_source_without_logging_key_characters() {
     let server = MockServer::start(
         "200 OK",
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
@@ -84,7 +84,11 @@ fn dash_v_v_masks_the_api_key_on_stderr() {
         "the raw api key must never appear in verbose output: {stderr}"
     );
     assert!(
-        stderr.contains("test***"),
-        "expected the masked api key prefix in stderr: {stderr}"
+        stderr.contains("api_key_source") && stderr.contains("literal"),
+        "expected the credential source in stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("test***"),
+        "credential prefixes must not be logged: {stderr}"
     );
 }

@@ -151,6 +151,52 @@ steps:
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dry_run_does_not_run_an_api_key_command() {
+    let config = ConfigDirectory::empty();
+    let marker = config.path().join("api-key-command-ran");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: http://127.0.0.1:1/v1
+        api_key_cmd: ["sh", "-c", "touch '{}' ; printf dry-run-secret"]
+      model_id: workflow-model
+nodes:
+  echo:
+    type: prompt
+    prompt: "{{{{ input }}}}"
+steps:
+  - use: echo
+"#,
+        marker.display()
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "run",
+            workflow
+                .path
+                .to_str()
+                .expect("workflow path should be UTF-8"),
+            "hello",
+            "--dry-run",
+        ])
+        .output()
+        .expect("failed to execute lait run --dry-run");
+
+    assert!(output.status.success(), "dry-run failed: {output:?}");
+    assert!(
+        !marker.exists(),
+        "dry-run must not resolve an API-key command"
+    );
+}
+
 #[test]
 fn run_emits_json_with_the_same_shape_as_chat() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);

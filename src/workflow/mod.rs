@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
 
 use crate::{config::ConfigFile, jq, registry};
 
@@ -15,6 +15,7 @@ pub(crate) mod dryrun;
 pub(crate) mod exec;
 pub(crate) mod graph;
 mod model;
+mod raw;
 pub(crate) mod scope;
 mod validate;
 
@@ -82,49 +83,28 @@ pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
         .with_context(|| format!("failed to parse workflow file '{}'", path.display()))
 }
 
-fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
-    let workflow: WorkflowFile = serde_yaml::from_str(contents).map_err(|error| {
+pub(crate) fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
+    let workflow: model::RawWorkflowFile = serde_yaml::from_str(contents).map_err(|error| {
         // A node with no `type:` at all — the pre-version schema's shape —
         // fails here with a "missing field `type`" message from the
         // now-tagged `NodeDefinition` enum. That message alone doesn't say
         // *why*, so point the author at the fix instead of leaving them to
         // find B-1's changelog entry.
         if error.to_string().contains("missing field `type`") {
-            anyhow!(
-                "{error}\n\nevery entry under 'nodes:' now requires a 'type:' \
-                 (prompt/agent/workflow/command/transform/ask); see docs/usage/ja/workflow.md"
+            anyhow::Error::new(error).context(
+                "every entry under 'nodes:' requires a 'type:' \
+                 (prompt/agent/workflow/command/transform/ask); see docs/usage/ja/workflow.md",
             )
         } else {
             error.into()
         }
     })?;
-    if let Some(version) = workflow.version
-        && version != CURRENT_WORKFLOW_VERSION
-    {
-        bail!(
-            "unsupported workflow schema 'version: {version}'; this build of lait supports \
-             version {CURRENT_WORKFLOW_VERSION} (omit 'version:' to use the latest one this \
-             build supports)"
-        );
-    }
-    if workflow.steps.is_empty() {
-        bail!("workflow must contain at least one step");
-    }
-    validate::validate_workflow_defaults(&workflow.default)?;
-    for (node_id, node) in &workflow.nodes {
-        validate::validate_node(node, node_id)?;
-    }
-    validate::validate_steps(
-        &workflow.steps,
-        &workflow.nodes,
-        validate::FlowContext::TOP_LEVEL,
-    )?;
-    Ok(workflow)
+    workflow.validate()
 }
 
 /// Builds the `vars` object a `lait run --var KEY=VALUE` invocation exposes
 /// to step templates as `{{ vars.<key> }}` and to jq filters as
-/// `$vars.<key>` (see `engine::AppContext::vars`). Unlike a named prompt's
+/// `$vars.<key>` (see `engine::RunContext::vars`). Unlike a named prompt's
 /// `--var` (`prompt::build_vars`, always a string), each VALUE is parsed as
 /// JSON when possible — `--var items='["a","b"]'` becomes a structured
 /// array/object rather than its literal text — falling back to a plain JSON
@@ -154,7 +134,7 @@ pub(crate) type StepOutputs = jq::Steps;
 /// worker as well, so a very large plain-text input cannot block a Tokio
 /// executor thread before jq starts evaluating it. `steps` is exposed to the
 /// filter as `$steps` (see `StepOutputs`), `vars` as `$vars` (see
-/// `engine::AppContext::vars`).
+/// `engine::RunContext::vars`).
 pub(crate) async fn eval_when_async(
     filter: &str,
     current_input: &str,

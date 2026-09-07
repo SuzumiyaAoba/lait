@@ -28,6 +28,8 @@ use std::os::unix::fs::FileTypeExt;
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 
+use crate::file_lock;
+
 /// A filesystem operation gets one dedicated OS thread, rather than occupying
 /// Tokio's shared blocking pool.  Keep the number of such threads bounded,
 /// though: a caller can provide a large attachment list and a slow filesystem
@@ -129,12 +131,78 @@ pub(crate) async fn acquire_path_lock(
     path: &Path,
     cancellation: Option<&CancellationToken>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let path = path.to_owned();
+    let key = run_blocking(
+        move |cancelled| output_path_identity(&path, cancelled),
+        cancellation.cloned(),
+    )
+    .await?;
     acquire_permit(
-        path_lock(path),
+        path_lock(&key),
         cancellation,
         "output path is still owned by a previous write",
     )
     .await
+}
+
+/// Resolve aliases before entering the lock table. Outputs need not exist yet;
+/// in that case normalize their parent and also follow a dangling final symlink.
+/// Filesystem resolution runs on the same bounded, cancellable worker pool as I/O.
+fn output_path_identity(path: &Path, cancelled: &AtomicBool) -> Result<PathBuf> {
+    let mut current = path.to_owned();
+    let mut suffix = Vec::new();
+    let mut links = 0;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            bail!(crate::error::Interrupted::cancelled(
+                "output path resolution was cancelled"
+            ));
+        }
+        match std::fs::canonicalize(&current) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to resolve output path '{}'", path.display())
+                });
+            }
+        }
+        if std::fs::symlink_metadata(&current)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            if links >= 40 {
+                bail!(
+                    "too many symbolic links in output path '{}'",
+                    path.display()
+                );
+            }
+            links += 1;
+            let target = std::fs::read_link(&current).with_context(|| {
+                format!("failed to read output symlink '{}'", current.display())
+            })?;
+            current = if target.is_absolute() {
+                target
+            } else {
+                current.parent().unwrap_or(Path::new(".")).join(target)
+            };
+            continue;
+        }
+        let name = current
+            .file_name()
+            .with_context(|| format!("invalid output path '{}'", path.display()))?
+            .to_owned();
+        suffix.push(name);
+        current = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_owned();
+    }
 }
 
 /// Runs a blocking operation while holding the ownership lease for `path`.
@@ -562,46 +630,33 @@ fn wait_for_fifo_event(file: &mut File, path: &Path) -> Result<FifoEvent> {
             ));
         }
 
-        // POSIX does not expose a FIFO's writer count. In particular, macOS
-        // reports no poll event for both "no writer" and "writer connected,
-        // no data". Temporarily opening a non-blocking write descriptor and
-        // then probing the reader distinguishes those states without leaving
-        // a synthetic writer attached: EOF means the probe was the only
-        // writer, WouldBlock means a real writer is still connected, and a
-        // byte is retained for the normal read loop.
-        return probe_fifo_writer(file, path);
+        // On systems exposing POLLHUP, this also observes a writer that
+        // connected and closed without leaving any bytes between our polls.
+        if pollfd.revents & libc::POLLHUP != 0 {
+            return Ok(FifoEvent::WriterConnected);
+        }
+        return probe_fifo_reader(file);
     }
 }
 
 #[cfg(unix)]
-fn probe_fifo_writer(file: &mut File, path: &Path) -> Result<FifoEvent> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    match OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(probe) => drop(probe),
-        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-            return Ok(FifoEvent::NoWriter);
-        }
-        Err(error) => return Err(error.into()),
-    }
-
+fn probe_fifo_reader(file: &mut File) -> Result<FifoEvent> {
+    // Reading an empty nonblocking FIFO returns EOF when no writer exists,
+    // and WouldBlock when a writer is connected. Do not manufacture a writer:
+    // that changes FIFO state, requires write permission, and its descriptor
+    // can be inherited transiently by concurrent process creation.
     let mut byte = [0_u8; 1];
     match file.read(&mut byte) {
         Ok(0) => {
-            // The probe was the only writer. Avoid a tight loop while waiting
-            // for a real writer to arrive (poll can return immediately for a
-            // FIFO in this state on some platforms).
             std::thread::sleep(Duration::from_millis(10));
             Ok(FifoEvent::NoWriter)
         }
         Ok(1) => Ok(FifoEvent::Data(byte[0])),
         Ok(read) => bail!("FIFO probe read an unexpected number of bytes: {read}"),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(FifoEvent::WriterConnected),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => probe_fifo_writer(file, path),
+        // Return to the outer cancellation check instead of recursively
+        // probing under a sustained stream of signals.
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(FifoEvent::NoWriter),
         Err(error) => Err(error.into()),
     }
 }
@@ -670,7 +725,11 @@ pub(crate) async fn canonicalize(
 /// this cleanup cannot itself get stuck. Regular files use the same direct
 /// create/truncate/write behavior as `fs::write`, with cancellation checks
 /// between bounded chunks so existing inode, permission, hard-link, and
-/// symlink semantics remain intact.
+/// symlink semantics remain intact. After opening a regular file, an advisory
+/// descriptor lease from [`crate::file_lock`] is held through the write so
+/// hard-link aliases and path replacement after canonicalization are serialized
+/// when the cooperating writers use the same lease. External writers that do
+/// not take an advisory lease remain outside this guarantee.
 pub(crate) async fn write_output_file(
     path: &Path,
     output: &str,
@@ -712,7 +771,7 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let file = loop {
+        let mut file = loop {
             if cancelled.load(Ordering::Acquire) {
                 bail!(crate::error::Interrupted::cancelled(
                     "output file write was cancelled"
@@ -739,7 +798,12 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
             return write_nonblocking_special_file(file, output, cancelled);
         }
 
-        write_regular_output_file(file, output, cancelled)
+        // The canonical path lease above serializes aliases we can resolve by
+        // name. This second, advisory descriptor lease covers hard links and
+        // symlink replacement after path resolution. It is acquired before
+        // truncate and held through the entire regular-file write.
+        let _lease = file_lock::ExclusiveLease::acquire(&file, cancelled)?;
+        write_regular_output_file(&mut file, output, cancelled)
     }
 
     #[cfg(not(unix))]
@@ -767,14 +831,18 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
                 path.display()
             );
         }
-        write_regular_output_file(file, output, cancelled)
+        // Keep the descriptor lease on the opened regular file until the
+        // write returns; this also covers every failure path before/after
+        // truncation without relying on the path name remaining stable.
+        let _lease = file_lock::ExclusiveLease::acquire(&file, cancelled)?;
+        write_regular_output_file(&mut file, output, cancelled)
     }
 }
 
 /// Writes an ordinary file directly, preserving the target inode and the
 /// overwrite/permission behavior of `fs::write`. Chunking only exists to give
 /// a timed worker a bounded opportunity to observe cancellation.
-fn write_regular_output_file(mut file: File, output: &str, cancelled: &AtomicBool) -> Result<()> {
+fn write_regular_output_file(file: &mut File, output: &str, cancelled: &AtomicBool) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
         bail!(crate::error::Interrupted::cancelled(
             "output file write was cancelled"
@@ -847,7 +915,7 @@ mod tests {
         run_blocking_with_path_lock, run_blocking_with_pool, write_output_file,
     };
     use std::{
-        fs,
+        fs::{self, OpenOptions},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1224,6 +1292,71 @@ mod tests {
         assert_eq!(contents, "original");
     }
 
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn hardlink_writers_publish_one_complete_payload() {
+        let dir = crate::test_support::unique_temp_path("lait-hardlink-writers", "");
+        fs::create_dir(&dir).unwrap();
+        let first_path = dir.join("first.txt");
+        let second_path = dir.join("second.txt");
+        fs::write(&first_path, "seed").unwrap();
+        fs::hard_link(&first_path, &second_path).unwrap();
+
+        let first_output = "A".repeat(2 * 1024 * 1024);
+        let second_output = "B".repeat(2 * 1024 * 1024);
+        let (first, second) = tokio::join!(
+            write_output_file(&first_path, &first_output, None),
+            write_output_file(&second_path, &second_output, None),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let written = fs::read(&first_path).unwrap();
+        assert!(
+            written == first_output.as_bytes() || written == second_output.as_bytes(),
+            "hardlink writes must not interleave"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cancelling_a_hardlink_writer_before_its_lease_keeps_original_contents() {
+        let dir = crate::test_support::unique_temp_path("lait-hardlink-cancel", "");
+        fs::create_dir(&dir).unwrap();
+        let first_path = dir.join("first.txt");
+        let second_path = dir.join("second.txt");
+        fs::write(&first_path, "original").unwrap();
+        fs::hard_link(&first_path, &second_path).unwrap();
+
+        let held_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&first_path)
+            .unwrap();
+        let held_cancelled = AtomicBool::new(false);
+        let _held_lease =
+            crate::file_lock::ExclusiveLease::acquire(&held_file, &held_cancelled).unwrap();
+
+        let cancellation = CancellationToken::new();
+        let writer_path = second_path.clone();
+        let writer_cancellation = cancellation.clone();
+        let writer = tokio::spawn(async move {
+            write_output_file(&writer_path, "replacement", Some(writer_cancellation)).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("a contended hardlink writer should cancel promptly")
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), "original");
+        drop(_held_lease);
+        drop(held_file);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cancelled_fifo_write_is_joined_before_a_retry_can_write() {
@@ -1324,6 +1457,83 @@ mod tests {
             "the cancelled writer's bytes must precede the retry payload"
         );
         assert_eq!(&received[first_prefix_len..], retry_output.as_bytes());
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn output_path_aliases_share_the_same_lease_before_and_after_creation() {
+        let dir = crate::test_support::unique_temp_path("lait-output-alias", "");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("output.txt");
+        let alias = dir.join(".").join("output.txt");
+        let lease = acquire_path_lock(&path, None).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&alias, None))
+                .await
+                .is_err()
+        );
+        std::fs::write(&path, "created while holding the lease").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&alias, None))
+                .await
+                .is_err()
+        );
+        drop(lease);
+        let _next = tokio::time::timeout(Duration::from_secs(1), acquire_path_lock(&alias, None))
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dangling_output_symlink_and_its_target_share_a_lease() {
+        let dir = crate::test_support::unique_temp_path("lait-output-symlink", "");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("output.txt");
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink("output.txt", &link).unwrap();
+        let lease = acquire_path_lock(&link, None).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&path, None))
+                .await
+                .is_err()
+        );
+        drop(lease);
+        let _next = tokio::time::timeout(Duration::from_secs(1), acquire_path_lock(&path, None))
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn waiting_for_a_fifo_writer_needs_only_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = crate::test_support::unique_temp_path("lait-read-only-fifo", "");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut read = Box::pin(super::read_to_string_cancellable(
+            &path,
+            Some(cancellation.clone()),
+            1024,
+        ));
+        tokio::select! {
+            result = &mut read => panic!("reader returned before any writer: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => cancellation.cancel(),
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.downcast_ref::<crate::error::Interrupted>().is_some());
         std::fs::remove_file(path).unwrap();
     }
 }

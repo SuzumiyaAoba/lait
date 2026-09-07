@@ -69,7 +69,7 @@ fn print_step(
     ctx: &DryRunContext,
     indent: &str,
 ) -> Result<()> {
-    match &step.when {
+    match step.when() {
         Some(when) => println!("{indent}[{counter}] {label}  (when: {when})"),
         None => println!("{indent}[{counter}] {label}"),
     }
@@ -79,26 +79,18 @@ fn print_step(
         return Ok(());
     }
 
-    if let Some(node_id) = &step.r#use {
-        // Guaranteed by `validate::validate_steps` before a workflow ever
-        // reaches this point (or `execute_step`'s runtime lookup, which the
-        // same comment justifies).
-        let node = ctx
-            .scope
-            .nodes
-            .get(node_id)
-            .expect("validate_steps guarantees 'use' resolves in 'nodes'");
-        print_node(node, node_id, label, ctx, indent)?;
-        if let Some(on_error) = &step.on_error {
+    if let Some(call) = step.call() {
+        print_node(call.definition, call.name, label, ctx, indent)?;
+        if let Some(on_error) = step.on_error() {
             println!("{indent}    -> on_error:");
             print_steps(&on_error.steps, ctx, &format!("{indent}       "))?;
         }
     }
 
-    if step.stop == Some(true) {
+    if step.control() == crate::workflow::Control::Stop {
         println!("{indent}    -> stop: ends the workflow with this step's output");
     }
-    if step.r#break == Some(true) {
+    if step.control() == crate::workflow::Control::Break {
         println!(
             "{indent}    -> break: ends the nearest enclosing loop/for_each with this step's output"
         );
@@ -143,14 +135,12 @@ fn print_router(router: Router<'_>, ctx: &DryRunContext, indent: &str) -> Result
             }
         }
         Router::Loop(loop_def) => {
-            let condition = match (&loop_def.r#while, &loop_def.until) {
-                (Some(cond), _) => format!("while {cond}"),
-                (None, Some(cond)) => format!("until {cond}"),
-                (None, None) => "(no condition)".to_owned(),
-            };
-            let max_iterations = loop_def
-                .max_iterations
-                .map_or_else(|| "?".to_owned(), |n| n.to_string());
+            let condition = format!(
+                "{} {}",
+                loop_def.condition.keyword(),
+                loop_def.condition.filter()
+            );
+            let max_iterations = loop_def.max_iterations;
             println!("{inner}{condition}, max_iterations: {max_iterations}");
             print_steps(&loop_def.steps, ctx, &body_indent)?;
         }

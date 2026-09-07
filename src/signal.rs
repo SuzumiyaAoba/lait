@@ -6,7 +6,7 @@
 //! deliberately never calls it — see `app::run_chat_or_repl`'s doc comment
 //! for why a one-shot token doesn't fit a loop that runs many turns.
 //!
-//! The first Ctrl-C cancels the process's `engine::AppContext::cancel`
+//! The first Ctrl-C cancels the process's root cancellation token
 //! token, which every in-flight blocking I/O op, model request, and MCP
 //! call is already wired to react to (see `async_io.rs`) — including a
 //! workflow's own `run_steps` step loop

@@ -8,10 +8,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::{
-    cli::{Cli, ReasoningEffort},
-    secret,
-};
+use crate::cli::{Cli, ReasoningEffort};
 
 pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
 
@@ -117,8 +114,8 @@ pub(crate) struct ConfigFile {
     /// of embedding it in plaintext (or requiring a pre-exported environment
     /// variable, like `${VAR}` does) — e.g. a secrets-manager CLI (1Password,
     /// pass, gopass, aws secretsmanager, ...). Mutually exclusive with
-    /// `api_key`; see `resolve_endpoint`, which enforces that and runs
-    /// whichever layer's command actually wins. See `secret::resolve`.
+    /// `api_key`; see `resolve_endpoint`, which enforces that and retains
+    /// whichever layer's command actually wins for request-time resolution.
     pub(crate) api_key_cmd: Option<CommandSpec>,
     #[serde(default)]
     pub(crate) default: DefaultSettings,
@@ -190,7 +187,8 @@ pub(crate) struct ShellToolDefinition {
     /// through a shell — no element can inject a second command via `;`/`|`/
     /// backticks, even if it's built from an untrusted rendered value.
     /// Validated non-empty at first use (see `shell_tool::tools`) and by
-    /// `lait lint`, since `process::run_command` panics on an empty argv.
+    /// `lait lint`; `process::run_command` also returns a clear error for an
+    /// empty argv instead of attempting to spawn it.
     pub(crate) command: Vec<String>,
     /// The JSON Schema describing the tool's call arguments, sent to the
     /// model verbatim as the OpenAI tool definition's `parameters`. Defaults
@@ -552,12 +550,33 @@ struct ProviderConfig {
 /// pipes/quoting/subshells work the way a one-liner like `op read
 /// op://Personal/OpenAI/api-key` expects — or a literal argv list, run
 /// directly with no shell involved, for a command whose arguments should
-/// never be shell-interpreted. See `secret::resolve`.
-#[derive(Debug, Clone, Deserialize)]
+/// never be shell-interpreted. See [`crate::secret::SecretResolver`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CommandSpec {
     Shell(String),
     Argv(Vec<String>),
+}
+
+/// The selected API-key source for one endpoint. Selection and environment
+/// expansion happen in `resolve_endpoint`; a [`Command`] is intentionally
+/// retained as data so the command can be executed asynchronously only when
+/// the request is about to be sent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ApiKeySource {
+    Absent,
+    Literal(String),
+    Command(CommandSpec),
+}
+
+/// A fully selected endpoint. It is pure configuration data: resolving a
+/// command source never launches a process. `engine::RequestSettings` keeps
+/// the `api_key` source until its first actual request and asks the shared
+/// `secret::SecretResolver` to resolve it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Endpoint {
+    pub(crate) base_url: String,
+    pub(crate) api_key: ApiKeySource,
 }
 
 #[derive(Debug)]
@@ -638,7 +657,7 @@ pub(crate) fn check_provider_api_key_sources(config: &ConfigFile) -> Vec<String>
 /// Checks every `tools:` entry's `command`/`parameters` for the two things
 /// `process::run_command` and the OpenAI tool-schema wire format both
 /// require but `serde`'s own type-checking can't: a non-empty `command`
-/// (`run_command` panics on an empty argv — see
+/// (`run_command` rejects an empty argv at runtime — see
 /// `ShellToolDefinition::command`'s doc comment) and a `parameters` value
 /// that is a JSON object (a non-object `parameters` would still deserialize
 /// fine as `serde_json::Value`, but is not a valid JSON Schema object for
@@ -736,64 +755,58 @@ pub(crate) fn resolve_model_fallbacks(
 
 /// Resolves `candidate`'s endpoint (`${VAR}`-expanded, trailing slash
 /// trimmed — the same normalization `resolve_endpoint` applies to the
-/// primary candidate) and API key (literal, `api_key_cmd`, or falling back
-/// to the top-level `api_key`/`api_key_cmd` — the same three-tier order
-/// `resolve_endpoint` uses for the primary candidate's own model-definition
-/// layer). Only called for a candidate `RequestSettings::complete_recorded`/
-/// `complete_stream` is actually about to attempt, so a losing candidate's
-/// `api_key_cmd` (if any) is never run — see `secret::resolve`.
+/// primary candidate) and selects its API-key source (literal,
+/// `api_key_cmd`, or falling back to the top-level `api_key`/`api_key_cmd`).
+/// Only called when a candidate is about to be attempted. It never launches
+/// an `api_key_cmd`; the returned [`ApiKeySource::Command`] is resolved by the
+/// shared asynchronous secret resolver at the actual request boundary.
 pub(crate) fn resolve_fallback_endpoint(
     candidate: &FallbackCandidate,
     file_config: &ConfigFile,
-) -> Result<(String, String)> {
+) -> Result<Endpoint> {
     let base_url = normalize_base_url(expand_env_placeholders(&candidate.base_url)?)?;
-    let api_key = resolve_api_key(
+    check_api_key_source(
+        &file_config.api_key,
+        &file_config.api_key_cmd,
+        "top-level configuration",
+    )?;
+    let api_key = select_api_key_source(
         None,
         candidate.api_key.as_deref(),
         candidate.api_key_cmd.as_ref(),
         file_config.api_key.as_deref(),
         file_config.api_key_cmd.as_ref(),
-    )?
-    .unwrap_or_else(|| {
-        // Mirrors `resolve_request_settings`'s own dummy-key substitution —
-        // async-openai always builds an Authorization header, and LM Studio
-        // ignores its value.
-        "lm-studio".to_owned()
-    });
-    Ok((base_url, api_key))
+    )?;
+    Ok(Endpoint { base_url, api_key })
 }
 
-/// Resolves one `api_key`/`api_key_cmd` layer — a literal value (`${VAR}`-
-/// expanded) or an `api_key_cmd` to run for it — the same two-source pair
-/// every layer (candidate, model-definition, top-level config) offers.
-/// `None` when neither is set.
-fn resolve_literal_or_cmd(
+/// Selects one API-key source in precedence order. Literal values from config
+/// are expanded here, after their layer has won; command specs remain inert
+/// data for [`crate::secret::SecretResolver`] to execute asynchronously at
+/// request time.
+fn select_api_key_source(
+    override_value: Option<String>,
     api_key: Option<&str>,
     api_key_cmd: Option<&CommandSpec>,
-) -> Result<Option<String>> {
-    if let Some(api_key) = api_key {
-        Ok(Some(expand_env_placeholders(api_key)?))
-    } else if let Some(command) = api_key_cmd {
-        Ok(Some(secret::resolve(command)?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn resolve_api_key(
-    override_value: Option<String>,
-    model_api_key: Option<&str>,
-    model_api_key_cmd: Option<&CommandSpec>,
     config_api_key: Option<&str>,
     config_api_key_cmd: Option<&CommandSpec>,
-) -> Result<Option<String>> {
+) -> Result<ApiKeySource> {
     if let Some(api_key) = override_value {
-        return Ok(Some(api_key));
+        return Ok(ApiKeySource::Literal(api_key));
     }
-    if let Some(api_key) = resolve_literal_or_cmd(model_api_key, model_api_key_cmd)? {
-        return Ok(Some(api_key));
+    if let Some(api_key) = api_key {
+        return Ok(ApiKeySource::Literal(expand_env_placeholders(api_key)?));
     }
-    resolve_literal_or_cmd(config_api_key, config_api_key_cmd)
+    if let Some(command) = api_key_cmd {
+        return Ok(ApiKeySource::Command(command.clone()));
+    }
+    if let Some(api_key) = config_api_key {
+        return Ok(ApiKeySource::Literal(expand_env_placeholders(api_key)?));
+    }
+    if let Some(command) = config_api_key_cmd {
+        return Ok(ApiKeySource::Command(command.clone()));
+    }
+    Ok(ApiKeySource::Absent)
 }
 
 fn expand_list(values: &[String]) -> Result<Vec<String>> {
@@ -866,13 +879,12 @@ pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 /// The API key follows the same three layers, except each of the two
 /// config-sourced ones (`model_api_key`/`model_api_key_cmd`,
 /// `file_config.api_key`/`file_config.api_key_cmd`) may set a literal value
-/// *or* an `api_key_cmd` to run for it — never both (`check_api_key_source`
-/// rejects that regardless of which layer ends up winning). Only the winning
-/// layer's command, if any, is actually run — `secret::resolve` caches by
-/// command, but there is no reason to run a losing layer's command at all.
-/// The result comes back as `None` when no layer sets a key —
-/// `resolve_request_settings` substitutes its dummy key, `lait models
-/// --remote` sends no Authorization header at all.
+/// *or* an `api_key_cmd` — never both (`check_api_key_source` rejects that
+/// regardless of which layer ends up winning). The selected command is kept
+/// inert in the returned [`Endpoint`] and is resolved by the asynchronous
+/// secret resolver only when a request is sent. `ApiKeySource::Absent` means
+/// `RequestSettings` can use its dummy key for async-openai, while
+/// `lait models --remote` can omit the Authorization header.
 pub(crate) fn resolve_endpoint(
     base_url_override: Option<String>,
     api_key_override: Option<String>,
@@ -880,17 +892,23 @@ pub(crate) fn resolve_endpoint(
     model_api_key: Option<&str>,
     model_api_key_cmd: Option<&CommandSpec>,
     file_config: &ConfigFile,
-) -> Result<(String, Option<String>)> {
-    let model_base_url = model_base_url.map(expand_env_placeholders).transpose()?;
-    let config_base_url = file_config
-        .base_url
-        .as_deref()
-        .map(expand_env_placeholders)
-        .transpose()?;
-    let base_url = base_url_override
-        .or(model_base_url)
-        .or(config_base_url)
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+) -> Result<Endpoint> {
+    // Select the source before expanding it. Apart from avoiding needless
+    // work, this is important for precedence: an unset `${VAR}` in a lower
+    // priority source must not make a request fail when an override already
+    // supplies the endpoint that will be used.
+    let base_url = match base_url_override {
+        Some(base_url) => base_url,
+        None => match model_base_url {
+            Some(base_url) => expand_env_placeholders(base_url)?,
+            None => file_config
+                .base_url
+                .as_deref()
+                .map(expand_env_placeholders)
+                .transpose()?
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
+        },
+    };
     let base_url = normalize_base_url(base_url)?;
 
     check_api_key_source(
@@ -898,14 +916,14 @@ pub(crate) fn resolve_endpoint(
         &file_config.api_key_cmd,
         "top-level configuration",
     )?;
-    let api_key = resolve_api_key(
+    let api_key = select_api_key_source(
         api_key_override,
         model_api_key,
         model_api_key_cmd,
         file_config.api_key.as_deref(),
         file_config.api_key_cmd.as_ref(),
     )?;
-    Ok((base_url, api_key))
+    Ok(Endpoint { base_url, api_key })
 }
 
 /// The parsing logic behind `expand_env_placeholders`, taking a `lookup`
@@ -1103,9 +1121,9 @@ fn load_global_config() -> Result<Option<ConfigFile>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigFile, DefaultSettings, McpServerConfig, McpTransport, ShellToolDefinition,
-        ToolPolicy, check_shell_tool_definition, expand_with, normalize_base_url, resolve_api_key,
-        resolve_model,
+        ApiKeySource, ConfigFile, DefaultSettings, McpServerConfig, McpTransport,
+        ShellToolDefinition, ToolPolicy, check_shell_tool_definition, expand_with,
+        normalize_base_url, resolve_endpoint, resolve_model,
     };
     use std::collections::HashMap;
 
@@ -1269,25 +1287,109 @@ mod tests {
     }
 
     #[test]
-    fn resolve_api_key_uses_the_first_available_layer() {
+    fn resolve_endpoint_selects_the_first_available_api_key_source() {
+        let config = ConfigFile {
+            api_key: Some("config-key".to_owned()),
+            ..ConfigFile::default()
+        };
+        let endpoint = resolve_endpoint(
+            None,
+            None,
+            Some("https://model.example/v1"),
+            Some("model-key"),
+            None,
+            &config,
+        )
+        .unwrap();
         assert_eq!(
-            resolve_api_key(None, Some("model-key"), None, Some("config-key"), None,)
-                .unwrap()
-                .as_deref(),
-            Some("model-key")
+            endpoint.api_key,
+            ApiKeySource::Literal("model-key".to_owned())
         );
+
+        let endpoint = resolve_endpoint(
+            None,
+            Some("override-key".to_owned()),
+            Some("https://model.example/v1"),
+            Some("model-key"),
+            None,
+            &config,
+        )
+        .unwrap();
         assert_eq!(
-            resolve_api_key(
-                Some("override-key".to_owned()),
-                Some("model-key"),
-                None,
-                Some("config-key"),
-                None,
-            )
-            .unwrap()
-            .as_deref(),
-            Some("override-key")
+            endpoint.api_key,
+            ApiKeySource::Literal("override-key".to_owned())
         );
+    }
+
+    #[test]
+    fn resolve_endpoint_keeps_api_key_commands_inert() {
+        let config = ConfigFile {
+            api_key_cmd: Some(super::CommandSpec::Argv(vec![
+                "command-that-must-not-run".to_owned(),
+            ])),
+            ..ConfigFile::default()
+        };
+        let endpoint = resolve_endpoint(
+            None,
+            None,
+            Some("https://model.example/v1"),
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint.api_key,
+            ApiKeySource::Command(super::CommandSpec::Argv(vec![
+                "command-that-must-not-run".to_owned(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_expands_only_the_winning_base_url_layer() {
+        let config = ConfigFile {
+            base_url: Some("${config-base-url-must-not-be-read}".to_owned()),
+            api_key: Some("${config-api-key-must-not-be-read}".to_owned()),
+            ..ConfigFile::default()
+        };
+
+        let endpoint = resolve_endpoint(
+            Some("http://override.example/v1///".to_owned()),
+            Some("override-key".to_owned()),
+            Some("${model-base-url-must-not-be-read}"),
+            Some("${model-api-key-must-not-be-read}"),
+            None,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(endpoint.base_url, "http://override.example/v1");
+        assert_eq!(
+            endpoint.api_key,
+            ApiKeySource::Literal("override-key".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_does_not_expand_config_when_model_base_url_wins() {
+        let config = ConfigFile {
+            base_url: Some("${config-base-url-must-not-be-read}".to_owned()),
+            ..ConfigFile::default()
+        };
+
+        let endpoint = resolve_endpoint(
+            None,
+            None,
+            Some("http://model.example/v1///"),
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(endpoint.base_url, "http://model.example/v1");
+        assert_eq!(endpoint.api_key, ApiKeySource::Absent);
     }
 
     fn lookup_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

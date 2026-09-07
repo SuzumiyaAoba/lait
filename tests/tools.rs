@@ -133,6 +133,43 @@ fn a_timeout_is_returned_as_a_tool_result_and_the_loop_continues() {
 }
 
 #[test]
+fn a_shell_tool_rejects_non_object_arguments_without_running_the_command() {
+    let llm_server = MockServer::start("200 OK", &tool_call_response("tool__marker", r#"[]"#));
+    let config =
+        ConfigDirectory::new("tools:\n  marker:\n    command: [\"touch\", \"marker.txt\"]\n");
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--model",
+            "test-model",
+            "--base-url",
+            &llm_server.base_url,
+            "--tool",
+            "marker",
+            "invalid arguments",
+        ])
+        .output()
+        .expect("failed to execute lait");
+    let _request = llm_server.receive_request();
+    llm_server.finish();
+
+    assert!(
+        !output.status.success(),
+        "expected invalid arguments to fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("JSON object"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !config.path().join("marker.txt").exists(),
+        "a malformed tool call must not run the configured command"
+    );
+}
+
+#[test]
 fn an_empty_command_list_is_a_lint_error() {
     // `lait lint` checks every 'tools:' entry in lait.config.yml regardless
     // of which files are named on the command line — so a trivial workflow

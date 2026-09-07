@@ -37,6 +37,38 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+  native-locks:
+    name: Native file locks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # aws-lc-sys (via rustls) assembles with NASM on MSVC targets.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: choco install nasm --yes
+
+      - name: Run file lock tests
+        run: cargo test --locked --bin lait file_lock::
+
+      - name: Run cancellable filesystem tests
+        run: cargo test --locked --bin lait async_io::
+
   website:
     name: Website checks
     runs-on: ubuntu-latest

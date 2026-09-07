@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
-use super::{FlowStep, NodeDefinition, NodeMap, Router, WorkflowFile};
+use super::{FlowStep, NodeDefinition, Router, WorkflowFile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GraphFormat {
@@ -70,7 +70,7 @@ pub(crate) fn render(wf: &WorkflowFile, format: GraphFormat) -> Result<String> {
 fn build(wf: &WorkflowFile) -> Result<GraphModel> {
     let mut builder = GraphBuilder::default();
     let start = builder.add_node("start".to_owned(), NodeShape::Terminal);
-    let (entry, exits) = render_chain(&wf.steps, &wf.nodes, &mut builder);
+    let (entry, exits) = render_chain(&wf.steps, &mut builder);
     if let Some(entry) = entry {
         builder.add_edge(&start, &entry, None);
     }
@@ -150,16 +150,12 @@ impl GraphBuilder {
 /// last step is itself a `switch`/`parallel` router (each of *its* branches'
 /// own exits becomes an exit of this whole list, so whatever follows
 /// connects from all of them).
-fn render_chain(
-    steps: &[FlowStep],
-    nodes: &NodeMap,
-    builder: &mut GraphBuilder,
-) -> (Option<String>, Vec<String>) {
+fn render_chain(steps: &[FlowStep], builder: &mut GraphBuilder) -> (Option<String>, Vec<String>) {
     let mut entry: Option<String> = None;
     let mut prev_exits: Vec<String> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         let label = step.label_or(index + 1);
-        let (step_entry, step_exits) = render_step(step, &label, nodes, builder);
+        let (step_entry, step_exits) = render_step(step, &label, builder);
         if let Some(step_entry) = &step_entry {
             if entry.is_none() {
                 entry = Some(step_entry.clone());
@@ -176,44 +172,38 @@ fn render_chain(
 fn render_step(
     step: &FlowStep,
     label: &str,
-    nodes: &NodeMap,
     builder: &mut GraphBuilder,
 ) -> (Option<String>, Vec<String>) {
     if let Some(router) = step.router() {
-        return render_router(router, label, nodes, builder);
+        return render_router(router, label, builder);
     }
 
-    match &step.r#use {
-        Some(node_id) => {
-            // Guaranteed by `validate::validate_steps` before a workflow is
-            // ever run or graphed (see the same lookup in
-            // `dryrun::print_step`/`execute_step`'s runtime version).
-            let node = nodes
-                .get(node_id)
-                .expect("validate_steps guarantees 'use' resolves in 'nodes'");
+    match step.call() {
+        Some(call) => {
+            let node = call.definition;
             let mut node_label = format!("[{label}]\ntype: {}", node.type_name());
             if let NodeDefinition::Workflow(workflow_node) = node {
                 node_label.push_str(&format!("\n{}", workflow_node.workflow.display()));
             }
-            if let Some(when) = &step.when {
+            if let Some(when) = step.when() {
                 node_label.push_str(&format!("\nwhen: {when}"));
             }
             let id = builder.add_node(node_label, NodeShape::Action);
-            if let Some(on_error) = &step.on_error {
+            if let Some(on_error) = step.on_error() {
                 let error_label = format!("{label}: on_error");
                 let since = builder.nodes.len();
-                let (on_error_entry, _) = render_chain(&on_error.steps, nodes, builder);
+                let (on_error_entry, _) = render_chain(&on_error.steps, builder);
                 if let Some(on_error_entry) = on_error_entry {
                     builder.add_edge(&id, &on_error_entry, Some("on_error".to_owned()));
                 }
                 builder.add_subgraph(error_label, since);
             }
             let mut exits = vec![id.clone()];
-            if step.stop == Some(true) {
+            if step.control() == crate::workflow::Control::Stop {
                 let stop_id = builder.add_node("stop".to_owned(), NodeShape::Terminal);
                 builder.add_edge(&id, &stop_id, None);
                 exits = Vec::new();
-            } else if step.r#break == Some(true) {
+            } else if step.control() == crate::workflow::Control::Break {
                 let break_id = builder.add_node("break".to_owned(), NodeShape::Terminal);
                 builder.add_edge(&id, &break_id, None);
                 exits = Vec::new();
@@ -222,7 +212,7 @@ fn render_step(
         }
         None => {
             // A standalone `stop`/`break` (no `use`, no router).
-            let kind = if step.stop == Some(true) {
+            let kind = if step.control() == crate::workflow::Control::Stop {
                 "stop"
             } else {
                 "break"
@@ -236,7 +226,6 @@ fn render_step(
 fn render_router(
     router: Router<'_>,
     label: &str,
-    nodes: &NodeMap,
     builder: &mut GraphBuilder,
 ) -> (Option<String>, Vec<String>) {
     match router {
@@ -248,7 +237,7 @@ fn render_router(
                     .id
                     .clone()
                     .unwrap_or_else(|| format!("case-{}", index + 1));
-                let (case_entry, case_exits) = render_chain(&case.steps, nodes, builder);
+                let (case_entry, case_exits) = render_chain(&case.steps, builder);
                 if let Some(case_entry) = case_entry {
                     builder.add_edge(
                         &router_id,
@@ -259,7 +248,7 @@ fn render_router(
                 exits.extend(case_exits);
             }
             if let Some(else_steps) = &switch.else_steps {
-                let (else_entry, else_exits) = render_chain(else_steps, nodes, builder);
+                let (else_entry, else_exits) = render_chain(else_steps, builder);
                 if let Some(else_entry) = else_entry {
                     builder.add_edge(&router_id, &else_entry, Some("else".to_owned()));
                 }
@@ -276,7 +265,7 @@ fn render_router(
             let join_id = builder.add_node(join_label, NodeShape::Decision);
             for (index, branch) in parallel.branches.iter().enumerate() {
                 let since = builder.nodes.len();
-                let (branch_entry, branch_exits) = render_chain(&branch.steps, nodes, builder);
+                let (branch_entry, branch_exits) = render_chain(&branch.steps, builder);
                 match branch_entry {
                     Some(branch_entry) => {
                         builder.add_edge(&fork_id, &branch_entry, None);
@@ -291,20 +280,18 @@ fn render_router(
             (Some(fork_id), vec![join_id])
         }
         Router::Loop(loop_def) => {
-            let condition = match (&loop_def.r#while, &loop_def.until) {
-                (Some(cond), _) => format!("while {cond}"),
-                (None, Some(cond)) => format!("until {cond}"),
-                (None, None) => "(no condition)".to_owned(),
-            };
-            let max_iterations = loop_def
-                .max_iterations
-                .map_or_else(|| "?".to_owned(), |n| n.to_string());
+            let condition = format!(
+                "{} {}",
+                loop_def.condition.keyword(),
+                loop_def.condition.filter()
+            );
+            let max_iterations = loop_def.max_iterations;
             let loop_id = builder.add_node(
                 format!("[{label}]\nloop: {condition}\nmax_iterations: {max_iterations}"),
                 NodeShape::Decision,
             );
             let since = builder.nodes.len();
-            let (body_entry, body_exits) = render_chain(&loop_def.steps, nodes, builder);
+            let (body_entry, body_exits) = render_chain(&loop_def.steps, builder);
             if let Some(body_entry) = body_entry {
                 builder.add_edge(&loop_id, &body_entry, Some("iterate".to_owned()));
                 for exit in body_exits {
@@ -321,7 +308,7 @@ fn render_router(
             }
             let for_each_id = builder.add_node(node_label, NodeShape::Decision);
             let since = builder.nodes.len();
-            let (body_entry, body_exits) = render_chain(&for_each.steps, nodes, builder);
+            let (body_entry, body_exits) = render_chain(&for_each.steps, builder);
             if let Some(body_entry) = body_entry {
                 builder.add_edge(&for_each_id, &body_entry, Some("per item".to_owned()));
                 for exit in body_exits {

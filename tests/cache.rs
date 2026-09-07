@@ -135,3 +135,47 @@ fn a_different_api_key_still_hits_the_cache() {
         "a different --api-key should not bypass the cache — the cache key deliberately excludes it"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_cache_hit_does_not_run_an_api_key_command_again() {
+    let server = MockServer::start("200 OK", OK_BODY);
+    let config = ConfigDirectory::empty();
+    let marker = config.path().join("api-key-command-ran");
+    std::fs::write(
+        config.config_path(),
+        format!(
+            "default:\n  model: m\nmodels:\n  m:\n    - provider:\n        base_url: \"{}\"\n        api_key_cmd: [\"sh\", \"-c\", \"touch '{}' ; printf cache-secret\"]\n      model_id: model-a\n",
+            server.base_url,
+            marker.display()
+        ),
+    )
+    .expect("failed to write test config");
+
+    let first = test_command()
+        .current_dir(config.path())
+        .args(["--cache", "hello"])
+        .output()
+        .expect("failed to execute the first cached request");
+    server.receive_request();
+    assert!(first.status.success(), "first run failed: {first:?}");
+    assert!(marker.exists(), "the first request should resolve the key");
+    std::fs::remove_file(&marker).expect("failed to reset API-key marker");
+
+    let second = test_command()
+        .current_dir(config.path())
+        .args(["--cache", "hello"])
+        .output()
+        .expect("failed to execute the cached request");
+    assert!(second.status.success(), "second run failed: {second:?}");
+    assert!(
+        !marker.exists(),
+        "a cache hit must not resolve an API-key command"
+    );
+    let leaked = server.try_receive_request(Duration::from_millis(600));
+    server.finish();
+    assert!(
+        leaked.is_none(),
+        "the cache hit must not contact the network"
+    );
+}
