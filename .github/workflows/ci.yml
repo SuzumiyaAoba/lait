@@ -64,10 +64,10 @@ jobs:
         run: choco install nasm --yes
 
       - name: Run file lock tests
-        run: cargo test --locked --bin lait file_lock::
+        run: 'cargo test --locked --bin lait file_lock::'
 
       - name: Run cancellable filesystem tests
-        run: cargo test --locked --bin lait async_io::
+        run: 'cargo test --locked --bin lait async_io::'
 
   website:
     name: Website checks
