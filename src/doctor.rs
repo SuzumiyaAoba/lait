@@ -122,45 +122,50 @@ pub(crate) async fn run(
     // `config::load_config`, which returns an empty `ConfigFile` both when
     // `lait.config.yml` is absent and when `--no-config` was passed, this
     // check needs to tell those two apart from "found but failed to parse".
-    let config_path = config::resolve_config_path(&config_source)?;
-    let global_config_present =
-        matches!(config_source, ConfigSource::Search) && config::global_config_path()?.is_file();
+    let config_path =
+        config::resolve_config_path_cancellable(&config_source, Some(cancellation.clone())).await?;
+    let global_config_present = matches!(config_source, ConfigSource::Search)
+        && config::global_config_exists_cancellable(Some(cancellation.clone())).await?;
     let config_present = config_path.is_some() || global_config_present;
 
-    let file_config = match config::load_config(&config_source) {
-        Ok(file_config) => {
-            if config_present {
-                checks.push(Check::ok(
+    let file_config =
+        match config::load_config_cancellable(&config_source, Some(cancellation.clone())).await {
+            Ok(file_config) => {
+                if config_present {
+                    checks.push(Check::ok(
+                        "config",
+                        config::CONFIG_FILE_NAME,
+                        "読み込み・パースに成功しました",
+                    ));
+                } else {
+                    checks.push(Check::warn(
+                        "config",
+                        config::CONFIG_FILE_NAME,
+                        "設定ファイルが見つかりません（デフォルト設定で動作します）",
+                        Some(format!(
+                            "プロジェクトルートに {} を作成するか `lait init` を実行してください",
+                            config::CONFIG_FILE_NAME
+                        )),
+                    ));
+                }
+                Some(Arc::new(file_config))
+            }
+            Err(error) => {
+                if is_interrupted(&error) {
+                    return Err(error);
+                }
+                checks.push(Check::error(
                     "config",
                     config::CONFIG_FILE_NAME,
-                    "読み込み・パースに成功しました",
-                ));
-            } else {
-                checks.push(Check::warn(
-                    "config",
-                    config::CONFIG_FILE_NAME,
-                    "設定ファイルが見つかりません（デフォルト設定で動作します）",
+                    format!("{error:#}"),
                     Some(format!(
-                        "プロジェクトルートに {} を作成するか `lait init` を実行してください",
+                        "{} の構文を確認してください",
                         config::CONFIG_FILE_NAME
                     )),
                 ));
+                None
             }
-            Some(Arc::new(file_config))
-        }
-        Err(error) => {
-            checks.push(Check::error(
-                "config",
-                config::CONFIG_FILE_NAME,
-                format!("{error:#}"),
-                Some(format!(
-                    "{} の構文を確認してください",
-                    config::CONFIG_FILE_NAME
-                )),
-            ));
-            None
-        }
-    };
+        };
 
     match &file_config {
         Some(file_config) => {

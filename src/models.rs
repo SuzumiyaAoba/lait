@@ -20,10 +20,12 @@ pub(crate) async fn run(
     config_source: ConfigSource,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let cancellation = cancellation.unwrap_or_default();
+    crate::signal::spawn_handler(cancellation.clone());
+    let file_config = Arc::new(
+        config::load_config_cancellable(&config_source, Some(cancellation.clone())).await?,
+    );
     if args.remote {
-        let cancellation = cancellation.unwrap_or_default();
-        crate::signal::spawn_handler(cancellation.clone());
         let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
         services
             .clone()

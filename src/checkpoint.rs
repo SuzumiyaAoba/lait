@@ -145,6 +145,40 @@ pub(crate) fn load(run_id: &str) -> Result<Checkpoint> {
     read(&path)
 }
 
+/// Runtime counterpart to `load`: even a slow or FIFO-backed snapshot must
+/// not prevent the enclosing command from observing cancellation.
+pub(crate) async fn load_cancellable(
+    run_id: &str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Checkpoint> {
+    let path = run_path(run_id)?;
+    load_path_cancellable(path, run_id.to_owned(), cancellation).await
+}
+
+async fn load_path_cancellable(
+    path: PathBuf,
+    run_id: String,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Checkpoint> {
+    crate::async_io::run_blocking(
+        move |cancelled| {
+            if !jsonl::path_exists(&path)? {
+                bail!("no such checkpointed run '{run_id}'");
+            }
+            let body = crate::async_io::read_to_string_wait_for_fifo_writer(
+                &path,
+                cancelled,
+                crate::async_io::MAX_READ_BYTES,
+            )
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+            serde_json::from_str(&body)
+                .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
+        },
+        cancellation,
+    )
+    .await
+}
+
 /// Lists every checkpointed run under `RUNS_DIR`, sorted by run id (which
 /// sorts chronologically — see `generate_run_id`). Returns an empty `Vec`
 /// when the directory doesn't exist yet.
@@ -255,6 +289,8 @@ pub(crate) fn run(command: RunsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::load_path_cancellable;
     use super::{Checkpoint, RunStatus, check_resumable, generate_run_id, run_path};
 
     fn checkpoint_with(top_level_labels: Vec<&str>, completed_index: usize) -> Checkpoint {
@@ -327,5 +363,38 @@ mod tests {
     fn run_ids_are_unique_across_rapid_calls() {
         let ids: std::collections::HashSet<_> = (0..10_000).map(|_| generate_run_id()).collect();
         assert_eq!(ids.len(), 10_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_cancellable_stops_waiting_for_a_fifo_checkpoint() {
+        let path = crate::test_support::unique_temp_path("lait-checkpoint-fifo", ".json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo should be available on Unix");
+        assert!(status.success(), "mkfifo failed: {status}");
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut load = Box::pin(load_path_cancellable(
+            path.clone(),
+            "fifo-test".to_owned(),
+            Some(token.clone()),
+        ));
+        tokio::select! {
+            result = &mut load => panic!("FIFO checkpoint unexpectedly loaded: {result:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => token.cancel(),
+        }
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), load)
+            .await
+            .expect("cancellable checkpoint load should finish promptly")
+            .expect_err("a checkpoint FIFO without a writer should be cancelled");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "checkpoint cancellation should remain typed: {error:#}"
+        );
+        std::fs::remove_file(path).expect("checkpoint FIFO should be removable");
     }
 }

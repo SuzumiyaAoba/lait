@@ -99,6 +99,87 @@ impl StepsState {
     }
 }
 
+/// Physical concurrency inherited across workflow-file boundaries. Lexical
+/// break/stop scopes are validated separately within each workflow document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExecutionPlacement {
+    #[default]
+    Sequential,
+    Parallel,
+    ConcurrentItems,
+}
+
+impl ExecutionPlacement {
+    fn parallel(self) -> Self {
+        match self {
+            Self::ConcurrentItems => self,
+            Self::Sequential | Self::Parallel => Self::Parallel,
+        }
+    }
+}
+
+fn validate_node_placement(
+    node: &workflow::NodeDefinition,
+    placement: ExecutionPlacement,
+    label: &str,
+) -> Result<()> {
+    if placement != ExecutionPlacement::Sequential && node.requires_interactive_stdin() {
+        bail!(
+            "step '{label}' cannot run an 'ask' node inside concurrent execution, including a nested workflow"
+        );
+    }
+    if placement == ExecutionPlacement::ConcurrentItems && node.settings().write_file.is_some() {
+        bail!(
+            "step '{label}' has 'write_file' inside a concurrent 'for_each', including a nested workflow; move the write after the loop"
+        );
+    }
+    Ok(())
+}
+
+/// Preflights a newly loaded child before any of its actions run. References
+/// to other workflow files remain lazy; each child checks its own plan on load.
+fn validate_execution_placement(
+    steps: &[workflow::FlowStep],
+    placement: ExecutionPlacement,
+) -> Result<()> {
+    for (index, step) in steps.iter().enumerate() {
+        if let Some(call) = step.call() {
+            validate_node_placement(call.definition, placement, &step.label_or(index + 1))?;
+        }
+        if let Some(handler) = step.on_error() {
+            validate_execution_placement(&handler.steps, placement)?;
+        }
+        match step.router() {
+            Some(workflow::Router::Switch(router)) => {
+                for case in &router.cases {
+                    validate_execution_placement(&case.steps, placement)?;
+                }
+                if let Some(steps) = &router.else_steps {
+                    validate_execution_placement(steps, placement)?;
+                }
+            }
+            Some(workflow::Router::Parallel(router)) => {
+                for branch in &router.branches {
+                    validate_execution_placement(&branch.steps, placement.parallel())?;
+                }
+            }
+            Some(workflow::Router::Loop(router)) => {
+                validate_execution_placement(&router.steps, placement)?
+            }
+            Some(workflow::Router::ForEach(router)) => {
+                let inner = if router.max_concurrency.unwrap_or(1) > 1 {
+                    ExecutionPlacement::ConcurrentItems
+                } else {
+                    placement
+                };
+                validate_execution_placement(&router.steps, inner)?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 /// Read-only context shared by all router handlers. `RunStepsFrame` keeps the
 /// caller's starting counter because it is part of the public recursive entry
 /// point; router handlers only need the invariant scope/environment/prefix and
@@ -107,6 +188,7 @@ impl StepsState {
 struct RouterContext<'a> {
     scope: &'a WorkflowScope,
     env: &'a RunContext,
+    placement: ExecutionPlacement,
     progress_prefix: &'a str,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 }
@@ -119,6 +201,7 @@ impl<'a> RouterContext<'a> {
             start_counter,
             progress_prefix,
             cancellation: self.cancellation.clone(),
+            placement: self.placement,
         }
     }
 }
@@ -139,39 +222,24 @@ fn check_workflow_cancellation(
     Ok(())
 }
 
-/// Where in the overall run a call to `run_steps` sits, as opposed to
-/// `steps`/`current_input`/`steps_outputs` (passed to `run_steps` directly),
-/// which are what to run and the data flowing through it. Unchanged across
-/// most recursive calls — `switch`/`loop`/a sequential `for_each` item/
-/// `on_error` all reuse the caller's own frame fields — while a `parallel`
-/// branch or a concurrent `for_each` item builds itself a fresh one with
-/// `start_counter: 0` and a branch-local `progress_prefix`, and a nested
-/// `workflow:` node's own call (from `execute_step`) builds one with a new
-/// `scope` (see `WorkflowScope::nested`) and `cancellation` set to the
-/// node's own `step_cancel`.
-///
-/// `+ Send` on `run_steps`'s return type (below) means a `parallel`/
-/// concurrent `for_each` branch's future *could* run on `tokio::spawn`, but
-/// none do yet — they're still driven concurrently in-task via
-/// `try_join_all`/`.buffered()`, which interleaves I/O-bound work (the
-/// common case here) but never uses more than one OS thread. Actually
-/// spawning needs every borrow in this frame's `'a` to become `'static`,
-/// and `scope: &'a WorkflowScope`/`env: &'a RunContext` already could (both
-/// are already `Arc`-friendly), but `steps: &'a [FlowStep]` (below) can't:
-/// it's borrowed from the top-level `WorkflowFile` on `run_workflow`'s
-/// stack, reachable through `SwitchCase`/`ParallelBranch`/
-/// `LoopDefinition`/`ForEachDefinition`/`OnError`'s own `Vec<FlowStep>`
-/// fields. Making the whole step AST `Arc`-shared is a bigger change than
-/// it looks (`Arc<[FlowStep]>` doesn't `Deserialize` the way `Vec<FlowStep>`
-/// does) and lands on exactly the structs the design review's Phase B-1
-/// (`NodeDefinition` → a `type:`-tagged enum) is going to rewrite anyway —
-/// better done together than as two passes over the same types.
+/// Execution scope, cancellation, and progress for a sequence of steps.
+/// Routers inherit this frame, adjusting progress and placement for concurrent
+/// branches. Child workflows replace the scope while retaining the parent's
+/// concurrency restrictions and the calling node's cancellation token.
 pub(crate) struct RunStepsFrame<'a> {
     pub(crate) scope: &'a WorkflowScope,
     pub(crate) env: &'a RunContext,
+    pub(crate) placement: ExecutionPlacement,
     pub(crate) start_counter: usize,
     pub(crate) progress_prefix: &'a str,
     pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl<'a> RunStepsFrame<'a> {
+    fn with_placement(mut self, placement: ExecutionPlacement) -> Self {
+        self.placement = placement;
+        self
+    }
 }
 
 /// Runs a sequence of steps (the workflow's top-level `steps`, the nested
@@ -207,6 +275,7 @@ pub(crate) fn run_steps<'a>(
         start_counter,
         progress_prefix,
         cancellation,
+        placement,
     } = frame;
     Box::pin(async move {
         let mut current_input = current_input;
@@ -225,6 +294,7 @@ pub(crate) fn run_steps<'a>(
             let router_context = RouterContext {
                 scope,
                 env,
+                placement,
                 progress_prefix,
                 cancellation: cancellation.clone(),
             };
@@ -347,12 +417,14 @@ pub(crate) fn run_steps<'a>(
                 None => current_input,
                 Some(call) => {
                     let node = call.definition;
+                    validate_node_placement(node, placement, &label)?;
                     let attempt_result = execute_step_with_retry(
                         node,
                         &current_input,
                         StepContext {
                             scope,
                             env,
+                            placement,
                             label: &label,
                             progress_prefix,
                             steps_outputs: &steps_outputs,
@@ -368,7 +440,7 @@ pub(crate) fn run_steps<'a>(
                                     "{progress_prefix}    -> step failed, running 'on_error': {error}"
                                 );
                                 let error_input = serde_json::json!({
-                                    "error": error.to_string(),
+                                    "error": format!("{error:#}"),
                                     "input": template::parse_input(&current_input),
                                 });
                                 let error_input_json = serde_json::to_string(&error_input)
@@ -388,6 +460,7 @@ pub(crate) fn run_steps<'a>(
                                         start_counter: counter,
                                         progress_prefix,
                                         cancellation: cancellation.clone(),
+                                        placement,
                                     },
                                 )
                                 .await?;
@@ -551,7 +624,9 @@ async fn execute_parallel<'a>(
             &branch.steps,
             current_input.clone(),
             steps_outputs.clone(),
-            context.frame(0, branch_prefix),
+            context
+                .frame(0, branch_prefix)
+                .with_placement(context.placement.parallel()),
         ));
     }
     let branch_results = futures_util::future::try_join_all(branch_futures).await?;
@@ -859,7 +934,9 @@ async fn execute_concurrent_items<'a>(
             &for_each.steps,
             item_input,
             steps_outputs.clone(),
-            context.frame(0, item_prefix),
+            context
+                .frame(0, item_prefix)
+                .with_placement(ExecutionPlacement::ConcurrentItems),
         ));
     }
     let item_results: Vec<StepsOutcome> = futures_util::stream::iter(item_futures)
@@ -938,6 +1015,7 @@ async fn execute_step_with_retry(
     let StepContext {
         scope,
         env,
+        placement,
         label,
         progress_prefix,
         steps_outputs,
@@ -989,6 +1067,7 @@ async fn execute_step_with_retry(
                     StepContext {
                         scope,
                         env,
+                        placement,
                         label,
                         progress_prefix,
                         steps_outputs,
@@ -1014,6 +1093,7 @@ async fn execute_step_with_retry(
                     StepContext {
                         scope,
                         env,
+                        placement,
                         label,
                         progress_prefix,
                         steps_outputs,
@@ -1097,6 +1177,7 @@ async fn wait_retry_delay(
 struct StepContext<'a> {
     scope: &'a WorkflowScope,
     env: &'a RunContext,
+    placement: ExecutionPlacement,
     label: &'a str,
     progress_prefix: &'a str,
     steps_outputs: &'a workflow::StepOutputs,
@@ -1239,6 +1320,7 @@ async fn execute_step(
     let StepContext {
         scope,
         env,
+        placement,
         label,
         progress_prefix,
         steps_outputs,
@@ -1396,10 +1478,19 @@ async fn execute_step(
             .with_context(|| format!("step '{label}'"))?
         }
         workflow::NodeDefinition::Workflow(workflow_node) => {
-            let resolved_path = scope.base_dir.join(&workflow_node.workflow);
-            let mut sub_wf = workflow::load_workflow(&resolved_path)
-                .with_context(|| format!("step '{label}'"))?;
-            let sub_scope = scope.nested(&workflow_node.workflow, &mut sub_wf, label)?;
+            // Resolve cycles before opening a child file: a recursive FIFO
+            // reference must fail rather than waiting for a second writer.
+            let resolved_path = scope
+                .resolve_nested_path(&workflow_node.workflow, label, step_cancel.clone())
+                .await?;
+            let mut sub_wf =
+                workflow::load_workflow_cancellable(&resolved_path, step_cancel.clone())
+                    .await
+                    .with_context(|| format!("step '{label}'"))?;
+            validate_execution_placement(&sub_wf.steps, placement).with_context(|| {
+                format!("step '{label}': workflow '{}'", resolved_path.display())
+            })?;
+            let sub_scope = scope.nested(resolved_path, &mut sub_wf);
             announce_named_file(
                 &format!("{progress_prefix}    ->"),
                 sub_wf.name.as_deref(),
@@ -1422,6 +1513,7 @@ async fn execute_step(
                     start_counter: 0,
                     progress_prefix: &sub_progress_prefix,
                     cancellation: step_cancel.clone(),
+                    placement,
                 },
             )
             .await
@@ -1537,7 +1629,9 @@ steps:
         )
         .expect("router workflow fixture should be writable");
         let mut workflow = crate::workflow::load_workflow(&path).unwrap();
-        let scope = WorkflowScope::top_level(&mut workflow, &path).unwrap();
+        let scope = WorkflowScope::top_level(&mut workflow, &path, None)
+            .await
+            .unwrap();
         let config = std::sync::Arc::new(crate::config::ConfigFile::default());
         let env = RunContext::new(
             std::sync::Arc::new(crate::engine::AppServices::new(config)),
@@ -1555,6 +1649,7 @@ steps:
                 start_counter: 0,
                 progress_prefix: "",
                 cancellation: Some(token.clone()),
+                placement: Default::default(),
             },
         );
         tokio::pin!(execution);

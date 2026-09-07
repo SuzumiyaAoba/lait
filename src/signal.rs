@@ -1,10 +1,8 @@
 //! Process-wide Ctrl-C (SIGINT) handling for every genuinely single-shot
 //! async command — `lait run`, single-shot chat, `lait agent run`,
-//! `lait prompt run` — each of which calls `spawn_handler` itself, right
-//! where it starts using its own `CancellationToken` (see `app::run_chat`/
-//! `run_agent`/`run_prompt`/`run_workflow`). `repl::run`'s multi-turn REPL
-//! deliberately never calls it — see `app::run_chat_or_repl`'s doc comment
-//! for why a one-shot token doesn't fit a loop that runs many turns.
+//! `lait prompt run` — each arms `spawn_handler` before its initial
+//! config/input read. `repl::run`'s multi-turn REPL owns the listener for its
+//! whole loop.
 //!
 //! The first Ctrl-C cancels the process's root cancellation token
 //! token, which every in-flight blocking I/O op, model request, and MCP

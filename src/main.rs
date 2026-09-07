@@ -1,5 +1,3 @@
-use clap::Parser;
-
 mod agent;
 mod app;
 mod assert;

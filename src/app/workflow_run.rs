@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    checkpoint,
+    async_io, checkpoint,
     cli::RunArgs,
     config::{self, ConfigSource},
     engine::{AppServices, RunContext},
@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-use super::{resolve_cache_settings, resolve_input_with_stdin};
+use super::{resolve_cache_settings, resolve_input_with_stdin_cancellable};
 
 /// Runtime progress between top-level steps. Keeping the state together avoids
 /// mixing a router's nested counter with the checkpoint's top-level position.
@@ -103,15 +103,21 @@ pub(super) async fn run_workflow(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
-    let resolved_file = workflow::resolve_run_target(&run_args.file, &file_config);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+    let argument = run_args.file.clone();
+    let registry_config = Arc::clone(&file_config);
+    let resolved_file = async_io::run_blocking(
+        move |_| Ok(workflow::resolve_run_target(&argument, &registry_config)),
+        Some(cancel.clone()),
+    )
+    .await?;
     let workflow_path = resolved_file.display().to_string();
 
-    let resumed = run_args
-        .resume
-        .as_deref()
-        .map(checkpoint::load)
-        .transpose()?;
+    let resumed = match run_args.resume.as_deref() {
+        Some(run_id) => Some(checkpoint::load_cancellable(run_id, Some(cancel.clone())).await?),
+        None => None,
+    };
     if let Some(resumed) = &resumed {
         if resumed.workflow_path != workflow_path {
             bail!(
@@ -129,9 +135,9 @@ pub(super) async fn run_workflow(
         }
     }
 
-    let mut wf = workflow::load_workflow(&resolved_file)?;
+    let mut wf = workflow::load_workflow_cancellable(&resolved_file, Some(cancel.clone())).await?;
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
-    let scope = WorkflowScope::top_level(&mut wf, &resolved_file)?;
+    let scope = WorkflowScope::top_level(&mut wf, &resolved_file, Some(cancel.clone())).await?;
     let top_level_labels = top_level_step_labels(&wf.steps);
 
     let (initial_prompt, vars, progress) = match &resumed {
@@ -160,9 +166,12 @@ pub(super) async fn run_workflow(
             )
         }
         None => {
-            let prompt = resolve_input_with_stdin(run_args.prompt.clone())?.ok_or_else(|| {
-                anyhow!("a PROMPT is required; provide one or pipe input via stdin")
-            })?;
+            let prompt =
+                resolve_input_with_stdin_cancellable(run_args.prompt.clone(), Some(cancel.clone()))
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("a PROMPT is required; provide one or pipe input via stdin")
+                    })?;
             let vars = workflow::build_vars(&run_args.var.var)?;
             (
                 prompt.clone(),
@@ -267,6 +276,7 @@ async fn run_top_level(
                 start_counter: progress.counter,
                 progress_prefix: "",
                 cancellation: Some(env.root_token()),
+                placement: Default::default(),
             },
         )
         .await;

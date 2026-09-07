@@ -9,6 +9,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
 };
 
 use crate::{
@@ -236,37 +237,93 @@ async fn tool_decision(
     if !env.policy.approve_tools {
         return Ok(ToolDecision::Allow);
     }
-    if env
-        .always_approved_tools
-        .lock()
-        .expect("always_approved_tools lock poisoned")
-        .contains(qualified_name)
-    {
+
+    // Tool loops from parallel workflow branches and separate compare jobs
+    // share one process stdin. Keep the gate until the blocking reader worker
+    // has finished, even when the async owner is cancelled; the lease is
+    // moved into that worker by `prompt_tool_approval` below.
+    let Some(approval_lease) =
+        acquire_approval_slot(env, qualified_name, cancellation.as_ref()).await?
+    else {
         return Ok(ToolDecision::Allow);
-    }
+    };
     let command_preview = command_preview();
-    match prompt_tool_approval(
+    let (answer, approval_lease) = prompt_tool_approval(
         qualified_name,
         arguments,
         command_preview.as_deref(),
+        approval_lease,
         cancellation,
     )
-    .await?
-    {
+    .await?;
+    match answer {
         ToolApprovalAnswer::Once => Ok(ToolDecision::Allow),
         ToolApprovalAnswer::Always => {
             env.always_approved_tools
                 .lock()
                 .expect("always_approved_tools lock poisoned")
                 .insert(qualified_name.to_owned());
+            // Keep the lease through the cache update so a concurrent caller
+            // cannot observe the old cache state and prompt a second time.
+            drop(approval_lease);
             Ok(ToolDecision::Allow)
         }
-        ToolApprovalAnswer::Deny => Ok(ToolDecision::Deny(
-            "denied interactively (--approve-tools)".to_owned(),
-        )),
+        ToolApprovalAnswer::Deny => {
+            drop(approval_lease);
+            Ok(ToolDecision::Deny(
+                "denied interactively (--approve-tools)".to_owned(),
+            ))
+        }
     }
 }
 
+fn always_approved(env: &RunContext, qualified_name: &str) -> bool {
+    env.always_approved_tools
+        .lock()
+        .expect("always_approved_tools lock poisoned")
+        .contains(qualified_name)
+}
+
+type ApprovalGateLease = tokio::sync::OwnedMutexGuard<()>;
+
+async fn acquire_approval_gate(
+    env: &RunContext,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ApprovalGateLease> {
+    let gate = Arc::clone(&env.approval_gate);
+    match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    Err(crate::error::Interrupted::cancelled(
+                        "tool approval was cancelled",
+                    ).into())
+                }
+                lease = gate.lock_owned() => Ok(lease),
+            }
+        }
+        None => Ok(gate.lock_owned().await),
+    }
+}
+
+/// Acquires the process-wide approval gate and rechecks the `always` cache
+/// while holding it. The second check closes the race where another tool loop
+/// approved this name while this caller was waiting for stdin ownership.
+async fn acquire_approval_slot(
+    env: &RunContext,
+    qualified_name: &str,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Option<ApprovalGateLease>> {
+    let approval_lease = acquire_approval_gate(env, cancellation).await?;
+    if always_approved(env, qualified_name) {
+        drop(approval_lease);
+        return Ok(None);
+    }
+    Ok(Some(approval_lease))
+}
+
+#[derive(Debug)]
 enum ToolApprovalAnswer {
     Once,
     Always,
@@ -285,8 +342,9 @@ async fn prompt_tool_approval(
     name: &str,
     arguments: &str,
     command_preview: Option<&str>,
+    approval_lease: ApprovalGateLease,
     cancellation: Option<tokio_util::sync::CancellationToken>,
-) -> Result<ToolApprovalAnswer> {
+) -> Result<(ToolApprovalAnswer, ApprovalGateLease)> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         bail!(
@@ -306,8 +364,26 @@ async fn prompt_tool_approval(
     }
     eprint!("allow this call? [y(es)/n(o)/a(lways for this tool)] ");
     let name = name.to_owned();
+    read_tool_approval_with_lease(approval_lease, cancellation, move || {
+        read_tool_approval_answer(&name)
+    })
+    .await
+}
+
+/// Runs one approval reader while transferring the gate lease into the
+/// worker. `run_blocking` may return a cancellation error before that worker
+/// exits; in that case the worker still owns the lease and remains the sole
+/// reader of stdin until its blocking read completes.
+async fn read_tool_approval_with_lease<R>(
+    approval_lease: ApprovalGateLease,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    reader: R,
+) -> Result<(ToolApprovalAnswer, ApprovalGateLease)>
+where
+    R: FnOnce() -> Result<ToolApprovalAnswer> + Send + 'static,
+{
     async_io::run_blocking(
-        move |_cancelled| read_tool_approval_answer(&name),
+        move |_cancelled| Ok((reader()?, approval_lease)),
         cancellation,
     )
     .await
@@ -1432,8 +1508,18 @@ pub(crate) fn agent_file_settings(
 #[cfg(test)]
 mod tests {
     use super::context::{CachePolicy, CancellationSource, CassettePolicy, RunContext};
-    use super::{AppServices, stream_response};
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use super::{
+        AppServices, ToolApprovalAnswer, acquire_approval_gate, acquire_approval_slot,
+        read_tool_approval_with_lease, stream_response,
+    };
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
     use tokio_util::sync::CancellationToken;
 
     /// A regression test for the bug `stream_response`'s cancellation
@@ -1505,5 +1591,138 @@ mod tests {
         let replay = CassettePolicy::Replay(PathBuf::from("replay"));
         assert!(replay.record_dir().is_none());
         assert!(replay.replay_dir().is_some());
+    }
+
+    #[tokio::test]
+    async fn approval_gate_serializes_injected_readers() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let first_started = Arc::new(AtomicBool::new(false));
+        let first_answer = {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let lease = gate.clone().lock_owned().await;
+            let started = Arc::clone(&first_started);
+            let first = tokio::spawn(read_tool_approval_with_lease(lease, None, move || {
+                started.store(true, Ordering::Release);
+                receiver
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("first approval reader was closed"))?;
+                Ok(ToolApprovalAnswer::Once)
+            }));
+            (first, sender)
+        };
+        for _ in 0..100 {
+            if first_started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(first_started.load(Ordering::Acquire));
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            let started = Arc::clone(&second_started);
+            async move {
+                let lease = gate.lock_owned().await;
+                read_tool_approval_with_lease(lease, None, move || {
+                    started.store(true, Ordering::Release);
+                    Ok(ToolApprovalAnswer::Once)
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_started.load(Ordering::Acquire),
+            "a second approval reader must wait for the first reader"
+        );
+
+        first_answer.1.send(()).unwrap();
+        first_answer.0.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if second_started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(second_started.load(Ordering::Acquire));
+        assert!(matches!(
+            second.await.unwrap().unwrap().0,
+            ToolApprovalAnswer::Once
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_approval_reader_keeps_the_gate_until_the_worker_exits() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let lease = gate.clone().lock_owned().await;
+        let started = Arc::new(AtomicBool::new(false));
+        let (answer_sender, answer_receiver) = std::sync::mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let reader = tokio::spawn({
+            let started = Arc::clone(&started);
+            read_tool_approval_with_lease(lease, Some(cancellation.clone()), move || {
+                started.store(true, Ordering::Release);
+                answer_receiver
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("approval reader was closed"))?;
+                Ok(ToolApprovalAnswer::Once)
+            })
+        });
+        for _ in 0..100 {
+            if started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.load(Ordering::Acquire));
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .expect("a cancelled approval owner must return promptly")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>())
+        );
+        assert!(
+            gate.clone().try_lock_owned().is_err(),
+            "the cancelled worker must retain the approval gate while blocked"
+        );
+
+        answer_sender.send(()).unwrap();
+        let released = tokio::time::timeout(Duration::from_secs(1), gate.lock_owned())
+            .await
+            .expect("the worker must eventually release the gate");
+        drop(released);
+    }
+
+    #[tokio::test]
+    async fn always_cache_is_rechecked_after_waiting_for_the_approval_gate() {
+        let services = Arc::new(AppServices::new(Arc::new(
+            crate::config::ConfigFile::default(),
+        )));
+        let env = Arc::new(RunContext::new(services, CancellationToken::new()));
+        let held = acquire_approval_gate(&env, None).await.unwrap();
+        let waiter = tokio::spawn({
+            let env = Arc::clone(&env);
+            async move { acquire_approval_slot(&env, "tool__echo", None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+        env.always_approved_tools
+            .lock()
+            .unwrap()
+            .insert("tool__echo".to_owned());
+        drop(held);
+
+        let slot = waiter.await.unwrap().unwrap();
+        assert!(
+            slot.is_none(),
+            "always-approved calls must not prompt again"
+        );
     }
 }

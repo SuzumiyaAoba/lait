@@ -42,10 +42,13 @@ pub(crate) async fn run(
     }
 
     signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let prompt = app::resolve_input_with_stdin(args.prompt.clone())?
-        .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
+    let prompt =
+        app::resolve_input_with_stdin_cancellable(args.prompt.clone(), Some(cancel.clone()))
+            .await?
+            .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
 
     let sampling = SamplingOverrides {
         reasoning_effort: args.reasoning_effort,

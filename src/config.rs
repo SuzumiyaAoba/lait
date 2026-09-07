@@ -8,7 +8,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::cli::{Cli, ReasoningEffort};
+use crate::{
+    async_io,
+    cli::{Cli, ReasoningEffort},
+};
 
 pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
 
@@ -1051,6 +1054,170 @@ pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
     }
 }
 
+/// Cancellation-aware counterpart to [`load_config`] for async command entry
+/// points. Configuration files can be FIFOs or live on a slow filesystem, so
+/// both path discovery and file reads run through [`async_io::run_blocking`]
+/// rather than blocking the Tokio runtime. The synchronous loader remains the
+/// API for runtime-free commands such as `lint`, `init`, and registry listing.
+pub(crate) async fn load_config_cancellable(
+    source: &ConfigSource,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<ConfigFile> {
+    let project_path = resolve_config_path_cancellable(source, cancellation.clone()).await?;
+    let project = load_config_at_cancellable(source, project_path, cancellation.clone()).await?;
+    match source {
+        ConfigSource::Search => match load_global_config_cancellable(cancellation).await? {
+            Some(global) => Ok(merge_config(global, project)),
+            None => Ok(project),
+        },
+        ConfigSource::Explicit(_) | ConfigSource::Disabled => Ok(project),
+    }
+}
+
+/// Cancellation-aware counterpart to [`resolve_config_path`]. Search walks
+/// ancestor directories on the bounded filesystem worker so metadata checks
+/// cannot block signal handling on the Tokio runtime. Explicit and disabled
+/// sources have no filesystem work and return immediately.
+pub(crate) async fn resolve_config_path_cancellable(
+    source: &ConfigSource,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Option<PathBuf>> {
+    if cancellation
+        .as_ref()
+        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    {
+        bail!(crate::error::Interrupted::cancelled(
+            "configuration lookup was cancelled"
+        ));
+    }
+    match source {
+        ConfigSource::Disabled => Ok(None),
+        ConfigSource::Explicit(path) => Ok(Some(path.clone())),
+        ConfigSource::Search => {
+            async_io::run_blocking(
+                move |cancelled| {
+                    let cwd = std::env::current_dir()
+                        .context("failed to determine the current directory for configuration")?;
+                    find_config_upward_cancellable(&cwd, cancelled)
+                },
+                cancellation,
+            )
+            .await
+        }
+    }
+}
+
+fn find_config_upward_cancellable(
+    start: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Option<PathBuf>> {
+    use std::sync::atomic::Ordering;
+
+    for directory in start.ancestors() {
+        if cancelled.load(Ordering::Acquire) {
+            bail!(crate::error::Interrupted::cancelled(
+                "configuration lookup was cancelled"
+            ));
+        }
+        let candidate = directory.join(CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+async fn load_config_at_cancellable(
+    source: &ConfigSource,
+    path: Option<PathBuf>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<ConfigFile> {
+    let Some(path) = path else {
+        return Ok(ConfigFile::default());
+    };
+    let contents =
+        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+        {
+            Ok(contents) => contents,
+            Err(error) if !matches!(source, ConfigSource::Explicit(_)) && is_not_found(&error) => {
+                return Ok(ConfigFile::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read YAML configuration file '{}'",
+                        path.display()
+                    )
+                });
+            }
+        };
+    parse_config_file(&path, &contents)
+}
+
+async fn load_global_config_cancellable(
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Option<ConfigFile>> {
+    let path = global_config_path()?;
+    if !is_file_cancellable(&path, cancellation.clone()).await? {
+        return Ok(None);
+    }
+    let contents =
+        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+        {
+            Ok(contents) => contents,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read YAML configuration file '{}'",
+                        path.display()
+                    )
+                });
+            }
+        };
+    Ok(Some(parse_config_file(&path, &contents)?))
+}
+
+/// Reports whether the optional global config exists without performing a
+/// synchronous metadata call. `doctor` uses this to distinguish an absent
+/// global file from a parsed empty config.
+pub(crate) async fn global_config_exists_cancellable(
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    is_file_cancellable(&global_config_path()?, cancellation).await
+}
+
+async fn is_file_cancellable(
+    path: &Path,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    let path = path.to_owned();
+    async_io::run_blocking(
+        move |cancelled| {
+            use std::sync::atomic::Ordering;
+
+            if cancelled.load(Ordering::Acquire) {
+                bail!(crate::error::Interrupted::cancelled(
+                    "configuration metadata lookup was cancelled"
+                ));
+            }
+            Ok(path.is_file())
+        },
+        cancellation,
+    )
+    .await
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 /// Parses `contents` (already read from `path`) into a `ConfigFile` and
 /// resolves its registry paths against `path`'s parent directory — the one
 /// piece of post-processing both the project and the global config load
@@ -1121,11 +1288,41 @@ fn load_global_config() -> Result<Option<ConfigFile>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiKeySource, ConfigFile, DefaultSettings, McpServerConfig, McpTransport,
+        ApiKeySource, ConfigFile, ConfigSource, DefaultSettings, McpServerConfig, McpTransport,
         ShellToolDefinition, ToolPolicy, check_shell_tool_definition, expand_with,
-        normalize_base_url, resolve_endpoint, resolve_model,
+        load_config_cancellable, normalize_base_url, resolve_endpoint, resolve_model,
     };
     use std::collections::HashMap;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellable_config_load_stops_waiting_for_a_fifo() {
+        let path = crate::test_support::unique_temp_path("lait-config-fifo", ".yml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo should be available on Unix");
+        assert!(status.success());
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let source = ConfigSource::Explicit(path.clone());
+        let mut load = Box::pin(load_config_cancellable(&source, Some(token.clone())));
+        tokio::select! {
+            result = &mut load => panic!("FIFO config unexpectedly loaded: {result:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => token.cancel(),
+        }
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), load)
+            .await
+            .expect("cancellable config load should finish promptly")
+            .expect_err("a config FIFO without a writer should be cancelled");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "config cancellation should remain typed: {error:#}"
+        );
+        std::fs::remove_file(path).expect("config FIFO should be removable");
+    }
 
     #[test]
     fn tool_policy_allows_everything_by_default() {

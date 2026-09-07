@@ -34,28 +34,24 @@ fn read_stdin_text() -> Result<String> {
     Ok(buffer.trim_end_matches(['\n', '\r']).to_owned())
 }
 
-/// Combines a positional PROMPT/INPUT argument with piped stdin, the shared
-/// rule for chat, `lait run`, and `lait agent run`: a `-` argument reads
-/// stdin as the whole input; otherwise piped stdin (stdin not being a TTY)
-/// is the whole input when no argument is given, or is appended to the
-/// argument as context when one is. Returns `Ok(None)` when there is no
-/// input from either source — each caller reports that with its own message.
-pub(crate) fn resolve_input_with_stdin(positional: Option<String>) -> Result<Option<String>> {
+/// Reads a positional prompt/input and optional piped stdin for async
+/// entry points. Reading stdin is kept on the bounded blocking-I/O worker so a
+/// FIFO or a pipe with no EOF cannot hold the Tokio runtime past Ctrl-C.
+pub(crate) async fn resolve_input_with_stdin_cancellable(
+    positional: Option<String>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Option<String>> {
     use std::io::IsTerminal;
 
-    if positional.as_deref() == Some("-") {
-        return Ok(Some(read_stdin_text()?).filter(|text| !text.trim().is_empty()));
-    }
-    let piped_text = if std::io::stdin().is_terminal() {
-        None
+    let read_stdin = positional.as_deref() == Some("-") || !std::io::stdin().is_terminal();
+    let piped_text = if read_stdin {
+        Some(crate::async_io::run_blocking(move |_| read_stdin_text(), cancellation).await?)
+            .filter(|text| !text.trim().is_empty())
     } else {
-        // An empty pipe (e.g. `< /dev/null`) counts as no input at all, not
-        // as an empty prompt.
-        Some(read_stdin_text()?).filter(|text| !text.trim().is_empty())
+        None
     };
     Ok(match (positional, piped_text) {
-        // Both given: the instruction first, then the piped text as context,
-        // separated by a blank line (e.g. `git diff | lait "review this"`).
+        (Some(argument), piped) if argument == "-" => piped,
         (Some(argument), Some(piped)) => Some(format!("{argument}\n\n{piped}")),
         (Some(argument), None) => Some(argument),
         (None, piped) => piped,
@@ -217,7 +213,7 @@ pub(crate) fn resolve_cache_settings(
 
 /// The bare-invocation entry point (`lait [OPTIONS] [PROMPT]`, no
 /// subcommand): sends a single-shot chat request when a prompt is available
-/// (an argument or piped stdin — see `resolve_input_with_stdin`), or, when
+/// (an argument or piped stdin — see `resolve_input_with_stdin_cancellable`), or, when
 /// none is and stdin is an interactive terminal, starts the same REPL
 /// `lait chat` does instead of erroring. Piped-but-empty stdin (a script's
 /// `< /dev/null`, or a forgotten argument in a pipeline) still errors exactly
@@ -234,7 +230,14 @@ async fn run_chat_or_repl(
 ) -> Result<()> {
     use std::io::IsTerminal;
 
-    match resolve_input_with_stdin(chat.prompt.clone())? {
+    // The REPL installs its own listener once it starts. Every other bare
+    // invocation must install one before the cancellable initial stdin read
+    // (or before `run_chat`'s config load).
+    let enters_repl = chat.prompt.is_none() && std::io::stdin().is_terminal();
+    if !enters_repl {
+        crate::signal::spawn_handler(cancel.clone());
+    }
+    match resolve_input_with_stdin_cancellable(chat.prompt.clone(), Some(cancel.clone())).await? {
         Some(prompt) => {
             run_chat(
                 chat,
@@ -472,8 +475,8 @@ async fn run_chat(
     approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    crate::signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
     // `-p`/`--prompt-name` renders a named `prompts:` template against
     // `prompt` (which, for this path, is really the template's `{{ input }}`
@@ -621,9 +624,11 @@ async fn run_prompt(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let raw_input = resolve_input_with_stdin(args.input.clone())?
+    let raw_input = resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
+        .await?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
     let (prompt_text, prompt_model) =
         prompt::render_named(&args.name, &raw_input, &args.var.var, &file_config)?;
@@ -695,16 +700,20 @@ async fn run_agent(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let raw_input = resolve_input_with_stdin(args.input.clone())?
+    let raw_input = resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
+        .await?
         .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
-    let agent_file = agent::load_agent(&args.file)?;
-    let canonical_agent_path = std::fs::canonicalize(&args.file).with_context(|| {
-        format!(
-            "failed to resolve agent file path '{}'",
-            args.file.display()
-        )
-    })?;
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let agent_file = agent::load_agent_cancellable(&args.file, Some(cancel.clone())).await?;
+    let canonical_agent_path = crate::async_io::canonicalize(&args.file, Some(cancel.clone()))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to resolve agent file path '{}'",
+                args.file.display()
+            )
+        })?;
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
     announce_named_file(
         "==>",

@@ -70,7 +70,8 @@ pub(crate) async fn run(
 ) -> Result<()> {
     signal::spawn_handler(cancel.clone());
     let mut shared = args.shared;
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
     let mut history = app::load_session_history(shared.session.as_deref())?;
     let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
     let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);

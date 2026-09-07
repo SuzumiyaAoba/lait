@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::{config::ModelMap, nesting, schema};
+use crate::{async_io, config::ModelMap, nesting, schema};
 
 use super::model::{WorkflowDefaults, WorkflowFile};
 
@@ -47,13 +47,19 @@ impl WorkflowScope {
     /// Moves defaults and model/schema aliases into the execution scope.
     /// Steps already own shared references to their validated node definitions,
     /// so node lookup does not depend on this scope's identity or mutability.
-    pub(crate) fn top_level(wf: &mut WorkflowFile, file_path: &Path) -> Result<Self> {
-        let canonical = std::fs::canonicalize(file_path).with_context(|| {
-            format!(
-                "failed to resolve workflow file path '{}'",
-                file_path.display()
-            )
-        })?;
+    pub(crate) async fn top_level(
+        wf: &mut WorkflowFile,
+        file_path: &Path,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Self> {
+        let canonical = async_io::canonicalize(file_path, cancellation)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve workflow file path '{}'",
+                    file_path.display()
+                )
+            })?;
         let base_dir = canonical
             .parent()
             .map(Path::to_path_buf)
@@ -71,19 +77,21 @@ impl WorkflowScope {
     /// and checking canonical file paths for cycles and excessive nesting.
     /// Node references remain bound to the file where the step was parsed.
     /// Empty model/schema layers share the parent's Arc without cloning entries.
-    pub(crate) fn nested(
+    pub(crate) async fn resolve_nested_path(
         &self,
         relative_path: &Path,
-        sub_wf: &mut WorkflowFile,
         label: &str,
-    ) -> Result<Self> {
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<PathBuf> {
         let resolved_path = self.base_dir.join(relative_path);
-        let canonical = std::fs::canonicalize(&resolved_path).with_context(|| {
-            format!(
-                "step '{label}': failed to resolve workflow file path '{}'",
-                resolved_path.display()
-            )
-        })?;
+        let canonical = async_io::canonicalize(&resolved_path, cancellation)
+            .await
+            .with_context(|| {
+                format!(
+                    "step '{label}': failed to resolve workflow file path '{}'",
+                    resolved_path.display()
+                )
+            })?;
         if let Err(error) = nesting::check_workflow_nesting(&self.active_paths, &canonical) {
             match error {
                 nesting::NestingDepthError::Cycle => bail!(
@@ -98,6 +106,11 @@ impl WorkflowScope {
             }
         }
 
+        Ok(canonical)
+    }
+
+    /// Builds a child scope from a path already checked for cycles and depth.
+    pub(crate) fn nested(&self, canonical: PathBuf, sub_wf: &mut WorkflowFile) -> Self {
         let models = if sub_wf.models.is_empty() {
             Arc::clone(&self.models)
         } else {
@@ -125,7 +138,7 @@ impl WorkflowScope {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        Ok(Self {
+        Self {
             defaults: WorkflowDefaults::fold(&[
                 std::mem::take(&mut sub_wf.default),
                 self.defaults.clone(),
@@ -134,6 +147,6 @@ impl WorkflowScope {
             json_schemas,
             base_dir,
             active_paths,
-        })
+        }
     }
 }

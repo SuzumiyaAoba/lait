@@ -101,6 +101,7 @@ impl Target {
                         start_counter: 0,
                         progress_prefix: "",
                         cancellation: operation.clone(),
+                        placement: Default::default(),
                     },
                 )
                 .await?;
@@ -128,12 +129,18 @@ impl Target {
     }
 }
 
-fn load_target(target: &EvalTarget, base_dir: &Path, file_config: &ConfigFile) -> Result<Target> {
+async fn load_target(
+    target: &EvalTarget,
+    base_dir: &Path,
+    file_config: &ConfigFile,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Target> {
     match target {
         EvalTarget::Workflow { workflow } => {
             let workflow_path = base_dir.join(workflow);
-            let mut wf = workflow::load_workflow(&workflow_path)?;
-            let scope = WorkflowScope::top_level(&mut wf, &workflow_path)?;
+            let mut wf =
+                workflow::load_workflow_cancellable(&workflow_path, cancellation.clone()).await?;
+            let scope = WorkflowScope::top_level(&mut wf, &workflow_path, cancellation).await?;
             Ok(Target::Workflow {
                 wf: Box::new(wf),
                 scope,
@@ -283,15 +290,27 @@ pub(crate) async fn run(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     signal::spawn_handler(cancel.clone());
-    let file_config = Arc::new(config::load_config(&config_source)?);
+    let file_config =
+        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let contents = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("failed to read eval definition '{}'", args.file.display()))?;
+    let contents = crate::async_io::read_to_string_cancellable(
+        &args.file,
+        Some(cancel.clone()),
+        crate::async_io::MAX_READ_BYTES,
+    )
+    .await
+    .with_context(|| format!("failed to read eval definition '{}'", args.file.display()))?;
     let definition: EvalDefinition = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse eval definition '{}'", args.file.display()))?;
     let base_dir = args.file.parent().unwrap_or_else(|| Path::new("."));
 
-    let target = load_target(&definition.target, base_dir, &file_config)?;
+    let target = load_target(
+        &definition.target,
+        base_dir,
+        &file_config,
+        Some(cancel.clone()),
+    )
+    .await?;
     let default_model = target.default_model(&file_config);
 
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));

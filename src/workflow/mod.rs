@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{config::ConfigFile, jq, registry};
+use crate::{async_io, config::ConfigFile, jq, registry};
 
 #[cfg(test)]
 use crate::template;
@@ -81,6 +81,30 @@ pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
         .with_context(|| format!("failed to read workflow file '{}'", path.display()))?;
     parse_workflow(&contents)
         .with_context(|| format!("failed to parse workflow file '{}'", path.display()))
+}
+
+/// Loads and compiles a workflow without blocking the async executor. The
+/// worker owns the bounded read and parsing work, and observes cancellation
+/// while waiting for a FIFO writer or reading the source.
+pub(crate) async fn load_workflow_cancellable(
+    path: &Path,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<WorkflowFile> {
+    let path = path.to_owned();
+    async_io::run_blocking(
+        move |cancelled| {
+            let contents = async_io::read_to_string_wait_for_fifo_writer(
+                &path,
+                cancelled,
+                async_io::MAX_READ_BYTES,
+            )
+            .with_context(|| format!("failed to read workflow file '{}'", path.display()))?;
+            parse_workflow(&contents)
+                .with_context(|| format!("failed to parse workflow file '{}'", path.display()))
+        },
+        cancellation,
+    )
+    .await
 }
 
 pub(crate) fn parse_workflow(contents: &str) -> Result<WorkflowFile> {

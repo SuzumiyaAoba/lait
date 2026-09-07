@@ -145,6 +145,11 @@ pub(crate) struct RunContext {
     pub(crate) vars: serde_json::Map<String, serde_json::Value>,
     pub(super) policy: RunPolicy,
     pub(crate) always_approved_tools: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Serializes interactive tool approval across every tool loop that
+    /// shares this invocation. The mutex guard is transferred into the
+    /// blocking reader worker while it may outlive cancellation, so a later
+    /// prompt cannot consume the same stdin line prematurely.
+    pub(crate) approval_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RunContext {
@@ -159,6 +164,7 @@ impl RunContext {
             vars: serde_json::Map::new(),
             policy: RunPolicy::default(),
             always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
+            approval_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

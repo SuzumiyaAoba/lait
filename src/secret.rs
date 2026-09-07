@@ -273,7 +273,8 @@ mod tests {
         assert!(
             error
                 .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>())
+                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            "{error:#}"
         );
 
         for _ in 0..100 {
