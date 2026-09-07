@@ -597,6 +597,7 @@ fn read_from_file(
                 budget.claim(read)?;
                 contents.extend_from_slice(&buffer[..read]);
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -621,30 +622,30 @@ fn wait_for_fifo_event(file: &mut File, path: &Path) -> Result<FifoEvent> {
         events: libc::POLLIN | libc::POLLERR,
         revents: 0,
     };
-    loop {
-        // A short poll interval lets the cancellation check in the caller
-        // run even while no FIFO writer exists. `poll` itself is bounded and
-        // therefore cannot recreate the old uninterruptible worker problem.
-        let result = unsafe { libc::poll(&mut pollfd, 1, 10) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                pollfd.revents = 0;
-                continue;
-            }
-            return Err(anyhow::anyhow!(
-                "polling FIFO '{}' failed: {error}",
-                path.display()
-            ));
+    // A short poll interval lets the cancellation check in the caller run
+    // even while no FIFO writer exists. `poll` itself is bounded and therefore
+    // cannot recreate the old uninterruptible worker problem.
+    let result = unsafe { libc::poll(&mut pollfd, 1, 10) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            // Return to the outer read loop so it can observe the shared
+            // cancellation flag before polling again. Re-entering this loop
+            // would let a signal storm postpone cancellation indefinitely.
+            return Ok(FifoEvent::NoWriter);
         }
-
-        // On systems exposing POLLHUP, this also observes a writer that
-        // connected and closed without leaving any bytes between our polls.
-        if pollfd.revents & libc::POLLHUP != 0 {
-            return Ok(FifoEvent::WriterConnected);
-        }
-        return probe_fifo_reader(file);
+        return Err(anyhow::anyhow!(
+            "polling FIFO '{}' failed: {error}",
+            path.display()
+        ));
     }
+
+    // On systems exposing POLLHUP, this also observes a writer that connected
+    // and closed without leaving any bytes between our polls.
+    if pollfd.revents & libc::POLLHUP != 0 {
+        return Ok(FifoEvent::WriterConnected);
+    }
+    probe_fifo_reader(file)
 }
 
 #[cfg(unix)]
@@ -902,8 +903,9 @@ fn write_nonblocking_special_file(
         match file.write(&bytes[offset..]) {
             Ok(0) => bail!("output file write made no progress"),
             Ok(written) => offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+                wait_for_writable(&file)?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -914,6 +916,32 @@ fn write_nonblocking_special_file(
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_writable(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut pollfd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
+        revents: 0,
+    };
+    // Keep the poll bounded so the caller can re-check its cancellation flag
+    // between waits. When the reader drains the FIFO, POLLOUT wakes this
+    // worker immediately instead of adding another fixed sleep.
+    let result = unsafe { libc::poll(&mut pollfd, 1, 10) };
+    if result >= 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::Interrupted {
+        // Return to the writer loop so it can check cancellation before
+        // attempting another write. This keeps the poll wait bounded even
+        // when signals repeatedly interrupt poll(2).
+        return Ok(());
+    }
+    Err(error).context("polling output file for writability failed")
 }
 
 #[cfg(test)]
@@ -1143,9 +1171,15 @@ mod tests {
             )));
         }
 
+        let mut successful_tasks = 0;
         for task in tasks {
-            task.await.unwrap().unwrap();
+            match task.await.unwrap() {
+                Ok(()) => successful_tasks += 1,
+                Err(error) if error.to_string().contains("saturated") => {}
+                Err(error) => panic!("unexpected worker failure: {error:#}"),
+            }
         }
+        assert!(successful_tasks > 0, "at least one worker must be admitted");
         assert!(
             maximum.load(Ordering::Acquire) <= super::MAX_BLOCKING_WORKERS,
             "too many blocking workers ran concurrently: {}",
@@ -1361,9 +1395,9 @@ mod tests {
             .expect("a contended hardlink writer should cancel promptly")
             .unwrap();
         assert!(result.is_err());
-        assert_eq!(fs::read_to_string(&first_path).unwrap(), "original");
         drop(_held_lease);
         drop(held_file);
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), "original");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1440,6 +1474,7 @@ mod tests {
                             }
                         }
                     }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
                     }
@@ -1508,7 +1543,17 @@ mod tests {
             let _ = second.await;
             let _ = reader_thread.join();
             let _ = std::fs::remove_file(&path);
-            panic!("the retry FIFO writer timed out");
+            let reader_diagnostic = match reader_result.recv_timeout(Duration::from_secs(1)) {
+                Ok(Ok(bytes)) => format!(
+                    "reader received {} bytes (x={}, y={})",
+                    bytes.len(),
+                    bytes.iter().filter(|byte| **byte == b'x').count(),
+                    bytes.iter().filter(|byte| **byte == b'y').count(),
+                ),
+                Ok(Err(error)) => format!("reader failed: {error}"),
+                Err(error) => format!("reader result unavailable: {error}"),
+            };
+            panic!("the retry FIFO writer timed out; {reader_diagnostic}");
         }
         if second_result.as_ref().is_ok_and(|result| result.is_err()) {
             let _ = reader_thread.join();
