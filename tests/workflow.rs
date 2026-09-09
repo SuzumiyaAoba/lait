@@ -1905,6 +1905,162 @@ steps:
 }
 
 #[test]
+fn stop_inside_a_for_each_returns_the_stopping_item_without_running_join() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  increment:
+    type: transform
+    jq: '. + 10'
+  never:
+    type: transform
+    jq: 'error("later steps must not run")'
+steps:
+  - for_each:
+      items: '[1, 2, 3]'
+      steps:
+        - use: increment
+        - when: '. == 12'
+          stop: true
+      join: 'error("join must not run")'
+  - use: never
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "null");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "12");
+}
+
+#[test]
+fn an_on_error_stop_takes_precedence_over_the_failing_steps_break() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  fail:
+    type: transform
+    jq: 'error("failure")'
+  recover:
+    type: transform
+    jq: '"recovered"'
+  never:
+    type: transform
+    jq: 'error("later steps must not run")'
+steps:
+  - loop:
+      until: 'false'
+      max_iterations: 1
+      steps:
+        - use: fail
+          break: true
+          on_error:
+            steps:
+              - use: recover
+                stop: true
+              - use: never
+  - use: never
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "null");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "recovered");
+}
+
+#[test]
+fn nested_routers_preserve_named_outputs_and_progress_counters() {
+    let workflow = WorkflowFile::new(
+        r#"
+nodes:
+  increment:
+    type: transform
+    jq: '. + 1'
+  first:
+    type: transform
+    jq: '.[0]'
+  last:
+    type: transform
+    jq: '.[-1]'
+  inspect:
+    type: transform
+    jq: '{value: ., steps: $steps}'
+steps:
+  - id: seed
+    use: increment
+  - id: skipped
+    use: increment
+    when: 'false'
+  - id: route
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - id: repeat
+              loop:
+                while: '. < 3'
+                max_iterations: 2
+                steps:
+                  - id: item
+                    use: increment
+  - id: batch
+    for_each:
+      items: '[., . + 1]'
+      steps:
+        - id: seen
+          use: increment
+  - id: forks
+    parallel:
+      branches:
+        - id: left
+          steps:
+            - id: left_child
+              use: first
+        - id: right
+          steps:
+            - id: right_child
+              use: last
+  - id: report
+    use: inspect
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "0");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "value": {"left": 4, "right": 5},
+            "steps": {
+                "seed": 1,
+                "item": 3,
+                "repeat": 3,
+                "route": 3,
+                "seen": 5,
+                "batch": [4, 5],
+                "forks": {"left": 4, "right": 5},
+            },
+        }),
+        "sequential outputs must flow outward while branch outputs stay isolated"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for progress in [
+        "[2] skipped (skipped)",
+        "[6] item",
+        "[7] batch",
+        "[10] forks",
+        "[left] [1] left_child",
+        "[right] [1] right_child",
+        "[11] report",
+    ] {
+        assert!(stderr.contains(progress), "missing {progress}: {stderr}");
+    }
+}
+
+#[test]
 fn retry_succeeds_after_a_transient_failure() {
     let server = MockServer::start_sequence(&[
         ("500 Internal Server Error", SERVER_ERROR_BODY),

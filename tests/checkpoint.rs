@@ -116,6 +116,69 @@ fn checkpoint_records_the_first_step_and_resume_does_not_rerun_it() {
 }
 
 #[test]
+fn a_stopped_nested_router_checkpoints_only_completed_named_outputs() {
+    let dir = ConfigDirectory::empty();
+    fs::write(
+        dir.path().join("workflow.yml"),
+        r#"
+steps:
+  - id: outer
+    switch:
+      cases:
+        - when: 'true'
+          steps:
+            - id: repeat
+              loop:
+                until: 'false'
+                max_iterations: 1
+                steps:
+                  - id: items
+                    for_each:
+                      items: '[7, 8]'
+                      steps:
+                        - id: selected
+                          switch:
+                            cases:
+                              - when: 'true'
+                                steps:
+                                  - id: halt
+                                    stop: true
+"#,
+    )
+    .expect("failed to write test workflow");
+
+    let output = test_command()
+        .current_dir(dir.path())
+        .args([
+            "run",
+            "workflow.yml",
+            "null",
+            "--checkpoint",
+            "--no-config",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "7");
+    let ids = run_ids(&dir);
+    assert_eq!(ids.len(), 1);
+    let checkpoint: serde_json::Value = serde_json::from_slice(
+        &fs::read(dir.path().join(format!(".lait/runs/{}.json", ids[0]))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["status"], "completed");
+    assert_eq!(checkpoint["counter"], 5);
+    assert_eq!(checkpoint["current_input"], "7");
+    assert_eq!(
+        checkpoint["steps_outputs"],
+        serde_json::json!({"halt": 7, "selected": 7, "outer": 7}),
+        "switch outputs should be recorded, but stopped loop/item aggregation remains unfinished"
+    );
+}
+
+#[test]
 fn resume_fails_clearly_for_an_unknown_run_id() {
     let dir = ConfigDirectory::empty();
     fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW_FIXED)
