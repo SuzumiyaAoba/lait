@@ -781,6 +781,10 @@ async fn execute_step(
 
     let mut step_output = match node {
         workflow::NodeDefinition::Prompt(prompt_node) => {
+            // Parsed once and shared with the `RenderScope` built below —
+            // `input_schema` validation and prompt/system_prompt rendering
+            // both need the same parsed value.
+            let input = template::parse_input(current_input);
             if let Some(name_or_path) = &prompt_node.input_schema {
                 let schema = schema::resolve_named_schema_value_cancellable(
                     &scope.json_schemas,
@@ -789,7 +793,6 @@ async fn execute_step(
                 )
                 .await
                 .with_context(|| format!("step '{label}'"))?;
-                let input = template::parse_input(current_input);
                 schema::validate_input_against_schema(&schema, &input)
                     .with_context(|| format!("step '{label}'"))?;
             }
@@ -827,14 +830,19 @@ async fn execute_step(
                 None => None,
             };
 
-            let input = template::parse_input(current_input);
+            // Built once and shared by both renders below: handlebars'
+            // `Context` owns a clone of `input`/`steps_outputs`/`env.vars`,
+            // so rendering `prompt`/`system_prompt` through one scope
+            // clones that data once instead of once per template.
+            let render_scope = template::RenderScope::new(&input, steps_outputs, &env.vars);
             // A `system_prompt`-only node (no `prompt`) sends the current
             // input unchanged as the user message, the same way an `agent`
             // node's `current_input` passes straight through `call_agent`
             // without going through `template::render`.
             let prompt: Cow<'_, str> = match &prompt_node.prompt {
                 Some(prompt_template) => Cow::Owned(
-                    template::render(prompt_template, &input, steps_outputs, &env.vars)
+                    render_scope
+                        .render(prompt_template)
                         .with_context(|| format!("step '{label}'"))?,
                 ),
                 None => Cow::Borrowed(current_input),
@@ -851,9 +859,7 @@ async fn execute_step(
                 .system_prompt
                 .as_deref()
                 .or(scope.defaults.system_prompt.as_deref())
-                .map(|system_prompt_template| {
-                    template::render(system_prompt_template, &input, steps_outputs, &env.vars)
-                })
+                .map(|system_prompt_template| render_scope.render(system_prompt_template))
                 .transpose()
                 .with_context(|| format!("step '{label}'"))?;
 
@@ -974,10 +980,14 @@ async fn execute_step(
         }
         workflow::NodeDefinition::Command(command_node) => {
             let input = template::parse_input(current_input);
+            // One `RenderScope` for every argv element, instead of
+            // rebuilding a handlebars `Context` (a clone of `input`/
+            // `steps_outputs`/`env.vars`) per element.
+            let render_scope = template::RenderScope::new(&input, steps_outputs, &env.vars);
             let rendered_argv: Vec<String> = command_node
                 .command
                 .iter()
-                .map(|arg| template::render(arg, &input, steps_outputs, &env.vars))
+                .map(|arg| render_scope.render(arg))
                 .collect::<Result<_>>()
                 .with_context(|| format!("step '{label}'"))?;
             crate::process::run_command(&rendered_argv, current_input, step_cancel.clone())
