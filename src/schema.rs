@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -29,8 +28,8 @@ pub(crate) enum JsonSchemaEntry {
 
 /// The pure part of resolving a file-backed schema entry, shared by
 /// [`load_schema_value`]/[`load_schema_value_cancellable`]: only the read
-/// (sync `fs::read_to_string` vs. the cancellation-aware worker) differs
-/// between them.
+/// (`async_io::read_to_string_sync` vs. the cancellation-aware worker)
+/// differs between them.
 fn parse_schema_entry_contents(contents: &str, file_path: &Path) -> Result<serde_json::Value> {
     serde_json::from_str(contents)
         .with_context(|| format!("failed to parse JSON schema file '{}'", file_path.display()))
@@ -42,7 +41,7 @@ pub(crate) fn load_schema_value(entry: &JsonSchemaEntry) -> Result<serde_json::V
     match entry {
         JsonSchemaEntry::Inline { schema } => Ok(schema.clone()),
         JsonSchemaEntry::FilePath { file_path } => {
-            let contents = fs::read_to_string(file_path).with_context(|| {
+            let contents = async_io::read_to_string_sync(file_path).with_context(|| {
                 format!("failed to read JSON schema file '{}'", file_path.display())
             })?;
             parse_schema_entry_contents(&contents, file_path)
@@ -100,7 +99,7 @@ pub(crate) fn resolve_named_schema_value(
         Some(entry) => load_schema_value(entry),
         None => {
             let path = Path::new(name_or_path);
-            let contents = fs::read_to_string(path)
+            let contents = async_io::read_to_string_sync(path)
                 .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
             parse_schema_entry_contents(&contents, path)
         }
@@ -318,7 +317,7 @@ fn parse_json_schema_contents(contents: &str, path: &Path, name: &str) -> Result
 }
 
 pub(crate) fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
-    let contents = fs::read_to_string(path)
+    let contents = async_io::read_to_string_sync(path)
         .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
     parse_json_schema_contents(&contents, path, name)
 }

@@ -681,6 +681,22 @@ pub(crate) fn read_to_string(
     String::from_utf8(bytes).context("file contents were not valid UTF-8")
 }
 
+/// Synchronous counterpart to [`read_to_string_cancellable`], for a caller
+/// with no async runtime to run on (`lint`, `agent list`/`prompt list`, and
+/// other purely local commands — see `app::needs_async_runtime`). Applies
+/// the same [`MAX_READ_BYTES`] bound and non-blocking Unix special-file
+/// handling [`read_file`] gives every other reader in this module, rather
+/// than a bare `std::fs::read_to_string`, so a sync-path caller and its
+/// `_cancellable` counterpart enforce the same limits on the same kind of
+/// file — the point of routing every sync reader through this one function
+/// instead of each reaching for `std::fs::read_to_string` directly. Unlike
+/// `read_to_string_cancellable`'s FIFO-waiting variant, this never waits for
+/// a writer: a synchronous caller has no cancellation channel to interrupt
+/// that wait, so a FIFO with no writer yet fails fast instead of hanging.
+pub(crate) fn read_to_string_sync(path: &Path) -> Result<String> {
+    read_to_string(path, &AtomicBool::new(false), MAX_READ_BYTES)
+}
+
 /// FIFO-waiting counterpart to [`read_to_string`].
 pub(crate) fn read_to_string_wait_for_fifo_writer(
     path: &Path,
@@ -949,8 +965,8 @@ mod tests {
     #[cfg(unix)]
     use super::read_file_wait_for_fifo_writer;
     use super::{
-        ReadBudget, acquire_path_lock, read_file, run_blocking_with_path_lock,
-        run_blocking_with_pool, write_output_file,
+        MAX_READ_BYTES, ReadBudget, acquire_path_lock, read_file, read_to_string_sync,
+        run_blocking_with_path_lock, run_blocking_with_pool, write_output_file,
     };
     use std::{
         fs::{self, OpenOptions},
@@ -1194,6 +1210,23 @@ mod tests {
         let cancelled = AtomicBool::new(false);
 
         let error = read_file(&path, &cancelled, 3).unwrap_err();
+        assert!(error.to_string().contains("read limit"));
+        let _ = fs::remove_file(path);
+    }
+
+    /// `read_to_string_sync` (the sync-path counterpart every purely local
+    /// command's schema/config loader now goes through — see B1-G2's commit
+    /// message) enforces the same `MAX_READ_BYTES` bound as
+    /// `read_to_string_cancellable`'s async path, rather than the unbounded
+    /// `std::fs::read_to_string` it replaced. Mirrors
+    /// `read_file_rejects_bytes_beyond_the_explicit_limit` above, at the
+    /// actual configured limit instead of an explicit small one.
+    #[test]
+    fn read_to_string_sync_rejects_a_file_beyond_max_read_bytes() {
+        let path = crate::test_support::unique_temp_path("lait-test-sync-read-limit", ".txt");
+        fs::write(&path, vec![b'a'; MAX_READ_BYTES + 1]).unwrap();
+
+        let error = read_to_string_sync(&path).unwrap_err();
         assert!(error.to_string().contains("read limit"));
         let _ = fs::remove_file(path);
     }
