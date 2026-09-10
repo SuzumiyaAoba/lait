@@ -51,10 +51,14 @@ const CACHE_DIR: &str = ".lait/cache";
 struct CacheKeyInput<'a> {
     base_url: &'a str,
     model_id: &'a str,
-    // `ReasoningEffort` implements neither `Serialize` (a CLI/config-only
-    // type) nor `Display`, so its own `as_str()` (already the canonical
-    // lowercase form used across the CLI/YAML) stands in for it here.
-    reasoning_effort: Option<&'static str>,
+    // `ReasoningEffort` derives `Serialize` (see `reasoning.rs`'s module
+    // doc for why it moved out of `cli.rs`), and its `#[serde(rename)]`
+    // attributes are pinned to match `as_str()` exactly
+    // (`reasoning::tests::serialized_name_matches_as_str`) — so this
+    // field's byte encoding is unchanged from when it held `as_str()`'s
+    // `Option<&'static str>` directly (see
+    // `key_output_is_pinned_against_a_fixed_encoding` below).
+    reasoning_effort: Option<crate::reasoning::ReasoningEffort>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
@@ -89,9 +93,7 @@ pub(crate) fn key(
     let payload = CacheKeyInput {
         base_url,
         model_id,
-        reasoning_effort: sampling
-            .reasoning_effort
-            .map(crate::cli::ReasoningEffort::as_str),
+        reasoning_effort: sampling.reasoning_effort,
         temperature: sampling.temperature,
         top_p: sampling.top_p,
         max_tokens: sampling.max_tokens,
@@ -136,9 +138,15 @@ fn entry_path(key: &str) -> PathBuf {
 /// lookup runs on every `complete_recorded` call, including from concurrent
 /// workflow branches (`for_each`/`parallel`), so it needs to observe the
 /// same cancellation a request's own timeout would.
+///
+/// `now` is a parameter (production call sites pass `chrono::Utc::now()`)
+/// rather than read internally, so TTL expiry can be tested deterministically
+/// instead of depending on real elapsed time — see
+/// `expired_entries_are_treated_as_a_miss`.
 pub(crate) async fn load(
     key: &str,
     ttl_secs: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Option<response::ChatCompletionResponse>> {
     let path = entry_path(key);
@@ -156,7 +164,7 @@ pub(crate) async fn load(
         return Ok(None);
     };
     if let Some(ttl_secs) = ttl_secs {
-        let age = chrono::Utc::now().signed_duration_since(entry.created_at);
+        let age = now.signed_duration_since(entry.created_at);
         if age < chrono::Duration::zero() || age.num_seconds() as u64 > ttl_secs {
             return Ok(None);
         }
@@ -165,11 +173,17 @@ pub(crate) async fn load(
 }
 
 /// Writes `response` to `key`'s cache entry, atomically (temp file in the
-/// same directory, then `rename` — see `storage::write_atomic`).
-pub(crate) fn save(key: &str, response: &response::ChatCompletionResponse) -> Result<()> {
+/// same directory, then `rename` — see `storage::write_atomic`). `now`
+/// becomes the entry's `created_at` — see `load`'s doc comment for why it's
+/// a parameter rather than read internally.
+pub(crate) fn save(
+    key: &str,
+    response: &response::ChatCompletionResponse,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
     let path = entry_path(key);
     let entry = CacheEntryRef {
-        created_at: chrono::Utc::now(),
+        created_at: now,
         response,
     };
     let body = serde_json::to_string_pretty(&entry).context("failed to serialize cache entry")?;
@@ -203,8 +217,9 @@ pub(crate) fn run(command: CacheCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{key, load};
+    use super::{key, load, save};
     use crate::engine::SamplingOverrides;
+    use crate::response;
 
     /// `load` now reads through `async_io::read_to_string_cancellable`
     /// rather than a bare `std::fs::read_to_string` — pins that the
@@ -218,10 +233,61 @@ mod tests {
             let path = std::path::Path::new(super::CACHE_DIR).join("big-key.json");
             std::fs::write(&path, vec![b'a'; crate::async_io::MAX_READ_BYTES + 1]).unwrap();
 
-            let error = load("big-key", None, None).await.unwrap_err();
+            let error = load("big-key", None, chrono::Utc::now(), None)
+                .await
+                .unwrap_err();
             assert!(
                 format!("{error:#}").contains("read limit"),
                 "error: {error:#}"
+            );
+        })
+        .await;
+    }
+
+    fn sample_response() -> response::ChatCompletionResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "model-a",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }],
+        }))
+        .expect("sample response should deserialize")
+    }
+
+    /// `load`/`save` take `now` as a parameter rather than reading
+    /// `chrono::Utc::now()` internally (B7), specifically so TTL expiry can
+    /// be tested deterministically instead of needing a real sleep — this is
+    /// that test.
+    #[tokio::test]
+    async fn expired_entries_are_treated_as_a_miss() {
+        crate::test_support::in_temp_dir_async("lait-cache-ttl", async {
+            let saved_at = chrono::Utc::now();
+            let response = sample_response();
+            save("ttl-key", &response, saved_at).expect("save should succeed");
+
+            // Just inside the TTL: still a hit.
+            let just_before_expiry = saved_at + chrono::Duration::seconds(59);
+            assert!(
+                load("ttl-key", Some(60), just_before_expiry, None)
+                    .await
+                    .expect("load should succeed")
+                    .is_some(),
+                "an entry younger than its TTL should still be a hit"
+            );
+
+            // Past the TTL: a miss, not an error.
+            let after_expiry = saved_at + chrono::Duration::seconds(61);
+            assert!(
+                load("ttl-key", Some(60), after_expiry, None)
+                    .await
+                    .expect("load should succeed")
+                    .is_none(),
+                "an entry older than its TTL should be treated as a miss"
             );
         })
         .await;
@@ -254,7 +320,7 @@ mod tests {
         );
 
         let sampling = SamplingOverrides {
-            reasoning_effort: Some(crate::cli::ReasoningEffort::High),
+            reasoning_effort: Some(crate::reasoning::ReasoningEffort::High),
             temperature: Some(0.5),
             top_p: Some(0.9),
             max_tokens: Some(256),

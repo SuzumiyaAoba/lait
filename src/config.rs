@@ -26,10 +26,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::{
-    async_io,
-    cli::{Cli, ReasoningEffort},
-};
+use crate::{async_io, cli::Cli, reasoning::ReasoningEffort};
 
 pub(crate) const CONFIG_FILE_NAME: &str = "lait.config.yml";
 

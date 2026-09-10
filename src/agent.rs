@@ -4,9 +4,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::{
-    async_io,
-    cli::ReasoningEffort,
-    frontmatter, llm,
+    async_io, frontmatter, llm,
+    reasoning::ReasoningEffort,
     schema::{self, JsonSchemaEntry},
 };
 

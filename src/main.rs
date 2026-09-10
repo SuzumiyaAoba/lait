@@ -31,6 +31,7 @@ mod models;
 mod nesting;
 mod process;
 mod prompt;
+mod reasoning;
 mod registry;
 mod render;
 mod repl;

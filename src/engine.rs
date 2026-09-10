@@ -15,9 +15,10 @@ use std::{
 use crate::{
     agent::AgentFile,
     async_io, cache, cassette,
-    cli::ReasoningEffort,
     config::{self, ConfigFile, ModelMap},
-    llm, mcp, nesting, process, response, schema, shell_tool, skill, subagent, template, workflow,
+    llm, mcp, nesting, process,
+    reasoning::ReasoningEffort,
+    response, schema, shell_tool, skill, subagent, template, workflow,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::{
@@ -805,7 +806,14 @@ impl RequestSettings {
             let cache_key = content_key
                 .as_deref()
                 .expect("content_key is computed above whenever cache_enabled is set");
-            match cache::load(cache_key, env.policy.cache.ttl(), cancellation.clone()).await {
+            match cache::load(
+                cache_key,
+                env.policy.cache.ttl(),
+                chrono::Utc::now(),
+                cancellation.clone(),
+            )
+            .await
+            {
                 Ok(Some(response)) => {
                     eprintln!("note: cache hit for {}", self.usage_label);
                     tracing::debug!(cache_key = %cache_key, "response cache hit");
@@ -842,7 +850,7 @@ impl RequestSettings {
                     env.usage.record_response(&self.usage_label, &response);
                     if env.policy.cache.enabled()
                         && let Some(cache_key) = &content_key
-                        && let Err(error) = cache::save(cache_key, &response)
+                        && let Err(error) = cache::save(cache_key, &response, chrono::Utc::now())
                     {
                         tracing::debug!(error = %error, "failed to write response cache entry");
                     }

@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::{cli::ReasoningEffort, config::ModelMap, schema::JsonSchemaMap};
+use crate::{config::ModelMap, reasoning::ReasoningEffort, schema::JsonSchemaMap};
 
 /// The only workflow schema version this build understands. `WorkflowFile`'s
 /// `version:` is optional (omitted means "latest"); an explicit but

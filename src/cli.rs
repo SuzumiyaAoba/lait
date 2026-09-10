@@ -7,17 +7,17 @@
 //! by subcommand would move declarations around without reducing what a
 //! reader has to hold in mind.
 //!
-//! `app::needs_async_runtime`/`app::run_blocking`/`app::run` are the
-//! consumers that turn a parsed `Command` into behavior; this module owns
-//! only the shape of the arguments, not their dispatch.
+//! `app::classify`/`app::run_blocking`/`app::run` are the consumers that
+//! turn a parsed `Command` into behavior; this module owns only the shape of
+//! the arguments, not their dispatch.
 
 use std::path::PathBuf;
 
+use crate::reasoning::ReasoningEffort;
 use clap::{
     ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
     error::ErrorKind, parser::ValueSource,
 };
-use serde::Deserialize;
 
 /// Lightweight AI Tool command-line interface.
 #[derive(Debug, Parser)]
@@ -894,48 +894,10 @@ pub(crate) struct ChatReplArgs {
     pub(crate) shared: SharedChatArgs,
 }
 
-impl ReasoningEffort {
-    /// The lowercase name used on the CLI and in YAML, for display (e.g.
-    /// `lait models`' DEFAULTS column). Must match the `#[value(name)]`
-    /// attributes below — pinned by `as_str_matches_the_clap_value_names`
-    /// (`&'static str` is why this can't just call `to_possible_value`).
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ReasoningEffort {
-    #[value(name = "none")]
-    #[serde(rename = "none")]
-    None,
-    #[value(name = "minimal")]
-    #[serde(rename = "minimal")]
-    Minimal,
-    #[value(name = "low")]
-    #[serde(rename = "low")]
-    Low,
-    #[value(name = "medium")]
-    #[serde(rename = "medium")]
-    Medium,
-    #[value(name = "high")]
-    #[serde(rename = "high")]
-    High,
-    #[value(name = "xhigh")]
-    #[serde(rename = "xhigh")]
-    Xhigh,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AgentAction, AgentCommand, Cli, Command, EvalFormat, ReasoningEffort, TestFormat};
+    use super::{AgentAction, AgentCommand, Cli, Command, EvalFormat, TestFormat};
+    use crate::reasoning::ReasoningEffort;
 
     #[test]
     fn parses_prompt_and_options() {
@@ -1003,22 +965,6 @@ mod tests {
 
         assert!(!cli.chat.shared.show_reasoning);
         assert_eq!(cli.chat.shared.reasoning_effort, None);
-    }
-
-    #[test]
-    fn as_str_matches_the_clap_value_names() {
-        use clap::ValueEnum;
-
-        for variant in ReasoningEffort::value_variants() {
-            assert_eq!(
-                variant.as_str(),
-                variant
-                    .to_possible_value()
-                    .expect("no reasoning effort variant is skipped")
-                    .get_name(),
-                "ReasoningEffort::as_str drifted from the #[value(name)] attribute"
-            );
-        }
     }
 
     #[test]

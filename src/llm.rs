@@ -20,7 +20,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use crate::{
-    cli::ReasoningEffort,
+    reasoning::ReasoningEffort,
     response::{ChatCompletionResponse, ChatCompletionStreamChunk, ToolCall},
 };
 
