@@ -1,7 +1,11 @@
 use std::{
+    collections::HashMap,
     io::{self, Write},
     mem::size_of,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,6 +17,84 @@ use jaq_core::{
 use jaq_json::{Val, read};
 
 use crate::{async_io, template};
+
+/// A compiled jq filter, keyed by its source text in [`FILTER_CACHE`]. The
+/// lookup-table representation a filter compiles to (`jaq_core::Filter`'s
+/// `Term`s and native-filter function pointers) is fully owned — no
+/// `jaq_json::Val` or borrow from the compiling `Arena` survives past
+/// `compiled_filter` — so it can be cached across calls and across threads;
+/// see the `Send + Sync + 'static` assertion below.
+type CompiledFilter = jaq_core::Filter<data::JustLut<Val>>;
+
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<CompiledFilter>();
+};
+
+/// Filters compiled by [`compiled_filter`], shared across every jq call in
+/// the process. Every `run_filter_with`/`check_syntax` invocation parses and
+/// compiles the same fixed prelude (`jaq_core`/`jaq_std`/`jaq_json`'s
+/// `defs()`, ~200 lines of jq source) plus `filter_source` itself; caching
+/// the compiled result means only the first call for a given filter text
+/// pays that cost, which matters most for `for_each`/`loop` bodies that
+/// re-evaluate the same `when:`/`jq:` filter many times. Unbounded by
+/// design: a workflow's set of distinct filter strings is fixed at parse
+/// time, so this cannot grow without bound the way a per-request cache
+/// could.
+static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CompiledFilter>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Parses and compiles `filter_source` (defs/funs prelude plus the filter
+/// itself), or returns the cached result of an earlier call with the same
+/// source text. Callers must call [`validate_filter_source`] first — this
+/// function does not re-check the byte/nesting limits, so a cache hit must
+/// not be reachable for a filter that failed validation.
+///
+/// The prelude and `with_global_vars(["$steps", "$vars"])` are fixed across
+/// every caller (`run_filter_with` and `check_syntax` alike), so neither
+/// needs to be part of the cache key.
+fn compiled_filter(filter_source: &str) -> Result<Arc<CompiledFilter>> {
+    if let Some(filter) = FILTER_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(filter_source)
+    {
+        return Ok(Arc::clone(filter));
+    }
+
+    let program = File {
+        code: filter_source,
+        path: (),
+    };
+    let defs = jaq_core::defs()
+        .chain(jaq_std::defs())
+        .chain(jaq_json::defs());
+    // Turbofished for the same reason `check_syntax` used to spell it out:
+    // nothing downstream of `compiled_filter` builds a `Ctx` to pin `D`
+    // retroactively, since the whole point is to hand back a filter whose
+    // `D` is already fixed to `data::JustLut<Val>` (see `CompiledFilter`).
+    let funs = jaq_core::funs::<data::JustLut<Val>>()
+        .chain(jaq_std::funs())
+        .chain(jaq_json::funs());
+
+    let loader = Loader::new(defs);
+    let arena = Arena::default();
+    let modules = loader
+        .load(&arena, program)
+        .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
+    let filter: CompiledFilter = Compiler::default()
+        .with_funs(funs)
+        .with_global_vars(["$steps", "$vars"])
+        .compile(modules)
+        .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
+
+    let filter = Arc::new(filter);
+    FILTER_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(filter_source.to_owned(), Arc::clone(&filter));
+    Ok(filter)
+}
 
 /// jq is intentionally run in a bounded worker rather than on Tokio's
 /// executor. These limits keep a filter that emits an unbounded stream from
@@ -212,39 +294,15 @@ pub(crate) fn apply_one(
 
 /// Parses and compiles `filter_source` without running it against any input,
 /// to check its syntax statically (used by the workflow/agent linter, which
-/// has no `$steps`/input value at hand yet). Mirrors the parse/compile half
-/// of `run_filter` (kept as its own copy rather than factored out: the
-/// compiled filter's type borrows from the local `arena`, so sharing it back
-/// out to a caller isn't worth the lifetime plumbing for a check that never
-/// needs the result). A filter that only references `$steps` still compiles
-/// here, since `with_global_vars` is declared the same way `run_filter` does.
+/// has no `$steps`/input value at hand yet). Goes through the same
+/// [`compiled_filter`] cache `run_filter_with` uses, so a filter the linter
+/// already checked (or that a prior workflow run already compiled) doesn't
+/// pay the parse/compile cost twice. A filter that only references `$steps`
+/// still compiles here, since `with_global_vars` is declared the same way
+/// `run_filter_with` does.
 pub(crate) fn check_syntax(filter_source: &str) -> Result<()> {
     validate_filter_source(filter_source)?;
-    let program = File {
-        code: filter_source,
-        path: (),
-    };
-    let defs = jaq_core::defs()
-        .chain(jaq_std::defs())
-        .chain(jaq_json::defs());
-    // `run_filter` leaves this turbofish off: its later `Ctx::<data::JustLut<Val>>`
-    // pins `D` retroactively. `check_syntax` never builds a `Ctx` (it only
-    // compiles, never runs, the filter), so nothing else fixes `D` — spell it
-    // out instead.
-    let funs = jaq_core::funs::<data::JustLut<Val>>()
-        .chain(jaq_std::funs())
-        .chain(jaq_json::funs());
-
-    let loader = Loader::new(defs);
-    let arena = Arena::default();
-    let modules = loader
-        .load(&arena, program)
-        .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
-    Compiler::default()
-        .with_funs(funs)
-        .with_global_vars(["$steps", "$vars"])
-        .compile(modules)
-        .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
+    compiled_filter(filter_source)?;
     Ok(())
 }
 
@@ -381,28 +439,7 @@ where
     let vars_val = parse_global_var(vars, "$vars")?;
     check_cancelled_opt(cancelled)?;
 
-    let program = File {
-        code: filter_source,
-        path: (),
-    };
-    let defs = jaq_core::defs()
-        .chain(jaq_std::defs())
-        .chain(jaq_json::defs());
-    let funs = jaq_core::funs()
-        .chain(jaq_std::funs())
-        .chain(jaq_json::funs());
-
-    let loader = Loader::new(defs);
-    let arena = Arena::default();
-    let modules = loader
-        .load(&arena, program)
-        .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
-    check_cancelled_opt(cancelled)?;
-    let filter = Compiler::default()
-        .with_funs(funs)
-        .with_global_vars(["$steps", "$vars"])
-        .compile(modules)
-        .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
+    let filter = compiled_filter(filter_source)?;
     check_cancelled_opt(cancelled)?;
 
     let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([steps_val, vars_val]));
