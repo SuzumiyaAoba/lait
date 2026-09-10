@@ -62,11 +62,14 @@ impl ToolLoop {
         Ok(self.round)
     }
 
-    /// Returns a snapshot suitable for an `llm::CompletionRequest`.
-    /// Requests own their message vector, while the loop must retain its
-    /// history for the following tool round.
-    pub(super) fn messages_snapshot(&self) -> Vec<ChatCompletionRequestMessage> {
-        self.messages.clone()
+    /// Borrows the current message history for an `llm::CompletionRequest`.
+    /// The loop must retain its history for the following tool round, so
+    /// callers that need to keep sending requests across rounds borrow here
+    /// rather than taking a clone per round — `RequestSettings::complete`
+    /// only needs the messages for the duration of one `llm::complete*`
+    /// call.
+    pub(super) fn messages(&self) -> &[ChatCompletionRequestMessage] {
+        &self.messages
     }
 
     /// Consumes the loop when the final response format re-issue is made.

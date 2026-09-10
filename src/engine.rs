@@ -621,7 +621,7 @@ impl RequestSettings {
             let messages =
                 llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             return self
-                .complete_recorded(env, response_format, messages, &[], cancellation)
+                .complete_recorded(env, response_format, &messages, &[], cancellation)
                 .await;
         }
 
@@ -637,7 +637,7 @@ impl RequestSettings {
                 .complete_recorded(
                     env,
                     None,
-                    tool_loop.messages_snapshot(),
+                    tool_loop.messages(),
                     tool_loop.tools(),
                     cancellation.clone(),
                 )
@@ -654,14 +654,9 @@ impl RequestSettings {
                 // The model stopped calling tools; re-issue the same history
                 // once more with `response_format` attached, now that doing
                 // so can no longer suppress a tool call.
+                let messages = tool_loop.into_messages();
                 return self
-                    .complete_recorded(
-                        env,
-                        response_format,
-                        tool_loop.into_messages(),
-                        &[],
-                        cancellation.clone(),
-                    )
+                    .complete_recorded(env, response_format, &messages, &[], cancellation.clone())
                     .await;
             };
 
@@ -760,7 +755,7 @@ impl RequestSettings {
         &self,
         env: &RunContext,
         response_format: Option<ResponseFormat>,
-        messages: Vec<ChatCompletionRequestMessage>,
+        messages: &[ChatCompletionRequestMessage],
         tools: &[ChatCompletionTools],
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
@@ -777,7 +772,7 @@ impl RequestSettings {
                 &self.base_url,
                 &self.resolved_model.model_id,
                 self.sampling,
-                &messages,
+                messages,
                 tools,
                 response_format.as_ref(),
             )?)
@@ -832,7 +827,7 @@ impl RequestSettings {
                 &endpoint,
                 &api_key,
                 response_format.clone(),
-                messages.clone(),
+                messages.to_vec(),
                 tools,
                 cancellation.clone(),
             );
@@ -854,7 +849,7 @@ impl RequestSettings {
                             key,
                             &endpoint.base_url,
                             &endpoint.model_id,
-                            &messages,
+                            messages,
                             tools,
                             response_format.as_ref(),
                             &response,
@@ -894,7 +889,7 @@ impl RequestSettings {
         &self,
         env: &RunContext,
         response_format: Option<ResponseFormat>,
-        messages: Vec<ChatCompletionRequestMessage>,
+        messages: &[ChatCompletionRequestMessage],
         tools: &[ChatCompletionTools],
         include_usage: bool,
         cancellation: Option<tokio_util::sync::CancellationToken>,
@@ -912,7 +907,7 @@ impl RequestSettings {
                 &endpoint,
                 &api_key,
                 response_format.clone(),
-                messages.clone(),
+                messages.to_vec(),
                 tools,
                 cancellation.clone(),
             );
@@ -981,7 +976,7 @@ impl RequestSettings {
                 .stream_endpoint(
                     env,
                     response_format,
-                    messages,
+                    &messages,
                     &[],
                     include_usage,
                     cancellation.clone(),
@@ -1002,7 +997,7 @@ impl RequestSettings {
                 .stream_endpoint(
                     env,
                     None,
-                    tool_loop.messages_snapshot(),
+                    tool_loop.messages(),
                     tool_loop.tools(),
                     include_usage,
                     cancellation.clone(),
@@ -1036,11 +1031,12 @@ impl RequestSettings {
                 if let Some(usage) = outcome.usage {
                     env.usage.record(&self.usage_label, usage);
                 }
+                let messages = tool_loop.into_messages();
                 let stream = self
                     .stream_endpoint(
                         env,
                         response_format,
-                        tool_loop.into_messages(),
+                        &messages,
                         &[],
                         include_usage,
                         cancellation.clone(),
