@@ -18,6 +18,29 @@ pkg-fmt = "tgz"
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
 pkg-fmt = "zip"
 
+# Deliberately does NOT include `[lints.rust] warnings = "deny"` or an
+# equivalent blanket clippy deny: that would make every `cargo build`/`cargo
+# check` fail on an in-progress edit (an unused variable, say), which is
+# exactly why this repo enforces `-D warnings` on the CI/`makers clippy`
+# command line (see `.github/workflows/ci.yml`, `Makefile.toml`) instead of
+# here. What's declared below are specific, narrow lints worth catching on
+# every local build regardless of edit-in-progress noise — verified via
+# `grep` rather than a `cargo clippy` run (clippy is not available as a
+# component in every dev environment this crate is built in).
+[lints.clippy]
+# `src/` has zero uses of `dbg!`/`todo!`/`unimplemented!` today (verified by
+# grep across the tree, including test modules). All three are markers of
+# code that was never meant to reach a commit, so denying them locally
+# catches a leftover before it reaches review rather than waiting for CI.
+# (`.unwrap()` is deliberately not covered here: `src/` proper already has
+# zero non-test `.unwrap()` calls, but enforcing that via `clippy::unwrap_used`
+# needs a per-test-module `#[allow]` that can only be placed correctly with
+# a working `cargo clippy` to check against — not available in every dev
+# environment this crate is built in.)
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [dependencies]
 anyhow = "1"
 async-openai = { version = "0.41.3", default-features = false, features = ["byot", "chat-completion", "rustls"] }
@@ -51,3 +74,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 jsonschema = "0.53.0"
+
+# `panic = "abort"` is deliberately not set here: several tests rely on
+# catching a panic (or on ordinary unwinding during teardown), and `abort`
+# would take the whole test process down instead.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -34,7 +34,13 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      # `cargo test` above already built and ran the debug profile; a release
+      # build is a from-scratch compile under a different profile (and, as of
+      # `[profile.release]` in Cargo.toml, LTO), so it can't reuse those
+      # artifacts. Limited to `master`/tags rather than every push and PR to
+      # avoid paying for a second full compile on every commit.
       - name: Build release binary
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
         run: cargo build --release --locked
 
   msrv:
