@@ -28,6 +28,21 @@ use super::WorkflowScope;
 
 mod routers;
 
+/// Attaches the `step '<label>'` context every step-level error carries, so
+/// a failure inside `run_steps`/`execute_step`/a router always names which
+/// step it happened in. `.step(label)` replaces the repeated
+/// `.with_context(|| format!("step '{label}'"))` this file and `routers`
+/// otherwise write at every fallible call.
+pub(super) trait StepContextExt {
+    fn step(self, label: &str) -> Self;
+}
+
+impl<T> StepContextExt for Result<T> {
+    fn step(self, label: &str) -> Self {
+        self.with_context(|| format!("step '{label}'"))
+    }
+}
+
 /// Prints the `<prefix> name: description` announcement line shared by
 /// `run_agent`/`run_workflow` (prefix `==>`) and `execute_step`'s `workflow:`
 /// branch (a progress-indented `->`): nothing when `name` is unset, and no
@@ -331,7 +346,7 @@ pub(crate) fn run_steps<'a>(
                     cancellation.clone(),
                 )
                 .await
-                .with_context(|| format!("step '{label}'"))?;
+                .step(&label)?;
                 if !truthy {
                     eprintln!("{progress_prefix}[{counter}] {label} (skipped)");
                     continue;
@@ -727,7 +742,7 @@ pub(crate) fn resolve_step_settings(
         &scope.models,
         file_config,
     )
-    .with_context(|| format!("step '{label}'"))
+    .step(label)
 }
 
 /// Resolves a node's `files:`/`images:` attachments against `base_prompt`:
@@ -752,7 +767,7 @@ async fn resolve_attachments<'a>(
         attachment::read_file_attachments_cancellable(files.unwrap_or(&[]), cancellation.clone(),),
         attachment::resolve_image_urls_cancellable(images.unwrap_or(&[]), cancellation),
     )
-    .with_context(|| format!("step '{label}'"))?;
+    .step(label)?;
     let prompt = match file_context {
         Some(context) => Cow::Owned(format!("{base_prompt}\n\n{context}")),
         None => Cow::Borrowed(base_prompt),
@@ -792,9 +807,8 @@ async fn execute_step(
                     step_cancel.clone(),
                 )
                 .await
-                .with_context(|| format!("step '{label}'"))?;
-                schema::validate_input_against_schema(&schema, &input)
-                    .with_context(|| format!("step '{label}'"))?;
+                .step(label)?;
+                schema::validate_input_against_schema(&schema, &input).step(label)?;
             }
 
             let settings =
@@ -825,7 +839,7 @@ async fn execute_step(
                             .await
                         }
                     };
-                    Some(response_format.with_context(|| format!("step '{label}'"))?)
+                    Some(response_format.step(label)?)
                 }
                 None => None,
             };
@@ -840,11 +854,9 @@ async fn execute_step(
             // node's `current_input` passes straight through `call_agent`
             // without going through `template::render`.
             let prompt: Cow<'_, str> = match &prompt_node.prompt {
-                Some(prompt_template) => Cow::Owned(
-                    render_scope
-                        .render(prompt_template)
-                        .with_context(|| format!("step '{label}'"))?,
-                ),
+                Some(prompt_template) => {
+                    Cow::Owned(render_scope.render(prompt_template).step(label)?)
+                }
                 None => Cow::Borrowed(current_input),
             };
             let (prompt, image_urls) = resolve_attachments(
@@ -861,7 +873,7 @@ async fn execute_step(
                 .or(scope.defaults.system_prompt.as_deref())
                 .map(|system_prompt_template| render_scope.render(system_prompt_template))
                 .transpose()
-                .with_context(|| format!("step '{label}'"))?;
+                .step(label)?;
 
             let response = settings
                 .complete(
@@ -877,10 +889,9 @@ async fn execute_step(
                     step_cancel.clone(),
                 )
                 .await
-                .with_context(|| format!("step '{label}'"))?;
+                .step(label)?;
 
-            response::render_response(&response, false, false)
-                .with_context(|| format!("step '{label}'"))?
+            response::render_response(&response, false, false).step(label)?
         }
         workflow::NodeDefinition::Agent(agent_node) => {
             // Loaded through the registry's path cache (not
@@ -893,13 +904,11 @@ async fn execute_step(
                 .agent_registry
                 .load_path_cancellable(&agent_node.agent, step_cancel.clone())
                 .await
-                .with_context(|| format!("step '{label}'"))?;
+                .step(label)?;
             let agent_file = &loaded.file;
 
             let input = template::parse_input(current_input);
-            loaded
-                .validate_input(&input)
-                .with_context(|| format!("step '{label}'"))?;
+            loaded.validate_input(&input).step(label)?;
 
             let settings = resolve_step_settings(
                 node,
@@ -933,7 +942,7 @@ async fn execute_step(
                 step_cancel.clone(),
             )
             .await
-            .with_context(|| format!("step '{label}'"))?
+            .step(label)?
         }
         workflow::NodeDefinition::Workflow(workflow_node) => {
             // Resolve cycles before opening a child file: a recursive FIFO
@@ -950,7 +959,7 @@ async fn execute_step(
                 .workflow_registry
                 .load_path_cancellable(&resolved_path, step_cancel.clone())
                 .await
-                .with_context(|| format!("step '{label}'"))?;
+                .step(label)?;
             validate_execution_placement(&sub_wf.steps, placement).with_context(|| {
                 format!("step '{label}': workflow '{}'", resolved_path.display())
             })?;
@@ -981,7 +990,7 @@ async fn execute_step(
                 },
             )
             .await
-            .with_context(|| format!("step '{label}'"))?;
+            .step(label)?;
             result
         }
         workflow::NodeDefinition::Command(command_node) => {
@@ -995,19 +1004,19 @@ async fn execute_step(
                 .iter()
                 .map(|arg| render_scope.render(arg))
                 .collect::<Result<_>>()
-                .with_context(|| format!("step '{label}'"))?;
+                .step(label)?;
             crate::process::run_command(&rendered_argv, current_input, step_cancel.clone())
                 .await
-                .with_context(|| format!("step '{label}'"))?
+                .step(label)?
         }
         workflow::NodeDefinition::Transform(_) => current_input.to_string(),
         workflow::NodeDefinition::Ask(ask_node) => {
             let input = template::parse_input(current_input);
-            let prompt = template::render(&ask_node.prompt, &input, steps_outputs, &env.vars)
-                .with_context(|| format!("step '{label}'"))?;
+            let prompt =
+                template::render(&ask_node.prompt, &input, steps_outputs, &env.vars).step(label)?;
             super::ask::run_ask(&prompt, ask_node, step_cancel.clone())
                 .await
-                .with_context(|| format!("step '{label}'"))?
+                .step(label)?
         }
     };
 
@@ -1021,13 +1030,13 @@ async fn execute_step(
             step_cancel.as_ref(),
         )
         .await
-        .with_context(|| format!("step '{label}'"))?;
+        .step(label)?;
     }
 
     if let Some(path) = settings.write_file {
         async_io::write_output_file(path, &step_output, step_cancel)
             .await
-            .with_context(|| format!("step '{label}'"))?;
+            .step(label)?;
     }
 
     Ok(step_output)

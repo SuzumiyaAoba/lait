@@ -6,8 +6,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use crate::{engine::value_to_input_text, jq, template, workflow};
 
 use super::{
-    ExecutionPlacement, Flow, RouterContext, StepsOutcome, StepsState, record_step_output,
-    run_steps,
+    ExecutionPlacement, Flow, RouterContext, StepContextExt, StepsOutcome, StepsState,
+    record_step_output, run_steps,
 };
 
 /// Dispatches a router and publishes its named output when it completes.
@@ -60,7 +60,7 @@ async fn execute_switch<'a>(
             context.cancellation.clone(),
         )
         .await
-        .with_context(|| format!("step '{label}'"))?
+        .step(label)?
         {
             let case_label = case
                 .id
@@ -156,7 +156,7 @@ async fn execute_parallel<'a>(
             context.cancellation.clone(),
         )
         .await
-        .with_context(|| format!("step '{label}'"))?,
+        .step(label)?,
         None => joined_json,
     };
 
@@ -196,7 +196,7 @@ async fn execute_loop<'a>(
                 context.cancellation.clone(),
             )
             .await
-            .with_context(|| format!("step '{label}'"))?
+            .step(label)?
         {
             break true;
         }
@@ -245,7 +245,7 @@ async fn execute_loop<'a>(
                 context.cancellation.clone(),
             )
             .await
-            .with_context(|| format!("step '{label}'"))?
+            .step(label)?
         {
             break true;
         }
@@ -288,7 +288,7 @@ async fn execute_for_each<'a>(
         context.cancellation.clone(),
     )
     .await
-    .with_context(|| format!("step '{label}'"))?;
+    .step(label)?;
     let items_value: serde_json::Value = serde_json::from_str(&items_json).with_context(|| {
         format!("step '{label}': failed to parse 'for_each.items' output as JSON")
     })?;
@@ -352,7 +352,7 @@ async fn execute_for_each<'a>(
             context.cancellation.clone(),
         )
         .await
-        .with_context(|| format!("step '{label}'"))?,
+        .step(label)?,
         None => results_json,
     };
 
