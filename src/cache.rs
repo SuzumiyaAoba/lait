@@ -37,15 +37,46 @@ use crate::{
 /// directory — see `checkpoint::RUNS_DIR`, which this mirrors.
 const CACHE_DIR: &str = ".lait/cache";
 
+/// The `key` payload's shape, borrowing every field: this is `Serialize`d
+/// straight into the hasher (see `key`) instead of first being collected
+/// into an owned `serde_json::Value` tree (as a `json!` literal would do)
+/// and then re-serialized — the same borrowed-struct pattern
+/// `template::RenderScope` uses for the same reason. Field order here is
+/// exactly the field declaration order, since `derive(Serialize)` on a
+/// struct serializes as a map in declaration order — matching the `json!`
+/// literal this replaced (`preserve_order` is irrelevant either way, since
+/// neither form goes through a `HashMap`).
+#[derive(Serialize)]
+struct CacheKeyInput<'a> {
+    base_url: &'a str,
+    model_id: &'a str,
+    // `ReasoningEffort` implements neither `Serialize` (a CLI/config-only
+    // type) nor `Display`, so its own `as_str()` (already the canonical
+    // lowercase form used across the CLI/YAML) stands in for it here.
+    reasoning_effort: Option<&'static str>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
+    messages: &'a [ChatCompletionRequestMessage],
+    tools: &'a [ChatCompletionTools],
+    response_format: Option<&'a ResponseFormat>,
+}
+
 /// Computes the cache key for a request: a SHA-256 hex digest over a
 /// canonical JSON encoding of every input that determines the response.
 /// `sha2` rather than `std::collections::hash_map::DefaultHasher` because
 /// the latter's algorithm is explicitly not guaranteed stable across Rust
 /// releases, and a cache key needs to keep matching across `cargo` upgrades
-/// for entries already on disk to stay useful. Field order in the `json!`
-/// call below is fixed by the macro (not a `HashMap`), so the encoding is
+/// for entries already on disk to stay useful. `CacheKeyInput`'s fields are
+/// declared in a fixed order (not a `HashMap`), so the encoding is
 /// deterministic without needing `serde_json`'s `preserve_order` feature to
 /// do any extra work here. Deliberately excludes `api_key`.
+///
+/// Serializes straight into the hasher via `serde_json::to_writer` (`Sha256`
+/// implements `io::Write` through the `digest` crate's `std`-feature
+/// `CoreWrapper` impl) rather than building an intermediate `Vec<u8>` first
+/// — one pass over `messages`/`tools` (which, for a tool loop's later
+/// rounds, can be the largest input here) instead of two.
 pub(crate) fn key(
     base_url: &str,
     model_id: &str,
@@ -54,24 +85,22 @@ pub(crate) fn key(
     tools: &[ChatCompletionTools],
     response_format: Option<&ResponseFormat>,
 ) -> Result<String> {
-    // `ReasoningEffort` implements neither `Serialize` (a CLI/config-only
-    // type) nor `Display`, so its own `as_str()` (already the canonical
-    // lowercase form used across the CLI/YAML) stands in for it here.
-    let payload = serde_json::json!({
-        "base_url": base_url,
-        "model_id": model_id,
-        "reasoning_effort": sampling.reasoning_effort.map(crate::cli::ReasoningEffort::as_str),
-        "temperature": sampling.temperature,
-        "top_p": sampling.top_p,
-        "max_tokens": sampling.max_tokens,
-        "messages": messages,
-        "tools": tools,
-        "response_format": response_format,
-    });
-    let serialized =
-        serde_json::to_vec(&payload).context("failed to serialize the cache key input")?;
+    let payload = CacheKeyInput {
+        base_url,
+        model_id,
+        reasoning_effort: sampling
+            .reasoning_effort
+            .map(crate::cli::ReasoningEffort::as_str),
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
+        max_tokens: sampling.max_tokens,
+        messages,
+        tools,
+        response_format,
+    };
     let mut hasher = Sha256::new();
-    hasher.update(&serialized);
+    serde_json::to_writer(&mut hasher, &payload)
+        .context("failed to serialize the cache key input")?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -164,6 +193,66 @@ pub(crate) fn run(command: CacheCommand) -> Result<()> {
 mod tests {
     use super::key;
     use crate::engine::SamplingOverrides;
+
+    /// Pins `key`'s output against two fixed inputs, hardcoded as of the
+    /// `json!`-plus-`to_vec` implementation. This is the only test in this
+    /// module that would catch a change to the key's byte encoding (the
+    /// other tests below only check "same input -> same key" and "different
+    /// input -> different key", which a differently-encoded-but-still-
+    /// deterministic implementation would still satisfy) — a changed key
+    /// silently invalidates every existing `.lait/cache/*.json` entry and
+    /// every `--replay` cassette (see `cassette::load`, keyed the same way),
+    /// so changing the encoding must be a deliberate, reviewed decision, not
+    /// an accidental side effect of an unrelated refactor.
+    #[test]
+    fn key_output_is_pinned_against_a_fixed_encoding() {
+        let empty = key(
+            "http://x",
+            "m",
+            SamplingOverrides::default(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            empty,
+            "4f31bb16957772afd4b0e91ec7cc92478f9b67169bbcb8b9271768cf9e6e92ef"
+        );
+
+        let sampling = SamplingOverrides {
+            reasoning_effort: Some(crate::cli::ReasoningEffort::High),
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            max_tokens: Some(256),
+        };
+        let messages = vec![crate::llm::user_message("hello", &[]).unwrap()];
+        let tools = vec![async_openai::types::chat::ChatCompletionTools::Function(
+            async_openai::types::chat::ChatCompletionTool {
+                function: async_openai::types::chat::FunctionObject {
+                    name: "tool__example".to_owned(),
+                    description: Some("an example tool".to_owned()),
+                    parameters: Some(serde_json::json!({"type": "object"})),
+                    strict: None,
+                },
+            },
+        )];
+        let response_format =
+            crate::schema::build_json_schema(serde_json::json!({"type": "object"}), "out").unwrap();
+        let rich = key(
+            "http://x",
+            "m",
+            sampling,
+            &messages,
+            &tools,
+            Some(&response_format),
+        )
+        .unwrap();
+        assert_eq!(
+            rich,
+            "c709b731bbd10d404af85bfb35cc73063ad9787b0ad40ae994a08fabce04f47f"
+        );
+    }
 
     #[test]
     fn the_same_inputs_produce_the_same_key() {
