@@ -15,7 +15,7 @@
 //!
 //! Like `checkpoint.rs`'s `.lait/runs/`, this is a project-local concept
 //! (relative to the current directory, not XDG), and a write is a whole-file
-//! temp-then-`rename` for the same crash-safety reason — see `checkpoint::save`'s
+//! temp-then-`rename` for the same crash-safety reason — see `checkpoint::save_cancellable`'s
 //! doc comment for why `jsonl.rs`'s append-only primitives don't fit here.
 
 use std::path::{Path, PathBuf};

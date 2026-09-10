@@ -35,19 +35,33 @@ struct CheckpointContext<'a> {
 }
 
 impl CheckpointContext<'_> {
-    fn save(&self, progress: &Progress, status: checkpoint::RunStatus) -> Result<()> {
-        checkpoint::save(&checkpoint::Checkpoint {
-            run_id: self.run_id.to_owned(),
-            workflow_path: self.workflow_path.to_owned(),
-            initial_prompt: self.initial_prompt.to_owned(),
-            vars: self.vars.clone(),
-            top_level_labels: self.labels.to_vec(),
-            completed_index: progress.completed_index,
-            counter: progress.counter,
-            current_input: progress.input.clone(),
-            steps_outputs: progress.outputs.clone(),
-            status,
-        })
+    /// Every field here is borrowed (see `checkpoint::CheckpointRef`'s doc
+    /// comment) — this write happens after *every* top-level step, and
+    /// `progress.outputs` in particular grows by one entry per completed
+    /// step, so building an owned `Checkpoint` first would deep-clone it
+    /// again on every single write.
+    async fn save(
+        &self,
+        progress: &Progress,
+        status: checkpoint::RunStatus,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<()> {
+        checkpoint::save_cancellable(
+            &checkpoint::CheckpointRef {
+                run_id: self.run_id,
+                workflow_path: self.workflow_path,
+                initial_prompt: self.initial_prompt,
+                vars: self.vars,
+                top_level_labels: self.labels,
+                completed_index: progress.completed_index,
+                counter: progress.counter,
+                current_input: &progress.input,
+                steps_outputs: &progress.outputs,
+                status,
+            },
+            cancellation,
+        )
+        .await
     }
 }
 
@@ -226,7 +240,13 @@ pub(super) async fn run_workflow(
         .await?;
     drop(deadline);
     if checkpointing {
-        checkpoint.save(&progress, checkpoint::RunStatus::Completed)?;
+        checkpoint
+            .save(
+                &progress,
+                checkpoint::RunStatus::Completed,
+                Some(env.root_token()),
+            )
+            .await?;
     }
     let current_input = progress.input;
 
@@ -291,7 +311,14 @@ async fn run_top_level(
                     progress.outputs = outputs;
                     // Persistence failure must not replace the execution error,
                     // especially its typed cancellation/API classification.
-                    match checkpoint.save(&progress, checkpoint::RunStatus::Failed) {
+                    match checkpoint
+                        .save(
+                            &progress,
+                            checkpoint::RunStatus::Failed,
+                            Some(env.root_token()),
+                        )
+                        .await
+                    {
                         Ok(()) => eprintln!(
                             "note: run checkpointed as '{}'; resume with `lait run {} --resume {}`",
                             checkpoint.run_id,
@@ -314,7 +341,13 @@ async fn run_top_level(
             outputs: steps_outputs,
         };
         if let Some(checkpoint) = checkpoint {
-            checkpoint.save(&progress, checkpoint::RunStatus::Failed)?;
+            checkpoint
+                .save(
+                    &progress,
+                    checkpoint::RunStatus::Failed,
+                    Some(env.root_token()),
+                )
+                .await?;
         }
         if flow != Flow::Continue {
             break;

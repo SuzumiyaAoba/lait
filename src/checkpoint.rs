@@ -91,6 +91,28 @@ pub(crate) struct Checkpoint {
     pub(crate) status: RunStatus,
 }
 
+/// The borrowed shape of [`Checkpoint`] [`save`] actually serializes — the
+/// same borrowed-struct pattern `cache::CacheEntryRef` uses for the same
+/// reason. A checkpoint is written after *every* top-level step (see this
+/// module's doc comment), and `vars`/`top_level_labels`/`current_input`/
+/// `steps_outputs` are exactly the fields a run accumulates over time
+/// (`steps_outputs` in particular grows by one entry per completed step);
+/// building an owned [`Checkpoint`] to serialize would deep-clone all of
+/// them on every single write, for a value the write only ever reads.
+#[derive(Debug, Serialize)]
+pub(crate) struct CheckpointRef<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) workflow_path: &'a str,
+    pub(crate) initial_prompt: &'a str,
+    pub(crate) vars: &'a serde_json::Map<String, serde_json::Value>,
+    pub(crate) top_level_labels: &'a [String],
+    pub(crate) completed_index: usize,
+    pub(crate) counter: usize,
+    pub(crate) current_input: &'a str,
+    pub(crate) steps_outputs: &'a workflow::StepOutputs,
+    pub(crate) status: RunStatus,
+}
+
 fn run_path(run_id: &str) -> Result<PathBuf> {
     // Run ids are generated internally (`generate_run_id`), but a
     // user-supplied `--resume <RUN_ID>`/`lait runs show <RUN_ID>` reaches
@@ -115,17 +137,31 @@ pub(crate) fn generate_run_id() -> String {
     )
 }
 
-/// Writes `checkpoint` to its run file, atomically: the full JSON body is
+/// Writes `checkpoint` to its run file, atomically (the full JSON body is
 /// written to a temp file in the same directory, then renamed into place —
 /// so a crash mid-write, or a concurrent `lait runs show`, never observes a
-/// half-written file.
-pub(crate) fn save(checkpoint: &Checkpoint) -> Result<()> {
-    let path = run_path(&checkpoint.run_id)?;
+/// half-written file), on the bounded blocking I/O worker
+/// (`async_io::run_blocking`): the workflow interpreter (the only caller)
+/// is async, and a slow or network filesystem must not stall it while an
+/// unrelated step is running its own timeout. Serializes synchronously
+/// first — fast, since [`CheckpointRef`]'s growing fields are borrowed
+/// rather than cloned, so this is CPU work, not I/O — and only the write
+/// itself crosses onto the worker.
+pub(crate) async fn save_cancellable(
+    checkpoint: &CheckpointRef<'_>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    let path = run_path(checkpoint.run_id)?;
     let body =
         serde_json::to_string_pretty(checkpoint).context("failed to serialize checkpoint")?;
-    crate::storage::write_atomic(&path, body.as_bytes())
-        .with_context(|| format!("failed to save checkpoint to '{}'", path.display()))?;
-    Ok(())
+    crate::async_io::run_blocking(
+        move |_| {
+            crate::storage::write_atomic(&path, body.as_bytes())
+                .with_context(|| format!("failed to save checkpoint to '{}'", path.display()))
+        },
+        cancellation,
+    )
+    .await
 }
 
 fn read(path: &Path) -> Result<Checkpoint> {

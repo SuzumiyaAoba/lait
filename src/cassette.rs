@@ -55,7 +55,7 @@ fn entry_path(dir: &Path, key: &str) -> PathBuf {
 
 /// Saves one request/response pair to `dir` under `key` (see `cache::key`),
 /// atomically (temp file in the same directory, then `rename` — see
-/// `cache::save`/`checkpoint::save`). Creates `dir` (and any missing parent
+/// `cache::save`/`checkpoint::save_cancellable`). Creates `dir` (and any missing parent
 /// directories) if it doesn't already exist.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn save(
