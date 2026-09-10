@@ -1,11 +1,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
 
-use crate::{async_io, config::ConfigFile, jq, registry};
+use crate::{async_cache::AsyncCache, async_io, config::ConfigFile, jq, registry};
 
 #[cfg(test)]
 use crate::template;
@@ -105,6 +106,50 @@ pub(crate) async fn load_workflow_cancellable(
         cancellation,
     )
     .await
+}
+
+/// Caches parsed sub-workflow files across a run, keyed by their configured
+/// path spelling (matching `AgentRegistry`/`SkillCache`'s own per-path
+/// caches — see `AppServices`). Without this, a `for_each`/`loop` body
+/// with a `workflow:` node would re-read and re-parse the same YAML on
+/// every iteration; agents and skills already avoid exactly this. A
+/// canonical path (after symlink/`..` resolution) would collapse more
+/// aliases into one cache entry, but `scope::resolve_nested_path` already
+/// canonicalizes and cycle-checks before this is ever consulted, so in
+/// practice every call already sees the same spelling for the same file.
+pub(crate) struct WorkflowRegistry {
+    loaded: AsyncCache<PathBuf, WorkflowFile>,
+}
+
+impl WorkflowRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            loaded: AsyncCache::new(),
+        }
+    }
+
+    /// Returns the workflow file at `path`, loading and parsing it (see
+    /// [`load_workflow_cancellable`]) on first use, then caching the result
+    /// for the registry's lifetime.
+    pub(crate) async fn load_path_cancellable(
+        &self,
+        path: &Path,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Arc<WorkflowFile>> {
+        let load_cancellation = cancellation.clone();
+        self.loaded
+            .get_or_try_init(
+                path.to_path_buf(),
+                cancellation,
+                || async move {
+                    load_workflow_cancellable(path, load_cancellation)
+                        .await
+                        .map(Arc::new)
+                },
+                "nested workflow load was cancelled",
+            )
+            .await
+    }
 }
 
 pub(crate) fn parse_workflow(contents: &str) -> Result<WorkflowFile> {

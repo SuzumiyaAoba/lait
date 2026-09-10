@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, bail};
 
-use crate::{config::ConfigFile, mcp, secret, skill, subagent, usage};
+use crate::{config::ConfigFile, mcp, secret, skill, subagent, usage, workflow};
 
 /// Shared services for one application configuration.
 ///
@@ -21,6 +21,10 @@ pub(crate) struct AppServices {
     pub(crate) registry: mcp::McpRegistry,
     pub(crate) skill_cache: skill::SkillCache,
     pub(crate) agent_registry: subagent::AgentRegistry,
+    /// Caches parsed nested `workflow:` files across the run — see
+    /// `workflow::WorkflowRegistry`'s doc comment for why this exists
+    /// alongside `agent_registry`/`skill_cache`.
+    pub(crate) workflow_registry: workflow::WorkflowRegistry,
     pub(crate) secret_resolver: secret::SecretResolver,
     shutdown: tokio::sync::OnceCell<()>,
 }
@@ -31,6 +35,7 @@ impl AppServices {
             registry: mcp::McpRegistry::new(Arc::new(file_config.mcp_servers.clone())),
             skill_cache: skill::SkillCache::new(Arc::new(file_config.skills.clone())),
             agent_registry: subagent::AgentRegistry::new(Arc::new(file_config.agents.clone())),
+            workflow_registry: workflow::WorkflowRegistry::new(),
             secret_resolver: secret::SecretResolver::new(),
             file_config,
             shutdown: tokio::sync::OnceCell::const_new(),

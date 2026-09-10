@@ -941,14 +941,20 @@ async fn execute_step(
             let resolved_path = scope
                 .resolve_nested_path(&workflow_node.workflow, label, step_cancel.clone())
                 .await?;
-            let mut sub_wf =
-                workflow::load_workflow_cancellable(&resolved_path, step_cancel.clone())
-                    .await
-                    .with_context(|| format!("step '{label}'"))?;
+            // Cached by path for the lifetime of the run — a `for_each`/
+            // `loop` body re-running this node reuses the parsed file
+            // instead of re-reading and re-parsing the same YAML on every
+            // iteration (see `workflow::WorkflowRegistry`).
+            let sub_wf = env
+                .services
+                .workflow_registry
+                .load_path_cancellable(&resolved_path, step_cancel.clone())
+                .await
+                .with_context(|| format!("step '{label}'"))?;
             validate_execution_placement(&sub_wf.steps, placement).with_context(|| {
                 format!("step '{label}': workflow '{}'", resolved_path.display())
             })?;
-            let sub_scope = scope.nested(resolved_path, &mut sub_wf);
+            let sub_scope = scope.nested(resolved_path, &sub_wf);
             announce_named_file(
                 &format!("{progress_prefix}    ->"),
                 sub_wf.name.as_deref(),

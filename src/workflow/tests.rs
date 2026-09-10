@@ -1,5 +1,30 @@
-use super::{NodeDefinition, NodeKind, StepOutputs, eval_when, parse_workflow};
+use super::{NodeDefinition, NodeKind, StepOutputs, WorkflowRegistry, eval_when, parse_workflow};
 use crate::schema::JsonSchemaEntry;
+
+/// `WorkflowRegistry::load_path_cancellable` caches by path: a second call
+/// for the same path must return the exact same `Arc` as the first, not a
+/// freshly re-read/re-parsed copy — the same guarantee
+/// `subagent::AgentRegistry`/`skill::SkillCache` give for agent files/skills.
+#[tokio::test]
+async fn workflow_registry_caches_a_loaded_file_by_path() {
+    let path = crate::test_support::unique_temp_path("lait-test-workflow-registry", ".yml");
+    std::fs::write(
+        &path,
+        "nodes:\n  noop:\n    type: transform\n    jq: '.'\nsteps:\n  - use: noop\n",
+    )
+    .unwrap();
+
+    let registry = WorkflowRegistry::new();
+    let first = registry.load_path_cancellable(&path, None).await.unwrap();
+    let second = registry.load_path_cancellable(&path, None).await.unwrap();
+
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "a second load of the same path should hit the cache instead of re-reading/re-parsing the file"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
 
 #[test]
 fn parses_workflow_with_multiple_steps() {

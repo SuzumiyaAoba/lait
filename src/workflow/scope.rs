@@ -110,11 +110,21 @@ impl WorkflowScope {
     }
 
     /// Builds a child scope from a path already checked for cycles and depth.
-    pub(crate) fn nested(&self, canonical: PathBuf, sub_wf: &mut WorkflowFile) -> Self {
+    /// Takes `sub_wf` by shared reference (not `&mut`, unlike an earlier
+    /// version of this method) so the caller can hold onto the loaded
+    /// `WorkflowFile` afterward — needed once it comes from
+    /// `WorkflowRegistry`'s cache (an `Arc<WorkflowFile>` shared across
+    /// every `workflow:` step that resolves to the same path), rather than
+    /// being consumed here. The empty-map fast path below still shares the
+    /// parent's `Arc` without cloning entries; only a sub-workflow that
+    /// actually declares its own `models:`/`json_schemas:` pays for a
+    /// cloned map (once, regardless of how many times that same cached file
+    /// is nested into).
+    pub(crate) fn nested(&self, canonical: PathBuf, sub_wf: &WorkflowFile) -> Self {
         let models = if sub_wf.models.is_empty() {
             Arc::clone(&self.models)
         } else {
-            let mut merged = std::mem::take(&mut sub_wf.models);
+            let mut merged = sub_wf.models.clone();
             for (name, definitions) in self.models.iter() {
                 merged
                     .entry(name.clone())
@@ -125,7 +135,7 @@ impl WorkflowScope {
         let json_schemas = if sub_wf.json_schemas.is_empty() {
             Arc::clone(&self.json_schemas)
         } else {
-            let mut merged = std::mem::take(&mut sub_wf.json_schemas);
+            let mut merged = sub_wf.json_schemas.clone();
             for (name, entry) in self.json_schemas.iter() {
                 merged.entry(name.clone()).or_insert_with(|| entry.clone());
             }
@@ -139,10 +149,7 @@ impl WorkflowScope {
             .unwrap_or_else(|| PathBuf::from("."));
 
         Self {
-            defaults: WorkflowDefaults::fold(&[
-                std::mem::take(&mut sub_wf.default),
-                self.defaults.clone(),
-            ]),
+            defaults: WorkflowDefaults::fold(&[sub_wf.default.clone(), self.defaults.clone()]),
             models,
             json_schemas,
             base_dir,
