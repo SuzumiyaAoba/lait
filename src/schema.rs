@@ -27,6 +27,15 @@ pub(crate) enum JsonSchemaEntry {
     Inline { schema: serde_json::Value },
 }
 
+/// The pure part of resolving a file-backed schema entry, shared by
+/// [`load_schema_value`]/[`load_schema_value_cancellable`]: only the read
+/// (sync `fs::read_to_string` vs. the cancellation-aware worker) differs
+/// between them.
+fn parse_schema_entry_contents(contents: &str, file_path: &Path) -> Result<serde_json::Value> {
+    serde_json::from_str(contents)
+        .with_context(|| format!("failed to parse JSON schema file '{}'", file_path.display()))
+}
+
 /// Resolves an entry to its JSON Schema body, reading the file for a
 /// `FilePath` entry.
 pub(crate) fn load_schema_value(entry: &JsonSchemaEntry) -> Result<serde_json::Value> {
@@ -36,9 +45,7 @@ pub(crate) fn load_schema_value(entry: &JsonSchemaEntry) -> Result<serde_json::V
             let contents = fs::read_to_string(file_path).with_context(|| {
                 format!("failed to read JSON schema file '{}'", file_path.display())
             })?;
-            serde_json::from_str(&contents).with_context(|| {
-                format!("failed to parse JSON schema file '{}'", file_path.display())
-            })
+            parse_schema_entry_contents(&contents, file_path)
         }
     }
 }
@@ -63,9 +70,7 @@ pub(crate) async fn load_schema_value_cancellable(
             .with_context(|| {
                 format!("failed to read JSON schema file '{}'", file_path.display())
             })?;
-            serde_json::from_str(&contents).with_context(|| {
-                format!("failed to parse JSON schema file '{}'", file_path.display())
-            })
+            parse_schema_entry_contents(&contents, file_path)
         }
     }
 }
@@ -94,10 +99,10 @@ pub(crate) fn resolve_named_schema_value(
     match json_schemas.get(name_or_path) {
         Some(entry) => load_schema_value(entry),
         None => {
-            let contents = fs::read_to_string(name_or_path)
+            let path = Path::new(name_or_path);
+            let contents = fs::read_to_string(path)
                 .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
-            serde_json::from_str(&contents)
-                .with_context(|| format!("failed to parse JSON schema file '{name_or_path}'"))
+            parse_schema_entry_contents(&contents, path)
         }
     }
 }
@@ -117,8 +122,7 @@ pub(crate) async fn resolve_named_schema_value_cancellable(
                 async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
                     .await
                     .with_context(|| format!("failed to read JSON schema file '{name_or_path}'"))?;
-            serde_json::from_str(&contents)
-                .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))
+            parse_schema_entry_contents(&contents, &path)
         }
     }
 }
@@ -304,12 +308,19 @@ fn validate_value_against_schema(
     Ok(())
 }
 
+/// The pure part of loading a file-backed Structured Outputs schema, shared
+/// by [`load_json_schema`]/[`load_json_schema_cancellable`]: only the read
+/// differs between them.
+fn parse_json_schema_contents(contents: &str, path: &Path, name: &str) -> Result<ResponseFormat> {
+    let schema = serde_json::from_str::<serde_json::Value>(contents)
+        .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))?;
+    build_json_schema(schema, name)
+}
+
 pub(crate) fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
-    let schema = serde_json::from_str::<serde_json::Value>(&contents)
-        .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))?;
-    build_json_schema(schema, name)
+    parse_json_schema_contents(&contents, path, name)
 }
 
 /// Cancellation-aware counterpart to [`load_json_schema`], used for a
@@ -323,9 +334,7 @@ pub(crate) async fn load_json_schema_cancellable(
         async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
             .await
             .with_context(|| format!("failed to read JSON schema file '{}'", path.display()))?;
-    let schema = serde_json::from_str::<serde_json::Value>(&contents)
-        .with_context(|| format!("failed to parse JSON schema file '{}'", path.display()))?;
-    build_json_schema(schema, name)
+    parse_json_schema_contents(&contents, path, name)
 }
 
 /// Checks a Structured Outputs schema `name` (a node/agent's `schema_name`,
