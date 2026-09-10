@@ -1,3 +1,20 @@
+//! Top-level command dispatch: turns a parsed `cli::Command` into a call
+//! into the module that actually implements it (`lint::run`,
+//! `workflow_run::run_workflow`, `repl::run`, ...). This module should stay
+//! pure dispatch — building a chat turn's settings/history/cache policy
+//! lives in `chat` instead (see `chat.rs`'s own doc comment for why that
+//! split exists), and `run`/`run_chat`/`run_prompt`/`run_agent` below only
+//! wire those pieces together for their one entry point each.
+//!
+//! Every `Command` variant is classified as needing an async runtime or not
+//! (`needs_async_runtime`) before `main` decides whether to start one at
+//! all; `run` (async path) and `run_blocking` (sync path) then each match
+//! over `Command` again to dispatch. All three matches must agree, and nothing
+//! in the type system enforces that today — a variant routed to the wrong
+//! path fails at runtime via one of the `internal error: ...` `bail!`s below
+//! rather than at compile time (see the design plan's B3 for the planned
+//! fix: a `Dispatch`/`classify` type that makes misrouting a compile error).
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};

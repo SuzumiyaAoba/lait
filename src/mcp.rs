@@ -1,3 +1,21 @@
+//! MCP (Model Context Protocol) client: connects to `mcp_servers:` entries,
+//! lists and calls their tools, and enforces the resource limits a
+//! third-party server must not be trusted to respect on its own.
+//!
+//! Three largely independent concerns share this file because they share
+//! those limits and the same `McpRegistry` entry point: the registry itself
+//! (connection lifecycle, per-server tool-list caching, tool-name
+//! qualification), a stdio transport (spawns the server as a child process,
+//! wraps its stdout in a frame-size-limited reader), and an HTTP transport
+//! (a `reqwest`-backed `StreamableHttpClient` with its own Content-Length
+//! and SSE-event-size enforcement, since `rmcp` does not cap either). The
+//! `MAX_*` byte/depth constants near the top apply across all three and are
+//! kept together here rather than split per-transport.
+//!
+//! `qualify_tool_name`, at the bottom, is shared with `subagent` — MCP tools
+//! and subagent tools both need the same `server__tool` naming scheme so the
+//! two capability kinds cannot collide in one tool-call dispatch table.
+
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},

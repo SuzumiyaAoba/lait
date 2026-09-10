@@ -1,3 +1,11 @@
+//! The OpenAI-compatible chat completion response shape (non-streamed) and
+//! the accessors every caller uses instead of matching on it directly
+//! (`first_message`, `content_text`, `response_content`). Streaming has its
+//! own incremental shape in `stream` (`ChatCompletionStreamChunk`) since a
+//! partial chunk can't be modeled as a partially-filled `ChatCompletionResponse`;
+//! `render` turns either into the text this crate actually prints
+//! (`Reasoning:`-prefixed when requested, JSON when `--json`, ...).
+
 use serde::{Deserialize, Serialize};
 
 mod render;
@@ -9,6 +17,11 @@ pub(crate) use stream::{
     stream_chunk_tool_call_deltas,
 };
 
+/// A non-streamed chat completion response, in the OpenAI-compatible shape.
+/// Only the fields this crate actually reads are modeled — an
+/// OpenAI-compatible server's response commonly carries others (`id`,
+/// `created`, `model`, ...) that `serde`'s default "ignore unknown fields"
+/// behavior silently drops.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ChatCompletionResponse {
     choices: Vec<ChatCompletionChoice>,
@@ -64,6 +77,11 @@ struct ChatCompletionChoice {
     message: ChatCompletionResponseMessage,
 }
 
+/// The `message` object of a response's first (only, for lait's purposes)
+/// choice. `content`/`reasoning`/`reasoning_content` are all optional
+/// because a tool-calling turn commonly reports `tool_calls` with no
+/// `content` at all — see `first_message`/`content()` for how callers tell
+/// "no content" apart from "content, but empty".
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ChatCompletionResponseMessage {
     content: Option<String>,
@@ -87,6 +105,9 @@ pub(crate) struct ToolCall {
     pub(crate) function: ToolCallFunction,
 }
 
+/// `ToolCall`'s `function` object: which tool the model wants called
+/// (`name`, in lait's `server__tool`/subagent-qualified form) and with what
+/// arguments (raw, unparsed JSON text — see `ToolCall`'s doc).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ToolCallFunction {
     pub(crate) name: String,
@@ -114,6 +135,10 @@ pub(crate) fn content_text(response: &ChatCompletionResponse) -> &str {
 }
 
 impl ChatCompletionResponseMessage {
+    /// `content`, treating an empty string the same as absent — some
+    /// OpenAI-compatible servers send `"content": ""` on a tool-calling turn
+    /// instead of omitting the field, and every caller here wants "was there
+    /// actual text" rather than "was the field present".
     pub(crate) fn content(&self) -> Option<&str> {
         self.content
             .as_deref()

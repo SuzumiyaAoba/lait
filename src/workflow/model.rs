@@ -1,3 +1,11 @@
+//! Validated workflow step/router/node types — the shapes `exec::run_steps`
+//! actually interprets. These are reached only through `raw::FlowStep` +
+//! `validate::validate_steps` (see `super`'s module doc for the
+//! deserialize → validate → model pipeline); nothing outside that pipeline
+//! constructs a `NodeDefinition` directly, which is what lets `exec` assume
+//! every structural rule `validate` checks (router/action-field exclusivity,
+//! duplicate labels, ...) already holds by the time it sees one.
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},

@@ -1,3 +1,22 @@
+//! `lait.config.yml`'s schema, discovery, and resolution.
+//!
+//! Four concerns live in this one file because they form a pipeline rather
+//! than a set of independent features: the `serde`-deserialized schema types
+//! (`ConfigFile` and everything it nests), doctor-facing validation that
+//! turns a loaded config into human-readable warnings, model/endpoint
+//! resolution (`resolve_model`, `resolve_endpoint`, alias and fallback
+//! lookup), and finally discovery/loading/merging of the project and global
+//! files themselves. Each stage only makes sense once the one before it has
+//! run, so splitting them into separate modules would mostly relocate
+//! `pub(crate)` boundaries without changing how they're used.
+//!
+//! Loading comes in synchronous (`load_config`, for runtime-free commands
+//! like `lint`) and cancellation-aware (`load_config_cancellable`, for async
+//! command entry points) forms that share one parsing core
+//! (`parse_config_file`) — see `async_io::read_to_string_sync`'s doc for why
+//! every synchronous reader in this file goes through it rather than
+//! `std::fs::read_to_string` directly.
+
 use std::{
     collections::HashMap,
     fs,

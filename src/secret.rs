@@ -19,6 +19,11 @@ use crate::{
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// One cached command spec's resolved value, or `None` while unresolved
+/// (never yet run, or the last run failed/was cancelled). The `Mutex`
+/// doubles as the per-spec serialization point `resolve` locks while running
+/// the command, so concurrent resolutions of the same spec share one
+/// in-flight run instead of executing it twice.
 type SecretCell = Arc<Mutex<Option<String>>>;
 
 /// Per-application secret resolver. Successful values are cached by their
@@ -40,10 +45,16 @@ impl Default for SecretResolver {
 }
 
 impl SecretResolver {
+    /// Builds a resolver with the crate-wide default timeout/output-size
+    /// limits (`DEFAULT_TIMEOUT`/`DEFAULT_MAX_OUTPUT_BYTES`) — what every
+    /// production call site uses; `with_limits` exists so tests can shrink
+    /// both.
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
+    /// Builds a resolver with explicit limits, bypassing the crate-wide
+    /// defaults `new` uses.
     pub(crate) fn with_limits(timeout: Duration, max_output_bytes: usize) -> Self {
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),

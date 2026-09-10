@@ -1,3 +1,16 @@
+//! The `clap`-derived command-line grammar: `Cli`, its `Command` subcommand
+//! enum (one variant per top-level subcommand, `lait chat`/`lait run`/...),
+//! and each subcommand's own `*Args` struct. Deliberately kept as one file
+//! rather than split by command group (see the design plan's rejection of a
+//! `cli/` split) — the bulk of its line count is `#[derive]`/`#[arg]`
+//! attributes and field doc comments (`--help` text), not logic, so grouping
+//! by subcommand would move declarations around without reducing what a
+//! reader has to hold in mind.
+//!
+//! `app::needs_async_runtime`/`app::run_blocking`/`app::run` are the
+//! consumers that turn a parsed `Command` into behavior; this module owns
+//! only the shape of the arguments, not their dispatch.
+
 use std::path::PathBuf;
 
 use clap::{

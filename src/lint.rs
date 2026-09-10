@@ -1,3 +1,21 @@
+//! `lait lint`: static validation of workflow YAML and agent Markdown files
+//! without executing them.
+//!
+//! Three layers live in this one file: file discovery (which paths
+//! `lait lint <DIR>` walks into, see `SKIPPED_DIR_NAMES`), the lint rules
+//! themselves (`lint_workflow_file`/`lint_agent_file`, `walk_steps`,
+//! `lint_node`, the `check_*` family), and the CLI-facing output layer
+//! (`run`, `run_text`, `run_structured` — text/JSON/GitHub-Actions-
+//! annotation formats). They're kept together because `LintIssue`/
+//! `LintReport` are the shared vocabulary all three read and write; splitting
+//! the output formatters out is tracked separately (see the design plan's
+//! C6) rather than done reflexively here.
+//!
+//! `lint_file` never fails on a bad workflow/agent file — a parse error or a
+//! dangling reference becomes an `Error`-severity `LintIssue` in the
+//! returned `LintReport` instead, so `lait lint <DIR>` can keep checking the
+//! rest of a tree after one bad file.
+
 use std::{
     collections::HashSet,
     fmt,
@@ -35,6 +53,8 @@ impl fmt::Display for Severity {
     }
 }
 
+/// One thing `lait lint` found wrong (or worth flagging) in a single file —
+/// see `Severity` for the error/warning distinction.
 #[derive(Debug)]
 pub(crate) struct LintIssue {
     pub(crate) severity: Severity,
@@ -82,6 +102,10 @@ pub(crate) struct LintReport {
 }
 
 impl LintReport {
+    /// Whether any issue in this report is `Severity::Error` — the signal
+    /// `lait lint`'s exit code and `lait run`/`lait agent run`'s upfront
+    /// validation both key off of; a report containing only `Warning`
+    /// issues does not fail either.
     pub(crate) fn has_errors(&self) -> bool {
         self.issues
             .iter()
@@ -314,6 +338,14 @@ impl LintRun {
     }
 }
 
+/// Runs `lait lint`: expands `lint_args.files` into a concrete file list
+/// (`LintRun::collect`), lints each one, and renders the combined report in
+/// whichever format was requested. `run_text`/`run_structured` print the
+/// full report either way, then `bail!` when `LintRun::has_errors` is true —
+/// `main.rs`'s `is_lint` flag routes that error through
+/// `error::classify`'s validation exit code rather than the general one, so
+/// `lait lint`'s exit status reflects issue severity, not just success or
+/// failure of the linting process itself.
 pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
     let run = LintRun::collect(&lint_args.files, &config_source)?;
     match lint_args.format {

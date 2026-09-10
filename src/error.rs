@@ -41,6 +41,17 @@ pub(crate) enum ExitKind {
     Interrupted = 5,
 }
 
+/// The single entry point deciding a failed invocation's process exit code
+/// (`main::exit_with_error` calls this and casts the result to `i32`).
+/// Deliberately classifies by error *type* via `downcast_ref`/`chain().any`
+/// rather than by matching message text — a wording change elsewhere in the
+/// crate should never silently change a user's exit code. `is_lint` (set by
+/// `main` from `Command::Lint` before `cli.command` is moved — see
+/// `app.rs`'s module doc on why that classification is currently
+/// duplicated) forces `Validation` unconditionally: `lait lint` reports
+/// every issue as part of its normal output, so *any* error reaching this
+/// far means the run itself failed to validate cleanly, not that something
+/// crashed.
 pub(crate) fn classify(error: &anyhow::Error, is_lint: bool) -> ExitKind {
     if is_lint {
         return ExitKind::Validation;

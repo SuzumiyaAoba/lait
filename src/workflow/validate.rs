@@ -1,3 +1,12 @@
+//! Deserialize → validate → model, the middle step: turns `raw::FlowStep`
+//! trees into `model::NodeDefinition` trees, rejecting anything `exec` would
+//! otherwise have to check defensively at run time (router/action-field
+//! exclusivity, duplicate step labels, sampling params out of range, retry/
+//! timeout values that don't make sense). A `FlowStep` that passes
+//! `validate_steps` is guaranteed structurally sound; `exec::run_steps` only
+//! ever sees the validated `NodeDefinition` form and never re-checks these
+//! rules itself.
+
 use anyhow::{Result, bail};
 
 use crate::llm::{validate_max_tool_rounds, validate_sampling_params};
