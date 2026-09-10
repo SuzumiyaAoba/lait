@@ -47,12 +47,23 @@ pub(crate) async fn read_file_attachments_cancellable(
     }
 
     let texts = read_all(files, cancellation).await?;
-    let blocks: Vec<String> = files
-        .iter()
-        .zip(texts)
-        .map(|(path, text)| fenced_block(path, &text))
-        .collect();
-    Ok(Some(blocks.join("\n\n")))
+    // Written directly into one accumulator (sized for every attachment's
+    // contents plus a little fence/separator overhead) instead of
+    // collecting a `Vec<String>` of individually rendered blocks and
+    // `join`ing them: `MAX_TOTAL_ATTACHMENT_BYTES` bounds `texts`'s combined
+    // size at 10MB, so the old two-pass approach could hold roughly three
+    // full copies of that (the per-block `Vec`, the final joined `String`,
+    // and `texts` itself) live at once.
+    let mut combined = String::with_capacity(
+        texts.iter().map(|text| text.len() + 16).sum::<usize>() + files.len().saturating_sub(1) * 2,
+    );
+    for (index, (path, text)) in files.iter().zip(&texts).enumerate() {
+        if index > 0 {
+            combined.push_str("\n\n");
+        }
+        push_fenced_block(&mut combined, path, text);
+    }
+    Ok(Some(combined))
 }
 
 /// Reads and UTF-8-decodes every path in `files`, in order. Each independent
@@ -191,8 +202,13 @@ fn resolve_one_blocking(
             path.display()
         )
     })?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:{mime};base64,{encoded}"))
+    // `encode_string` appends directly into `url` instead of `encode`
+    // returning its own owned `String` for `format!` to copy a second time
+    // — for a 16MiB image (`async_io::MAX_READ_BYTES`) that second copy
+    // would otherwise be ~21MB of base64 text.
+    let mut url = format!("data:{mime};base64,");
+    base64::engine::general_purpose::STANDARD.encode_string(&bytes, &mut url);
+    Ok(url)
 }
 
 /// Identifies an image's MIME type from its leading magic bytes, falling back
@@ -227,15 +243,40 @@ fn sniff_image_mime(bytes: &[u8], path: &Path) -> Result<&'static str> {
     }
 }
 
-/// Renders one attachment as a fenced code block named after its path. The
-/// fence is widened past the longest run of backticks already in `contents`
-/// (matching how Pandoc/CommonMark tooling avoids a fence prematurely closing
-/// on content that itself contains a code fence), rather than always using a
-/// fixed three-backtick fence.
-fn fenced_block(path: &Path, contents: &str) -> String {
+/// Appends one attachment, rendered as a fenced code block named after its
+/// path, onto `out`. The fence is widened past the longest run of backticks
+/// already in `contents` (matching how Pandoc/CommonMark tooling avoids a
+/// fence prematurely closing on content that itself contains a code fence),
+/// rather than always using a fixed three-backtick fence. Writes directly
+/// into the caller's accumulator instead of allocating and returning its
+/// own `String` — see `read_file_attachments_cancellable`'s doc comment for
+/// why that matters when there are several attachments.
+fn push_fenced_block(out: &mut String, path: &Path, contents: &str) {
     let fence_len = longest_backtick_run(contents).max(2) + 1;
-    let fence = "`".repeat(fence_len);
-    format!("{fence}{}\n{contents}\n{fence}", path.display())
+    for _ in 0..fence_len {
+        out.push('`');
+    }
+    // `Path::display`'s `Display` impl writes straight into `out` via
+    // `write!`, rather than through an intermediate `to_string()`.
+    use std::fmt::Write;
+    let _ = write!(out, "{}", path.display());
+    out.push('\n');
+    out.push_str(contents);
+    out.push('\n');
+    for _ in 0..fence_len {
+        out.push('`');
+    }
+}
+
+/// The `String`-returning form [`push_fenced_block`] replaced as this
+/// module's own hot path — kept as a thin wrapper since it reads more
+/// naturally in isolation (a single attachment, no shared accumulator to
+/// thread through) and this module's own tests exercise it directly.
+#[cfg(test)]
+fn fenced_block(path: &Path, contents: &str) -> String {
+    let mut out = String::new();
+    push_fenced_block(&mut out, path, contents);
+    out
 }
 
 /// The length of the longest consecutive run of backtick characters in `text`.
