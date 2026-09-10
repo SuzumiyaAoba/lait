@@ -787,7 +787,13 @@ impl RequestSettings {
             let key = content_key
                 .as_deref()
                 .expect("content_key is computed above whenever replay_dir is set");
-            let response = cassette::load(replay_dir, key, &self.resolved_model.model_id)?;
+            let response = cassette::load(
+                replay_dir,
+                key,
+                &self.resolved_model.model_id,
+                cancellation.clone(),
+            )
+            .await?;
             env.usage.record_response(&self.usage_label, &response);
             return Ok(response);
         }
@@ -799,7 +805,7 @@ impl RequestSettings {
             let cache_key = content_key
                 .as_deref()
                 .expect("content_key is computed above whenever cache_enabled is set");
-            match cache::load(cache_key, env.policy.cache.ttl()) {
+            match cache::load(cache_key, env.policy.cache.ttl(), cancellation.clone()).await {
                 Ok(Some(response)) => {
                     eprintln!("note: cache hit for {}", self.usage_label);
                     tracing::debug!(cache_key = %cache_key, "response cache hit");

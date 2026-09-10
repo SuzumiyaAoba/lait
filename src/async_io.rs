@@ -732,6 +732,22 @@ pub(crate) async fn read_to_string_cancellable(
     .await
 }
 
+/// Whether `error` (from one of this module's readers, wrapped in
+/// `anyhow::Error` by `?` on the way up through a `with_context`) has a
+/// missing-file `std::io::Error` anywhere in its cause chain. Every reader
+/// here that treats "file doesn't exist" as its own outcome (an optional
+/// config layer, a cache/cassette miss, ...) checks this once its read
+/// fails, rather than pre-checking existence with a separate `is_file`/
+/// `exists` call — a check-then-read has a race a direct read+classify does
+/// not.
+pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 /// Resolves a path on a worker so cancellation cannot be delayed by a slow
 /// network/FUSE filesystem. `canonicalize` is metadata I/O rather than a file
 /// read, but it belongs to the same timeout-sensitive loader paths.

@@ -129,7 +129,7 @@ pub(crate) fn save(checkpoint: &Checkpoint) -> Result<()> {
 }
 
 fn read(path: &Path) -> Result<Checkpoint> {
-    let body = std::fs::read_to_string(path)
+    let body = crate::async_io::read_to_string_sync(path)
         .with_context(|| format!("failed to read '{}'", path.display()))?;
     serde_json::from_str(&body)
         .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
@@ -291,7 +291,25 @@ pub(crate) fn run(command: RunsCommand) -> Result<()> {
 mod tests {
     #[cfg(unix)]
     use super::load_path_cancellable;
-    use super::{Checkpoint, RunStatus, check_resumable, generate_run_id, run_path};
+    use super::{Checkpoint, RunStatus, check_resumable, generate_run_id, read, run_path};
+
+    /// `read` (the synchronous half of `load`, used by `lait runs show`)
+    /// goes through `async_io::read_to_string_sync` rather than a bare
+    /// `std::fs::read_to_string` — pins that the crate-wide 16MiB read
+    /// limit applies here too. Mirrors
+    /// `async_io::read_to_string_sync_rejects_a_file_beyond_max_read_bytes`.
+    #[test]
+    fn read_rejects_a_checkpoint_file_beyond_max_read_bytes() {
+        let path = crate::test_support::unique_temp_path("lait-checkpoint-read-limit", ".json");
+        std::fs::write(&path, vec![b'a'; crate::async_io::MAX_READ_BYTES + 1]).unwrap();
+
+        let error = read(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read limit"),
+            "error: {error:#}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     fn checkpoint_with(top_level_labels: Vec<&str>, completed_index: usize) -> Checkpoint {
         Checkpoint {

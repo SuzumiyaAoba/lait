@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -72,7 +72,7 @@ impl AgentFile {
 }
 
 pub(crate) fn load_agent(path: &Path) -> Result<AgentFile> {
-    let contents = fs::read_to_string(path)
+    let contents = async_io::read_to_string_sync(path)
         .with_context(|| format!("failed to read agent file '{}'", path.display()))?;
     parse_agent(&contents)
         .with_context(|| format!("failed to parse agent file '{}'", path.display()))
@@ -116,9 +116,26 @@ fn parse_agent(contents: &str) -> Result<AgentFile> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_agent;
+    use super::{load_agent, parse_agent};
     use crate::schema::JsonSchemaEntry;
     use serde_json::json;
+
+    /// `load_agent` now reads through `async_io::read_to_string_sync` (see
+    /// its call site's comment) rather than a bare `std::fs::read_to_string`
+    /// — pins that the crate-wide 16MiB read limit applies here too. Mirrors
+    /// `async_io::read_to_string_sync_rejects_a_file_beyond_max_read_bytes`.
+    #[test]
+    fn load_agent_rejects_a_file_beyond_max_read_bytes() {
+        let path = crate::test_support::unique_temp_path("lait-agent-read-limit", ".md");
+        std::fs::write(&path, vec![b'a'; crate::async_io::MAX_READ_BYTES + 1]).unwrap();
+
+        let error = load_agent(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read limit"),
+            "error: {error:#}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn parses_frontmatter_and_body() {

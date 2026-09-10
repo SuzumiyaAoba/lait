@@ -13,6 +13,14 @@ CLI 引数や環境変数で指定していない値は、`lait.config.yml` か�
 `run`・`agent run`・`eval`・`test` など実行を伴うコマンドでは、設定ファイルの探索・読み込み中も
 Ctrl-C で処理を中断できます。実行時に読み込む設定ファイルは1ファイルあたり最大16 MiBです。
 
+`lint`・`init`・`agent list`・`prompt list`・`skill list`・`workflow list`・`runs show`
+のようにモデルへリクエストを送らないコマンドでも、同じ16 MiBの上限が設定ファイル
+（および、それぞれが読み込む agent Markdown / workflow YAML / スキル Markdown /
+チェックポイント JSON）に適用されます。ただしこれらのコマンドは Ctrl-C
+での中断に対応していないため、書き込み側のいない名前付きパイプ（FIFO）を指定した
+場合は待機せず即座にエラーになります（実行を伴うコマンド側は、書き込み側が現れるまで
+待機したうえで Ctrl-C を受け付けます）。
+
 エディタで補完・検証を効かせたい場合は [`lait schema config`](./schema.md) が出力する
 JSON Schema を使えます。
 

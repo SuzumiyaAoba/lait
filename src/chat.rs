@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
+    async_io,
     cli::SharedChatArgs,
     config::{self, ConfigFile, ModelMap},
     engine::{CapabilityOverrides, RequestSettings, SamplingOverrides, resolve_request_settings},
@@ -96,17 +97,28 @@ pub(crate) fn resolve_cache_settings(
 /// Resolves chat mode's system prompt: `--system` text, else `--system-file`
 /// contents, else `default.system` from lait.config.yml (`--system` and
 /// `--system-file` conflict at the clap level, so their order here never
-/// actually decides anything).
-pub(crate) fn resolve_system_prompt(
+/// actually decides anything). Reads `--system-file` through
+/// `async_io::read_to_string_cancellable` rather than a plain synchronous
+/// read: this runs once at the start of `run_chat`/`repl::run`, both already
+/// holding the invocation's cancellation token at that point, and a blocked
+/// read here would otherwise delay Ctrl-C the same way an un-migrated cache/
+/// cassette read would (see `cache::load`'s doc comment for the same
+/// reasoning).
+pub(crate) async fn resolve_system_prompt(
     shared: &SharedChatArgs,
     file_config: &ConfigFile,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Option<String>> {
     if let Some(text) = &shared.system {
         return Ok(Some(text.clone()));
     }
     if let Some(path) = &shared.system_file {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read system prompt file '{}'", path.display()))?;
+        let text =
+            async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
+                .await
+                .with_context(|| {
+                    format!("failed to read system prompt file '{}'", path.display())
+                })?;
         return Ok(Some(text.trim_end().to_owned()));
     }
     Ok(file_config.default.system.clone())

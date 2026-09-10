@@ -53,6 +53,30 @@ fn reads_the_system_prompt_from_a_file() {
     );
 }
 
+/// `--system-file` now reads through `async_io::read_to_string_cancellable`
+/// (see `chat::resolve_system_prompt`'s doc comment) rather than a bare
+/// `std::fs::read_to_string`, so the crate-wide 16MiB read limit applies
+/// here too instead of the file being read in full regardless of size.
+#[test]
+fn rejects_a_system_file_beyond_the_read_limit() {
+    let config_dir = ConfigDirectory::empty();
+    let system_path = config_dir.path().join("huge-system.txt");
+    std::fs::write(&system_path, vec![b'a'; 16 * 1024 * 1024 + 1])
+        .expect("failed to write oversized system file");
+
+    let output = test_command()
+        .args(["--model", "test-model"])
+        .arg("--system-file")
+        .arg(&system_path)
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("read limit"), "stderr: {stderr}");
+}
+
 #[test]
 fn rejects_system_and_system_file_together() {
     let output = test_command()

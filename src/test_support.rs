@@ -25,6 +25,40 @@ pub(crate) fn unique_temp_path(prefix: &str, suffix: &str) -> std::path::PathBuf
     ))
 }
 
+struct DirectoryGuard {
+    original: std::path::PathBuf,
+    temporary: std::path::PathBuf,
+}
+
+impl Drop for DirectoryGuard {
+    fn drop(&mut self) {
+        // Restore even when the test panics, before releasing the shared
+        // lock. Otherwise one failure changes the environment of later tests.
+        if std::env::set_current_dir(&self.original).is_ok() {
+            let _ = std::fs::remove_dir_all(&self.temporary);
+        }
+    }
+}
+
+/// One process-wide lock guarding the current directory for both
+/// [`in_temp_dir`] and [`in_temp_dir_async`] — a single `static` shared by
+/// both functions, not one per function (a `static` declared inside each
+/// function body would be a *separate* instance per function, which would
+/// let a sync caller and an async caller race on the current directory
+/// exactly the way this lock exists to prevent).
+static CURRENT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn enter_temp_dir(label: &str) -> DirectoryGuard {
+    let dir = unique_temp_path(label, "");
+    std::fs::create_dir_all(&dir).unwrap();
+    let original = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    DirectoryGuard {
+        original,
+        temporary: dir,
+    }
+}
+
 /// Runs `body` with the current directory temporarily switched to a fresh,
 /// empty directory named after `label`, so relative paths under it (e.g.
 /// `session::SESSIONS_DIR`) resolve in isolation instead of under this
@@ -35,31 +69,29 @@ pub(crate) fn unique_temp_path(prefix: &str, suffix: &str) -> std::path::PathBuf
 /// module, which is why this lives here instead of as a private per-module
 /// helper.
 pub(crate) fn in_temp_dir<T>(label: &str, body: impl FnOnce() -> T) -> T {
-    struct DirectoryGuard {
-        original: std::path::PathBuf,
-        temporary: std::path::PathBuf,
-    }
-
-    impl Drop for DirectoryGuard {
-        fn drop(&mut self) {
-            // Restore even when the test panics, before releasing the shared
-            // lock. Otherwise one failure changes the environment of later tests.
-            if std::env::set_current_dir(&self.original).is_ok() {
-                let _ = std::fs::remove_dir_all(&self.temporary);
-            }
-        }
-    }
-
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let dir = unique_temp_path(label, "");
-    std::fs::create_dir_all(&dir).unwrap();
-    let original = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&dir).unwrap();
-    let _directory = DirectoryGuard {
-        original,
-        temporary: dir,
-    };
+    let _guard = CURRENT_DIR_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _directory = enter_temp_dir(label);
     body()
+}
+
+/// Async counterpart to [`in_temp_dir`], for a test exercising an
+/// `async_io`-backed reader/writer (`cache::load`, `cassette::load`, ...)
+/// that resolves a path relative to the current directory. `body` is
+/// `.await`ed while the directory swap and lock are both still held —
+/// safe here because every production path this crate's async filesystem
+/// helpers actually take offloads to a plain OS thread (see
+/// `async_io::run_blocking`'s doc comment) rather than `tokio::spawn`, so
+/// nothing requires this function's own future, or the `MutexGuard`/
+/// `DirectoryGuard` it holds across the `.await`, to be `Send`.
+pub(crate) async fn in_temp_dir_async<T>(
+    label: &str,
+    body: impl std::future::Future<Output = T>,
+) -> T {
+    let _guard = CURRENT_DIR_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _directory = enter_temp_dir(label);
+    body.await
 }

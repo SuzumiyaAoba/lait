@@ -1,5 +1,26 @@
-use super::{NodeDefinition, NodeKind, StepOutputs, WorkflowRegistry, eval_when, parse_workflow};
+use super::{
+    NodeDefinition, NodeKind, StepOutputs, WorkflowRegistry, eval_when, load_workflow,
+    parse_workflow,
+};
 use crate::schema::JsonSchemaEntry;
+
+/// `load_workflow` (the synchronous loader used by `lint`/`graph`/registry
+/// listing) reads through `async_io::read_to_string_sync` rather than a
+/// bare `std::fs::read_to_string` — pins that the crate-wide 16MiB read
+/// limit applies here too. Mirrors
+/// `async_io::read_to_string_sync_rejects_a_file_beyond_max_read_bytes`.
+#[test]
+fn load_workflow_rejects_a_file_beyond_max_read_bytes() {
+    let path = crate::test_support::unique_temp_path("lait-workflow-read-limit", ".yml");
+    std::fs::write(&path, vec![b'a'; crate::async_io::MAX_READ_BYTES + 1]).unwrap();
+
+    let error = load_workflow(&path).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("read limit"),
+        "error: {error:#}"
+    );
+    let _ = std::fs::remove_file(path);
+}
 
 /// `WorkflowRegistry::load_path_cancellable` caches by path: a second call
 /// for the same path must return the exact same `Arc` as the first, not a

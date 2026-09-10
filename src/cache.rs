@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    async_io,
     cli::{CacheAction, CacheCommand},
     engine::SamplingOverrides,
     response,
@@ -128,18 +129,29 @@ fn entry_path(key: &str) -> PathBuf {
 /// entry are all treated as a plain miss (`Ok(None)`) rather than an error —
 /// a cache is an optimization, and refusing to serve a request over a stale
 /// or unreadable cache entry would defeat the point.
-pub(crate) fn load(
+///
+/// Goes through `async_io::read_to_string_cancellable` rather than a plain
+/// synchronous read: unlike `report::emit_output`'s one-shot final write
+/// (see its own doc comment for why that one stays synchronous), a cache
+/// lookup runs on every `complete_recorded` call, including from concurrent
+/// workflow branches (`for_each`/`parallel`), so it needs to observe the
+/// same cancellation a request's own timeout would.
+pub(crate) async fn load(
     key: &str,
     ttl_secs: Option<u64>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Option<response::ChatCompletionResponse>> {
     let path = entry_path(key);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read '{}'", path.display()));
-        }
-    };
+    let body =
+        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+        {
+            Ok(body) => body,
+            Err(error) if async_io::is_not_found(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read '{}'", path.display()));
+            }
+        };
     let Ok(entry) = serde_json::from_str::<CacheEntry>(&body) else {
         return Ok(None);
     };
@@ -191,8 +203,29 @@ pub(crate) fn run(command: CacheCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::key;
+    use super::{key, load};
     use crate::engine::SamplingOverrides;
+
+    /// `load` now reads through `async_io::read_to_string_cancellable`
+    /// rather than a bare `std::fs::read_to_string` — pins that the
+    /// crate-wide 16MiB read limit applies here too, as an actual error
+    /// rather than the "treat as a miss" fallback a parse failure gets.
+    /// Mirrors `async_io::read_to_string_sync_rejects_a_file_beyond_max_read_bytes`.
+    #[tokio::test]
+    async fn load_rejects_a_cache_entry_beyond_max_read_bytes() {
+        crate::test_support::in_temp_dir_async("lait-cache-read-limit", async {
+            std::fs::create_dir_all(super::CACHE_DIR).unwrap();
+            let path = std::path::Path::new(super::CACHE_DIR).join("big-key.json");
+            std::fs::write(&path, vec![b'a'; crate::async_io::MAX_READ_BYTES + 1]).unwrap();
+
+            let error = load("big-key", None, None).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("read limit"),
+                "error: {error:#}"
+            );
+        })
+        .await;
+    }
 
     /// Pins `key`'s output against two fixed inputs, hardcoded as of the
     /// `json!`-plus-`to_vec` implementation. This is the only test in this

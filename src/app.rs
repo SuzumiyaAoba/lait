@@ -355,7 +355,8 @@ async fn run_chat(
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
-    let system_prompt = chat::resolve_system_prompt(&chat.shared, &file_config)?;
+    let system_prompt =
+        chat::resolve_system_prompt(&chat.shared, &file_config, Some(cancel.clone())).await?;
     let image_urls = attachment::resolve_image_urls(&chat.images).await?;
     let session_history = chat::load_session_history(chat.shared.session.as_deref())?;
     let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);

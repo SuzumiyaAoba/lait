@@ -12,7 +12,6 @@
 //! caches the analogous way, but keyed by skill name rather than path).
 
 use std::{
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -91,7 +90,7 @@ pub(crate) fn list(file_config: &ConfigFile) -> Result<()> {
 }
 
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
-    let contents = fs::read_to_string(path)
+    let contents = async_io::read_to_string_sync(path)
         .with_context(|| format!("failed to read workflow file '{}'", path.display()))?;
     parse_workflow(&contents)
         .with_context(|| format!("failed to parse workflow file '{}'", path.display()))

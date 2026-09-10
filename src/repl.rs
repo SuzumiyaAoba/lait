@@ -73,7 +73,8 @@ pub(crate) async fn run(
     let file_config =
         Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
     let mut history = chat::load_session_history(shared.session.as_deref())?;
-    let mut system_prompt = chat::resolve_system_prompt(&shared, &file_config)?;
+    let mut system_prompt =
+        chat::resolve_system_prompt(&shared, &file_config, Some(cancel.clone())).await?;
     let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
     let env = RunContext::new(Arc::clone(&services), cancel.clone())

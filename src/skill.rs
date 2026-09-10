@@ -40,20 +40,22 @@ fn resolve_skill_file_path(configured_path: &Path) -> PathBuf {
 
 /// Runs `lait skill list`: prints every configured `skills:` entry's name,
 /// path, and (when the file loads cleanly) its own `description:`. Reads
-/// the file directly with a plain, synchronous `fs::read_to_string` rather
-/// than through `load_skill`/`SkillCache` — this only ever runs once per
-/// entry, so none of `load_skill`'s cancellation-aware/FIFO-safe machinery
-/// (built for a request that may need to time out) is worth pulling in.
-/// Registry paths are already absolute (resolved once at config-load time,
-/// against the directory containing whichever `lait.config.yml`/global
-/// `config.yml` defined the entry — not the current working directory — see
-/// `config::load_config`). A registry entry whose file is missing or fails
-/// to parse is still listed (with a note) rather than aborting the whole
-/// command — `lait lint` is where a hard failure on a bad entry belongs.
+/// the file directly with `async_io::read_to_string_sync` rather than
+/// through `load_skill`/`SkillCache` — this only ever runs once per entry,
+/// so none of `load_skill`'s cancellation-aware/FIFO-safe machinery (built
+/// for a request that may need to time out) is worth pulling in, but the
+/// plain read still goes through the crate's one synchronous entry point so
+/// `MAX_READ_BYTES` applies here too. Registry paths are already absolute
+/// (resolved once at config-load time, against the directory containing
+/// whichever `lait.config.yml`/global `config.yml` defined the entry — not
+/// the current working directory — see `config::load_config`). A registry
+/// entry whose file is missing or fails to parse is still listed (with a
+/// note) rather than aborting the whole command — `lait lint` is where a
+/// hard failure on a bad entry belongs.
 pub(crate) fn list(file_config: &config::ConfigFile) -> Result<()> {
     registry::list_path_registry("skills", &file_config.skills, |name, configured_path| {
         let path = resolve_skill_file_path(configured_path);
-        let loaded = std::fs::read_to_string(&path)
+        let loaded = crate::async_io::read_to_string_sync(&path)
             .with_context(|| format!("failed to read skill file '{}'", path.display()))
             .and_then(|contents| parse_skill(name, &contents))
             .map(|skill| skill.description);

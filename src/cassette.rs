@@ -20,7 +20,7 @@ use async_openai::types::chat::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::response;
+use crate::{async_io, response};
 
 /// The request side of a cassette entry, kept only for human inspection —
 /// matching a replay request to its cassette is entirely done by filename
@@ -93,28 +93,35 @@ pub(crate) fn save(
 /// and `model_id`, so a mismatch is easy to diagnose (a workflow/input/vars
 /// change since the recording, or a cassette directory that was never
 /// populated for this request at all).
-pub(crate) fn load(
+///
+/// Goes through `async_io::read_to_string_cancellable` for the same reason
+/// `cache::load` does — see its doc comment.
+pub(crate) async fn load(
     dir: &Path,
     key: &str,
     model_id: &str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<response::ChatCompletionResponse> {
     let path = entry_path(dir, key);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "no recorded cassette for this request (model '{model_id}') at '{}'; run `lait \
+    let body =
+        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+            .await
+        {
+            Ok(body) => body,
+            Err(error) if async_io::is_not_found(&error) => {
+                bail!(
+                    "no recorded cassette for this request (model '{model_id}') at '{}'; run `lait \
                  run --record {}` first against the same workflow/input/vars, or check that \
                  they still match this recording",
-                path.display(),
-                dir.display(),
-            );
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read cassette '{}'", path.display()));
-        }
-    };
+                    path.display(),
+                    dir.display(),
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read cassette '{}'", path.display()));
+            }
+        };
     let entry: CassetteEntry = serde_json::from_str(&body)
         .with_context(|| format!("failed to parse cassette entry '{}'", path.display()))?;
     Ok(entry.response)
@@ -140,8 +147,8 @@ mod tests {
         .expect("sample response should deserialize")
     }
 
-    #[test]
-    fn saves_and_loads_a_cassette_entry() {
+    #[tokio::test]
+    async fn saves_and_loads_a_cassette_entry() {
         let dir = tempfile_dir();
         let response = sample_response("hello");
         save(
@@ -156,24 +163,53 @@ mod tests {
         )
         .expect("save should succeed");
 
-        let loaded = load(dir.path(), "key-1", "model-a").expect("load should succeed");
+        let loaded = load(dir.path(), "key-1", "model-a", None)
+            .await
+            .expect("load should succeed");
         assert_eq!(crate::response::content_text(&loaded), "hello");
     }
 
-    #[test]
-    fn load_fails_clearly_when_the_key_has_no_cassette() {
+    /// `load` now reads through `async_io::read_to_string_cancellable`
+    /// rather than a bare `std::fs::read_to_string` — pins that the
+    /// crate-wide 16MiB read limit applies here too, as its own distinct
+    /// error rather than the missing-entry message. Mirrors
+    /// `async_io::read_to_string_sync_rejects_a_file_beyond_max_read_bytes`.
+    #[tokio::test]
+    async fn load_rejects_a_cassette_entry_beyond_max_read_bytes() {
         let dir = tempfile_dir();
-        let error = load(dir.path(), "missing-key", "model-a").unwrap_err();
+        std::fs::write(
+            dir.path().join("big-key.json"),
+            vec![b'a'; crate::async_io::MAX_READ_BYTES + 1],
+        )
+        .unwrap();
+
+        let error = load(dir.path(), "big-key", "model-a", None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read limit"),
+            "error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_fails_clearly_when_the_key_has_no_cassette() {
+        let dir = tempfile_dir();
+        let error = load(dir.path(), "missing-key", "model-a", None)
+            .await
+            .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("model-a"), "{message}");
         assert!(message.contains("--record"), "{message}");
     }
 
-    #[test]
-    fn load_reports_a_parse_failure_distinctly_from_a_missing_entry() {
+    #[tokio::test]
+    async fn load_reports_a_parse_failure_distinctly_from_a_missing_entry() {
         let dir = tempfile_dir();
         std::fs::write(dir.path().join("bad-key.json"), "not json").unwrap();
-        let error = load(dir.path(), "bad-key", "model-a").unwrap_err();
+        let error = load(dir.path(), "bad-key", "model-a", None)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("bad-key.json"), "{error}");
     }
 

@@ -19,7 +19,6 @@
 
 use std::{
     collections::HashMap,
-    fs,
     hash::Hash,
     path::{Path, PathBuf},
 };
@@ -76,10 +75,14 @@ impl From<&Cli> for ConfigSource {
 /// does. Ancestors are compared to the walk's own directories, never
 /// symlink-resolved, matching `Path::ancestors`'s usual (lexical) behavior.
 fn find_config_upward(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .map(|dir| dir.join(CONFIG_FILE_NAME))
-        .find(|candidate| candidate.is_file())
+    // Delegates to the cancellable walk with a flag that is never set, so
+    // the two never drift on which directory wins — a synchronous caller
+    // has no cancellation channel to check in the first place, so this is
+    // exactly the cancellable loop with every check compiled down to "never
+    // trips". The flag being always-false means the walk can only ever
+    // return `Ok`, never the `Err` its cancellation check would produce.
+    find_config_upward_cancellable(start, &std::sync::atomic::AtomicBool::new(false))
+        .expect("a cancellation flag that is never set cannot trip the cancellation check")
 }
 
 /// Resolves `source` to a concrete file path to read, or `None` when there is
@@ -1154,49 +1157,18 @@ async fn load_config_at_cancellable(
     let Some(path) = path else {
         return Ok(ConfigFile::default());
     };
-    let contents =
-        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
-            .await
-        {
-            Ok(contents) => contents,
-            Err(error) if !matches!(source, ConfigSource::Explicit(_)) && is_not_found(&error) => {
-                return Ok(ConfigFile::default());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to read YAML configuration file '{}'",
-                        path.display()
-                    )
-                });
-            }
-        };
-    parse_config_file(&path, &contents)
+    let read_result =
+        async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES).await;
+    config_from_read_result(source, &path, read_result)
 }
 
 async fn load_global_config_cancellable(
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Option<ConfigFile>> {
     let path = global_config_path()?;
-    if !is_file_cancellable(&path, cancellation.clone()).await? {
-        return Ok(None);
-    }
-    let contents =
-        match async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
-            .await
-        {
-            Ok(contents) => contents,
-            Err(error) if is_not_found(&error) => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to read YAML configuration file '{}'",
-                        path.display()
-                    )
-                });
-            }
-        };
-    Ok(Some(parse_config_file(&path, &contents)?))
+    let read_result =
+        async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES).await;
+    optional_config_from_read_result(&path, read_result)
 }
 
 /// Reports whether the optional global config exists without performing a
@@ -1229,14 +1201,6 @@ async fn is_file_cancellable(
     .await
 }
 
-fn is_not_found(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    })
-}
-
 /// Parses `contents` (already read from `path`) into a `ConfigFile` and
 /// resolves its registry paths against `path`'s parent directory — the one
 /// piece of post-processing both the project and the global config load
@@ -1258,31 +1222,41 @@ fn load_config_at(source: &ConfigSource, path: Option<PathBuf>) -> Result<Config
     let Some(path) = path else {
         return Ok(ConfigFile::default());
     };
+    config_from_read_result(source, &path, async_io::read_to_string_sync(&path))
+}
 
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
+/// The non-I/O core [`load_config_at`]/[`load_config_at_cancellable`] share:
+/// given a project config file's read attempt, either parse it, fall back to
+/// `ConfigFile::default()` on a missing file (unless `source` names the path
+/// explicitly — see the inline note below), or wrap the read error with
+/// context. Factored out so the sync and cancellation-aware loaders can each
+/// own just their own I/O call and still apply this decision identically —
+/// see `async_io::read_to_string_sync`'s doc for why a `trait`-based
+/// injection point for the read itself was rejected instead.
+fn config_from_read_result(
+    source: &ConfigSource,
+    path: &Path,
+    read_result: Result<String>,
+) -> Result<ConfigFile> {
+    match read_result {
+        Ok(contents) => parse_config_file(path, &contents),
         // `Search` found nothing and falls back to defaults (unchanged
         // behavior); `Explicit` named this exact path, so a missing file
         // here falls through to the `with_context` error below instead —
         // the user asked for it by name, so silently using defaults would
         // hide a typo.
         Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && !matches!(source, ConfigSource::Explicit(_)) =>
+            if !matches!(source, ConfigSource::Explicit(_)) && async_io::is_not_found(&error) =>
         {
-            return Ok(ConfigFile::default());
+            Ok(ConfigFile::default())
         }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to read YAML configuration file '{}'",
-                    path.display()
-                )
-            });
-        }
-    };
-
-    parse_config_file(&path, &contents)
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to read YAML configuration file '{}'",
+                path.display()
+            )
+        }),
+    }
 }
 
 /// Loads the global config file at [`global_config_path`], or `None` when it
@@ -1292,26 +1266,56 @@ fn load_config_at(source: &ConfigSource, path: Option<PathBuf>) -> Result<Config
 /// [`ConfigSource::Search`] (see [`load_config`]).
 fn load_global_config() -> Result<Option<ConfigFile>> {
     let path = global_config_path()?;
-    if !path.is_file() {
-        return Ok(None);
+    optional_config_from_read_result(&path, async_io::read_to_string_sync(&path))
+}
+
+/// The non-I/O core [`load_global_config`]/[`load_global_config_cancellable`]
+/// share — see [`config_from_read_result`]'s doc for why this is split from
+/// the I/O rather than injected as a trait. The global file has no
+/// `Explicit`/`--no-config` case (see [`load_global_config`]'s doc), so a
+/// missing file is always `Ok(None)` here, never the caller's choice.
+fn optional_config_from_read_result(
+    path: &Path,
+    read_result: Result<String>,
+) -> Result<Option<ConfigFile>> {
+    match read_result {
+        Ok(contents) => Ok(Some(parse_config_file(path, &contents)?)),
+        Err(error) if async_io::is_not_found(&error) => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to read YAML configuration file '{}'",
+                path.display()
+            )
+        }),
     }
-    let contents = fs::read_to_string(&path).with_context(|| {
-        format!(
-            "failed to read YAML configuration file '{}'",
-            path.display()
-        )
-    })?;
-    Ok(Some(parse_config_file(&path, &contents)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ApiKeySource, ConfigFile, ConfigSource, DefaultSettings, McpServerConfig, McpTransport,
-        ShellToolDefinition, ToolPolicy, check_shell_tool_definition, expand_with,
+        ShellToolDefinition, ToolPolicy, check_shell_tool_definition, expand_with, load_config,
         load_config_cancellable, normalize_base_url, resolve_endpoint, resolve_model,
     };
     use std::collections::HashMap;
+
+    /// `load_config`'s project-file read goes through
+    /// `async_io::read_to_string_sync` (via `load_config_at` ->
+    /// `config_from_read_result`) rather than a bare `std::fs::read_to_string`
+    /// — pins that the crate-wide 16MiB read limit applies here too. Mirrors
+    /// `async_io::read_to_string_sync_rejects_a_file_beyond_max_read_bytes`.
+    #[test]
+    fn load_config_rejects_a_project_file_beyond_max_read_bytes() {
+        let path = crate::test_support::unique_temp_path("lait-config-read-limit", ".yml");
+        std::fs::write(&path, vec![b'a'; crate::async_io::MAX_READ_BYTES + 1]).unwrap();
+
+        let error = load_config(&ConfigSource::Explicit(path.clone())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read limit"),
+            "error: {error:#}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[cfg(unix)]
     #[tokio::test]
