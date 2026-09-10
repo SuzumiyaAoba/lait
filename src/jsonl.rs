@@ -3,7 +3,7 @@
 //! `session` (one log per named session) use.
 //!
 //! This file has six `#[cfg(unix)]`/`#[cfg(not(unix))]` function pairs
-//! (`append_relative`, `read_relative`, `path_exists_relative`,
+//! (`append_relative`, `open_relative`, `path_exists_relative`,
 //! `directory_exists_relative`, `remove_relative`, `read_dir_relative`).
 //! Collapsing them behind a `trait SafeFs` with two implementations was
 //! considered (see the design plan's A-6) and deliberately not done: this
@@ -13,12 +13,15 @@
 //! error, which `cargo check` still parses and would still catch) would be
 //! invisible until a tag build, with no local or PR-time way to check it
 //! here. The cosmetic win of one trait over six already-correct,
-//! already-documented cfg pairs doesn't justify that risk.
+//! already-documented cfg pairs doesn't justify that risk. `open_relative`
+//! (opens a file without reading it) replaced an earlier `read_relative`
+//! pair once every whole-file reader here started building on it instead —
+//! see `read_or_empty`'s and `load_rev`'s doc comments.
 
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::Path,
 };
 
@@ -49,7 +52,7 @@ mod unix_relative {
     use std::{
         ffi::{CStr, CString, OsString},
         fs::File,
-        io::{self, Read, Write},
+        io::{self, Write},
         mem::MaybeUninit,
         os::{
             fd::{AsRawFd, FromRawFd},
@@ -254,10 +257,16 @@ mod unix_relative {
         Ok(())
     }
 
-    pub(super) fn read(path: &Path) -> Result<String> {
+    /// Opens `path` for reading through the no-follow-symlink `openat`
+    /// sequence every other function in this module uses, without reading
+    /// its contents — the `File`-returning core `super::read_or_empty`
+    /// (a whole-file read) and `super::open_or_none`'s reverse-line reader
+    /// (a bounded read from the end — see its doc comment) both build on.
+    /// `None` means "doesn't exist yet", not an error.
+    pub(super) fn open(path: &Path) -> Result<Option<File>> {
         let (directory, name) = match open_parent(path, false) {
             Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("failed to open parent of '{}'", path.display()));
@@ -266,14 +275,11 @@ mod unix_relative {
         let Some(_) = check_final(&directory, &name, path)
             .with_context(|| format!("failed to inspect '{}'", path.display()))?
         else {
-            return Ok(String::new());
+            return Ok(None);
         };
-        let mut file = open_file_at(&directory, &name, READ_FLAGS, 0)
+        let file = open_file_at(&directory, &name, READ_FLAGS, 0)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
-        Ok(contents)
+        Ok(Some(file))
     }
 
     pub(super) fn path_exists(path: &Path) -> Result<bool> {
@@ -497,18 +503,25 @@ fn append_relative(path: &Path, records: impl IntoIterator<Item = impl Serialize
     Ok(())
 }
 
+/// Opens a relative path for reading through the platform's no-follow-symlink
+/// sequence, without reading its contents — `super::open_or_none`'s
+/// platform-independent counterpart, and the one relative-path primitive
+/// `super::read_or_empty` (a whole-file read) and `super::load_rev`/
+/// `super::count_lines` (a bounded read from the end) all share.
 #[cfg(unix)]
-fn read_relative(path: &Path) -> Result<String> {
-    unix_relative::read(path)
+fn open_relative(path: &Path) -> Result<Option<File>> {
+    unix_relative::open(path)
 }
 
 #[cfg(not(unix))]
-fn read_relative(path: &Path) -> Result<String> {
+fn open_relative(path: &Path) -> Result<Option<File>> {
     check_relative_parent(path)?;
-    check_final_path(path)?;
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+    if check_final_path(path)?.is_none() {
+        return Ok(None);
+    }
+    match open_for_read(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read '{}'", path.display())),
     }
 }
@@ -603,23 +616,112 @@ pub(crate) fn append(path: &Path, records: impl IntoIterator<Item = impl Seriali
 }
 
 /// `path`'s contents, or an empty string when it doesn't exist yet — the
-/// common case for a log that's never been written to. Shared by [`load`]
-/// and [`count_lines`].
+/// common case for a log that's never been written to. Shared by [`load`].
 fn read_or_empty(path: &Path) -> Result<String> {
-    if path.is_relative() {
-        return read_relative(path);
-    }
-    let mut file = match open_for_read(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read '{}'", path.display()));
-        }
+    let Some(mut file) = open_or_none(path)? else {
+        return Ok(String::new());
     };
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .with_context(|| format!("failed to read '{}'", path.display()))?;
     Ok(contents)
+}
+
+/// Opens `path` for reading, or `None` when it doesn't exist yet — the
+/// `File`-returning counterpart to [`read_or_empty`] that [`load_rev`]/
+/// [`count_lines`] build on instead of materializing the whole file as a
+/// `String` first.
+fn open_or_none(path: &Path) -> Result<Option<File>> {
+    if path.is_relative() {
+        return open_relative(path);
+    }
+    match open_for_read(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read '{}'", path.display())),
+    }
+}
+
+/// Reads complete, non-empty lines from `file` backward from the end —
+/// most-recently-appended first — invoking `visit` once per line until
+/// either the start of the file is reached or `visit` returns
+/// `ControlFlow::Break`. The `File`-consuming core [`load_rev`] and
+/// [`count_lines`] share.
+///
+/// Reads in fixed-size chunks working backward rather than one
+/// `read_to_string` + `.rev()`: an append-only log only grows, so a caller
+/// that only needs a bounded prefix of the most recent entries (`history
+/// list`/`history show <N>`) should pay for that prefix, not for the whole
+/// file. Splitting on a raw `\n` byte is safe here because `\n` can never
+/// appear as a UTF-8 continuation byte, so a chunk boundary can only ever
+/// fall between complete characters, never inside one — every log line
+/// this crate writes (`append`, via `serde_json::to_string` + `writeln!`)
+/// is valid UTF-8 by construction.
+fn visit_lines_reverse(
+    file: &mut File,
+    mut visit: impl FnMut(&str) -> Result<std::ops::ControlFlow<()>>,
+) -> Result<()> {
+    use std::ops::ControlFlow;
+
+    const CHUNK_SIZE: u64 = 64 * 1024;
+
+    let file_len = file
+        .metadata()
+        .context("failed to read file metadata")?
+        .len();
+    let mut position = file_len;
+    // Bytes carried over from a later (already-scanned) chunk that hadn't
+    // yet found their leading '\n' — the incomplete prefix of what will
+    // become a complete line once joined with more of the file's start.
+    let mut pending: Vec<u8> = Vec::new();
+
+    let emit = |bytes: &[u8], visit: &mut dyn FnMut(&str) -> Result<ControlFlow<()>>| {
+        if bytes.is_empty() {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let text = std::str::from_utf8(bytes).context("log line was not valid UTF-8")?;
+        if text.trim().is_empty() {
+            return Ok(ControlFlow::Continue(()));
+        }
+        visit(text)
+    };
+
+    while position > 0 {
+        let chunk_len = CHUNK_SIZE.min(position);
+        position -= chunk_len;
+        file.seek(std::io::SeekFrom::Start(position))
+            .context("failed to seek in file")?;
+        let mut chunk = vec![0_u8; chunk_len as usize];
+        file.read_exact(&mut chunk)
+            .context("failed to read file chunk")?;
+        chunk.extend_from_slice(&pending);
+        pending.clear();
+
+        let mut end = chunk.len();
+        loop {
+            match chunk[..end].iter().rposition(|&byte| byte == b'\n') {
+                Some(newline_index) => {
+                    if let ControlFlow::Break(()) =
+                        emit(&chunk[newline_index + 1..end], &mut visit)?
+                    {
+                        return Ok(());
+                    }
+                    end = newline_index;
+                }
+                None => {
+                    // No '\n' left in this chunk: everything from 0..end is
+                    // an incomplete prefix, carried into the next (earlier)
+                    // chunk.
+                    pending = chunk[..end].to_vec();
+                    break;
+                }
+            }
+        }
+    }
+    // Whatever remains in `pending` is the file's first line — it never had
+    // a preceding '\n'.
+    let _ = emit(&pending, &mut visit)?;
+    Ok(())
 }
 
 /// Returns whether a relative session path exists without following a
@@ -677,16 +779,138 @@ pub(crate) fn load<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
 
 /// The number of non-empty lines in the log at `path` — cheaper than
 /// [`load`] when a caller only needs a count (e.g. `session::count_turns`).
+/// Still visits every line (a count can't be known without that), but
+/// through [`visit_lines_reverse`]'s bounded chunk buffer rather than
+/// materializing the whole file as one `String` first.
 pub(crate) fn count_lines(path: &Path) -> Result<usize> {
-    Ok(read_or_empty(path)?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count())
+    let Some(mut file) = open_or_none(path)? else {
+        return Ok(0);
+    };
+    let mut count = 0_usize;
+    visit_lines_reverse(&mut file, |_| {
+        count += 1;
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+    Ok(count)
+}
+
+/// Visits every record in the log at `path`, most-recently-appended first,
+/// stopping early when `visit` returns `ControlFlow::Break` — the
+/// most-recent-first counterpart to [`load`], for a caller
+/// (`history::list`/`history::show`) that only needs a bounded prefix of
+/// the most recent entries and would otherwise pay to deserialize (and
+/// reverse) the entire log just to throw most of it away. A missing file
+/// is treated as empty (`visit` is simply never called), matching [`load`].
+pub(crate) fn load_rev<T: DeserializeOwned>(
+    path: &Path,
+    mut visit: impl FnMut(T) -> Result<std::ops::ControlFlow<()>>,
+) -> Result<()> {
+    let Some(mut file) = open_or_none(path)? else {
+        return Ok(());
+    };
+    visit_lines_reverse(&mut file, |line| {
+        let record: T = serde_json::from_str(line)
+            .with_context(|| format!("failed to parse a line of '{}'", path.display()))?;
+        visit(record)
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::append;
+    use super::{append, load, load_rev};
+    use std::ops::ControlFlow;
+
+    /// `load_rev` must visit records in reverse append order (most-recent
+    /// first) — the property `history::list`/`history::show`'s "1 = most
+    /// recent" numbering depends on.
+    #[test]
+    fn load_rev_visits_records_most_recently_appended_first() {
+        let path = crate::test_support::unique_temp_path("lait-jsonl-load-rev", ".jsonl");
+        append(&path, [1, 2, 3]).unwrap();
+
+        let mut seen = Vec::new();
+        load_rev(&path, |value: i32| {
+            seen.push(value);
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+
+        assert_eq!(seen, vec![3, 2, 1]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The property `history::list`/`history::show` actually rely on for
+    /// their performance: `load_rev` must stop deserializing once the
+    /// visitor breaks, not merely stop *returning* early after
+    /// deserializing everything internally. Appends far more records than
+    /// the break point and asserts the visitor fired exactly that many
+    /// times — if `load_rev` ever regressed into reading the whole file
+    /// first, this count would silently become the full record count
+    /// instead.
+    #[test]
+    fn load_rev_stops_after_the_visitor_breaks() {
+        let path = crate::test_support::unique_temp_path("lait-jsonl-load-rev-break", ".jsonl");
+        append(&path, 0..10_000).unwrap();
+
+        let mut visits = 0_usize;
+        load_rev(&path, |_value: i32| {
+            visits += 1;
+            Ok(if visits >= 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            })
+        })
+        .unwrap();
+
+        assert_eq!(
+            visits, 3,
+            "load_rev should stop as soon as the visitor breaks, not after reading every record"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A file whose size is an exact multiple of `visit_lines_reverse`'s
+    /// internal chunk size (or close to it) must not lose or duplicate the
+    /// line that straddles a chunk boundary. Regression test for the
+    /// backward chunked reader's boundary handling.
+    #[test]
+    fn load_rev_handles_records_spanning_a_chunk_boundary() {
+        let path = crate::test_support::unique_temp_path("lait-jsonl-load-rev-chunk", ".jsonl");
+        // Each record serializes to more than 10 bytes, so at 10,000
+        // records this file is several chunk-widths (64KiB) long,
+        // guaranteeing at least one record straddles a chunk boundary.
+        let records: Vec<String> = (0..10_000).map(|n| format!("record-{n:06}")).collect();
+        append(&path, records.iter()).unwrap();
+
+        let loaded: Vec<String> = load(&path).unwrap();
+        assert_eq!(loaded, records);
+
+        let mut reversed = Vec::new();
+        load_rev(&path, |value: String| {
+            reversed.push(value);
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        reversed.reverse();
+        assert_eq!(
+            reversed, records,
+            "load_rev (reversed back to append order) should match load exactly"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rev_on_a_missing_file_never_calls_the_visitor() {
+        let path = crate::test_support::unique_temp_path("lait-jsonl-load-rev-missing", ".jsonl");
+        let mut called = false;
+        load_rev(&path, |_value: i32| {
+            called = true;
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        assert!(!called);
+    }
 
     /// Regression test for `ensure_dir`'s cache key: `session`'s log
     /// directory is `cwd`-relative, so the same relative parent path

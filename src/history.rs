@@ -72,51 +72,65 @@ pub(crate) fn record(
     jsonl::append(&history_path()?, [entry])
 }
 
-fn load_all() -> Result<Vec<HistoryEntry>> {
-    jsonl::load(&history_path()?)
-}
-
-/// Every recorded entry, most-recent first, numbered so `1` is the most
-/// recent — the numbering `lait history show <n>`/`lait history search`
-/// display and accept.
-fn numbered_most_recent_first() -> Result<Vec<(usize, HistoryEntry)>> {
-    let mut entries = load_all()?;
-    entries.reverse();
-    Ok(entries
-        .into_iter()
-        .enumerate()
-        .map(|(i, entry)| (i + 1, entry))
-        .collect())
-}
-
 /// The `limit` most recent entries, for `lait history`'s bare listing.
+/// Reads the log most-recent-first (see `jsonl::load_rev`) and stops as
+/// soon as `limit` entries are collected, rather than deserializing (and
+/// reversing) the whole file first just to keep its tail — a history log
+/// only grows, so this makes `lait history`'s cost O(`limit`), not O(every
+/// run ever recorded).
 pub(crate) fn list(limit: usize) -> Result<Vec<(usize, HistoryEntry)>> {
-    let mut entries = numbered_most_recent_first()?;
-    entries.truncate(limit);
+    let mut entries = Vec::new();
+    let mut number = 0_usize;
+    jsonl::load_rev(&history_path()?, |entry: HistoryEntry| {
+        number += 1;
+        entries.push((number, entry));
+        Ok(if entries.len() >= limit {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        })
+    })?;
     Ok(entries)
 }
 
 /// The single entry numbered `index` (`1` = most recent). Fails clearly when
-/// `index` is out of range.
+/// `index` is out of range. Stops reading the log as soon as `index` is
+/// reached — see [`list`]'s doc comment for why this reads most-recent-first
+/// instead of loading every entry.
 pub(crate) fn show(index: usize) -> Result<HistoryEntry> {
-    numbered_most_recent_first()?
-        .into_iter()
-        .find(|(number, _)| *number == index)
-        .map(|(_, entry)| entry)
-        .ok_or_else(|| anyhow!("no history entry numbered {index}"))
+    let mut found = None;
+    let mut number = 0_usize;
+    jsonl::load_rev(&history_path()?, |entry: HistoryEntry| {
+        number += 1;
+        Ok(if number == index {
+            found = Some(entry);
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        })
+    })?;
+    found.ok_or_else(|| anyhow!("no history entry numbered {index}"))
 }
 
 /// Every entry (most-recent first) whose prompt or response contains `query`
-/// as a case-insensitive substring.
+/// as a case-insensitive substring. A match can be anywhere in the log, so
+/// (unlike [`list`]/[`show`]) this still visits every entry — but streamed
+/// one at a time via [`jsonl::load_rev`] rather than first collecting every
+/// entry into a `Vec`, reversing it, and filtering a second pass.
 pub(crate) fn search(query: &str) -> Result<Vec<(usize, HistoryEntry)>> {
     let query = query.to_lowercase();
-    Ok(numbered_most_recent_first()?
-        .into_iter()
-        .filter(|(_, entry)| {
-            entry.prompt.to_lowercase().contains(&query)
-                || entry.response.to_lowercase().contains(&query)
-        })
-        .collect())
+    let mut matches = Vec::new();
+    let mut number = 0_usize;
+    jsonl::load_rev(&history_path()?, |entry: HistoryEntry| {
+        number += 1;
+        if entry.prompt.to_lowercase().contains(&query)
+            || entry.response.to_lowercase().contains(&query)
+        {
+            matches.push((number, entry));
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+    Ok(matches)
 }
 
 fn print_entry(number: usize, entry: &HistoryEntry) {
@@ -131,9 +145,27 @@ fn print_entry(number: usize, entry: &HistoryEntry) {
 
 /// A one-line, ellipsized preview of a prompt/response for the list/search
 /// table — the full text is only ever shown by `lait history show <n>`.
+/// Builds the flattened (whitespace-collapsed) preview directly into one
+/// `String`, stopping as soon as it has more than `MAX_CHARS` worth of
+/// content, instead of collecting every word of `text` (a whole response,
+/// which can be far longer than the handful of words this ever keeps) into
+/// a `Vec<&str>` and joining all of it before truncating. Output is
+/// identical to the join-everything-then-truncate approach it replaced —
+/// the truncation below still takes exactly `MAX_CHARS` characters of the
+/// (possibly word-splitting) flattened prefix — only the amount of `text`
+/// actually visited is smaller.
 fn summarize(text: &str) -> String {
     const MAX_CHARS: usize = 60;
-    let flattened: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut flattened = String::new();
+    for word in text.split_whitespace() {
+        if !flattened.is_empty() {
+            flattened.push(' ');
+        }
+        flattened.push_str(word);
+        if flattened.chars().count() > MAX_CHARS {
+            break;
+        }
+    }
     if flattened.chars().count() <= MAX_CHARS {
         flattened
     } else {
