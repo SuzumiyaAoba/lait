@@ -1,3 +1,13 @@
+//! JSON Schema loading and validation: a workflow's top-level `json_schemas:`
+//! map ([`JsonSchemaMap`]/[`JsonSchemaEntry`]), `--json-schema`/`response_format:`
+//! resolution into an OpenAI-compatible [`ResponseFormat`], and `lait schema`
+//! itself ([`run`]). Every load path exists in a sync and a `_cancellable`
+//! async twin (`load_schema_value`/`_cancellable`, `resolve_named_schema_value`/
+//! `_cancellable`, `load_json_schema`/`_cancellable`) sharing a pure parsing
+//! core (`parse_schema_entry_contents`/`parse_json_schema_contents`) — only
+//! the read (`async_io::read_to_string_sync` vs. the cancellable worker)
+//! differs between them.
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

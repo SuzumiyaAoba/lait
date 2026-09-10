@@ -1,3 +1,12 @@
+//! Handlebars rendering for a workflow node's `prompt:`/`system_prompt:`/
+//! argv templates: `{{ input }}`/`{{ steps.<id> }}`/`{{ vars.<key> }}`
+//! placeholders and the `{{ json ... }}` helper for embedding a value as
+//! compact JSON text. [`RenderScope`] is the entry point a caller rendering
+//! more than one template against the same `input`/`steps`/`vars` should
+//! use directly (see its doc comment); [`render`] is a one-shot convenience
+//! wrapper around it. Both go through [`compiled_template`]'s process-wide
+//! cache rather than recompiling a template string on every render.
+
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
@@ -127,9 +136,13 @@ static HANDLEBARS: LazyLock<Handlebars<'static>> = LazyLock::new(|| {
 /// cache for an ad-hoc, unregistered template string); caching the compiled
 /// result here means a template text rendered more than once — most
 /// commonly a `for_each`/`loop` body's `prompt:`/`system_prompt:` re-run
-/// per iteration — is only parsed the first time. Unbounded by design, the
-/// same way `jq::FILTER_CACHE` is: a workflow's set of distinct template
-/// strings is fixed at parse time.
+/// per iteration — is only parsed the first time. Deliberately left
+/// unbounded, the same way `jq::FILTER_CACHE` is: for a single `lait
+/// run`/`lait chat` process, a workflow's set of distinct template strings
+/// is fixed at parse time. `lait lint <DIR>` is the one case where this
+/// grows across every workflow file in a directory tree rather than one
+/// workflow — still bounded by the distinct template strings on disk, and
+/// the process exits once linting finishes.
 static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<Template>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

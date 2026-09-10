@@ -1,3 +1,14 @@
+//! jq filter evaluation for `when:`/`jq:`/`for_each.items`/`join`/assert
+//! conditions across the workflow engine — the sync and cancellable-async
+//! entry points (`apply*`/`apply*_cancellable*`) both funnel into
+//! `run_filter_with`, which compiles through the process-wide
+//! [`FILTER_CACHE`] rather than reparsing `filter_source` and the jq
+//! standard-library prelude on every call. Lives at the crate root rather
+//! than under `workflow/` because `lint.rs`'s `check_syntax` path validates
+//! filter syntax independently of any one workflow node type, and because
+//! this module itself depends on `template::parse_input` for normalizing a
+//! filter's input value.
+
 use std::{
     collections::HashMap,
     io::{self, Write},
@@ -37,10 +48,14 @@ const _: fn() = || {
 /// `defs()`, ~200 lines of jq source) plus `filter_source` itself; caching
 /// the compiled result means only the first call for a given filter text
 /// pays that cost, which matters most for `for_each`/`loop` bodies that
-/// re-evaluate the same `when:`/`jq:` filter many times. Unbounded by
-/// design: a workflow's set of distinct filter strings is fixed at parse
-/// time, so this cannot grow without bound the way a per-request cache
-/// could.
+/// re-evaluate the same `when:`/`jq:` filter many times. Deliberately left
+/// unbounded: for a single `lait run`/`lait chat` process, a workflow's set
+/// of distinct filter strings is fixed at parse time, so this cannot grow
+/// without bound the way a per-request cache could. `lait lint <DIR>`
+/// recursing over many workflow files is the one case where this grows
+/// across a whole directory tree rather than one workflow — still bounded
+/// by the number of distinct filter strings on disk, and the process exits
+/// once linting finishes, so this is not a genuine leak.
 static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CompiledFilter>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

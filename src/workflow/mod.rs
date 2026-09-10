@@ -1,3 +1,15 @@
+//! Workflow file loading, validation, and the registry `lait run`/`lait
+//! lint` resolve a `FILE` argument or a `workflows:` registry name against
+//! (see [`resolve_run_target`]). The step/router/node types themselves live
+//! in `model.rs` (re-exported here via `pub(crate) use model::*`) and their
+//! execution in `exec`; this module is the entry point that ties file
+//! resolution, parsing, and [`WorkflowScope`] construction together before
+//! handing off to `exec::run_steps`. [`WorkflowRegistry`] caches a loaded,
+//! validated `WorkflowFile` by canonical path so a `workflow:` node inside a
+//! `for_each`/`loop` body does not re-read and re-parse the same sub-workflow
+//! file on every iteration — the same pattern `subagent::AgentRegistry` and
+//! `skill::SkillCache` use for their own by-path caches.
+
 use std::{
     fs,
     path::{Path, PathBuf},
