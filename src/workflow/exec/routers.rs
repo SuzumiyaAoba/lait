@@ -1,6 +1,6 @@
 //! Workflow router execution and branch/item output aggregation.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, TryStreamExt};
 
 use crate::{engine::value_to_input_text, jq, template, workflow};
@@ -292,10 +292,13 @@ async fn execute_for_each<'a>(
     let items_value: serde_json::Value = serde_json::from_str(&items_json).with_context(|| {
         format!("step '{label}': failed to parse 'for_each.items' output as JSON")
     })?;
-    let items = items_value
-        .as_array()
-        .cloned()
-        .ok_or_else(|| anyhow!("step '{label}': 'for_each.items' must produce a JSON array"))?;
+    // Moves the array out of `items_value` rather than `.as_array().cloned()`
+    // — nothing else needs `items_value` afterward, so cloning every element
+    // just to hand back an owned `Vec` would be wasted work.
+    let items = match items_value {
+        serde_json::Value::Array(items) => items,
+        _ => bail!("step '{label}': 'for_each.items' must produce a JSON array"),
+    };
 
     let max_concurrency = for_each.max_concurrency.unwrap_or(1);
     let item_outcome = if max_concurrency <= 1 {
@@ -385,10 +388,15 @@ async fn execute_sequential_items<'a>(
             items.len()
         );
         let item_input = value_to_input_text(item, "failed to serialize a 'for_each' item")?;
+        // `steps_outputs` is unconditionally overwritten by
+        // `new_steps_outputs` right below, so the value handed to
+        // `run_steps` here can be moved out instead of cloned — unlike
+        // `execute_concurrent_items`, where every item future needs its own
+        // independent copy since they run at once.
         let outcome = run_steps(
             &for_each.steps,
             item_input,
-            steps_outputs.clone(),
+            std::mem::take(&mut steps_outputs),
             context.frame(item_counter, context.progress_prefix),
         )
         .await?;
