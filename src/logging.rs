@@ -18,12 +18,25 @@ use tracing_subscriber::EnvFilter;
 /// Otherwise `verbosity` (`-v`'s `ArgAction::Count`) selects a level scoped to
 /// this crate only, so third-party dependency logs don't flood `-v` output:
 /// `0` is silent, `1` (`-v`) is `debug`, `2+` (`-vv`) is `trace`.
+///
+/// Skips building and installing a subscriber at all when there is nothing
+/// to log (`verbosity == 0` and `LAIT_LOG` unset/blank): every `tracing`
+/// macro is a no-op without one installed, so this changes nothing about
+/// what a caller sees, only whether `main` pays for an `EnvFilter` parse and
+/// a `stderr().is_terminal()` check on every invocation — `lait completions`
+/// in particular runs from shell startup files (see `main`'s own comment on
+/// why that path's cost matters), where this was pure overhead before.
 pub(crate) fn init(verbosity: u8) {
-    let filter = match std::env::var("LAIT_LOG") {
-        Ok(value) if !value.trim().is_empty() => {
-            EnvFilter::try_new(&value).unwrap_or_else(|_| default_filter(verbosity))
-        }
-        _ => default_filter(verbosity),
+    let log_env = std::env::var("LAIT_LOG")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if verbosity == 0 && log_env.is_none() {
+        return;
+    }
+
+    let filter = match log_env {
+        Some(value) => EnvFilter::try_new(&value).unwrap_or_else(|_| default_filter(verbosity)),
+        None => default_filter(verbosity),
     };
 
     tracing_subscriber::fmt()

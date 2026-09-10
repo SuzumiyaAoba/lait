@@ -5,17 +5,32 @@
 //! sense — rendering is off, or stdout isn't an actual terminal (a pipe, a
 //! redirect to a file) where ANSI escapes would just be noise.
 
-use std::io::IsTerminal;
+use std::{borrow::Cow, io::IsTerminal, sync::LazyLock};
+
+/// `termimad::MadSkin::default()` is a fixed, stateless style table (no
+/// per-render configuration ever varies it here), so it's built once and
+/// shared instead of reconstructed on every rendered response.
+/// `Send + Sync` holds because every field is either a `Copy` style/color
+/// type or a `&'static` reference (`skin.rs`'s struct definition) — nothing
+/// interior-mutable, so sharing one instance across renders is safe.
+static SKIN: LazyLock<termimad::MadSkin> = LazyLock::new(termimad::MadSkin::default);
+
+const _: fn() = || {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<termimad::MadSkin>();
+};
 
 /// Renders `content` as Markdown for terminal display when `enabled` and
-/// stdout is a terminal; otherwise returns `content` unchanged. Takes
-/// ownership of nothing and allocates only when actually rendering, so the
-/// common (disabled, or non-TTY) path is a plain pass-through.
-pub(crate) fn maybe_render(content: &str, enabled: bool) -> String {
+/// stdout is a terminal; otherwise returns `content` unchanged. Returns a
+/// borrow of `content` in the common (disabled, or non-TTY) path instead of
+/// an owned copy — the caller (`report::emit_output`) only ever needs to
+/// print the result once, immediately, so there is nothing for the copy to
+/// buy.
+pub(crate) fn maybe_render(content: &str, enabled: bool) -> Cow<'_, str> {
     if !enabled || !std::io::stdout().is_terminal() {
-        return content.to_owned();
+        return Cow::Borrowed(content);
     }
-    termimad::MadSkin::default().term_text(content).to_string()
+    Cow::Owned(SKIN.term_text(content).to_string())
 }
 
 #[cfg(test)]

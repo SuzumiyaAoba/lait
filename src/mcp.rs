@@ -1733,7 +1733,15 @@ fn render_tool_result(result: rmcp::model::CallToolResult) -> String {
     if is_error {
         parts.insert(0, "isError: true".to_owned());
     }
-    parts.join("\n\n")
+    // The common case (a single text content block, no structured content,
+    // no error) has nothing to join — `parts.join(..)` would still allocate
+    // a full copy of that one block just to hand back an equivalent
+    // `String`. `pop` moves it out instead.
+    match parts.len() {
+        0 => String::new(),
+        1 => parts.pop().expect("parts.len() == 1"),
+        _ => parts.join("\n\n"),
+    }
 }
 
 #[cfg(test)]
