@@ -156,6 +156,13 @@ async fn resolve_one_cancellable(
     budget: async_io::ReadBudget,
     wait_for_fifo_writer: bool,
 ) -> Result<String> {
+    // Checked here, before ever touching `run_blocking`'s dedicated OS
+    // thread: an `http(s)://` value returns immediately and never needs the
+    // filesystem, so it has no reason to pay for a worker thread just to
+    // hand the string straight back.
+    if image.starts_with("http://") || image.starts_with("https://") {
+        return Ok(image);
+    }
     async_io::run_blocking(
         move |cancelled| resolve_one_blocking(&image, cancelled, &budget, wait_for_fifo_writer),
         cancellation,
@@ -169,10 +176,6 @@ fn resolve_one_blocking(
     budget: &async_io::ReadBudget,
     wait_for_fifo_writer: bool,
 ) -> Result<String> {
-    if image.starts_with("http://") || image.starts_with("https://") {
-        return Ok(image.to_owned());
-    }
-
     let path = Path::new(image);
     let bytes = async_io::read_file_with_budget(
         path,
