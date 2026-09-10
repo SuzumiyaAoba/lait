@@ -1,8 +1,8 @@
 //! `lait chat`'s interactive REPL: meta-command syntax (`/exit`/`/clear`/
 //! `/model`/`/system`) and the read-eval-print loop itself. Chat-turn
-//! settings resolution (`resolve_chat_settings`/`resolve_system_prompt`/
-//! `load_session_history`/`finish_chat_turn`) stays in `app`, shared with
-//! `run_chat`'s single-shot path.
+//! settings resolution (`chat::resolve_chat_settings`/`chat::resolve_system_prompt`/
+//! `chat::load_session_history`/`chat::finish_chat_turn`) lives in the `chat`
+//! module, shared with `app::run_chat`'s single-shot path.
 
 use std::{io::Write, sync::Arc};
 
@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
-    app, async_io,
+    async_io, chat,
     cli::ChatReplArgs,
     config::{self, ConfigSource},
     engine::{AppServices, PromptTurn, RequestSettings, RunContext},
@@ -72,9 +72,9 @@ pub(crate) async fn run(
     let mut shared = args.shared;
     let file_config =
         Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
-    let mut history = app::load_session_history(shared.session.as_deref())?;
-    let mut system_prompt = app::resolve_system_prompt(&shared, &file_config)?;
-    let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);
+    let mut history = chat::load_session_history(shared.session.as_deref())?;
+    let mut system_prompt = chat::resolve_system_prompt(&shared, &file_config)?;
+    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
     let env = RunContext::new(Arc::clone(&services), cancel.clone())
         .with_cache(cache_enabled, cache_ttl)
@@ -135,7 +135,7 @@ pub(crate) async fn run(
             }
 
             if settings.is_none() {
-                settings = match app::resolve_chat_settings(&shared, None, &file_config) {
+                settings = match chat::resolve_chat_settings(&shared, None, &file_config) {
                     Ok(resolved) => Some(resolved),
                     Err(error) => {
                         eprintln!("lait: {error:#}");
@@ -161,7 +161,7 @@ pub(crate) async fn run(
                 Ok((assistant_text, turn_usage)) => {
                     history.push(llm::user_message(line, &[])?);
                     history.push(llm::assistant_message(&assistant_text)?);
-                    app::finish_chat_turn(
+                    chat::finish_chat_turn(
                         shared.session.as_deref(),
                         shared.reporting.no_history,
                         &file_config,

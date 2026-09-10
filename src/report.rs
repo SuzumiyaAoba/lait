@@ -5,7 +5,7 @@
 //! path), `lait history` recording (unless `--no-history`/
 //! `default.history: false` opts out), and the `--show-usage` summary. Chat
 //! has its own richer version of the record/summary half,
-//! `app::finish_chat_turn`, which also appends to a `--session` log — this
+//! `chat::finish_chat_turn`, which also appends to a `--session` log — this
 //! module's [`finish_run`] is for the three `run_*` entry points that don't
 //! have a session concept.
 

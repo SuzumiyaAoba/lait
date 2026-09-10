@@ -1397,7 +1397,7 @@ mod tests {
     fn compare_subcommand_prompt_is_optional_for_app_level_validation() {
         // PROMPT is optional at the clap level so it can come from piped
         // stdin instead; app-level code enforces that one of the two exists
-        // (see `app::resolve_input_with_stdin_cancellable`).
+        // (see `chat::resolve_input_with_stdin_cancellable`).
         let cli = Cli::try_parse_from(["lait", "compare", "--model", "a", "--model", "b"])
             .expect("prompt-less compare should still parse");
         match cli.command {

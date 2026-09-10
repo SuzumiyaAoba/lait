@@ -6,6 +6,7 @@ mod async_io;
 mod attachment;
 mod cache;
 mod cassette;
+mod chat;
 mod checkpoint;
 mod cli;
 mod compare;

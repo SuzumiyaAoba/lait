@@ -10,7 +10,7 @@ use futures_util::future::join_all;
 use serde::Serialize;
 
 use crate::{
-    app,
+    chat,
     cli::CompareArgs,
     config::{self, ConfigSource, ModelMap},
     engine::{
@@ -46,7 +46,7 @@ pub(crate) async fn run(
         Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
     let prompt =
-        app::resolve_input_with_stdin_cancellable(args.prompt.clone(), Some(cancel.clone()))
+        chat::resolve_input_with_stdin_cancellable(args.prompt.clone(), Some(cancel.clone()))
             .await?
             .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
 
@@ -72,7 +72,7 @@ pub(crate) async fn run(
         settings_list.push((model_name.clone(), settings));
     }
 
-    let (cache_enabled, cache_ttl) = app::resolve_cache_settings(cache_override, &file_config);
+    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
     let env = RunContext::new(Arc::clone(&services), cancel).with_cache(cache_enabled, cache_ttl);
 

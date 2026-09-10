@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    async_io, checkpoint,
+    async_io, chat, checkpoint,
     cli::RunArgs,
     config::{self, ConfigSource},
     engine::{AppServices, RunContext},
@@ -15,8 +15,6 @@ use crate::{
         exec::{Flow, RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
     },
 };
-
-use super::{resolve_cache_settings, resolve_input_with_stdin_cancellable};
 
 /// Runtime progress between top-level steps. Keeping the state together avoids
 /// mixing a router's nested counter with the checkpoint's top-level position.
@@ -166,12 +164,12 @@ pub(super) async fn run_workflow(
             )
         }
         None => {
-            let prompt =
-                resolve_input_with_stdin_cancellable(run_args.prompt.clone(), Some(cancel.clone()))
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!("a PROMPT is required; provide one or pipe input via stdin")
-                    })?;
+            let prompt = chat::resolve_input_with_stdin_cancellable(
+                run_args.prompt.clone(),
+                Some(cancel.clone()),
+            )
+            .await?
+            .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
             let vars = workflow::build_vars(&run_args.var.var)?;
             (
                 prompt.clone(),
@@ -202,7 +200,7 @@ pub(super) async fn run_workflow(
     let run_cancel = cancel.child_token();
     let deadline = RunDeadline::start(scope.defaults.workflow_timeout, run_cancel.clone());
 
-    let (cache_enabled, cache_ttl) = resolve_cache_settings(cache_override, &file_config);
+    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
     let env = RunContext::new(Arc::clone(&services), run_cancel)
         .with_vars(vars.clone())
