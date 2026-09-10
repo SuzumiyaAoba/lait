@@ -7,8 +7,9 @@
 //! handing off to `exec::run_steps`. [`WorkflowRegistry`] caches a loaded,
 //! validated `WorkflowFile` by canonical path so a `workflow:` node inside a
 //! `for_each`/`loop` body does not re-read and re-parse the same sub-workflow
-//! file on every iteration — the same pattern `subagent::AgentRegistry` and
-//! `skill::SkillCache` use for their own by-path caches.
+//! file on every iteration — the same `AsyncCache`-backed pattern
+//! `subagent::AgentRegistry` uses for its own by-path cache (`skill::SkillCache`
+//! caches the analogous way, but keyed by skill name rather than path).
 
 use std::{
     fs,
