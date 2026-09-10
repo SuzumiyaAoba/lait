@@ -26,7 +26,8 @@ fn all_formats_report_file_and_config_errors_from_the_same_analysis() {
 }
 
 use support::{
-    AgentMarkdownFile, ConfigDirectory, WorkflowFile, next_temp_path, run_lait_lint, test_command,
+    AgentMarkdownFile, ConfigDirectory, ScratchDir, WorkflowFile, next_temp_path, run_lait_lint,
+    test_command,
 };
 
 #[test]
@@ -391,39 +392,9 @@ fn lint_flags_a_model_definition_with_both_api_key_and_api_key_cmd() {
     );
 }
 
-/// A temporary directory tree for `lait lint <DIR>` recursion tests, cleaned
-/// up on drop. Distinct from `ConfigDirectory` (which always writes
-/// `lait.config.yml`) — this one is just an empty directory the test fills
-/// in itself.
-struct TempLintDir {
-    path: std::path::PathBuf,
-}
-
-impl TempLintDir {
-    fn new() -> Self {
-        let path = next_temp_path("lait-test-lint-dir", "");
-        std::fs::create_dir(&path).expect("failed to create temp lint directory");
-        Self { path }
-    }
-
-    fn write(&self, relative: &str, contents: &str) {
-        let full_path = self.path.join(relative);
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent).expect("failed to create nested lint directory");
-        }
-        std::fs::write(&full_path, contents).expect("failed to write lint fixture file");
-    }
-}
-
-impl Drop for TempLintDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 #[test]
 fn lint_recurses_into_a_directory_argument() {
-    let dir = TempLintDir::new();
+    let dir = ScratchDir::new();
     dir.write(
         "sub/workflow.yml",
         "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
@@ -431,7 +402,7 @@ fn lint_recurses_into_a_directory_argument() {
     dir.write("sub/agent.md", "---\nname: city-fact\n---\nbody\n");
     dir.write("sub/README.md", "# not an agent file, no frontmatter\n");
 
-    let output = run_lait_lint(&[&dir.path]);
+    let output = run_lait_lint(&[dir.path()]);
 
     assert!(output.status.success(), "lait lint failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -442,7 +413,7 @@ fn lint_recurses_into_a_directory_argument() {
 
 #[test]
 fn lint_directory_recursion_skips_target_and_node_modules() {
-    let dir = TempLintDir::new();
+    let dir = ScratchDir::new();
     dir.write(
         "top.yml",
         "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
@@ -452,7 +423,7 @@ fn lint_directory_recursion_skips_target_and_node_modules() {
     dir.write("target/build.yml", "steps: []\n");
     dir.write("node_modules/pkg/ci.yml", "steps: []\n");
 
-    let output = run_lait_lint(&[&dir.path]);
+    let output = run_lait_lint(&[dir.path()]);
 
     assert!(
         output.status.success(),
