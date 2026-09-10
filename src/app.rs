@@ -6,24 +6,32 @@
 //! split exists), and `run`/`run_chat`/`run_prompt`/`run_agent` below only
 //! wire those pieces together for their one entry point each.
 //!
-//! Every `Command` variant is classified as needing an async runtime or not
-//! (`needs_async_runtime`) before `main` decides whether to start one at
-//! all; `run` (async path) and `run_blocking` (sync path) then each match
-//! over `Command` again to dispatch. All three matches must agree, and nothing
-//! in the type system enforces that today — a variant routed to the wrong
-//! path fails at runtime via one of the `internal error: ...` `bail!`s below
-//! rather than at compile time (see the design plan's B3 for the planned
-//! fix: a `Dispatch`/`classify` type that makes misrouting a compile error).
+//! [`classify`] sorts every `Command` variant (plus the no-subcommand bare
+//! invocation) into [`SyncCommand`] or [`AsyncCommand`] once, in `main`: the
+//! sync/async split used to be encoded separately in three places (a
+//! `needs_async_runtime` predicate `main` consulted before deciding whether
+//! to start a Tokio runtime at all, plus [`run`] and [`run_blocking`] each
+//! re-matching over `Command` to dispatch), kept in agreement only by
+//! convention and twelve `bail!("internal error: ... must run on the
+//! {sync,async} path")` calls if they ever drifted. `run`/`run_blocking` now
+//! take `AsyncCommand`/`SyncCommand` directly rather than the raw `Cli`, so a
+//! variant classified as sync literally cannot reach `run`'s async handlers
+//! (or vice versa) — the type system rejects it at `main`'s single call
+//! site, not at runtime.
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 use crate::{
     agent, attachment, chat, checkpoint,
-    cli::{AgentAction, ChatArgs, ChatReplArgs, Cli, Command, PromptAction},
-    cli::{AgentRunArgs, GraphArgs, GraphFormat, PromptRunArgs},
-    cli::{SkillAction, WorkflowAction},
+    cli::{
+        AgentAction, AgentCommand, AgentRunArgs, CacheCommand, ChatArgs, ChatReplArgs, Command,
+        CompareArgs, CompletionsArgs, DoctorArgs, EvalArgs, GraphArgs, GraphFormat, HistoryArgs,
+        InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction, PromptCommand, PromptRunArgs,
+        RunArgs, RunsCommand, SchemaArgs, SessionsCommand, SkillAction, SkillCommand, TestArgs,
+        WorkflowAction, WorkflowCommand,
+    },
     config::{self, ConfigSource, ModelMap},
     docgen, doctor,
     engine::{
@@ -38,22 +46,132 @@ use crate::{
 mod workflow_run;
 use workflow_run::run_workflow;
 
-pub(crate) async fn run(cli: Cli) -> Result<()> {
-    // Built once per invocation and passed as the root source to each
-    // RunContext below. Each async handler arms `signal::spawn_handler` at
-    // the point where it starts using the token; the REPL watches that root
-    // while reading and running turns so cleanup also covers Ctrl-C there.
-    let cancel = tokio_util::sync::CancellationToken::new();
+/// Every subcommand (and the bare, no-subcommand invocation) that never
+/// awaits anything — no model request, no MCP connection — grouped by
+/// [`classify`] so [`run_blocking`] can dispatch to it without a Tokio
+/// runtime. `main` skips building one entirely for these, which matters for
+/// `Completions` in particular: shell startup files run it on every new
+/// shell, where runtime-startup cost is felt directly.
+pub(crate) enum SyncCommand {
+    Lint(LintArgs),
+    ModelsLocal(ModelsArgs),
+    Completions(CompletionsArgs),
+    Man(ManArgs),
+    Init(InitArgs),
+    Sessions(SessionsCommand),
+    PromptList,
+    History(HistoryArgs),
+    Graph(GraphArgs),
+    AgentList,
+    WorkflowList,
+    SkillList,
+    Runs(RunsCommand),
+    Cache(CacheCommand),
+    Schema(SchemaArgs),
+}
 
-    let config_source = ConfigSource::from(&cli);
-    // `--cache`/`--no-cache` are global flags on `Cli` itself (see
-    // `cli::Cli`), so they must be read before `cli.command` is moved into
-    // the match below — same reason `config_source` is built up front here
-    // rather than re-derived from `cli` at each call site.
-    let cache_override = cache_override(cli.cache, cli.no_cache);
-    let approve_tools = cli.approve_tools;
-    match cli.command {
-        Some(Command::Run(run_args)) => {
+/// Every subcommand (and the bare invocation) that awaits a model request or
+/// MCP/subagent work — see [`SyncCommand`] for the complementary half and
+/// this module's doc comment for why the split exists as a type rather than
+/// a predicate.
+pub(crate) enum AsyncCommand {
+    Run(RunArgs),
+    AgentRun(AgentRunArgs),
+    ModelsRemote(ModelsArgs),
+    Chat(ChatReplArgs),
+    PromptRun(PromptRunArgs),
+    Doctor(DoctorArgs),
+    Compare(CompareArgs),
+    Test(TestArgs),
+    Eval(EvalArgs),
+    /// The no-subcommand invocation (`lait [OPTIONS] [PROMPT]`). Carries no
+    /// payload here — unlike every other variant, its arguments
+    /// (`cli::Cli::chat`) live directly on `Cli` rather than on a `Command`
+    /// variant (there is no `Command` value at all when no subcommand was
+    /// given), so `main` threads `cli.chat` to [`run`] alongside this tag
+    /// instead of `classify` trying to manufacture one from an
+    /// `Option<Command>` that structurally cannot carry it.
+    Bare,
+}
+
+/// The result of sorting one parsed `command` into the sync/async split —
+/// see this module's doc comment. Takes `Option<Command>` (not the whole
+/// `Cli`) because that is all a `Command` variant's own classification ever
+/// depends on; the caller still owns every other `Cli` field (`chat`,
+/// `no_config`, `cache`, ...) throughout, since only the `command` field is
+/// moved into this call.
+pub(crate) enum Dispatch {
+    Sync(SyncCommand),
+    Async(AsyncCommand),
+}
+
+/// Classifies a parsed `Cli::command` into [`Dispatch::Sync`]/
+/// [`Dispatch::Async`]. Two subcommands classify by a field on their own
+/// payload rather than by variant alone: `Models(remote)` and
+/// `Prompt`/`Agent`'s own list-vs-run action — both are resolved here so
+/// every other call site only ever sees the already-sorted
+/// `SyncCommand`/`AsyncCommand` shape.
+pub(crate) fn classify(command: Option<Command>) -> Dispatch {
+    match command {
+        Some(Command::Lint(args)) => Dispatch::Sync(SyncCommand::Lint(args)),
+        Some(Command::Models(args)) => {
+            if args.remote {
+                Dispatch::Async(AsyncCommand::ModelsRemote(args))
+            } else {
+                Dispatch::Sync(SyncCommand::ModelsLocal(args))
+            }
+        }
+        Some(Command::Completions(args)) => Dispatch::Sync(SyncCommand::Completions(args)),
+        Some(Command::Man(args)) => Dispatch::Sync(SyncCommand::Man(args)),
+        Some(Command::Init(args)) => Dispatch::Sync(SyncCommand::Init(args)),
+        Some(Command::Sessions(command)) => Dispatch::Sync(SyncCommand::Sessions(command)),
+        Some(Command::Chat(args)) => Dispatch::Async(AsyncCommand::Chat(args)),
+        Some(Command::Prompt(PromptCommand {
+            action: PromptAction::List,
+        })) => Dispatch::Sync(SyncCommand::PromptList),
+        Some(Command::Prompt(PromptCommand {
+            action: PromptAction::Run(args),
+        })) => Dispatch::Async(AsyncCommand::PromptRun(args)),
+        Some(Command::History(args)) => Dispatch::Sync(SyncCommand::History(args)),
+        Some(Command::Graph(args)) => Dispatch::Sync(SyncCommand::Graph(args)),
+        Some(Command::Workflow(WorkflowCommand {
+            action: WorkflowAction::List,
+        })) => Dispatch::Sync(SyncCommand::WorkflowList),
+        Some(Command::Skill(SkillCommand {
+            action: SkillAction::List,
+        })) => Dispatch::Sync(SyncCommand::SkillList),
+        Some(Command::Runs(command)) => Dispatch::Sync(SyncCommand::Runs(command)),
+        Some(Command::Cache(command)) => Dispatch::Sync(SyncCommand::Cache(command)),
+        Some(Command::Schema(args)) => Dispatch::Sync(SyncCommand::Schema(args)),
+        Some(Command::Agent(AgentCommand {
+            action: AgentAction::List,
+        })) => Dispatch::Sync(SyncCommand::AgentList),
+        Some(Command::Agent(AgentCommand {
+            action: AgentAction::Run(args),
+        })) => Dispatch::Async(AsyncCommand::AgentRun(args)),
+        Some(Command::Run(args)) => Dispatch::Async(AsyncCommand::Run(args)),
+        Some(Command::Doctor(args)) => Dispatch::Async(AsyncCommand::Doctor(args)),
+        Some(Command::Compare(args)) => Dispatch::Async(AsyncCommand::Compare(args)),
+        Some(Command::Test(args)) => Dispatch::Async(AsyncCommand::Test(args)),
+        Some(Command::Eval(args)) => Dispatch::Async(AsyncCommand::Eval(args)),
+        None => Dispatch::Async(AsyncCommand::Bare),
+    }
+}
+
+/// Runs the `AsyncCommand` [`classify`] sorted onto the async path, on an
+/// already-running Tokio runtime. `bare_chat` is only read for
+/// `AsyncCommand::Bare` — see that variant's doc comment for why it isn't
+/// part of `AsyncCommand` itself.
+pub(crate) async fn run(
+    command: AsyncCommand,
+    bare_chat: ChatArgs,
+    config_source: ConfigSource,
+    cache_override: Option<bool>,
+    approve_tools: bool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    match command {
+        AsyncCommand::Run(run_args) => {
             run_workflow(
                 run_args,
                 config_source,
@@ -63,24 +181,13 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Some(Command::Agent(agent_command)) => match agent_command.action {
-            AgentAction::Run(args) => {
-                run_agent(args, config_source, cache_override, approve_tools, cancel).await
-            }
-            AgentAction::List => bail!("internal error: `agent list` must run on the sync path"),
-        },
-        Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
-        Some(Command::Models(models_args)) => {
+        AsyncCommand::AgentRun(args) => {
+            run_agent(args, config_source, cache_override, approve_tools, cancel).await
+        }
+        AsyncCommand::ModelsRemote(models_args) => {
             crate::models::run(models_args, config_source, Some(cancel)).await
         }
-        Some(Command::Completions(completions_args)) => {
-            docgen::generate_completions(completions_args);
-            Ok(())
-        }
-        Some(Command::Man(man_args)) => docgen::generate_man_pages(man_args),
-        Some(Command::Init(init_args)) => crate::init::run(init_args),
-        Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
-        Some(Command::Chat(chat_repl_args)) => {
+        AsyncCommand::Chat(chat_repl_args) => {
             repl::run(
                 chat_repl_args,
                 config_source,
@@ -90,41 +197,27 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Some(Command::Prompt(prompt_command)) => match prompt_command.action {
-            PromptAction::List => {
-                bail!("internal error: `prompt list` must run on the sync path")
-            }
-            PromptAction::Run(run_args) => {
-                run_prompt(
-                    run_args,
-                    config_source,
-                    cache_override,
-                    approve_tools,
-                    cancel,
-                )
-                .await
-            }
-        },
-        Some(Command::History(history_args)) => history::run(history_args),
-        Some(Command::Graph(_)) => bail!("internal error: `graph` must run on the sync path"),
-        Some(Command::Workflow(_)) => {
-            bail!("internal error: `workflow list` must run on the sync path")
+        AsyncCommand::PromptRun(run_args) => {
+            run_prompt(
+                run_args,
+                config_source,
+                cache_override,
+                approve_tools,
+                cancel,
+            )
+            .await
         }
-        Some(Command::Skill(_)) => bail!("internal error: `skill list` must run on the sync path"),
-        Some(Command::Runs(_)) => bail!("internal error: `runs` must run on the sync path"),
-        Some(Command::Cache(_)) => bail!("internal error: `cache` must run on the sync path"),
-        Some(Command::Schema(_)) => bail!("internal error: `schema` must run on the sync path"),
-        Some(Command::Doctor(doctor_args)) => {
+        AsyncCommand::Doctor(doctor_args) => {
             doctor::run(doctor_args, config_source, Some(cancel)).await
         }
-        Some(Command::Compare(compare_args)) => {
+        AsyncCommand::Compare(compare_args) => {
             crate::compare::run(compare_args, config_source, cache_override, cancel).await
         }
-        Some(Command::Test(test_args)) => test_run::run(test_args, config_source, cancel).await,
-        Some(Command::Eval(eval_args)) => crate::eval::run(eval_args, config_source, cancel).await,
-        None => {
+        AsyncCommand::Test(test_args) => test_run::run(test_args, config_source, cancel).await,
+        AsyncCommand::Eval(eval_args) => crate::eval::run(eval_args, config_source, cancel).await,
+        AsyncCommand::Bare => {
             run_chat_or_repl(
-                cli.chat,
+                bare_chat,
                 config_source,
                 cache_override,
                 approve_tools,
@@ -139,7 +232,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 /// `cli::Cli`) into the `Option<bool>` `chat::resolve_cache_settings` expects:
 /// `Some(true)`/`Some(false)` when either flag was passed, `None` when
 /// neither was, letting `default.cache` in lait.config.yml decide.
-fn cache_override(cache: bool, no_cache: bool) -> Option<bool> {
+pub(crate) fn cache_override(cache: bool, no_cache: bool) -> Option<bool> {
     if cache {
         Some(true)
     } else if no_cache {
@@ -207,100 +300,34 @@ async fn run_chat_or_repl(
     }
 }
 
-/// Whether `cli`'s command awaits anything (a model request, MCP). `main`
-/// consults this before building the tokio runtime, so the purely local
-/// subcommands — `completions` in particular, which shell startup files run
-/// on every new shell — skip spawning worker threads and go through
-/// `run_blocking` instead. Every command still works through `run`, so a
-/// drift in this classification costs only startup time, never correctness.
-pub(crate) fn needs_async_runtime(cli: &Cli) -> bool {
-    match &cli.command {
-        Some(
-            Command::Lint(_)
-            | Command::Completions(_)
-            | Command::Man(_)
-            | Command::Init(_)
-            | Command::Sessions(_)
-            | Command::History(_)
-            | Command::Graph(_)
-            | Command::Workflow(_)
-            | Command::Skill(_)
-            | Command::Runs(_)
-            | Command::Cache(_)
-            | Command::Schema(_),
-        ) => false,
-        Some(Command::Models(models_args)) => models_args.remote,
-        Some(Command::Prompt(prompt_command)) => {
-            matches!(prompt_command.action, PromptAction::Run(_))
-        }
-        Some(Command::Agent(agent_command)) => {
-            matches!(agent_command.action, AgentAction::Run(_))
-        }
-        Some(
-            Command::Run(_)
-            | Command::Chat(_)
-            | Command::Doctor(_)
-            | Command::Compare(_)
-            | Command::Test(_)
-            | Command::Eval(_),
-        )
-        | None => true,
-    }
-}
-
-/// Runs the commands `needs_async_runtime` classifies as synchronous,
-/// without any async runtime behind them.
-pub(crate) fn run_blocking(cli: Cli) -> Result<()> {
-    let config_source = ConfigSource::from(&cli);
-    match cli.command {
-        Some(Command::Lint(lint_args)) => lint::run(lint_args, config_source),
-        Some(Command::Models(models_args)) => {
-            if models_args.remote {
-                bail!("internal error: `models --remote` must run on the async path");
-            }
+/// Runs the `SyncCommand` [`classify`] sorted onto the sync path — no Tokio
+/// runtime behind this call at all (see this module's doc comment). Every
+/// arm is reachable and exhaustive over `SyncCommand`'s own variants; there
+/// is no catch-all/`bail!` arm because there is no `Command` variant left
+/// for one to catch — `classify` already routed every async variant to
+/// `AsyncCommand` instead.
+pub(crate) fn run_blocking(command: SyncCommand, config_source: ConfigSource) -> Result<()> {
+    match command {
+        SyncCommand::Lint(lint_args) => lint::run(lint_args, config_source),
+        SyncCommand::ModelsLocal(models_args) => {
             crate::models::run_local(models_args, config_source)
         }
-        Some(Command::Completions(completions_args)) => {
+        SyncCommand::Completions(completions_args) => {
             docgen::generate_completions(completions_args);
             Ok(())
         }
-        Some(Command::Man(man_args)) => docgen::generate_man_pages(man_args),
-        Some(Command::Init(init_args)) => crate::init::run(init_args),
-        Some(Command::Sessions(sessions_command)) => crate::session::run(sessions_command),
-        Some(Command::Prompt(prompt_command)) => match prompt_command.action {
-            PromptAction::List => crate::prompt::list(&config::load_config(&config_source)?),
-            PromptAction::Run(_) => {
-                bail!("internal error: `prompt run` must run on the async path")
-            }
-        },
-        Some(Command::History(history_args)) => crate::history::run(history_args),
-        Some(Command::Graph(graph_args)) => run_graph(graph_args),
-        Some(Command::Agent(agent_command)) => match agent_command.action {
-            AgentAction::List => subagent::list(&config::load_config(&config_source)?),
-            AgentAction::Run(_) => {
-                bail!("internal error: `agent run` must run on the async path")
-            }
-        },
-        Some(Command::Workflow(workflow_command)) => match workflow_command.action {
-            WorkflowAction::List => workflow::list(&config::load_config(&config_source)?),
-        },
-        Some(Command::Skill(skill_command)) => match skill_command.action {
-            SkillAction::List => skill::list(&config::load_config(&config_source)?),
-        },
-        Some(Command::Runs(runs_command)) => checkpoint::run(runs_command),
-        Some(Command::Cache(cache_command)) => crate::cache::run(cache_command),
-        Some(Command::Schema(schema_args)) => crate::schema::run(schema_args),
-        Some(
-            Command::Run(_)
-            | Command::Chat(_)
-            | Command::Doctor(_)
-            | Command::Compare(_)
-            | Command::Test(_)
-            | Command::Eval(_),
-        )
-        | None => {
-            bail!("internal error: an async command reached run_blocking")
-        }
+        SyncCommand::Man(man_args) => docgen::generate_man_pages(man_args),
+        SyncCommand::Init(init_args) => crate::init::run(init_args),
+        SyncCommand::Sessions(sessions_command) => crate::session::run(sessions_command),
+        SyncCommand::PromptList => crate::prompt::list(&config::load_config(&config_source)?),
+        SyncCommand::History(history_args) => history::run(history_args),
+        SyncCommand::Graph(graph_args) => run_graph(graph_args),
+        SyncCommand::AgentList => subagent::list(&config::load_config(&config_source)?),
+        SyncCommand::WorkflowList => workflow::list(&config::load_config(&config_source)?),
+        SyncCommand::SkillList => skill::list(&config::load_config(&config_source)?),
+        SyncCommand::Runs(runs_command) => checkpoint::run(runs_command),
+        SyncCommand::Cache(cache_command) => crate::cache::run(cache_command),
+        SyncCommand::Schema(schema_args) => crate::schema::run(schema_args),
     }
 }
 
@@ -620,4 +647,79 @@ async fn run_agent(
         &env.usage,
         args.reporting.show_usage,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dispatch, classify};
+    use crate::cli::Cli;
+
+    /// Which of `run`/`run_blocking` a `classify` result would route to —
+    /// the table below only needs this, not every field of the resulting
+    /// `SyncCommand`/`AsyncCommand` payload.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Lane {
+        Sync,
+        Async,
+    }
+
+    fn lane(args: &[&str]) -> Lane {
+        let cli = Cli::try_parse_from(args)
+            .unwrap_or_else(|error| panic!("failed to parse {args:?}: {error}"));
+        match classify(cli.command) {
+            Dispatch::Sync(_) => Lane::Sync,
+            Dispatch::Async(_) => Lane::Async,
+        }
+    }
+
+    /// The table-driven test the design plan's B3 requires before merging:
+    /// clap's derive doesn't enumerate `Command`'s variants for us, so this
+    /// table is the only thing that actually exercises every one of them
+    /// (`tests/man.rs` only covers 8 of ~23 — see its own comment). Every
+    /// top-level subcommand appears at least once, `models`/`prompt`/`agent`
+    /// each appear in both of their lanes (the three variants `classify`
+    /// resolves by a field rather than by `Command` variant alone), and the
+    /// bare invocation appears both plain and with a `Cli`-level global flag
+    /// set — the row that would silently drop `--cache`/`--approve-tools`
+    /// if `classify` were ever changed to consume the whole `Cli` instead of
+    /// just `cli.command` (see this module's doc comment on why it doesn't).
+    #[test]
+    fn every_subcommand_classifies_to_the_expected_lane() {
+        let cases: &[(&[&str], Lane)] = &[
+            (&["lait", "run", "workflow.yml", "hi"], Lane::Async),
+            (&["lait", "agent", "run", "agent.md", "hi"], Lane::Async),
+            (&["lait", "agent", "list"], Lane::Sync),
+            (&["lait", "lint", "workflow.yml"], Lane::Sync),
+            (&["lait", "models"], Lane::Sync),
+            (&["lait", "models", "--remote"], Lane::Async),
+            (&["lait", "completions", "bash"], Lane::Sync),
+            (&["lait", "man"], Lane::Sync),
+            (&["lait", "init"], Lane::Sync),
+            (&["lait", "sessions", "list"], Lane::Sync),
+            (&["lait", "chat"], Lane::Async),
+            (&["lait", "prompt", "list"], Lane::Sync),
+            (&["lait", "prompt", "run", "name", "hi"], Lane::Async),
+            (&["lait", "history"], Lane::Sync),
+            (&["lait", "graph", "workflow.yml"], Lane::Sync),
+            (&["lait", "workflow", "list"], Lane::Sync),
+            (&["lait", "skill", "list"], Lane::Sync),
+            (&["lait", "runs", "list"], Lane::Sync),
+            (&["lait", "cache", "clear"], Lane::Sync),
+            (&["lait", "schema", "workflow"], Lane::Sync),
+            (&["lait", "doctor"], Lane::Async),
+            (
+                &["lait", "compare", "--model", "a", "--model", "b", "hi"],
+                Lane::Async,
+            ),
+            (&["lait", "test", "case.yml"], Lane::Async),
+            (&["lait", "eval", "eval.yml"], Lane::Async),
+            (&["lait", "hi"], Lane::Async),
+            (&["lait"], Lane::Async),
+            (&["lait", "--cache", "hi"], Lane::Async),
+            (&["lait", "--approve-tools", "hi"], Lane::Async),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(lane(args), *expected, "args: {args:?}");
+        }
+    }
 }

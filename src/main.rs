@@ -74,33 +74,67 @@ fn main() {
 
     let cli = cli::Cli::parse();
     logging::init(cli.verbose);
-    // Captured before `cli` is moved into `run_blocking`/`run` below — the
-    // command-specific exit policy: all lint failures are validation errors.
-    let is_lint = matches!(cli.command, Some(cli::Command::Lint(_)));
 
-    // The purely local subcommands (completions/man/init/lint/local models)
-    // never await; skip spawning the runtime's worker threads for them —
-    // `lait completions` runs from shell startup files, where that cost is
-    // felt on every new shell.
-    if !app::needs_async_runtime(&cli) {
-        if let Err(error) = app::run_blocking(cli) {
-            exit_with_error(error, is_lint);
+    // Computed from `&cli` before `cli.command` is moved into `classify`
+    // below — a `&Cli` borrow can't follow a partial move of one of its
+    // fields, even though `ConfigSource::from` only ever reads
+    // `no_config`/`config`, neither of which `classify` touches.
+    let config_source = config::ConfigSource::from(&cli);
+    // `cli.command` is moved into `classify` here; every other `Cli` field
+    // (`chat`, `cache`, `no_cache`, `approve_tools`) remains available below
+    // via the partial move — see `app`'s module doc for why `classify` only
+    // ever needs the command itself.
+    let dispatch = app::classify(cli.command);
+    // The command-specific exit policy: all lint failures are validation
+    // errors. Derived from `dispatch` (not re-matched from `cli.command`,
+    // which is already moved) so this can never drift from what `classify`
+    // itself decided.
+    let is_lint = matches!(dispatch, app::Dispatch::Sync(app::SyncCommand::Lint(_)));
+
+    match dispatch {
+        // The purely local subcommands (completions/man/init/lint/local
+        // models) never await; skip spawning the runtime's worker threads
+        // for them — `lait completions` runs from shell startup files,
+        // where that cost is felt on every new shell.
+        app::Dispatch::Sync(sync_command) => {
+            if let Err(error) = app::run_blocking(sync_command, config_source) {
+                exit_with_error(error, is_lint);
+            }
         }
-        return;
-    }
+        app::Dispatch::Async(async_command) => {
+            // `--cache`/`--no-cache`/`--approve-tools` are global flags on
+            // `Cli` itself, so they're read here rather than re-derived at
+            // each async handler's own call site.
+            let cache_override = app::cache_override(cli.cache, cli.no_cache);
+            let approve_tools = cli.approve_tools;
+            // Built once per invocation and passed as the root source to
+            // each RunContext. Each async handler arms
+            // `signal::spawn_handler` at the point where it starts using
+            // the token; the REPL watches that root while reading and
+            // running turns so cleanup also covers Ctrl-C there.
+            let cancel = tokio_util::sync::CancellationToken::new();
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => exit_with_error(
-            anyhow::Error::new(error).context("failed to start the async runtime"),
-            is_lint,
-        ),
-    };
-    if let Err(error) = runtime.block_on(app::run(cli)) {
-        exit_with_error(error, is_lint);
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => exit_with_error(
+                    anyhow::Error::new(error).context("failed to start the async runtime"),
+                    is_lint,
+                ),
+            };
+            if let Err(error) = runtime.block_on(app::run(
+                async_command,
+                cli.chat,
+                config_source,
+                cache_override,
+                approve_tools,
+                cancel,
+            )) {
+                exit_with_error(error, is_lint);
+            }
+        }
     }
 }
 
