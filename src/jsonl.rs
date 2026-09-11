@@ -38,6 +38,31 @@ fn refusing_symlink(path: &Path) -> anyhow::Error {
     anyhow!("refusing to follow symbolic link '{}'", path.display())
 }
 
+/// The six `with_context`/`.context` message shapes this file repeats most
+/// (`open_parent`/`inspect`/`read`/`write`/`remove`/`open`, ~28 sites
+/// combined across `unix_relative` and the `#[cfg(unix)]`/`#[cfg(not(unix))]`
+/// pairs below it), matching `config::load::config_read_error_context`'s
+/// shape: a plain function returning the message, called as
+/// `.with_context(|| open_parent_context(path))`.
+fn open_parent_context(path: &Path) -> String {
+    format!("failed to open parent of '{}'", path.display())
+}
+fn inspect_context(path: &Path) -> String {
+    format!("failed to inspect '{}'", path.display())
+}
+fn read_context(path: &Path) -> String {
+    format!("failed to read '{}'", path.display())
+}
+fn write_context(path: &Path) -> String {
+    format!("failed to write to '{}'", path.display())
+}
+fn remove_context(path: &Path) -> String {
+    format!("failed to remove '{}'", path.display())
+}
+fn open_context(path: &Path) -> String {
+    format!("failed to open '{}'", path.display())
+}
+
 #[derive(Debug)]
 pub(crate) struct RelativeDirEntry {
     pub(crate) name: OsString,
@@ -46,7 +71,10 @@ pub(crate) struct RelativeDirEntry {
 
 #[cfg(unix)]
 mod unix_relative {
-    use super::RelativeDirEntry;
+    use super::{
+        RelativeDirEntry, inspect_context, open_context, open_parent_context, read_context,
+        remove_context, write_context,
+    };
     use anyhow::{Context, Result, anyhow, bail};
     use serde::Serialize;
     use std::{
@@ -243,16 +271,14 @@ mod unix_relative {
         path: &Path,
         records: impl IntoIterator<Item = impl Serialize>,
     ) -> Result<()> {
-        let (directory, name) = open_parent(path, true)
-            .with_context(|| format!("failed to open parent of '{}'", path.display()))?;
-        check_final(&directory, &name, path)
-            .with_context(|| format!("failed to inspect '{}'", path.display()))?;
+        let (directory, name) =
+            open_parent(path, true).with_context(|| open_parent_context(path))?;
+        check_final(&directory, &name, path).with_context(|| inspect_context(path))?;
         let mut file = open_file_at(&directory, &name, APPEND_FLAGS, 0o666)
-            .with_context(|| format!("failed to open '{}'", path.display()))?;
+            .with_context(|| open_context(path))?;
         for record in records {
             let line = serde_json::to_string(&record).context("failed to serialize a log entry")?;
-            writeln!(file, "{line}")
-                .with_context(|| format!("failed to write to '{}'", path.display()))?;
+            writeln!(file, "{line}").with_context(|| write_context(path))?;
         }
         Ok(())
     }
@@ -268,17 +294,16 @@ mod unix_relative {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to open parent of '{}'", path.display()));
+                return Err(error).with_context(|| open_parent_context(path));
             }
         };
-        let Some(_) = check_final(&directory, &name, path)
-            .with_context(|| format!("failed to inspect '{}'", path.display()))?
+        let Some(_) =
+            check_final(&directory, &name, path).with_context(|| inspect_context(path))?
         else {
             return Ok(None);
         };
-        let file = open_file_at(&directory, &name, READ_FLAGS, 0)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        let file =
+            open_file_at(&directory, &name, READ_FLAGS, 0).with_context(|| read_context(path))?;
         Ok(Some(file))
     }
 
@@ -287,12 +312,11 @@ mod unix_relative {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to open parent of '{}'", path.display()));
+                return Err(error).with_context(|| open_parent_context(path));
             }
         };
         Ok(check_final(&directory, &name, path)
-            .with_context(|| format!("failed to inspect '{}'", path.display()))?
+            .with_context(|| inspect_context(path))?
             .is_some())
     }
 
@@ -301,14 +325,13 @@ mod unix_relative {
             Ok(value) => Some(value),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to open parent of '{}'", path.display()));
+                return Err(error).with_context(|| open_parent_context(path));
             }
         }) else {
             return Ok(false);
         };
-        let Some(stat) = check_final(&directory, &name, path)
-            .with_context(|| format!("failed to inspect '{}'", path.display()))?
+        let Some(stat) =
+            check_final(&directory, &name, path).with_context(|| inspect_context(path))?
         else {
             return Ok(false);
         };
@@ -319,18 +342,17 @@ mod unix_relative {
     }
 
     pub(super) fn remove(path: &Path) -> Result<()> {
-        let (directory, name) = open_parent(path, false)
-            .with_context(|| format!("failed to open parent of '{}'", path.display()))?;
+        let (directory, name) =
+            open_parent(path, false).with_context(|| open_parent_context(path))?;
         if check_final(&directory, &name, path)
-            .with_context(|| format!("failed to inspect '{}'", path.display()))?
+            .with_context(|| inspect_context(path))?
             .is_none()
         {
             return Err(io::Error::new(io::ErrorKind::NotFound, "file not found").into());
         }
         let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
         if result < 0 {
-            return Err(io::Error::last_os_error())
-                .with_context(|| format!("failed to remove '{}'", path.display()));
+            return Err(io::Error::last_os_error()).with_context(|| remove_context(path));
         }
         Ok(())
     }
@@ -466,7 +488,7 @@ fn check_final_path(path: &Path) -> Result<Option<Metadata>> {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(refusing_symlink(path)),
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect '{}'", path.display())),
+        Err(error) => Err(error).with_context(|| inspect_context(path)),
     }
 }
 
@@ -493,12 +515,10 @@ fn append_relative(path: &Path, records: impl IntoIterator<Item = impl Serialize
         ensure_relative_dir(parent)?;
     }
     check_final_path(path)?;
-    let mut file =
-        open_for_append(path).with_context(|| format!("failed to open '{}'", path.display()))?;
+    let mut file = open_for_append(path).with_context(|| open_context(path))?;
     for record in records {
         let line = serde_json::to_string(&record).context("failed to serialize a log entry")?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to write to '{}'", path.display()))?;
+        writeln!(file, "{line}").with_context(|| write_context(path))?;
     }
     Ok(())
 }
@@ -522,7 +542,7 @@ fn open_relative(path: &Path) -> Result<Option<File>> {
     match open_for_read(path) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read '{}'", path.display())),
+        Err(error) => Err(error).with_context(|| read_context(path)),
     }
 }
 
@@ -561,7 +581,7 @@ fn remove_relative(path: &Path) -> Result<()> {
 fn remove_relative(path: &Path) -> Result<()> {
     check_relative_parent(path)?;
     check_final_path(path)?;
-    fs::remove_file(path).with_context(|| format!("failed to remove '{}'", path.display()))
+    fs::remove_file(path).with_context(|| remove_context(path))
 }
 
 #[cfg(unix)]
@@ -605,12 +625,10 @@ pub(crate) fn append(path: &Path, records: impl IntoIterator<Item = impl Seriali
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
     }
-    let mut file =
-        open_for_append(path).with_context(|| format!("failed to open '{}'", path.display()))?;
+    let mut file = open_for_append(path).with_context(|| open_context(path))?;
     for record in records {
         let line = serde_json::to_string(&record).context("failed to serialize a log entry")?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to write to '{}'", path.display()))?;
+        writeln!(file, "{line}").with_context(|| write_context(path))?;
     }
     Ok(())
 }
@@ -623,7 +641,7 @@ fn read_or_empty(path: &Path) -> Result<String> {
     };
     let mut contents = String::new();
     file.read_to_string(&mut contents)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
+        .with_context(|| read_context(path))?;
     Ok(contents)
 }
 
@@ -638,7 +656,7 @@ fn open_or_none(path: &Path) -> Result<Option<File>> {
     match open_for_read(path) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read '{}'", path.display())),
+        Err(error) => Err(error).with_context(|| read_context(path)),
     }
 }
 
@@ -750,7 +768,7 @@ pub(crate) fn remove(path: &Path) -> Result<()> {
     if path.is_relative() {
         return remove_relative(path);
     }
-    fs::remove_file(path).with_context(|| format!("failed to remove '{}'", path.display()))
+    fs::remove_file(path).with_context(|| remove_context(path))
 }
 
 /// Lists a relative directory through the platform's no-follow path. Unix
