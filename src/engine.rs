@@ -203,6 +203,19 @@ fn with_skills<'a>(base: Option<&'a str>, skills_text: Option<&str>) -> Option<C
     }
 }
 
+/// Unwraps `complete_recorded`'s `content_key`, which it computes once up
+/// front whenever `cache`/`--record`/`--replay` is active. Every call site
+/// only runs inside a branch already gated on one of those three being
+/// active, so `content_key` is provably `Some` there — this just gives the
+/// three call sites one shared message to document that invariant, instead
+/// of each repeating (and each needing to stay in sync with) its own
+/// slightly different wording.
+fn require_content_key(content_key: &Option<String>) -> &str {
+    content_key
+        .as_deref()
+        .expect("content_key is computed above whenever cache/record/replay is active")
+}
+
 /// Checks that no qualified tool name is claimed by more than one of the
 /// three tool sources a request can combine — `mcp::qualify_tool_name`
 /// prefixes each source differently (`<server>__`/`agent__`/`tool__`), so a
@@ -475,9 +488,7 @@ impl RequestSettings {
         // request is answered from `replay_dir`'s cassettes, or the run
         // fails outright (see `cassette::load`).
         if let Some(replay_dir) = env.policy.cassette.replay_dir() {
-            let key = content_key
-                .as_deref()
-                .expect("content_key is computed above whenever replay_dir is set");
+            let key = require_content_key(&content_key);
             let response = cassette::load(
                 replay_dir,
                 key,
@@ -493,9 +504,7 @@ impl RequestSettings {
         // to actually observe, so cache lookup (not the later cache *save*,
         // which stays harmless) is skipped while recording.
         if env.policy.cache.enabled() && env.policy.cassette.record_dir().is_none() {
-            let cache_key = content_key
-                .as_deref()
-                .expect("content_key is computed above whenever cache_enabled is set");
+            let cache_key = require_content_key(&content_key);
             match cache::load(
                 cache_key,
                 env.policy.cache.ttl(),
@@ -545,9 +554,7 @@ impl RequestSettings {
                         tracing::debug!(error = %error, "failed to write response cache entry");
                     }
                     if let Some(record_dir) = env.policy.cassette.record_dir() {
-                        let key = content_key
-                            .as_deref()
-                            .expect("content_key is computed above whenever record_dir is set");
+                        let key = require_content_key(&content_key);
                         cassette::save(
                             record_dir,
                             key,
