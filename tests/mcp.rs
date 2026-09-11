@@ -905,8 +905,18 @@ fn assert_stdio_descendant_was_stopped(marker: &Path, alive: &Path) {
     // The descendant is deliberately scheduled to create this file after the
     // timeout. A process-group cleanup that only kills the direct shell would
     // leave the marker behind, making the failure deterministic without
-    // relying on a potentially-zombie PID and `kill -0`.
-    std::thread::sleep(Duration::from_secs(4));
+    // relying on a potentially-zombie PID and `kill -0`. This can't become a
+    // poll-until-true wait like the one above: it's disproving a *future*
+    // event (the descendant's own `sleep 3` firing), not confirming a
+    // present one, so passing runs always pay the wait in full regardless of
+    // how it's spelled. 3.5s (500ms of margin past the descendant's `sleep
+    // 3`) is the tightest safe bound for every caller: two of the three
+    // callers already have `timeout: 1` elapse (plus kill/reap and process
+    // exit) before ever reaching this function, but the third
+    // (`successful_run_stops_and_reaps_its_stdio_mcp_descendant`) has no
+    // step timeout and can reach here within milliseconds of the descendant
+    // starting, so it still needs close to the full 3s.
+    std::thread::sleep(Duration::from_millis(3500));
     assert!(
         !alive.exists(),
         "MCP descendant survived process-tree shutdown: {}",
