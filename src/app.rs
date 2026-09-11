@@ -102,7 +102,11 @@ pub(crate) enum AsyncCommand {
 /// moved into this call.
 pub(crate) enum Dispatch {
     Sync(SyncCommand),
-    Async(AsyncCommand),
+    // Boxed: `AsyncCommand` (264 bytes, dominated by its largest payload
+    // variant) would otherwise make every `Dispatch` that large even along
+    // the `Sync` arm (56 bytes) — `clippy::large_enum_variant`. The extra
+    // indirection is paid once per invocation, not on a hot path.
+    Async(Box<AsyncCommand>),
 }
 
 /// Classifies a parsed `Cli::command` into [`Dispatch::Sync`]/
@@ -116,7 +120,7 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         Some(Command::Lint(args)) => Dispatch::Sync(SyncCommand::Lint(args)),
         Some(Command::Models(args)) => {
             if args.remote {
-                Dispatch::Async(AsyncCommand::ModelsRemote(args))
+                Dispatch::Async(Box::new(AsyncCommand::ModelsRemote(args)))
             } else {
                 Dispatch::Sync(SyncCommand::ModelsLocal(args))
             }
@@ -125,13 +129,13 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         Some(Command::Man(args)) => Dispatch::Sync(SyncCommand::Man(args)),
         Some(Command::Init(args)) => Dispatch::Sync(SyncCommand::Init(args)),
         Some(Command::Sessions(command)) => Dispatch::Sync(SyncCommand::Sessions(command)),
-        Some(Command::Chat(args)) => Dispatch::Async(AsyncCommand::Chat(args)),
+        Some(Command::Chat(args)) => Dispatch::Async(Box::new(AsyncCommand::Chat(args))),
         Some(Command::Prompt(PromptCommand {
             action: PromptAction::List,
         })) => Dispatch::Sync(SyncCommand::PromptList),
         Some(Command::Prompt(PromptCommand {
             action: PromptAction::Run(args),
-        })) => Dispatch::Async(AsyncCommand::PromptRun(args)),
+        })) => Dispatch::Async(Box::new(AsyncCommand::PromptRun(args))),
         Some(Command::History(args)) => Dispatch::Sync(SyncCommand::History(args)),
         Some(Command::Graph(args)) => Dispatch::Sync(SyncCommand::Graph(args)),
         Some(Command::Workflow(WorkflowCommand {
@@ -148,13 +152,13 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         })) => Dispatch::Sync(SyncCommand::AgentList),
         Some(Command::Agent(AgentCommand {
             action: AgentAction::Run(args),
-        })) => Dispatch::Async(AsyncCommand::AgentRun(args)),
-        Some(Command::Run(args)) => Dispatch::Async(AsyncCommand::Run(args)),
-        Some(Command::Doctor(args)) => Dispatch::Async(AsyncCommand::Doctor(args)),
-        Some(Command::Compare(args)) => Dispatch::Async(AsyncCommand::Compare(args)),
-        Some(Command::Test(args)) => Dispatch::Async(AsyncCommand::Test(args)),
-        Some(Command::Eval(args)) => Dispatch::Async(AsyncCommand::Eval(args)),
-        None => Dispatch::Async(AsyncCommand::Bare),
+        })) => Dispatch::Async(Box::new(AsyncCommand::AgentRun(args))),
+        Some(Command::Run(args)) => Dispatch::Async(Box::new(AsyncCommand::Run(args))),
+        Some(Command::Doctor(args)) => Dispatch::Async(Box::new(AsyncCommand::Doctor(args))),
+        Some(Command::Compare(args)) => Dispatch::Async(Box::new(AsyncCommand::Compare(args))),
+        Some(Command::Test(args)) => Dispatch::Async(Box::new(AsyncCommand::Test(args))),
+        Some(Command::Eval(args)) => Dispatch::Async(Box::new(AsyncCommand::Eval(args))),
+        None => Dispatch::Async(Box::new(AsyncCommand::Bare)),
     }
 }
 

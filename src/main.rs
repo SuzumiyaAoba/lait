@@ -126,7 +126,7 @@ fn main() {
                 ),
             };
             if let Err(error) = runtime.block_on(app::run(
-                async_command,
+                *async_command,
                 cli.chat,
                 config_source,
                 cache_override,
