@@ -11,7 +11,6 @@
 
 use std::{
     collections::HashMap,
-    io::{self, Write},
     mem::size_of,
     sync::{
         Arc, LazyLock, Mutex,
@@ -28,6 +27,10 @@ use jaq_core::{
 use jaq_json::{Val, read};
 
 use crate::{async_io, template};
+
+mod limits;
+
+use limits::{OutputWriter, render_value_into};
 
 /// A compiled jq filter, keyed by its source text in [`FILTER_CACHE`]. The
 /// lookup-table representation a filter compiles to (`jaq_core::Filter`'s
@@ -139,26 +142,6 @@ const MAX_VALUE_DEPTH: usize = 1024;
 /// The same type also holds `--var KEY=VALUE` overrides exposed as `$vars`
 /// (e.g. `$vars.lang`) — both are flat JSON objects keyed by name.
 pub(crate) type Steps = serde_json::Map<String, serde_json::Value>;
-
-/// Runs a jq filter against a single JSON input, rendering each output value as
-/// text and joining multiple outputs with newlines (as `jq` does on the command
-/// line). A string output is rendered raw/unquoted, like `jq -r`; every other
-/// value is rendered as compact JSON.
-#[cfg(test)]
-pub(crate) fn apply(
-    filter_source: &str,
-    input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
-) -> Result<String> {
-    apply_cancellable(
-        filter_source,
-        input_json,
-        steps,
-        vars,
-        &AtomicBool::new(false),
-    )
-}
 
 /// Runs a jq filter while allowing a caller that owns the evaluation worker
 /// to request a cooperative stop.  jaq evaluates filters lazily, so checking
@@ -283,6 +266,11 @@ pub(crate) async fn apply_one_cancellable_async(
 /// Runs a jq filter as a boolean condition (used by workflow `when:` guards).
 /// The filter must produce exactly one output value; that value is falsy iff
 /// it is JSON `false` or `null` (jq's own truthiness rules), truthy otherwise.
+/// Kept `pub(crate)` (not just test-only, despite the `#[cfg(test)]` at its
+/// only call site) because `workflow::eval_when` — itself `#[cfg(test)]`,
+/// retained for the pure workflow unit tests — calls this directly rather
+/// than `apply_bool_cancellable_async`; removing it would also break
+/// `src/workflow/tests.rs`'s dependency on that synchronous chain.
 #[cfg(test)]
 pub(crate) fn apply_bool(
     filter_source: &str,
@@ -291,20 +279,6 @@ pub(crate) fn apply_bool(
     vars: &Steps,
 ) -> Result<bool> {
     apply_bool_inner(filter_source, input_json, steps, vars, None)
-}
-
-/// Runs a jq filter that must produce exactly one JSON value (used by
-/// workflow `for_each.items:` filters). Unlike `apply`, the result is
-/// rendered as proper JSON text even for a string output (no `jq -r`-style
-/// unquoting), and multiple outputs are rejected instead of newline-joined.
-#[cfg(test)]
-pub(crate) fn apply_one(
-    filter_source: &str,
-    input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
-) -> Result<String> {
-    apply_one_inner(filter_source, input_json, steps, vars, None)
 }
 
 /// Parses and compiles `filter_source` without running it against any input,
@@ -577,225 +551,6 @@ fn check_cancelled_opt(cancelled: Option<&AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-/// A writer that bounds both the complete rendered result and the value that
-/// is currently being written. It borrows the result buffer so a filter's
-/// values are rendered one at a time without ever building a `Vec<Val>` or a
-/// second full-size string for each value.
-struct LimitedWriter<'a> {
-    bytes: &'a mut Vec<u8>,
-    value_start: usize,
-    total_limit: usize,
-    value_limit: usize,
-    cancelled: Option<&'a AtomicBool>,
-    exceeded: bool,
-}
-
-impl LimitedWriter<'_> {
-    fn new<'a>(
-        bytes: &'a mut Vec<u8>,
-        value_start: usize,
-        total_limit: usize,
-        value_limit: usize,
-        cancelled: Option<&'a AtomicBool>,
-    ) -> LimitedWriter<'a> {
-        LimitedWriter {
-            bytes,
-            value_start,
-            total_limit,
-            value_limit,
-            cancelled,
-            exceeded: false,
-        }
-    }
-}
-
-impl io::Write for LimitedWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        check_cancelled_opt(self.cancelled)
-            .map_err(|error| io::Error::new(io::ErrorKind::Interrupted, error.to_string()))?;
-        let Some(next_len) = self.bytes.len().checked_add(bytes.len()) else {
-            self.exceeded = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "jq rendered output exceeds the configured limit",
-            ));
-        };
-        let Some(value_len) = next_len.checked_sub(self.value_start) else {
-            self.exceeded = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "jq rendered output exceeds the configured limit",
-            ));
-        };
-        if next_len > self.total_limit || value_len > self.value_limit {
-            self.exceeded = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "jq rendered output exceeds the configured limit",
-            ));
-        }
-        if self.bytes.capacity() < next_len {
-            self.bytes
-                .try_reserve_exact(next_len - self.bytes.len())
-                .map_err(|error| io::Error::other(error.to_string()))?;
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Renders values yielded by `apply` directly into one bounded output buffer.
-/// A newline separator is charged to the cumulative limit but not to the
-/// per-value limit.
-struct OutputWriter<'a> {
-    bytes: Vec<u8>,
-    values: usize,
-    cancelled: Option<&'a AtomicBool>,
-}
-
-impl OutputWriter<'_> {
-    fn new(cancelled: Option<&AtomicBool>) -> OutputWriter<'_> {
-        OutputWriter {
-            bytes: Vec::new(),
-            values: 0,
-            cancelled,
-        }
-    }
-
-    fn render(&mut self, filter_source: &str, value: &Val) -> Result<()> {
-        check_cancelled_opt(self.cancelled)?;
-        if self.values >= MAX_OUTPUT_VALUES {
-            bail!(
-                "jq filter {filter_source:?} produced more than the configured limit of {} outputs",
-                MAX_OUTPUT_VALUES
-            );
-        }
-        if self.values != 0 {
-            let next_len = self
-                .bytes
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("jq rendered output exceeds the configured limit"))?;
-            if next_len > MAX_RENDERED_BYTES {
-                bail!(
-                    "jq filter {filter_source:?} rendered output exceeds the configured limit of {} bytes",
-                    MAX_RENDERED_BYTES
-                );
-            }
-            self.bytes.push(b'\n');
-        }
-        let value_start = self.bytes.len();
-        let cancelled = self.cancelled;
-        render_value_into(
-            value,
-            true,
-            &mut self.bytes,
-            value_start,
-            MAX_RENDERED_BYTES,
-            MAX_RENDERED_BYTES,
-            cancelled,
-        )
-        .map_err(|error| anyhow!("jq filter {filter_source:?} rendered output: {error}"))?;
-        self.values += 1;
-        Ok(())
-    }
-
-    fn finish(self, filter_source: &str) -> Result<String> {
-        check_cancelled_opt(self.cancelled)?;
-        String::from_utf8(self.bytes).map_err(|error| {
-            anyhow!("jq filter {filter_source:?} rendered output was not valid UTF-8: {error}")
-        })
-    }
-}
-
-/// Renders one value either in jq's raw-string mode (`apply`) or as compact
-/// JSON (`apply_one` and condition-size checks), never allowing the rendered
-/// bytes to exceed `MAX_RENDERED_BYTES`.
-fn render_value_into(
-    value: &Val,
-    raw_strings: bool,
-    output_bytes: &mut Vec<u8>,
-    value_start: usize,
-    total_limit: usize,
-    value_limit: usize,
-    cancelled: Option<&AtomicBool>,
-) -> Result<()> {
-    check_cancelled_opt(cancelled)?;
-    validate_value_structure(value)?;
-
-    if raw_strings && let Val::TStr(string_bytes) = value {
-        // JSON input and the standard jq string functions produce UTF-8,
-        // but jaq also permits a TStr containing invalid bytes. Reject by
-        // the source byte count before `from_utf8_lossy` can expand it.
-        if string_bytes.len() > value_limit {
-            bail!("jq rendered output exceeds the configured limit");
-        }
-        let mut writer = LimitedWriter::new(
-            output_bytes,
-            value_start,
-            total_limit,
-            value_limit,
-            cancelled,
-        );
-        write_raw_string(&mut writer, string_bytes).map_err(|error| {
-            if writer.exceeded {
-                anyhow!("jq rendered output exceeds the configured limit")
-            } else {
-                anyhow!("failed to render jq output: {error}")
-            }
-        })?;
-        check_cancelled_opt(cancelled)?;
-        return Ok(());
-    }
-
-    let mut writer = LimitedWriter::new(
-        output_bytes,
-        value_start,
-        total_limit,
-        value_limit,
-        cancelled,
-    );
-    jaq_json::write::write(&mut writer, &Default::default(), 0, value).map_err(|error| {
-        if writer.exceeded {
-            anyhow!("jq rendered output exceeds the configured limit")
-        } else {
-            anyhow!("failed to render jq output: {error}")
-        }
-    })?;
-    check_cancelled_opt(cancelled)?;
-    Ok(())
-}
-
-/// Writes a jq text string without first allocating a lossily-converted copy
-/// of the whole value. This matters for invalid UTF-8: `from_utf8_lossy` can
-/// expand every invalid byte to a three-byte replacement character, so a
-/// whole-value conversion would temporarily exceed the per-value limit.
-fn write_raw_string(writer: &mut LimitedWriter<'_>, bytes: &[u8]) -> io::Result<()> {
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        match std::str::from_utf8(remaining) {
-            Ok(valid) => {
-                writer.write_all(valid.as_bytes())?;
-                break;
-            }
-            Err(error) => {
-                let valid_len = error.valid_up_to();
-                if valid_len != 0 {
-                    writer.write_all(&remaining[..valid_len])?;
-                }
-                writer.write_all("�".as_bytes())?;
-                let invalid_len = error.error_len().unwrap_or(remaining.len() - valid_len);
-                remaining = &remaining[valid_len + invalid_len..];
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Checks an already-materialized jaq value before handing it to the JSON
 /// writer. The walk is iterative and keeps only one frame per nesting level,
 /// so a very wide array cannot make the guard itself allocate a second list of
@@ -902,7 +657,9 @@ fn charge_structure(estimated: &mut usize, bytes: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Steps, apply, apply_bool, apply_one};
+    use std::sync::atomic::AtomicBool;
+
+    use super::{Steps, apply_bool, apply_cancellable, apply_one_cancellable};
 
     fn no_steps() -> Steps {
         Steps::new()
@@ -927,7 +684,14 @@ mod tests {
     #[test]
     fn extracts_a_string_field_raw() {
         assert_eq!(
-            apply(".name", r#"{"name":"Alice"}"#, &no_steps(), &no_vars()).unwrap(),
+            apply_cancellable(
+                ".name",
+                r#"{"name":"Alice"}"#,
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "Alice"
         );
     }
@@ -935,7 +699,14 @@ mod tests {
     #[test]
     fn extracts_a_number_field_as_json() {
         assert_eq!(
-            apply(".age", r#"{"age":30}"#, &no_steps(), &no_vars()).unwrap(),
+            apply_cancellable(
+                ".age",
+                r#"{"age":30}"#,
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "30"
         );
     }
@@ -943,7 +714,14 @@ mod tests {
     #[test]
     fn joins_multiple_outputs_with_newlines() {
         assert_eq!(
-            apply(".[]", r#"["a","b","c"]"#, &no_steps(), &no_vars()).unwrap(),
+            apply_cancellable(
+                ".[]",
+                r#"["a","b","c"]"#,
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "a\nb\nc"
         );
     }
@@ -951,24 +729,52 @@ mod tests {
     #[test]
     fn renders_objects_and_arrays_as_compact_json() {
         assert_eq!(
-            apply("{n: .name}", r#"{"name":"Alice"}"#, &no_steps(), &no_vars()).unwrap(),
+            apply_cancellable(
+                "{n: .name}",
+                r#"{"name":"Alice"}"#,
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             r#"{"n":"Alice"}"#
         );
     }
 
     #[test]
     fn rejects_invalid_json_input() {
-        assert!(apply(".", "not json", &no_steps(), &no_vars()).is_err());
+        assert!(
+            apply_cancellable(
+                ".",
+                "not json",
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn rejects_invalid_filter_syntax() {
-        assert!(apply(".[", "{}", &no_steps(), &no_vars()).is_err());
+        assert!(
+            apply_cancellable(".[", "{}", &no_steps(), &no_vars(), &AtomicBool::new(false))
+                .is_err()
+        );
     }
 
     #[test]
     fn reports_a_runtime_error_from_the_filter() {
-        assert!(apply(".foo.bar", "1", &no_steps(), &no_vars()).is_err());
+        assert!(
+            apply_cancellable(
+                ".foo.bar",
+                "1",
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -997,7 +803,14 @@ mod tests {
     #[test]
     fn apply_one_renders_a_string_output_as_quoted_json() {
         assert_eq!(
-            apply_one(".name", r#"{"name":"Alice"}"#, &no_steps(), &no_vars()).unwrap(),
+            apply_one_cancellable(
+                ".name",
+                r#"{"name":"Alice"}"#,
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             r#""Alice""#
         );
     }
@@ -1005,24 +818,56 @@ mod tests {
     #[test]
     fn apply_one_renders_an_array_output_as_compact_json() {
         assert_eq!(
-            apply_one(".items", r#"{"items":[1,2,3]}"#, &no_steps(), &no_vars()).unwrap(),
+            apply_one_cancellable(
+                ".items",
+                r#"{"items":[1,2,3]}"#,
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "[1,2,3]"
         );
     }
 
     #[test]
     fn apply_one_rejects_zero_outputs() {
-        assert!(apply_one(".[]", "[]", &no_steps(), &no_vars()).is_err());
+        assert!(
+            apply_one_cancellable(
+                ".[]",
+                "[]",
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn apply_one_rejects_multiple_outputs() {
-        assert!(apply_one(".[]", "[1, 2]", &no_steps(), &no_vars()).is_err());
+        assert!(
+            apply_one_cancellable(
+                ".[]",
+                "[1, 2]",
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn rejects_an_unbounded_number_of_outputs() {
-        let error = apply("range(0; 100001)", "null", &no_steps(), &no_vars()).unwrap_err();
+        let error = apply_cancellable(
+            "range(0; 100001)",
+            "null",
+            &no_steps(),
+            &no_vars(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("configured limit"));
     }
 
@@ -1038,7 +883,14 @@ mod tests {
 
     #[test]
     fn apply_one_rejects_a_stream_after_the_second_value() {
-        let error = apply_one("range(0; 1000000000)", "null", &no_steps(), &no_vars()).unwrap_err();
+        let error = apply_one_cancellable(
+            "range(0; 1000000000)",
+            "null",
+            &no_steps(),
+            &no_vars(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("produced 2 outputs"),
             "unexpected jq error: {error:#}"
@@ -1048,7 +900,14 @@ mod tests {
     #[test]
     fn rejects_rendered_output_larger_than_the_evaluation_limit() {
         let filter = format!("\"x\" * {}", super::MAX_RENDERED_BYTES + 1);
-        let error = apply(&filter, "null", &no_steps(), &no_vars()).unwrap_err();
+        let error = apply_cancellable(
+            &filter,
+            "null",
+            &no_steps(),
+            &no_vars(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("rendered output exceeds"),
             "unexpected jq error: {error:#}"
@@ -1058,7 +917,14 @@ mod tests {
     #[test]
     fn apply_one_rejects_rendered_output_larger_than_the_evaluation_limit() {
         let filter = format!("\"x\" * {}", super::MAX_RENDERED_BYTES + 1);
-        let error = apply_one(&filter, "null", &no_steps(), &no_vars()).unwrap_err();
+        let error = apply_one_cancellable(
+            &filter,
+            "null",
+            &no_steps(),
+            &no_vars(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("rendered output exceeds"),
             "unexpected jq error: {error:#}"
@@ -1069,7 +935,14 @@ mod tests {
     fn rejects_an_output_with_excessive_nesting() {
         let filter =
             (0..=super::MAX_VALUE_DEPTH).fold("null".to_owned(), |value, _| format!("[{value}]"));
-        let error = apply(&filter, "null", &no_steps(), &no_vars()).unwrap_err();
+        let error = apply_cancellable(
+            &filter,
+            "null",
+            &no_steps(),
+            &no_vars(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("nesting limit"),
             "unexpected jq error: {error:#}"
@@ -1079,7 +952,14 @@ mod tests {
     #[test]
     fn rejects_input_larger_than_the_evaluation_limit() {
         let input = format!("\"{}\"", "x".repeat(super::MAX_INPUT_BYTES));
-        let error = apply(".", &input, &no_steps(), &no_vars()).unwrap_err();
+        let error = apply_cancellable(
+            ".",
+            &input,
+            &no_steps(),
+            &no_vars(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("input exceeds"));
     }
 
@@ -1087,7 +967,14 @@ mod tests {
     fn apply_can_reference_a_named_step_output_via_dollar_steps() {
         let steps = steps_with("extract", serde_json::json!({"city": "Tokyo"}));
         assert_eq!(
-            apply("$steps.extract.city", "null", &steps, &no_vars()).unwrap(),
+            apply_cancellable(
+                "$steps.extract.city",
+                "null",
+                &steps,
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "Tokyo"
         );
     }
@@ -1101,7 +988,14 @@ mod tests {
     #[test]
     fn dollar_steps_is_an_empty_object_when_no_step_output_is_recorded() {
         assert_eq!(
-            apply("$steps", "null", &no_steps(), &no_vars()).unwrap(),
+            apply_cancellable(
+                "$steps",
+                "null",
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "{}"
         );
     }
@@ -1110,7 +1004,14 @@ mod tests {
     fn apply_can_reference_a_var_via_dollar_vars() {
         let vars = vars_with("lang", serde_json::json!("英語"));
         assert_eq!(
-            apply("$vars.lang", "null", &no_steps(), &vars).unwrap(),
+            apply_cancellable(
+                "$vars.lang",
+                "null",
+                &no_steps(),
+                &vars,
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "英語"
         );
     }
@@ -1118,7 +1019,14 @@ mod tests {
     #[test]
     fn dollar_vars_is_an_empty_object_when_no_var_is_set() {
         assert_eq!(
-            apply("$vars", "null", &no_steps(), &no_vars()).unwrap(),
+            apply_cancellable(
+                "$vars",
+                "null",
+                &no_steps(),
+                &no_vars(),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             "{}"
         );
     }
