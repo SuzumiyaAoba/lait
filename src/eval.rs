@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::{
@@ -28,6 +29,12 @@ use crate::{
         exec::{RunStepsFrame, run_steps},
     },
 };
+
+/// Upper bound on concurrently in-flight (case, repeat) runs — matches
+/// `engine::tool_loop::MAX_CONCURRENT_TOOL_CALLS`'s rationale: independent
+/// model round-trips, bounded so a large suite doesn't open unbounded
+/// concurrent connections to the endpoint.
+const EVAL_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,25 +324,44 @@ pub(crate) async fn run(
     let env = RunContext::new(Arc::clone(&services), cancel);
     let repeat = args.repeat.max(1);
 
-    let cases: Vec<CaseOutcome> = services
+    // Every (case, repeat) run is independent — same target, same
+    // read-only env — so they're flattened into one future list and run
+    // with a fixed concurrency cap instead of one at a time; a 30-case
+    // suite with `--repeat 3` used to be 90 fully serial model round-trips.
+    // `buffered` (not `buffer_unordered`) preserves the flattened order, so
+    // `runs` below can just `take` each case's slice off the front in turn
+    // without needing to track which case a given run belonged to.
+    let mut run_futures = Vec::with_capacity(definition.cases.len() * repeat as usize);
+    for case in &definition.cases {
+        for _ in 0..repeat {
+            run_futures.push(run_case(
+                &target,
+                &env,
+                case,
+                default_model.as_deref(),
+                &file_config,
+            ));
+        }
+    }
+    let mut all_runs = services
         .finish(async {
-            let mut outcomes = Vec::with_capacity(definition.cases.len());
-            for (index, case) in definition.cases.iter().enumerate() {
-                let mut runs = Vec::with_capacity(repeat as usize);
-                for _ in 0..repeat {
-                    runs.push(
-                        run_case(&target, &env, case, default_model.as_deref(), &file_config).await,
-                    );
-                }
-                outcomes.push(CaseOutcome {
-                    index: index + 1,
-                    input: case.input.clone(),
-                    runs,
-                });
-            }
-            outcomes
+            futures_util::stream::iter(run_futures)
+                .buffered(EVAL_CONCURRENCY)
+                .collect::<Vec<RunResult>>()
+                .await
         })
-        .await;
+        .await
+        .into_iter();
+    let cases: Vec<CaseOutcome> = definition
+        .cases
+        .iter()
+        .enumerate()
+        .map(|(index, case)| CaseOutcome {
+            index: index + 1,
+            input: case.input.clone(),
+            runs: (&mut all_runs).take(repeat as usize).collect(),
+        })
+        .collect();
 
     match args.format {
         EvalFormat::Text => print_text_report(&cases),
