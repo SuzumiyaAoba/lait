@@ -1,15 +1,14 @@
 //! `lait lint`: static validation of workflow YAML and agent Markdown files
 //! without executing them.
 //!
-//! Three layers live in this one file: file discovery (which paths
-//! `lait lint <DIR>` walks into, see `SKIPPED_DIR_NAMES`), the lint rules
-//! themselves (`lint_workflow_file`/`lint_agent_file`, `walk_steps`,
-//! `lint_node`, the `check_*` family), and the CLI-facing output layer
-//! (`run`, `run_text`, `run_structured` — text/JSON/GitHub-Actions-
-//! annotation formats). They're kept together because `LintIssue`/
-//! `LintReport` are the shared vocabulary all three read and write; splitting
-//! the output formatters out is tracked separately (see the design plan's
-//! C6) rather than done reflexively here.
+//! The lint rules themselves (`lint_workflow_file`/`lint_agent_file`,
+//! `walk_steps`, `lint_node`, the `check_*` family) live in this file, since
+//! they're the ones that actually read and write `LintIssue`/`LintReport`.
+//! File discovery (which paths `lait lint <DIR>` walks into) is in
+//! [`targets`]; the CLI-facing output layer (text/JSON/GitHub-Actions-
+//! annotation formats) is in [`report`] — both only ever consume the
+//! `LintIssue`/`LintReport`/`LintRun` vocabulary this file produces, never
+//! the other way around.
 //!
 //! `lint_file` never fails on a bad workflow/agent file — a parse error or a
 //! dangling reference becomes an `Error`-severity `LintIssue` in the
@@ -22,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::{
     agent::{self, AgentFile},
@@ -32,6 +31,9 @@ use crate::{
     nesting::{MAX_WORKFLOW_DEPTH, NestingDepthError, check_workflow_nesting},
     schema, template, workflow,
 };
+
+mod report;
+mod targets;
 
 /// How serious a `LintIssue` is. An `Error` names something that would fail
 /// at `run`/`agent run` time (a bad reference, invalid syntax, a structural
@@ -135,83 +137,6 @@ pub(crate) fn lint_file(path: &Path, config: Option<&ConfigFile>) -> Result<Lint
     }
 }
 
-/// Directory names `lait lint <DIR>` never descends into, even though they
-/// don't start with `.` (dot-directories, e.g. `.git`, are always skipped
-/// too) — scanning them would be slow, and their `.yml`/`.md` files
-/// (dependency manifests, changelogs, CI configs belonging to a vendored
-/// package, ...) are never lait workflow/agent files.
-const SKIPPED_DIR_NAMES: &[&str] = &["target", "node_modules"];
-
-/// Expands `paths` (files and/or directories, as `lait lint` accepts) into
-/// the sorted, deduplicated list of files to actually lint: a file entry is
-/// kept as-is (even one with an extension `lint_file` will go on to reject,
-/// so that error is still reported per file); a directory entry is searched
-/// recursively for `.yml`/`.yaml` files and `.md` files that start with a
-/// `---` frontmatter delimiter (see `has_frontmatter_delimiter`), skipping
-/// `SKIPPED_DIR_NAMES` and dot-directories along the way.
-fn expand_lint_targets(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for path in paths {
-        if path.is_dir() {
-            collect_lintable_files(path, &mut files)?;
-        } else {
-            files.push(path.clone());
-        }
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-fn collect_lintable_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let mut entries = std::fs::read_dir(dir)
-        .with_context(|| format!("failed to read directory '{}'", dir.display()))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("failed to read directory '{}'", dir.display()))?;
-    // Deterministic traversal order, so directory expansion is stable across
-    // runs/platforms (relied on by tests, and generally friendlier for CI
-    // diffs than filesystem-dependent order).
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to inspect '{}'", path.display()))?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name.as_ref()) {
-                continue;
-            }
-            collect_lintable_files(&path, out)?;
-        } else if file_type.is_file() {
-            match path.extension().and_then(|extension| extension.to_str()) {
-                Some("yml") | Some("yaml") => out.push(path),
-                Some("md") if has_frontmatter_delimiter(&path)? => out.push(path),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Cheaply sniffs whether `path` starts with the `---` frontmatter
-/// delimiter `frontmatter::split` requires, without fully parsing it as an
-/// agent file — only the first line is read. Used by directory expansion to
-/// skip ordinary (non-agent) Markdown files like a README.
-fn has_frontmatter_delimiter(path: &Path) -> Result<bool> {
-    use std::io::BufRead;
-
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    let mut first_line = String::new();
-    std::io::BufReader::new(file)
-        .read_line(&mut first_line)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    Ok(first_line.trim_end_matches(['\n', '\r']) == "---")
-}
-
 /// Runs `lait lint <PATHS>...`: statically checks every file `expand_lint_targets`
 /// resolves `lint_args.files` to (see [`lint_file`]) and reports the result
 /// in `lint_args.format`. Synchronous, like `history::run`/`session::run` —
@@ -247,7 +172,7 @@ impl LintRun {
             && config::global_config_path()?.is_file();
         let file_config = config::load_config(config_source)?;
         let config = (config_path.is_some() || global_config_present).then_some(&file_config);
-        let files = expand_lint_targets(files)?;
+        let files = targets::expand_lint_targets(files)?;
         let mut registry: Vec<_> = file_config
             .workflows
             .iter()
@@ -296,232 +221,22 @@ impl LintRun {
             || !self.api_key_errors.is_empty()
             || !self.tool_errors.is_empty()
     }
-
-    fn findings(&self) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        for report in &self.reports {
-            let mut source = None;
-            for issue in &report.issues {
-                let line = issue.line.or_else(|| {
-                    let text = source.get_or_insert_with(|| {
-                        std::fs::read_to_string(&report.file).unwrap_or_default()
-                    });
-                    guess_line(text, &issue.message)
-                });
-                findings.push(Finding {
-                    file: report.file.display().to_string(),
-                    line,
-                    severity: issue.severity,
-                    message: issue.message.clone(),
-                });
-            }
-        }
-        for entry in self.registry.iter().filter(|entry| !entry.exists) {
-            findings.push(Finding::config(
-                &self.config_display,
-                Severity::Error,
-                format!(
-                    "workflows.{} resolves to '{}', which does not exist",
-                    entry.name,
-                    entry.path.display()
-                ),
-            ));
-        }
-        for message in self.api_key_errors.iter().chain(&self.tool_errors) {
-            findings.push(Finding::config(
-                &self.config_display,
-                Severity::Error,
-                message.clone(),
-            ));
-        }
-        findings
-    }
 }
 
 /// Runs `lait lint`: expands `lint_args.files` into a concrete file list
 /// (`LintRun::collect`), lints each one, and renders the combined report in
-/// whichever format was requested. `run_text`/`run_structured` print the
-/// full report either way, then `bail!` when `LintRun::has_errors` is true —
-/// `main.rs`'s `is_lint` flag routes that error through
+/// whichever format was requested. `report::run_text`/`report::run_structured`
+/// print the full report either way, then `bail!` when `LintRun::has_errors`
+/// is true — `main.rs`'s `is_lint` flag routes that error through
 /// `error::classify`'s validation exit code rather than the general one, so
 /// `lait lint`'s exit status reflects issue severity, not just success or
 /// failure of the linting process itself.
 pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()> {
     let run = LintRun::collect(&lint_args.files, &config_source)?;
     match lint_args.format {
-        LintFormat::Text => run_text(&run),
-        LintFormat::Json | LintFormat::Github => run_structured(&run, lint_args.format),
+        LintFormat::Text => report::run_text(&run),
+        LintFormat::Json | LintFormat::Github => report::run_structured(&run, lint_args.format),
     }
-}
-
-fn run_text(run: &LintRun) -> Result<()> {
-    if !run.registry.is_empty() {
-        println!("{} (workflows:):", config::CONFIG_FILE_NAME);
-        for entry in &run.registry {
-            if entry.exists {
-                println!("  {}: OK ({})", entry.name, entry.path.display());
-            } else {
-                println!(
-                    "  {}: error: no such file '{}'",
-                    entry.name,
-                    entry.path.display()
-                );
-            }
-        }
-    }
-    print_config_errors("api_key/api_key_cmd:", &run.api_key_errors);
-    print_config_errors("tools:", &run.tool_errors);
-    for report in &run.reports {
-        if report.issues.is_empty() {
-            println!("{}: OK", report.file.display());
-        } else {
-            println!("{}:", report.file.display());
-            for issue in &report.issues {
-                println!("  {}: {}", issue.severity, issue.message);
-            }
-        }
-    }
-    if run.has_errors() {
-        let mut suffix = String::new();
-        for (ok, section) in [
-            (run.registry_ok(), "'workflows:'"),
-            (run.api_key_errors.is_empty(), "api_key/api_key_cmd"),
-            (run.tool_errors.is_empty(), "'tools:'"),
-        ] {
-            if !ok {
-                suffix.push_str(&format!(
-                    "; {} {section} also has errors",
-                    config::CONFIG_FILE_NAME
-                ));
-            }
-        }
-        bail!(
-            "{} of {} file(s) had errors{suffix}",
-            run.failed_files(),
-            run.reports.len()
-        );
-    }
-    Ok(())
-}
-
-/// One machine-readable finding attributed to a file and optional source line.
-struct Finding {
-    file: String,
-    line: Option<usize>,
-    severity: Severity,
-    message: String,
-}
-
-impl Finding {
-    fn config(config_display: &str, severity: Severity, message: String) -> Self {
-        Self {
-            file: config_display.to_owned(),
-            line: None,
-            severity,
-            message,
-        }
-    }
-}
-
-fn run_structured(run: &LintRun, format: LintFormat) -> Result<()> {
-    let findings = run.findings();
-    match format {
-        LintFormat::Json => print_json_findings(&findings)?,
-        LintFormat::Github => print_github_findings(&findings),
-        LintFormat::Text => unreachable!("text has its own renderer"),
-    }
-    if run.has_errors() {
-        bail!(
-            "lint found {} error(s) across {} finding(s) in {} file(s)",
-            findings
-                .iter()
-                .filter(|finding| finding.severity == Severity::Error)
-                .count(),
-            findings.len(),
-            run.reports.len(),
-        );
-    }
-    Ok(())
-}
-
-fn print_config_errors(section: &str, errors: &[String]) {
-    if !errors.is_empty() {
-        println!("{} ({section}):", config::CONFIG_FILE_NAME);
-        for error in errors {
-            println!("  error: {error}");
-        }
-    }
-}
-
-fn print_json_findings(findings: &[Finding]) -> Result<()> {
-    let records: Vec<serde_json::Value> = findings
-        .iter()
-        .map(|finding| {
-            serde_json::json!({
-                "file": finding.file,
-                "line": finding.line,
-                "severity": match finding.severity {
-                    Severity::Error => "error",
-                    Severity::Warning => "warning",
-                },
-                "message": finding.message,
-            })
-        })
-        .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&records).context("failed to serialize lint findings")?
-    );
-    Ok(())
-}
-
-fn print_github_findings(findings: &[Finding]) {
-    for finding in findings {
-        let level = match finding.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-        };
-        let message = escape_github_annotation(&finding.message);
-        match finding.line {
-            Some(line) => println!("::{level} file={},line={line}::{message}", finding.file),
-            None => println!("::{level} file={}::{message}", finding.file),
-        }
-    }
-}
-
-/// Escapes a message for a GitHub Actions workflow command
-/// (`::error ...::<message>`), per GitHub's documented `%`/CR/LF escaping —
-/// otherwise a message containing one of these could corrupt the annotation
-/// or be misread as a second command.
-fn escape_github_annotation(message: &str) -> String {
-    message
-        .replace('%', "%25")
-        .replace('\r', "%0D")
-        .replace('\n', "%0A")
-}
-
-/// Best-effort line lookup for an issue that has no line of its own (i.e.
-/// everything except a YAML parse failure — see `yaml_error_line`): most
-/// lint messages name the offending thing in single quotes (`node 'x'`,
-/// `unknown MCP server 'y'`, ...), which is usually also how it appears
-/// literally in the source (a YAML mapping key, a list entry, ...). Returns
-/// the 1-based line of the first line containing that quoted text, or `None`
-/// when the message has no quoted identifier or nothing in `source` matches
-/// it. A heuristic, not a real position — good enough for an editor/CI
-/// annotation to land a reader in the right neighborhood, not a guarantee.
-fn guess_line(source: &str, message: &str) -> Option<usize> {
-    let needle = first_quoted_identifier(message)?;
-    source
-        .lines()
-        .position(|line| line.contains(needle))
-        .map(|index| index + 1)
-}
-
-fn first_quoted_identifier(message: &str) -> Option<&str> {
-    let start = message.find('\'')? + 1;
-    let end = message[start..].find('\'')?;
-    let candidate = &message[start..start + end];
-    (!candidate.is_empty()).then_some(candidate)
 }
 
 /// Threaded through every check in one `lint_file` call: `config` is looked
@@ -767,6 +482,10 @@ fn check_jq(filter: &str, description: &str, issues: &mut Vec<LintIssue>) {
     }
 }
 
+/// Dispatches per-node-type checks after the checks that apply uniformly
+/// across every node type (`jq`/`mcp`/`skills`/`subagents`/`tools`). Mirrors
+/// `workflow::exec::nodes::execute`'s shape: one dispatcher, one function per
+/// `workflow::NodeDefinition` variant.
 #[allow(clippy::too_many_arguments)]
 fn lint_node(
     node_id: &str,
@@ -790,94 +509,132 @@ fn lint_node(
 
     match node {
         workflow::NodeDefinition::Prompt(prompt) => {
-            if let Some(template) = &prompt.prompt {
-                check_prompt_template(&node_context, "'prompt' template", template, issues);
-            }
-            if let Some(system_prompt) = &prompt.system_prompt {
-                check_prompt_template(
-                    &node_context,
-                    "'system_prompt' template",
-                    system_prompt,
-                    issues,
-                );
-            }
-            if let Some(name_or_path) = &prompt.input_schema {
-                match schema::resolve_named_schema_value(json_schemas, name_or_path) {
-                    Ok(resolved) => check_unrecognized_schema_types(
-                        &format!("node '{node_id}''s 'input_schema'"),
-                        &resolved,
-                        issues,
-                    ),
-                    Err(error) => issues.push(LintIssue::error(format!(
-                        "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
-                    ))),
-                }
-            }
-            if let Some(name_or_path) = &prompt.output_schema {
-                if let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path) {
-                    issues.push(LintIssue::error(format!(
-                        "node '{node_id}' has an unresolvable 'output_schema': {error:#}"
-                    )));
-                }
-                // `output_schema` implies a `schema_name` (the node's own, or
-                // the "structured_output" default) is sent as the Structured
-                // Outputs request's schema name — validated only at request
-                // time otherwise (see `schema::build_json_schema`).
-                let schema_name = prompt.schema_name.as_deref().unwrap_or("structured_output");
-                if let Err(error) = schema::validate_schema_name(schema_name) {
-                    issues.push(LintIssue::error(format!(
-                        "node '{node_id}' has an invalid 'schema_name': {error:#}"
-                    )));
-                }
-            }
+            lint_prompt_node(node_id, &node_context, prompt, json_schemas, issues);
         }
         workflow::NodeDefinition::Agent(agent_node) => {
-            // Matches `execute_step`: `agent:` is loaded as given, relative
-            // to the current working directory (unlike `workflow:`, which
-            // resolves against the workflow file's own directory) — see
-            // `AgentNode::agent`'s doc comment.
-            match agent::load_agent(&agent_node.agent) {
-                Ok(agent_file) => lint_agent_contents(
-                    &format!("node '{node_id}''s agent"),
-                    &agent_file,
-                    ctx,
-                    issues,
-                ),
-                Err(error) => issues.push(LintIssue::error(format!(
-                    "node '{node_id}' has 'agent: {}' (resolved relative to the current working \
-                     directory, not this workflow file), which failed to load: {error:#}",
-                    agent_node.agent.display()
-                ))),
-            }
+            lint_agent_node(node_id, agent_node, ctx, issues);
         }
         workflow::NodeDefinition::Workflow(workflow_node) => {
-            lint_sub_workflow(
-                node_id,
-                &workflow_node.workflow,
-                base_dir,
-                ctx,
-                issues,
-                visited,
-            );
+            lint_workflow_node(node_id, workflow_node, base_dir, ctx, issues, visited);
         }
         workflow::NodeDefinition::Command(command) => {
-            if command
-                .command
-                .first()
-                .is_some_and(|program| program.trim().is_empty())
-            {
-                issues.push(LintIssue::error(format!(
-                    "{node_context} has an empty 'command[0]' program; it must name an executable"
-                )));
-            }
-            for arg in &command.command {
-                check_prompt_template(&node_context, "'command' argument template", arg, issues);
-            }
+            lint_command_node(&node_context, command, issues);
         }
         workflow::NodeDefinition::Transform(_) => {}
         workflow::NodeDefinition::Ask(ask) => {
             check_prompt_template(&node_context, "'prompt' template", &ask.prompt, issues);
         }
+    }
+}
+
+fn lint_prompt_node(
+    node_id: &str,
+    node_context: &str,
+    prompt: &workflow::PromptNode,
+    json_schemas: &schema::JsonSchemaMap,
+    issues: &mut Vec<LintIssue>,
+) {
+    if let Some(template) = &prompt.prompt {
+        check_prompt_template(node_context, "'prompt' template", template, issues);
+    }
+    if let Some(system_prompt) = &prompt.system_prompt {
+        check_prompt_template(
+            node_context,
+            "'system_prompt' template",
+            system_prompt,
+            issues,
+        );
+    }
+    if let Some(name_or_path) = &prompt.input_schema {
+        match schema::resolve_named_schema_value(json_schemas, name_or_path) {
+            Ok(resolved) => check_unrecognized_schema_types(
+                &format!("node '{node_id}''s 'input_schema'"),
+                &resolved,
+                issues,
+            ),
+            Err(error) => issues.push(LintIssue::error(format!(
+                "node '{node_id}' has an unresolvable 'input_schema': {error:#}"
+            ))),
+        }
+    }
+    if let Some(name_or_path) = &prompt.output_schema {
+        if let Err(error) = schema::resolve_named_schema_value(json_schemas, name_or_path) {
+            issues.push(LintIssue::error(format!(
+                "node '{node_id}' has an unresolvable 'output_schema': {error:#}"
+            )));
+        }
+        // `output_schema` implies a `schema_name` (the node's own, or
+        // the "structured_output" default) is sent as the Structured
+        // Outputs request's schema name — validated only at request
+        // time otherwise (see `schema::build_json_schema`).
+        let schema_name = prompt.schema_name.as_deref().unwrap_or("structured_output");
+        if let Err(error) = schema::validate_schema_name(schema_name) {
+            issues.push(LintIssue::error(format!(
+                "node '{node_id}' has an invalid 'schema_name': {error:#}"
+            )));
+        }
+    }
+}
+
+fn lint_agent_node(
+    node_id: &str,
+    agent_node: &workflow::AgentNode,
+    ctx: &mut LintCtx,
+    issues: &mut Vec<LintIssue>,
+) {
+    // Matches `execute_step`: `agent:` is loaded as given, relative
+    // to the current working directory (unlike `workflow:`, which
+    // resolves against the workflow file's own directory) — see
+    // `AgentNode::agent`'s doc comment.
+    match agent::load_agent(&agent_node.agent) {
+        Ok(agent_file) => lint_agent_contents(
+            &format!("node '{node_id}''s agent"),
+            &agent_file,
+            ctx,
+            issues,
+        ),
+        Err(error) => issues.push(LintIssue::error(format!(
+            "node '{node_id}' has 'agent: {}' (resolved relative to the current working \
+             directory, not this workflow file), which failed to load: {error:#}",
+            agent_node.agent.display()
+        ))),
+    }
+}
+
+fn lint_workflow_node(
+    node_id: &str,
+    workflow_node: &workflow::WorkflowNode,
+    base_dir: &Path,
+    ctx: &mut LintCtx,
+    issues: &mut Vec<LintIssue>,
+    visited: &mut Vec<PathBuf>,
+) {
+    lint_sub_workflow(
+        node_id,
+        &workflow_node.workflow,
+        base_dir,
+        ctx,
+        issues,
+        visited,
+    );
+}
+
+fn lint_command_node(
+    node_context: &str,
+    command: &workflow::CommandNode,
+    issues: &mut Vec<LintIssue>,
+) {
+    if command
+        .command
+        .first()
+        .is_some_and(|program| program.trim().is_empty())
+    {
+        issues.push(LintIssue::error(format!(
+            "{node_context} has an empty 'command[0]' program; it must name an executable"
+        )));
+    }
+    for arg in &command.command {
+        check_prompt_template(node_context, "'command' argument template", arg, issues);
     }
 }
 
@@ -1199,535 +956,4 @@ fn check_capability_names(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn parse_workflow_fixture(yaml: &str) -> workflow::WorkflowFile {
-        workflow::parse_workflow(yaml).expect("fixture workflow should validate")
-    }
-
-    fn empty_config() -> ConfigFile {
-        ConfigFile::default()
-    }
-
-    fn lint_fixture(wf: &workflow::WorkflowFile, config: Option<&ConfigFile>) -> Vec<LintIssue> {
-        let mut ctx = LintCtx::new(config);
-        let mut issues = Vec::new();
-        let mut visited = Vec::new();
-        lint_workflow_contents(wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
-        issues
-    }
-
-    #[test]
-    fn warns_about_a_node_defined_but_never_used() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues.iter().any(
-                |issue| issue.severity == Severity::Warning && issue.message.contains("unused")
-            ),
-            "{issues:?}"
-        );
-        assert!(
-            !issues.iter().any(|issue| issue.message.contains("'used'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn does_not_warn_when_every_node_is_used() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(issues.is_empty(), "{issues:?}");
-    }
-
-    #[test]
-    fn counts_a_node_used_only_inside_a_switch_case_as_used() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - switch:\n      cases:\n        - when: \".x\"\n          steps:\n            - use: a\n      else:\n        - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.message.contains("never referenced")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_an_invalid_jq_when_filter() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.severity == Severity::Error && issue.message.contains("'when'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_an_invalid_jq_for_each_items_filter() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - for_each:\n      items: \".[\"\n      steps:\n        - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues.iter().any(|issue| issue.message.contains("'items'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_an_invalid_prompt_template() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input\"\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues.iter().any(|issue| issue.severity == Severity::Error
-                && issue.message.contains("'prompt' template")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_an_invalid_command_argument_template() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: command\n    command: [\"echo\", \"{{ input\"]\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues.iter().any(|issue| issue.severity == Severity::Error
-                && issue.message.contains("'command' argument template")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn accepts_a_bare_input_placeholder_in_a_prompt() {
-        // A scalar `{{ input }}` (the common case for a first step run
-        // against a plain-text CLI argument) is valid; only `render`, at
-        // actual render time against real data, can know whether the input
-        // will be an object/array — see `template::check_syntax`'s doc
-        // comment.
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(issues.is_empty(), "{issues:?}");
-    }
-
-    #[test]
-    fn flags_an_unknown_mcp_server_name() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("unknown MCP server 'nope'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn accepts_a_known_mcp_server_name() {
-        let mut config = empty_config();
-        config.mcp_servers.insert(
-            "known".to_owned(),
-            config::McpServerConfig {
-                command: Some("true".to_owned()),
-                args: Vec::new(),
-                env: HashMap::new(),
-                cwd: None,
-                url: None,
-                headers: HashMap::new(),
-                allowed_tools: None,
-            },
-        );
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&config));
-        assert!(
-            !issues.iter().any(|issue| issue.message.contains("MCP")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_a_referenced_mcp_server_whose_allowed_tools_is_empty() {
-        let mut config = empty_config();
-        config.mcp_servers.insert(
-            "locked-down".to_owned(),
-            config::McpServerConfig {
-                command: Some("true".to_owned()),
-                args: Vec::new(),
-                env: HashMap::new(),
-                cwd: None,
-                url: None,
-                headers: HashMap::new(),
-                allowed_tools: Some(Vec::new()),
-            },
-        );
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [locked-down]\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&config));
-        assert!(
-            issues.iter().any(|issue| {
-                issue.severity == Severity::Warning
-                    && issue.message.contains("locked-down")
-                    && issue.message.contains("allowed_tools")
-            }),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_an_unknown_skill_name() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    skills: [nope]\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("unknown skill 'nope'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_an_unknown_subagent_name() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [nope]\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("unknown subagent 'nope'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn accepts_a_known_subagent_name() {
-        let mut config = empty_config();
-        config
-            .agents
-            .insert("known".to_owned(), PathBuf::from("agents/known.md"));
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&config));
-        assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.message.contains("subagent")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn skips_mcp_and_skill_checks_and_notes_it_when_there_is_no_config() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
-        );
-        let mut ctx = LintCtx::new(None);
-        let mut issues = Vec::new();
-        let mut visited = Vec::new();
-        lint_workflow_contents(&wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
-        note_skipped_capability_check(&mut ctx, &mut issues);
-        assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.message.contains("unknown MCP"))
-        );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("were not checked")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_an_unresolvable_output_schema_name() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: nonexistent.json\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("unresolvable 'output_schema'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn accepts_an_output_schema_name_defined_in_json_schemas() {
-        let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.message.contains("output_schema")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_a_schema_name_with_an_invalid_character() {
-        // `output_schema` alone (this fixture's `schema_name` is unset,
-        // defaulting to "structured_output", which is valid) isn't enough to
-        // trigger this — the invalid character has to actually be spelled
-        // out in `schema_name`.
-        let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\n    schema_name: \"bad name!\"\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("invalid 'schema_name'")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn accepts_the_default_schema_name_when_none_is_set() {
-        let wf = parse_workflow_fixture(
-            "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.message.contains("schema_name")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn flags_a_missing_agent_file() {
-        let wf = parse_workflow_fixture(
-            "nodes:\n  a:\n    type: agent\n    agent: /nonexistent/agent-does-not-exist.md\nsteps:\n  - use: a\n",
-        );
-        let issues = lint_fixture(&wf, Some(&empty_config()));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("failed to load")),
-            "{issues:?}"
-        );
-    }
-
-    /// A `.md` file at a unique path under the system temp directory,
-    /// removed on drop. `lint.rs`'s own tests use this directly (rather than
-    /// `tests/support::AgentMarkdownFile`, an integration-test-only helper
-    /// this binary crate's unit tests can't reach) for the handful of checks
-    /// that need a real agent file on disk (`agent::load_agent` reads from a
-    /// path, not a string).
-    struct TempAgentFile {
-        path: PathBuf,
-    }
-
-    impl TempAgentFile {
-        fn new(contents: &str) -> Self {
-            // A counter alongside the nanosecond timestamp: `cargo test` runs
-            // these concurrently on multiple threads, and two calls can land
-            // on the same nanosecond on a coarse-resolution clock, which
-            // would otherwise make the second `fs::write` silently overwrite
-            // the first test's file out from under it.
-            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after Unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "lait-lint-test-agent-{}-{unique}-{counter}.md",
-                std::process::id()
-            ));
-            std::fs::write(&path, contents).expect("failed to write fixture agent file");
-            Self { path }
-        }
-    }
-
-    impl Drop for TempAgentFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    #[test]
-    fn agent_lint_flags_an_unknown_skill_name() {
-        let agent = TempAgentFile::new("---\nskills: [nope]\n---\nbody\n");
-        let report = lint_agent_file(&agent.path, Some(&empty_config()));
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|issue| issue.message.contains("unknown skill 'nope'")),
-            "{:?}",
-            report.issues
-        );
-    }
-
-    #[test]
-    fn agent_lint_flags_an_unknown_subagent_name() {
-        let agent = TempAgentFile::new("---\nsubagents: [nope]\n---\nbody\n");
-        let report = lint_agent_file(&agent.path, Some(&empty_config()));
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|issue| issue.message.contains("unknown subagent 'nope'")),
-            "{:?}",
-            report.issues
-        );
-    }
-
-    #[test]
-    fn agent_lint_flags_an_invalid_system_prompt_template() {
-        let agent = TempAgentFile::new("---\n---\n{{ input\n");
-        let report = lint_agent_file(&agent.path, Some(&empty_config()));
-        assert!(
-            report.has_errors(),
-            "expected an invalid template to be flagged: {:?}",
-            report.issues
-        );
-    }
-
-    #[test]
-    fn agent_lint_flags_an_invalid_schema_name() {
-        let agent = TempAgentFile::new(
-            "---\noutput_schema:\n  schema:\n    type: object\nstructured_output: true\nschema_name: \"bad name!\"\n---\nbody\n",
-        );
-        let report = lint_agent_file(&agent.path, Some(&empty_config()));
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|issue| issue.message.contains("invalid 'schema_name'")),
-            "{:?}",
-            report.issues
-        );
-    }
-
-    #[test]
-    fn agent_lint_reports_a_parse_error_as_a_single_issue() {
-        let agent = TempAgentFile::new("no frontmatter here\n");
-        let report = lint_agent_file(&agent.path, Some(&empty_config()));
-        assert_eq!(report.issues.len(), 1, "{:?}", report.issues);
-        assert!(report.has_errors());
-    }
-
-    #[test]
-    fn lint_file_rejects_an_unrecognized_extension() {
-        assert!(lint_file(Path::new("thing.txt"), Some(&empty_config())).is_err());
-    }
-
-    #[test]
-    fn first_quoted_identifier_extracts_the_first_single_quoted_span() {
-        assert_eq!(
-            first_quoted_identifier("node 'extract': unknown skill 'nope'"),
-            Some("extract")
-        );
-    }
-
-    #[test]
-    fn first_quoted_identifier_is_none_without_quotes() {
-        assert_eq!(first_quoted_identifier("no quotes here"), None);
-    }
-
-    #[test]
-    fn guess_line_finds_the_line_containing_the_quoted_identifier() {
-        let source = "nodes:\n  extract:\n    type: prompt\n    prompt: hi\n";
-        assert_eq!(guess_line(source, "node 'extract' is unused"), Some(2));
-    }
-
-    #[test]
-    fn guess_line_is_none_when_nothing_matches() {
-        let source = "nodes:\n  extract:\n    type: prompt\n";
-        assert_eq!(guess_line(source, "node 'missing' is unused"), None);
-    }
-
-    #[test]
-    fn has_frontmatter_delimiter_detects_agent_style_files() {
-        crate::test_support::in_temp_dir("lait-test-lint-frontmatter", || {
-            std::fs::write("agent.md", "---\nname: x\n---\nbody\n").unwrap();
-            std::fs::write("plain.md", "# Just a heading\n\nbody\n").unwrap();
-
-            assert!(has_frontmatter_delimiter(Path::new("agent.md")).unwrap());
-            assert!(!has_frontmatter_delimiter(Path::new("plain.md")).unwrap());
-        });
-    }
-
-    #[test]
-    fn expand_lint_targets_recurses_into_directories_and_skips_non_agent_markdown() {
-        crate::test_support::in_temp_dir("lait-test-lint-expand", || {
-            std::fs::create_dir_all("sub").unwrap();
-            std::fs::write("sub/workflow.yml", "steps: []\n").unwrap();
-            std::fs::write("sub/agent.md", "---\n---\nbody\n").unwrap();
-            std::fs::write("sub/README.md", "# not an agent file\n").unwrap();
-            std::fs::write("sub/notes.txt", "irrelevant\n").unwrap();
-
-            let files = expand_lint_targets(&[PathBuf::from(".")]).unwrap();
-
-            assert_eq!(
-                files,
-                vec![
-                    PathBuf::from("./sub/agent.md"),
-                    PathBuf::from("./sub/workflow.yml"),
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn expand_lint_targets_skips_target_and_node_modules_and_dot_directories() {
-        crate::test_support::in_temp_dir("lait-test-lint-expand-skip", || {
-            std::fs::write("top.yml", "steps: []\n").unwrap();
-            std::fs::create_dir_all("target").unwrap();
-            std::fs::write("target/build.yml", "steps: []\n").unwrap();
-            std::fs::create_dir_all("node_modules/pkg").unwrap();
-            std::fs::write("node_modules/pkg/ci.yml", "steps: []\n").unwrap();
-            std::fs::create_dir_all(".git").unwrap();
-            std::fs::write(".git/config.yml", "steps: []\n").unwrap();
-
-            let files = expand_lint_targets(&[PathBuf::from(".")]).unwrap();
-
-            assert_eq!(files, vec![PathBuf::from("./top.yml")]);
-        });
-    }
-
-    #[test]
-    fn expand_lint_targets_passes_through_explicit_files_unchanged() {
-        let files = expand_lint_targets(&[PathBuf::from("a.yml"), PathBuf::from("b.md")]).unwrap();
-        assert_eq!(files, vec![PathBuf::from("a.yml"), PathBuf::from("b.md")]);
-    }
-
-    #[test]
-    fn yaml_error_line_reports_the_parser_location() {
-        let error = serde_yaml::from_str::<serde_yaml::Value>("steps: [\n")
-            .expect_err("malformed YAML should fail to parse");
-        let line = yaml_error_line(&anyhow::Error::new(error));
-        assert!(line.is_some(), "expected a line number from the parser");
-    }
-}
+mod tests;
