@@ -28,9 +28,9 @@ use crate::{
     cli::{
         AgentAction, AgentCommand, AgentRunArgs, CacheCommand, ChatArgs, ChatReplArgs, Command,
         CompareArgs, CompletionsArgs, DoctorArgs, EvalArgs, GraphArgs, GraphFormat, HistoryArgs,
-        InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction, PromptCommand, PromptRunArgs,
-        RunArgs, RunsCommand, SchemaArgs, SessionsCommand, SkillAction, SkillCommand, TestArgs,
-        WorkflowAction, WorkflowCommand,
+        InitArgs, LintArgs, ManArgs, ModelsArgs, OutputArgs, PromptAction, PromptCommand,
+        PromptRunArgs, ReportingArgs, RunArgs, RunsCommand, SchemaArgs, SessionsCommand,
+        SkillAction, SkillCommand, TestArgs, WorkflowAction, WorkflowCommand,
     },
     config::{self, ConfigSource, ModelMap},
     docgen, doctor,
@@ -349,6 +349,100 @@ fn run_graph(graph_args: GraphArgs) -> Result<()> {
     Ok(())
 }
 
+/// Builds the `AppServices`/`RunContext` pair `run_chat`/`run_prompt`/
+/// `run_agent` each need once `file_config` is loaded: resolve the cache
+/// policy, construct the services, and apply cache/approve-tools to a fresh
+/// `RunContext`. All three used to repeat this identical five-line block by
+/// hand; factoring it out means a future policy added here (or a bug fixed
+/// in it) can't drift between the three.
+fn build_run_context(
+    file_config: &Arc<config::ConfigFile>,
+    cache_override: Option<bool>,
+    approve_tools: bool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (Arc<AppServices>, RunContext) {
+    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, file_config);
+    let services = Arc::new(AppServices::new(Arc::clone(file_config)));
+    let env = RunContext::new(Arc::clone(&services), cancel)
+        .with_cache(cache_enabled, cache_ttl)
+        .with_approve_tools(approve_tools);
+    (services, env)
+}
+
+/// The reporting-related pieces `finish_prompt_or_agent_run` needs beyond
+/// the run's own content, bundled into one parameter (like `ProcessTasks`
+/// in `process.rs`) so adding them alongside `kind`/`output`/`model_id`/
+/// `prompt` doesn't trip `clippy::too_many_arguments`.
+struct RunReport<'a> {
+    output_args: &'a OutputArgs,
+    reporting: &'a ReportingArgs,
+    file_config: &'a config::ConfigFile,
+    usage: &'a usage::UsageTally,
+}
+
+/// Emits and records a `run_prompt`/`run_agent` result: prints `output`
+/// (respecting `--output`/`-o`), then records the run to history and prints
+/// the usage summary when asked. The two callers differ only in `kind`
+/// (`"prompt"`/`"agent"`), which model id to attribute the run to, and which
+/// text counts as the "prompt" in history — everything else here used to be
+/// copied verbatim between them.
+fn finish_prompt_or_agent_run(
+    kind: &'static str,
+    output: &str,
+    model_id: &str,
+    prompt: &str,
+    report: RunReport<'_>,
+) -> Result<()> {
+    report::emit_run_output(
+        output,
+        report.usage.total(),
+        report.output_args,
+        report.file_config,
+    )?;
+    report::finish_run(
+        report::RunRecord {
+            kind,
+            model: Some(model_id),
+            prompt,
+            response: output,
+        },
+        report.reporting.no_history,
+        report.file_config,
+        report.usage,
+        report.reporting.show_usage,
+    )
+}
+
+/// The tail shared by both of `run_chat`'s branches: records the turn to
+/// session/history and prints the usage summary when asked. `content` is
+/// the streamed outcome's accumulated text or the non-streamed response's
+/// rendered content, whichever branch reached here — the streamed branch
+/// still records the response's usage into `env.usage` itself first (see
+/// its own comment on why that can't move here).
+fn finish_chat_run(
+    chat: &ChatArgs,
+    file_config: &config::ConfigFile,
+    model_id: &str,
+    prompt: &str,
+    content: &str,
+    env: &RunContext,
+    show_usage: bool,
+) -> Result<()> {
+    chat::finish_chat_turn(
+        chat.shared.session.as_deref(),
+        chat.shared.reporting.no_history,
+        file_config,
+        model_id,
+        prompt,
+        content,
+        env.usage.total(),
+    )?;
+    if show_usage {
+        usage::print_usage_summary(&env.usage);
+    }
+    Ok(())
+}
+
 /// Runs a single-shot chat request with an already-resolved `prompt` — see
 /// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
 /// CLI argument and/or piped stdin).
@@ -399,11 +493,7 @@ async fn run_chat(
         None => prompt,
     };
     let session_history = chat::load_session_history(chat.shared.session.as_deref())?;
-    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
-    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
-    let env = RunContext::new(Arc::clone(&services), cancel)
-        .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools);
+    let (services, env) = build_run_context(&file_config, cache_override, approve_tools, cancel);
 
     // `--quiet` keeps the response body and drops every note around it.
     let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
@@ -442,19 +532,15 @@ async fn run_chat(
         if let Some(usage) = outcome.usage {
             env.usage.record(&settings.usage_label, usage);
         }
-        chat::finish_chat_turn(
-            chat.shared.session.as_deref(),
-            chat.shared.reporting.no_history,
+        return finish_chat_run(
+            &chat,
             &file_config,
             &settings.resolved_model.model_id,
             &prompt,
             &outcome.content,
-            env.usage.total(),
-        )?;
-        if show_usage {
-            usage::print_usage_summary(&env.usage);
-        }
-        return Ok(());
+            &env,
+            show_usage,
+        );
     }
 
     let response = services
@@ -487,19 +573,15 @@ async fn run_chat(
         }
     }
     let content = response::content_text(&response);
-    chat::finish_chat_turn(
-        chat.shared.session.as_deref(),
-        chat.shared.reporting.no_history,
+    finish_chat_run(
+        &chat,
         &file_config,
         &settings.resolved_model.model_id,
         &prompt,
         content,
-        env.usage.total(),
-    )?;
-    if show_usage {
-        usage::print_usage_summary(&env.usage);
-    }
-    Ok(())
+        &env,
+        show_usage,
+    )
 }
 
 /// Runs `lait prompt run <NAME> [INPUT]` (`lait prompt list` is handled
@@ -558,11 +640,7 @@ async fn run_prompt(
     )?
     .with_usage_label(format!("prompt '{}'", args.name));
 
-    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
-    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
-    let env = RunContext::new(Arc::clone(&services), cancel)
-        .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools);
+    let (services, env) = build_run_context(&file_config, cache_override, approve_tools, cancel);
     let response = services
         .finish(settings.complete(
             &env,
@@ -573,18 +651,17 @@ async fn run_prompt(
         ))
         .await?;
     let output = response::render_response(&response, false, false)?;
-    report::emit_run_output(&output, env.usage.total(), &args.output, &file_config)?;
-    report::finish_run(
-        report::RunRecord {
-            kind: "prompt",
-            model: Some(&settings.resolved_model.model_id),
-            prompt: &prompt_text,
-            response: &output,
+    finish_prompt_or_agent_run(
+        "prompt",
+        &output,
+        &settings.resolved_model.model_id,
+        &prompt_text,
+        RunReport {
+            output_args: &args.output,
+            reporting: &args.reporting,
+            file_config: &file_config,
+            usage: &env.usage,
         },
-        args.reporting.no_history,
-        &file_config,
-        &env.usage,
-        args.reporting.show_usage,
     )
 }
 
@@ -630,11 +707,7 @@ async fn run_agent(
     let settings =
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
-    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
-    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
-    let env = RunContext::new(Arc::clone(&services), cancel)
-        .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools);
+    let (services, env) = build_run_context(&file_config, cache_override, approve_tools, cancel);
     let output = services
         .finish(call_agent(
             &agent_file,
@@ -647,18 +720,17 @@ async fn run_agent(
         ))
         .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;
-    report::emit_run_output(&output, env.usage.total(), &args.output, &file_config)?;
-    report::finish_run(
-        report::RunRecord {
-            kind: "agent",
-            model: Some(&settings.resolved_model.model_id),
-            prompt: &raw_input,
-            response: &output,
+    finish_prompt_or_agent_run(
+        "agent",
+        &output,
+        &settings.resolved_model.model_id,
+        &raw_input,
+        RunReport {
+            output_args: &args.output,
+            reporting: &args.reporting,
+            file_config: &file_config,
+            usage: &env.usage,
         },
-        args.reporting.no_history,
-        &file_config,
-        &env.usage,
-        args.reporting.show_usage,
     )
 }
 
