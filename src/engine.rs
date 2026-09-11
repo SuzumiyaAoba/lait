@@ -308,25 +308,16 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<response::ChatCompletionResponse> {
-        let system_prompt = self
-            .system_prompt_with_skills(
-                &env.services.skill_cache,
-                turn.system_prompt,
-                cancellation.clone(),
-            )
+        let messages = self
+            .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
-        let system_prompt = system_prompt.as_deref();
 
         if self.mcp.is_empty() && self.subagents.is_empty() && self.tools.is_empty() {
-            let messages =
-                llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             return self
                 .complete_recorded(env, response_format, &messages, &[], cancellation)
                 .await;
         }
 
-        let messages =
-            llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
         let mut tool_loop = self
             .assemble_tool_loop(env, messages, cancellation.clone())
             .await?;
@@ -673,18 +664,11 @@ impl RequestSettings {
         output_path: Option<&Path>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<StreamOutcome> {
-        let system_prompt = self
-            .system_prompt_with_skills(
-                &env.services.skill_cache,
-                turn.system_prompt,
-                cancellation.clone(),
-            )
+        let messages = self
+            .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
-        let system_prompt = system_prompt.as_deref();
 
         if self.mcp.is_empty() && self.subagents.is_empty() && self.tools.is_empty() {
-            let messages =
-                llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
             let stream = self
                 .stream_endpoint(
                     env,
@@ -698,8 +682,6 @@ impl RequestSettings {
             return stream_response(stream, show_reasoning, output_path, false, cancellation).await;
         }
 
-        let messages =
-            llm::initial_messages(system_prompt, turn.history, turn.prompt, turn.image_urls)?;
         let mut tool_loop = self
             .assemble_tool_loop(env, messages, cancellation.clone())
             .await?;
@@ -801,6 +783,31 @@ impl RequestSettings {
     ) -> Result<Option<Cow<'a, str>>> {
         let skills_text = skill_cache.render(&self.skills, cancellation).await?;
         Ok(with_skills(system_prompt, skills_text.as_deref()))
+    }
+
+    /// The prologue shared by `complete`/`complete_stream`: resolves the
+    /// system prompt (with skills appended) and builds the initial message
+    /// list from `turn`. Both callers used to run this exact computation
+    /// twice each — once to build a tool-free fast path's messages, then
+    /// again right after with identical arguments, since the fast path's
+    /// early `return` made the two calls look unrelated even though nothing
+    /// between them could change the result. Computing it once up front and
+    /// branching *after* removes that redundant second call in both.
+    async fn initial_turn_messages(
+        &self,
+        env: &RunContext,
+        turn: PromptTurn<'_>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Vec<ChatCompletionRequestMessage>> {
+        let system_prompt = self
+            .system_prompt_with_skills(&env.services.skill_cache, turn.system_prompt, cancellation)
+            .await?;
+        llm::initial_messages(
+            system_prompt.as_deref(),
+            turn.history,
+            turn.prompt,
+            turn.image_urls,
+        )
     }
 }
 
