@@ -75,19 +75,10 @@ async fn read_all(
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Vec<String>> {
     let budget = async_io::ReadBudget::new(MAX_TOTAL_ATTACHMENT_BYTES as usize);
-    // Preserve the historical `fs::read` behavior for all callers: a FIFO
-    // attachment waits until a writer appears. The cancellation-aware worker
-    // still polls its descriptor, so a timed workflow can interrupt that wait
-    // through the shared flag.
-    let wait_for_fifo_writer = true;
-    let reads = files.iter().cloned().map(|path| {
-        read_text_file_cancellable(
-            path,
-            cancellation.clone(),
-            budget.clone(),
-            wait_for_fifo_writer,
-        )
-    });
+    let reads = files
+        .iter()
+        .cloned()
+        .map(|path| read_text_file_cancellable(path, cancellation.clone(), budget.clone()));
     futures_util::future::try_join_all(reads).await
 }
 
@@ -95,7 +86,6 @@ async fn read_text_file_cancellable(
     path: PathBuf,
     cancellation: Option<tokio_util::sync::CancellationToken>,
     budget: async_io::ReadBudget,
-    wait_for_fifo_writer: bool,
 ) -> Result<String> {
     let error_path = path.clone();
     let contents = async_io::run_blocking(
@@ -105,7 +95,14 @@ async fn read_text_file_cancellable(
                 cancelled,
                 MAX_TOTAL_ATTACHMENT_BYTES as usize,
                 &budget,
-                wait_for_fifo_writer,
+                // Preserve the historical `fs::read` behavior for every
+                // caller: a FIFO attachment waits until a writer appears.
+                // The cancellation-aware worker still polls its descriptor,
+                // so a timed workflow can interrupt that wait through the
+                // shared flag. Always `true` here — unlike `async_io`'s own
+                // `read_file`/`read_file_wait_for_fifo_writer` pair, nothing
+                // in this module ever wants the non-waiting form.
+                true,
             )
         },
         cancellation,
@@ -144,18 +141,10 @@ pub(crate) async fn resolve_image_urls_cancellable(
         [] => Ok(Vec::new()),
         _ => {
             let budget = async_io::ReadBudget::new(async_io::MAX_READ_BYTES);
-            // A local image path follows the same FIFO semantics as a text
-            // attachment. HTTP(S) values return immediately and never touch
-            // the filesystem.
-            let wait_for_fifo_writer = true;
-            let resolutions = images.iter().cloned().map(|image| {
-                resolve_one_cancellable(
-                    image,
-                    cancellation.clone(),
-                    budget.clone(),
-                    wait_for_fifo_writer,
-                )
-            });
+            let resolutions = images
+                .iter()
+                .cloned()
+                .map(|image| resolve_one_cancellable(image, cancellation.clone(), budget.clone()));
             futures_util::future::try_join_all(resolutions).await
         }
     }
@@ -165,7 +154,6 @@ async fn resolve_one_cancellable(
     image: String,
     cancellation: Option<tokio_util::sync::CancellationToken>,
     budget: async_io::ReadBudget,
-    wait_for_fifo_writer: bool,
 ) -> Result<String> {
     // Checked here, before ever touching `run_blocking`'s dedicated OS
     // thread: an `http(s)://` value returns immediately and never needs the
@@ -175,7 +163,7 @@ async fn resolve_one_cancellable(
         return Ok(image);
     }
     async_io::run_blocking(
-        move |cancelled| resolve_one_blocking(&image, cancelled, &budget, wait_for_fifo_writer),
+        move |cancelled| resolve_one_blocking(&image, cancelled, &budget),
         cancellation,
     )
     .await
@@ -185,7 +173,6 @@ fn resolve_one_blocking(
     image: &str,
     cancelled: &std::sync::atomic::AtomicBool,
     budget: &async_io::ReadBudget,
-    wait_for_fifo_writer: bool,
 ) -> Result<String> {
     let path = Path::new(image);
     let bytes = async_io::read_file_with_budget(
@@ -193,7 +180,11 @@ fn resolve_one_blocking(
         cancelled,
         async_io::MAX_READ_BYTES,
         budget,
-        wait_for_fifo_writer,
+        // A local image path follows the same FIFO semantics as a text
+        // attachment (see `read_text_file_cancellable`'s own comment) —
+        // HTTP(S) values never reach here at all, having already returned
+        // above in `resolve_one_cancellable`.
+        true,
     )
     .with_context(|| format!("failed to read image file '{}'", path.display()))?;
     let mime = sniff_image_mime(&bytes, path).with_context(|| {
