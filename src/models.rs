@@ -63,17 +63,23 @@ struct AliasRow<'a> {
 /// Collects the configured aliases sorted by name (the underlying map has no
 /// stable order), marking the one `default.model` names. An alias
 /// `resolve_model_alias` rejects (an empty definition list, an empty
-/// model_id) is skipped — running it would fail anyway, and a listing
-/// should still show the valid rest.
+/// model_id) is skipped with a warning on stderr — running it would fail
+/// anyway, and a listing should still show the valid rest, but silently
+/// dropping a broken alias from the output would look like it was never
+/// configured at all.
 fn alias_rows(file_config: &ConfigFile) -> Vec<AliasRow<'_>> {
     let default_model = file_config.default.model.as_deref();
     let mut rows: Vec<AliasRow<'_>> = file_config
         .models
         .iter()
         .filter_map(|(name, definitions)| {
-            let resolved = config::resolve_model_alias(name, &file_config.models)
-                .ok()
-                .flatten()?;
+            let resolved = match config::resolve_model_alias(name, &file_config.models) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    eprintln!("warning: skipping model alias '{name}': {error:#}");
+                    return None;
+                }
+            }?;
             Some(AliasRow {
                 name,
                 is_default: Some(name.as_str()) == default_model,

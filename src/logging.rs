@@ -35,7 +35,12 @@ pub(crate) fn init(verbosity: u8) {
     }
 
     let filter = match log_env {
-        Some(value) => EnvFilter::try_new(&value).unwrap_or_else(|_| default_filter(verbosity)),
+        Some(value) => EnvFilter::try_new(&value).unwrap_or_else(|error| {
+            eprintln!(
+                "lait: warning: invalid LAIT_LOG directive {value:?} ({error}); falling back to -v/-vv"
+            );
+            default_filter(verbosity)
+        }),
         None => default_filter(verbosity),
     };
 

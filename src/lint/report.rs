@@ -110,7 +110,13 @@ fn findings(run: &LintRun) -> Vec<Finding> {
         for issue in &report.issues {
             let line = issue.line.or_else(|| {
                 let text = source.get_or_insert_with(|| {
-                    std::fs::read_to_string(&report.file).unwrap_or_default()
+                    std::fs::read_to_string(&report.file).unwrap_or_else(|error| {
+                        eprintln!(
+                            "warning: failed to read '{}' to guess a line number ({error}); this finding will report no line",
+                            report.file.display()
+                        );
+                        String::new()
+                    })
                 });
                 guess_line(text, &issue.message)
             });

@@ -97,6 +97,44 @@ fn says_so_when_no_aliases_are_configured() {
 }
 
 #[test]
+fn warns_on_stderr_about_a_broken_alias_instead_of_silently_dropping_it() {
+    let config_dir = ConfigDirectory::new(
+        r#"
+models:
+  broken:
+    - provider:
+        base_url: http://localhost:1234/v1
+      model_id: ""
+  local:
+    - provider:
+        base_url: http://localhost:1234/v1
+      model_id: test-model-id
+"#,
+    );
+    let output = test_command()
+        .current_dir(config_dir.path())
+        .arg("models")
+        .output()
+        .expect("failed to execute lait models");
+
+    assert!(output.status.success(), "lait models failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("local") && stdout.contains("test-model-id"),
+        "the valid alias should still be listed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("broken"),
+        "a broken alias must not appear as a row: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning") && stderr.contains("broken"),
+        "the broken alias should be reported on stderr instead of silently dropped: {stderr}"
+    );
+}
+
+#[test]
 fn remote_queries_the_servers_model_list() {
     let server = MockServer::start(
         "200 OK",

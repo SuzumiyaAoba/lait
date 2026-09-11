@@ -285,7 +285,25 @@ fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
             // chain that loops back to it is caught the same way
             // `WorkflowScope::nested` catches it at `run` time.
             let mut visited = Vec::new();
-            let canonical = std::fs::canonicalize(path).ok();
+            let canonical = match std::fs::canonicalize(path) {
+                Ok(canonical) => Some(canonical),
+                Err(error) => {
+                    // Falling back to `path.parent()` below is not
+                    // equivalent: if `path` itself contains an unresolved
+                    // symlink component, its raw parent can differ from the
+                    // canonical parent `run` would use, so lint could then
+                    // inspect a different set of sub-workflow files than
+                    // `run` actually would. Surface it instead of silently
+                    // linting under a possibly-wrong base directory.
+                    issues.push(LintIssue::warning(format!(
+                        "failed to canonicalize '{}' ({error}); sub-workflow \
+                         resolution falls back to its non-canonical parent \
+                         directory, which may differ from what `lait run` uses",
+                        path.display()
+                    )));
+                    None
+                }
+            };
             // Runtime resolves nested workflow paths from the canonical
             // top-level file's parent (`WorkflowScope::top_level`).  Keep
             // linting on that same base so invoking lint through a symlink
