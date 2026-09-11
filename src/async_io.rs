@@ -487,15 +487,11 @@ pub(crate) fn read_file_with_budget(
             .custom_flags(libc::O_NONBLOCK)
             .open(path)?;
         let file_type = file.metadata()?.file_type();
-        let fifo_path = file_type.is_fifo().then_some(path);
-        read_from_file(
-            &mut file,
-            file_type.is_fifo() && wait_for_fifo_writer,
-            fifo_path,
-            cancelled,
-            max_bytes,
-            budget,
-        )
+        // `Some`/`None` collapses the two states `read_from_file` used to
+        // take as separate `bool`/`Option<&Path>` parameters that only ever
+        // varied together (see that function's own doc comment).
+        let fifo_wait_path = (file_type.is_fifo() && wait_for_fifo_writer).then_some(path);
+        read_from_file(&mut file, fifo_wait_path, cancelled, max_bytes, budget)
     }
 
     #[cfg(not(unix))]
@@ -505,32 +501,43 @@ pub(crate) fn read_file_with_budget(
     let mut file = File::open(path)?;
 
     #[cfg(not(unix))]
-    read_from_file(&mut file, false, None, cancelled, max_bytes, budget)
+    read_from_file(&mut file, None, cancelled, max_bytes, budget)
 }
 
 /// Reads a regular or non-blocking special file. A FIFO with no writer would
-/// otherwise report EOF immediately when opened non-blocking. When the caller
-/// requests writer-waiting, poll the descriptor so an empty FIFO is returned
-/// after a writer opens and closes, just as a blocking FIFO read would be.
+/// otherwise report EOF immediately when opened non-blocking. When
+/// `fifo_wait_path` is `Some`, poll that path's descriptor so an empty FIFO
+/// is returned only after a writer opens and closes, just as a blocking FIFO
+/// read would be — `None` skips all of that and reads as an ordinary file.
 /// The cancellation flag is checked on every poll interval.
+///
+/// `fifo_wait_path` used to be two separate parameters (`wait_for_fifo_writer:
+/// bool` and `fifo_path: Option<&Path>`) that only ever varied together: the
+/// caller could only reach `wait_for_fifo_writer: true` by first confirming
+/// `path` names a FIFO, which is exactly when `fifo_path` was `Some`. That
+/// left `fifo_path.expect("FIFO path is required")` below as the one place
+/// in this crate proving an invariant the type system couldn't — collapsing
+/// to one `Option` makes the invalid `(true, None)` state unrepresentable
+/// instead.
 fn read_from_file(
     file: &mut File,
-    wait_for_fifo_writer: bool,
-    fifo_path: Option<&Path>,
+    fifo_wait_path: Option<&Path>,
     cancelled: &AtomicBool,
     max_bytes: usize,
     budget: &ReadBudget,
 ) -> Result<Vec<u8>> {
-    #[cfg(not(unix))]
-    let _ = (wait_for_fifo_writer, fifo_path);
-
+    // Unlike the old `(wait_for_fifo_writer, fifo_path)` pair — where only
+    // `fifo_path` needed suppressing on non-Unix, since `wait_for_fifo_writer`
+    // was already read unconditionally below — `fifo_wait_path` alone is
+    // read unconditionally by the same `Ok(0)` arm on every platform, so no
+    // `#[cfg(not(unix))] let _ = ...;` is needed here.
     const CHUNK_SIZE: usize = 64 * 1024;
     let mut contents = Vec::new();
     // A nonblocking reader can see EOF before any writer connects. Keep that
     // initial state separate from EOF after an observed writer or data, so
     // waiting reads do not incorrectly return an empty file at startup.
     #[cfg(unix)]
-    let mut fifo_writer_seen = !wait_for_fifo_writer;
+    let mut fifo_writer_seen = fifo_wait_path.is_none();
     #[cfg(not(unix))]
     let fifo_writer_seen = true;
     let mut buffer = [0_u8; CHUNK_SIZE];
@@ -543,8 +550,8 @@ fn read_from_file(
         }
 
         #[cfg(unix)]
-        if wait_for_fifo_writer && !fifo_writer_seen {
-            match wait_for_fifo_event(file, fifo_path.expect("FIFO path is required"))? {
+        if !fifo_writer_seen && let Some(fifo_path) = fifo_wait_path {
+            match wait_for_fifo_event(file, fifo_path)? {
                 FifoEvent::NoWriter => continue,
                 FifoEvent::WriterConnected => fifo_writer_seen = true,
                 FifoEvent::Data(byte) => {
@@ -575,7 +582,7 @@ fn read_from_file(
                 // Once bytes have been received, however, a writer may have
                 // written and closed between polls; EOF is then final even
                 // when the last poll also carried POLLHUP.
-                if wait_for_fifo_writer && !fifo_writer_seen && contents.is_empty() {
+                if fifo_wait_path.is_some() && !fifo_writer_seen && contents.is_empty() {
                     continue;
                 }
                 return Ok(contents);
