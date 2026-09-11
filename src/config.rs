@@ -1230,6 +1230,17 @@ fn load_config_at(source: &ConfigSource, path: Option<PathBuf>) -> Result<Config
 /// own just their own I/O call and still apply this decision identically —
 /// see `async_io::read_to_string_sync`'s doc for why a `trait`-based
 /// injection point for the read itself was rejected instead.
+/// The read-failure context message shared by [`config_from_read_result`]/
+/// [`optional_config_from_read_result`] — previously duplicated literally at
+/// each site (see the design plan's B1 note); factored out so a future
+/// wording change can't drift between the project and global loaders.
+fn config_read_error_context(path: &Path) -> String {
+    format!(
+        "failed to read YAML configuration file '{}'",
+        path.display()
+    )
+}
+
 fn config_from_read_result(
     source: &ConfigSource,
     path: &Path,
@@ -1247,12 +1258,7 @@ fn config_from_read_result(
         {
             Ok(ConfigFile::default())
         }
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to read YAML configuration file '{}'",
-                path.display()
-            )
-        }),
+        Err(error) => Err(error).with_context(|| config_read_error_context(path)),
     }
 }
 
@@ -1278,12 +1284,7 @@ fn optional_config_from_read_result(
     match read_result {
         Ok(contents) => Ok(Some(parse_config_file(path, &contents)?)),
         Err(error) if async_io::is_not_found(&error) => Ok(None),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to read YAML configuration file '{}'",
-                path.display()
-            )
-        }),
+        Err(error) => Err(error).with_context(|| config_read_error_context(path)),
     }
 }
 
