@@ -364,26 +364,11 @@ fn lint_workflow_contents(
         }
     }
 
-    check_mcp_names(
+    check_capability_name_lists(
         "the workflow's 'default'",
         wf.default.mcp.as_deref(),
-        ctx,
-        issues,
-    );
-    check_skill_names(
-        "the workflow's 'default'",
         wf.default.skills.as_deref(),
-        ctx,
-        issues,
-    );
-    check_subagent_names(
-        "the workflow's 'default'",
         wf.default.subagents.as_deref(),
-        ctx,
-        issues,
-    );
-    check_tool_names(
-        "the workflow's 'default'",
         wf.default.tools.as_deref(),
         ctx,
         issues,
@@ -502,10 +487,15 @@ fn lint_node(
     if let Some(filter) = settings.jq {
         check_jq(filter, &format!("{node_context}: 'jq'"), issues);
     }
-    check_mcp_names(&node_context, settings.mcp, ctx, issues);
-    check_skill_names(&node_context, settings.skills, ctx, issues);
-    check_subagent_names(&node_context, settings.subagents, ctx, issues);
-    check_tool_names(&node_context, settings.tools, ctx, issues);
+    check_capability_name_lists(
+        &node_context,
+        settings.mcp,
+        settings.skills,
+        settings.subagents,
+        settings.tools,
+        ctx,
+        issues,
+    );
 
     match node {
         workflow::NodeDefinition::Prompt(prompt) => {
@@ -817,28 +807,15 @@ fn lint_agent_contents(
         )));
     }
 
-    check_mcp_names(context, agent_file.mcp.as_deref(), ctx, issues);
-    check_skill_names(context, agent_file.skills.as_deref(), ctx, issues);
-    check_subagent_names(context, agent_file.subagents.as_deref(), ctx, issues);
-    check_tool_names(context, agent_file.tools.as_deref(), ctx, issues);
-}
-
-fn check_mcp_names(
-    context: &str,
-    names: Option<&[String]>,
-    ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-) {
-    check_capability_names(
+    check_capability_name_lists(
         context,
-        "MCP server",
-        "mcp_servers:",
-        names,
-        |config, name| config.mcp_servers.contains_key(name),
+        agent_file.mcp.as_deref(),
+        agent_file.skills.as_deref(),
+        agent_file.subagents.as_deref(),
+        agent_file.tools.as_deref(),
         ctx,
         issues,
     );
-    check_mcp_allowed_tools_not_empty(context, names, ctx, issues);
 }
 
 /// Warns when a node/agent references an MCP server whose `allowed_tools`
@@ -871,58 +848,63 @@ fn check_mcp_allowed_tools_not_empty(
     }
 }
 
-fn check_skill_names(
+/// Checks all four capability-name lists (`mcp`/`skills`/`subagents`/
+/// `tools`) a node/agent file may declare, in one call — every call site
+/// below always checks all four together. This used to be four near-
+/// identical 12-line wrappers (`check_mcp_names`/`check_skill_names`/
+/// `check_subagent_names`/`check_tool_names`) around `check_capability_names`,
+/// differing only in three literals and a closure each, called as a group of
+/// four from every site; folding them into one function removes both that
+/// repetition and each call site's own repeated four-call group.
+fn check_capability_name_lists(
     context: &str,
-    names: Option<&[String]>,
+    mcp: Option<&[String]>,
+    skills: Option<&[String]>,
+    subagents: Option<&[String]>,
+    tools: Option<&[String]>,
     ctx: &mut LintCtx,
     issues: &mut Vec<LintIssue>,
 ) {
+    check_capability_names(
+        context,
+        "MCP server",
+        "mcp_servers:",
+        mcp,
+        |config, name| config.mcp_servers.contains_key(name),
+        ctx,
+        issues,
+    );
+    check_mcp_allowed_tools_not_empty(context, mcp, ctx, issues);
     check_capability_names(
         context,
         "skill",
         "skills:",
-        names,
+        skills,
         |config, name| config.skills.contains_key(name),
         ctx,
         issues,
     );
-}
-
-fn check_subagent_names(
-    context: &str,
-    names: Option<&[String]>,
-    ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-) {
     check_capability_names(
         context,
         "subagent",
         "agents:",
-        names,
+        subagents,
         |config, name| config.agents.contains_key(name),
         ctx,
         issues,
     );
-}
-
-fn check_tool_names(
-    context: &str,
-    names: Option<&[String]>,
-    ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-) {
     check_capability_names(
         context,
         "tool",
         "tools:",
-        names,
+        tools,
         |config, name| config.tools.contains_key(name),
         ctx,
         issues,
     );
 }
 
-/// Shared by `check_mcp_names`/`check_skill_names`: both look up a list of
+/// Shared by `check_capability_name_lists`: looks up a list of
 /// names against a map defined in `config` (`skipping`, and noting once, when
 /// there is no `config` to check against at all), differing only in which map
 /// they check and how they name it in an issue's message. `contains` decides

@@ -144,125 +144,136 @@ pub(super) fn validate_steps(steps: &[FlowStep], nodes: &NodeMap, ctx: FlowConte
         // would show for this site.
         let label = step.label_or(index + 1);
 
-        let router_count = step.router_count();
-        if router_count > 1 {
-            bail!(
-                "step '{}' can have at most one of 'switch', 'parallel', 'loop', or 'for_each'",
-                label
-            );
-        }
-        if router_count == 1 && step.r#use.is_some() {
-            bail!(
-                "step '{}' has 'use' set together with a router ('switch'/'parallel'/'loop'/'for_each'); \
-                 exactly one is allowed",
-                label
-            );
+        validate_router_exclusivity(step, nodes, &label)?;
+
+        // `validate_router_exclusivity` above guarantees at most one router
+        // field is set, so `step.router()` (which just checks them in a
+        // fixed order) can't silently prefer one over another here.
+        if let Some(router) = step.router() {
+            validate_router_site(step, router, &label, nodes, ctx)?;
+            continue;
         }
 
-        // Router and bare-control sites have no node lookup below, but their
-        // explicit ids are still recorded in the same `$steps` namespace.
-        if step.r#use.is_none() {
-            reject_step_id_node_collision(step, nodes, &label)?;
-        }
+        validate_use_or_control_site(step, nodes, ctx, &label)?;
+    }
+    Ok(())
+}
 
-        // `router_count` above guarantees at most one of these is set, so
-        // `step.router()` (which just checks them in a fixed order) can't
-        // silently prefer one over another here. Matched exhaustively (no
-        // `_` arm), like `run_steps`' and `lint::walk_steps`' own matches on
-        // this same enum, so a new router kind fails to compile here until
-        // this function's nesting-context handling is updated for it too.
-        match step.router() {
-            Some(Router::Switch(switch)) => {
-                reject_router_incompatible_fields(step, "switch", &label)?;
-                validate_switch(switch, &label, nodes, ctx)?;
-                continue;
-            }
-            Some(Router::Parallel(parallel)) => {
-                reject_router_incompatible_fields(step, "parallel", &label)?;
-                validate_parallel(parallel, &label, nodes, ctx)?;
-                continue;
-            }
-            Some(Router::Loop(loop_def)) => {
-                reject_router_incompatible_fields(step, "loop", &label)?;
-                validate_loop(loop_def, &label, nodes, ctx)?;
-                continue;
-            }
-            Some(Router::ForEach(for_each)) => {
-                reject_router_incompatible_fields(step, "for_each", &label)?;
-                validate_for_each(for_each, &label, nodes, ctx)?;
-                continue;
-            }
-            None => {}
-        }
+/// Rejects a step site that names more than one router field, or both a
+/// router and `use`; otherwise records a non-router site's id (a router
+/// site's own id collision is checked inside `validate_router_site` instead,
+/// since a router has no node lookup of its own to collide with).
+fn validate_router_exclusivity(step: &FlowStep, nodes: &NodeMap, label: &str) -> Result<()> {
+    let router_count = step.router_count();
+    if router_count > 1 {
+        bail!("step '{label}' can have at most one of 'switch', 'parallel', 'loop', or 'for_each'");
+    }
+    if router_count == 1 && step.r#use.is_some() {
+        bail!(
+            "step '{label}' has 'use' set together with a router ('switch'/'parallel'/'loop'/'for_each'); \
+             exactly one is allowed"
+        );
+    }
+    // Router and bare-control sites have no node lookup below, but their
+    // explicit ids are still recorded in the same `$steps` namespace.
+    if step.r#use.is_none() {
+        reject_step_id_node_collision(step, nodes, label)?;
+    }
+    Ok(())
+}
 
-        if step.r#use.is_none() && step.stop != Some(true) && step.r#break != Some(true) {
-            bail!(
-                "step '{}' must have a 'use', a 'switch', a 'parallel', a 'loop', a \
-                 'for_each', 'stop', 'break', or a combination",
-                label
-            );
+/// Dispatches to the one router kind `step` actually names. Matched
+/// exhaustively (no `_` arm), like `run_steps`' and `lint::walk_steps`' own
+/// matches on this same enum, so a new router kind fails to compile here
+/// until this function's nesting-context handling is updated for it too.
+fn validate_router_site(
+    step: &FlowStep,
+    router: Router<'_>,
+    label: &str,
+    nodes: &NodeMap,
+    ctx: FlowContext,
+) -> Result<()> {
+    match router {
+        Router::Switch(switch) => {
+            reject_router_incompatible_fields(step, "switch", label)?;
+            validate_switch(switch, label, nodes, ctx)
         }
-        if step.r#use.is_none() && step.on_error.is_some() {
-            bail!(
-                "step '{}' has 'on_error' set without 'use'; there is no node action for it \
-                 to guard",
-                label
-            );
+        Router::Parallel(parallel) => {
+            reject_router_incompatible_fields(step, "parallel", label)?;
+            validate_parallel(parallel, label, nodes, ctx)
         }
-        if let Some(node_id) = &step.r#use {
-            let Some(node) = nodes.get(node_id) else {
-                bail!(
-                    "step '{}' has 'use: {}', but no node with that id is defined in 'nodes'",
-                    label,
-                    node_id
-                );
-            };
-            reject_step_id_node_collision(step, nodes, &label)?;
-            if node.requires_interactive_stdin() && ctx.in_parallel_branch {
-                bail!(
-                    "step '{}' uses node '{}', which has 'type: ask', inside a 'parallel' branch \
-                     or a 'for_each' body with 'max_concurrency' above 1; concurrent interactive \
-                     prompts reading the same stdin are not supported",
-                    label,
-                    node_id
-                );
-            }
-            if node.settings().write_file.is_some() && ctx.in_concurrent_for_each {
-                bail!(
-                    "step '{}' uses node '{}', which has 'write_file' set, inside a 'for_each' body \
-                     with 'max_concurrency' above 1; every concurrently running item would write the \
-                     same static path. Move it after the 'for_each' step, or set 'max_concurrency: 1'",
-                    label,
-                    node_id
-                );
-            }
-            if let Some(on_error) = &step.on_error {
-                if on_error.steps.is_empty() {
-                    bail!("step '{}' has 'on_error' with an empty 'steps' list", label);
-                }
-                validate_steps(&on_error.steps, nodes, ctx)?;
-            }
+        Router::Loop(loop_def) => {
+            reject_router_incompatible_fields(step, "loop", label)?;
+            validate_loop(loop_def, label, nodes, ctx)
         }
+        Router::ForEach(for_each) => {
+            reject_router_incompatible_fields(step, "for_each", label)?;
+            validate_for_each(for_each, label, nodes, ctx)
+        }
+    }
+}
 
-        if step.r#break == Some(true) && step.stop == Some(true) {
+/// Validates a non-router step site: either a `use:` (bound to a node, with
+/// its own `on_error`/interactive-stdin/concurrent-`write_file` checks) or a
+/// bare `stop`/`break` control directive.
+fn validate_use_or_control_site(
+    step: &FlowStep,
+    nodes: &NodeMap,
+    ctx: FlowContext,
+    label: &str,
+) -> Result<()> {
+    if step.r#use.is_none() && step.stop != Some(true) && step.r#break != Some(true) {
+        bail!(
+            "step '{label}' must have a 'use', a 'switch', a 'parallel', a 'loop', a \
+             'for_each', 'stop', 'break', or a combination"
+        );
+    }
+    if step.r#use.is_none() && step.on_error.is_some() {
+        bail!(
+            "step '{label}' has 'on_error' set without 'use'; there is no node action for it \
+             to guard"
+        );
+    }
+    if let Some(node_id) = &step.r#use {
+        let Some(node) = nodes.get(node_id) else {
             bail!(
-                "step '{}' cannot have both 'stop: true' and 'break: true'",
-                label
+                "step '{label}' has 'use: {node_id}', but no node with that id is defined in 'nodes'"
+            );
+        };
+        reject_step_id_node_collision(step, nodes, label)?;
+        if node.requires_interactive_stdin() && ctx.in_parallel_branch {
+            bail!(
+                "step '{label}' uses node '{node_id}', which has 'type: ask', inside a 'parallel' branch \
+                 or a 'for_each' body with 'max_concurrency' above 1; concurrent interactive \
+                 prompts reading the same stdin are not supported"
             );
         }
-        if step.r#break == Some(true) && !ctx.in_loop {
+        if node.settings().write_file.is_some() && ctx.in_concurrent_for_each {
             bail!(
-                "step '{}' has 'break: true' outside a 'loop'/'for_each' body",
-                label
+                "step '{label}' uses node '{node_id}', which has 'write_file' set, inside a 'for_each' body \
+                 with 'max_concurrency' above 1; every concurrently running item would write the \
+                 same static path. Move it after the 'for_each' step, or set 'max_concurrency: 1'"
             );
         }
-        if step.stop == Some(true) && ctx.in_parallel_branch {
-            bail!(
-                "step '{}' has 'stop: true' inside a 'parallel' branch, where there is no \
-                 single well-defined workflow to stop",
-                label
-            );
+        if let Some(on_error) = &step.on_error {
+            if on_error.steps.is_empty() {
+                bail!("step '{label}' has 'on_error' with an empty 'steps' list");
+            }
+            validate_steps(&on_error.steps, nodes, ctx)?;
         }
+    }
+
+    if step.r#break == Some(true) && step.stop == Some(true) {
+        bail!("step '{label}' cannot have both 'stop: true' and 'break: true'");
+    }
+    if step.r#break == Some(true) && !ctx.in_loop {
+        bail!("step '{label}' has 'break: true' outside a 'loop'/'for_each' body");
+    }
+    if step.stop == Some(true) && ctx.in_parallel_branch {
+        bail!(
+            "step '{label}' has 'stop: true' inside a 'parallel' branch, where there is no \
+             single well-defined workflow to stop"
+        );
     }
     Ok(())
 }
