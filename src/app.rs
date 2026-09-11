@@ -584,6 +584,13 @@ async fn run_chat(
     )
 }
 
+/// Shared by [`run_prompt`]/[`run_agent`]: both resolve `INPUT` the same way
+/// (`chat::resolve_input_with_stdin_cancellable`) and fail identically when
+/// neither a positional argument nor piped stdin supplied one.
+fn missing_input_error() -> anyhow::Error {
+    anyhow!("an INPUT is required; provide one or pipe input via stdin")
+}
+
 /// Runs `lait prompt run <NAME> [INPUT]` (`lait prompt list` is handled
 /// separately, synchronously, by `prompt::list` — see `needs_async_runtime`/
 /// `run_blocking`): renders the named prompt (see `prompt::render_named`)
@@ -607,7 +614,7 @@ async fn run_prompt(
     let raw_input =
         chat::resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
             .await?
-            .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
+            .ok_or_else(missing_input_error)?;
     let (prompt_text, prompt_model) =
         prompt::render_named(&args.name, &raw_input, &args.var.var, &file_config)?;
 
@@ -676,7 +683,7 @@ async fn run_agent(
     let raw_input =
         chat::resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
             .await?
-            .ok_or_else(|| anyhow!("an INPUT is required; provide one or pipe input via stdin"))?;
+            .ok_or_else(missing_input_error)?;
     let agent_file = agent::load_agent_cancellable(&args.file, Some(cancel.clone())).await?;
     let canonical_agent_path = crate::async_io::canonicalize(&args.file, Some(cancel.clone()))
         .await

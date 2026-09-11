@@ -24,7 +24,7 @@ fn read_stdin_text() -> Result<String> {
     let mut buffer = String::new();
     std::io::stdin()
         .read_to_string(&mut buffer)
-        .context("failed to read stdin")?;
+        .context("failed to read from stdin")?;
     Ok(buffer.trim_end_matches(['\n', '\r']).to_owned())
 }
 
