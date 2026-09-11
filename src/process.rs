@@ -23,142 +23,11 @@ pub(crate) const MAX_COMMAND_OUTPUT_BYTES: usize = crate::async_io::MAX_READ_BYT
 /// within this bound; an elapsed bound is surfaced as a cleanup error.
 const COMMAND_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Tracks the OS primitive that owns a command's process tree.
-///
-/// Unix commands are put in a fresh process group before they are spawned,
-/// so a negative-PGID SIGKILL reaches the command and every descendant that
-/// inherits the group. Windows uses a Job Object for the same ownership
-/// boundary; terminating the job is the only reliable way to stop descendants
-/// when the command itself is a shell or has forked workers.
-#[cfg(unix)]
-struct CommandProcessTree {
-    process_group: libc::pid_t,
-    cleanup_on_drop: bool,
-}
-
-#[cfg(windows)]
-struct CommandProcessTree {
-    job: std::os::windows::io::OwnedHandle,
-    cleanup_on_drop: bool,
-}
-
-#[cfg(not(any(unix, windows)))]
-struct CommandProcessTree {
-    cleanup_on_drop: bool,
-}
-
-#[cfg(unix)]
-impl CommandProcessTree {
-    fn configure(command: &mut tokio::process::Command) {
-        // PGID 0 asks the OS to use the child's PID as its process-group ID.
-        // Tokio forwards this to std::process::Command before fork/exec, so
-        // there is no parent-side race between spawning and setpgid(2).
-        command.process_group(0);
-    }
-
-    fn attach(child: &tokio::process::Child) -> Result<Self> {
-        let pid = child
-            .id()
-            .ok_or_else(|| anyhow!("command exited before its process group was attached"))?;
-        let process_group = libc::pid_t::try_from(pid)
-            .map_err(|_| anyhow!("command process id {pid} does not fit in a process-group id"))?;
-        Ok(Self {
-            process_group,
-            cleanup_on_drop: true,
-        })
-    }
-
-    fn kill(&self) -> std::io::Result<()> {
-        // A negative PID targets the process group whose ID is -PID. ESRCH
-        // means that the group is already empty, which is successful cleanup.
-        let result = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.cleanup_on_drop = false;
-    }
-}
-
-#[cfg(unix)]
-impl Drop for CommandProcessTree {
-    fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            let _ = self.kill();
-        }
-    }
-}
-
 #[cfg(windows)]
 mod job_windows;
+mod tree;
 
-#[cfg(windows)]
-impl CommandProcessTree {
-    fn configure(command: &mut tokio::process::Command) {
-        job_windows::configure(command);
-    }
-
-    fn attach(child: &tokio::process::Child) -> Result<Self> {
-        let process = child
-            .raw_handle()
-            .ok_or_else(|| anyhow!("command exited before its Windows job was attached"))?;
-        let job = job_windows::attach(process)
-            .context("failed to assign command process to a Windows Job Object")?;
-        Ok(Self {
-            job,
-            cleanup_on_drop: true,
-        })
-    }
-
-    fn kill(&self) -> std::io::Result<()> {
-        job_windows::terminate(std::os::windows::io::AsRawHandle::as_raw_handle(&self.job))
-    }
-
-    fn disarm(&mut self) {
-        self.cleanup_on_drop = false;
-    }
-}
-
-#[cfg(windows)]
-impl Drop for CommandProcessTree {
-    fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            let _ = self.kill();
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-impl CommandProcessTree {
-    fn configure(_command: &mut tokio::process::Command) {}
-
-    fn attach(_child: &tokio::process::Child) -> Result<Self> {
-        Ok(Self {
-            cleanup_on_drop: false,
-        })
-    }
-
-    fn kill(&self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn disarm(&mut self) {
-        self.cleanup_on_drop = false;
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-impl Drop for CommandProcessTree {
-    fn drop(&mut self) {}
-}
+use tree::CommandProcessTree;
 
 /// Terminates a command's process tree and reaps its direct child. The
 /// containment primitive is intentionally attempted twice: a child can fork
@@ -312,10 +181,15 @@ async fn abort_process_tasks(
     abort_optional_task(read_stderr).await;
 }
 
-/// Cleans up a command after one of its output readers fails. A completed
-/// child has already been reaped by `child.wait`, so only its descendants need
-/// the process-tree termination call in that case.
-async fn cleanup_after_reader_failure(
+/// Contains the process tree once a run is ending for any reason (a reader
+/// task failed, the run was cancelled, or its timeout elapsed). A completed
+/// child has already been reaped by `child.wait`, so only its descendants
+/// need the process-tree termination call in that case — and not even that
+/// if an end-of-loop `kill_descendants_after_exit` cleanup already ran it.
+/// Shared by `reader_failed` and both the cancellation and timeout `select!`
+/// arms in `run_process`, which each computed this same decision inline
+/// before converging on it here.
+async fn contain_process_tree(
     process_tree: &CommandProcessTree,
     child: &mut tokio::process::Child,
     child_reaped: bool,
@@ -329,6 +203,45 @@ async fn cleanup_after_reader_failure(
     } else {
         terminate_command_process_tree(process_tree, child).await
     }
+}
+
+/// The three background tasks one `run_process` invocation owns (the stdin
+/// writer, the stdout/stderr readers), bundled into one parameter so a
+/// cleanup helper taking them alongside its other arguments doesn't trip
+/// `clippy::too_many_arguments`.
+struct ProcessTasks<'a> {
+    write_stdin: &'a mut Option<JoinHandle<Result<()>>>,
+    read_stdout: &'a mut Option<JoinHandle<Result<Vec<u8>>>>,
+    read_stderr: &'a mut Option<JoinHandle<Result<Vec<u8>>>>,
+}
+
+/// Finishes handling one stdout/stderr reader task that failed: aborts every
+/// other in-flight task, contains the process tree, and builds the error
+/// `run_process` should return. Its two `select!` arms are otherwise
+/// byte-for-byte identical from here on — only which `Option` gets cleared
+/// and which `outcome` field gets set on the *success* side differs, and
+/// that (plus the `drop(child_wait)` immediately before this call, required
+/// so the pinned `child.wait()` future's borrow of `child` ends before this
+/// can take `&mut child`) can't be pulled into a shared `select!` future, so
+/// this factors out everything that can be: the whole recovery path.
+async fn reader_failed(
+    error: anyhow::Error,
+    process_tree: &CommandProcessTree,
+    child: &mut tokio::process::Child,
+    child_reaped: bool,
+    descendants_terminated: bool,
+    command_kind: &'static str,
+    tasks: ProcessTasks<'_>,
+) -> anyhow::Error {
+    abort_process_tasks(tasks.write_stdin, tasks.read_stdout, tasks.read_stderr).await;
+    if let Err(cleanup_error) =
+        contain_process_tree(process_tree, child, child_reaped, descendants_terminated).await
+    {
+        return error.context(format!(
+            "failed to terminate {command_kind} process tree after output reader failure: {cleanup_error:#}"
+        ));
+    }
+    error
 }
 
 /// Terminates descendants after the direct child has already been reaped.
@@ -553,15 +466,13 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                 }
             } => {
                 drop(child_wait);
-                let cleanup = if outcome.child_status.as_ref().is_some_and(Result::is_ok) {
-                    if outcome.descendants_terminated {
-                        Ok(())
-                    } else {
-                        terminate_reaped_process_tree(&process_tree).await
-                    }
-                } else {
-                    terminate_command_process_tree(&process_tree, &mut child).await
-                };
+                let cleanup = contain_process_tree(
+                    &process_tree,
+                    &mut child,
+                    outcome.child_status.as_ref().is_some_and(Result::is_ok),
+                    outcome.descendants_terminated,
+                )
+                .await;
                 abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
                 let message = format!("{} '{program}' was cancelled", request.command_kind);
                 return match cleanup {
@@ -585,18 +496,19 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                     Err(error) => {
                         let child_reaped = outcome.child_status.as_ref().is_some_and(Result::is_ok);
                         drop(child_wait);
-                        abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
-                        if let Err(cleanup_error) = cleanup_after_reader_failure(
+                        return Err(reader_failed(
+                            error,
                             &process_tree,
                             &mut child,
                             child_reaped,
                             outcome.descendants_terminated,
-                        ).await {
-                            return Err(error.context(format!(
-                                "failed to terminate {command_kind} process tree after output reader failure: {cleanup_error:#}"
-                            )));
-                        }
-                        return Err(error);
+                            command_kind,
+                            ProcessTasks {
+                                write_stdin: &mut write_stdin,
+                                read_stdout: &mut read_stdout,
+                                read_stderr: &mut read_stderr,
+                            },
+                        ).await);
                     }
                 }
             }
@@ -607,18 +519,19 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                     Err(error) => {
                         let child_reaped = outcome.child_status.as_ref().is_some_and(Result::is_ok);
                         drop(child_wait);
-                        abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
-                        if let Err(cleanup_error) = cleanup_after_reader_failure(
+                        return Err(reader_failed(
+                            error,
                             &process_tree,
                             &mut child,
                             child_reaped,
                             outcome.descendants_terminated,
-                        ).await {
-                            return Err(error.context(format!(
-                                "failed to terminate {command_kind} process tree after output reader failure: {cleanup_error:#}"
-                            )));
-                        }
-                        return Err(error);
+                            command_kind,
+                            ProcessTasks {
+                                write_stdin: &mut write_stdin,
+                                read_stdout: &mut read_stdout,
+                                read_stderr: &mut read_stderr,
+                            },
+                        ).await);
                     }
                 }
             }
@@ -636,11 +549,13 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                     timeout.as_secs_f64(),
                 );
                 drop(child_wait);
-                let cleanup = if outcome.child_status.as_ref().is_some_and(Result::is_ok) {
-                    terminate_reaped_process_tree(&process_tree).await
-                } else {
-                    terminate_command_process_tree(&process_tree, &mut child).await
-                };
+                let cleanup = contain_process_tree(
+                    &process_tree,
+                    &mut child,
+                    outcome.child_status.as_ref().is_some_and(Result::is_ok),
+                    outcome.descendants_terminated,
+                )
+                .await;
                 abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
                 if let Err(cleanup_error) = cleanup {
                     return Err(cleanup_error.context(crate::error::Interrupted::timed_out(
