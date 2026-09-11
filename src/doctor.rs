@@ -442,36 +442,90 @@ async fn check_connectivity(
         }
     }
 
-    let mut results = HashMap::new();
-    for (base_url, api_key_source) in ordered_base_urls {
-        let api_key = match services
-            .secret_resolver
-            .resolve(&api_key_source, cancellation.clone())
-            .await
-        {
-            Ok(api_key) => api_key,
-            Err(error) => {
-                if is_interrupted(&error) {
-                    return Err(error);
-                }
-                checks.push(Check::error(
-                    "connectivity",
-                    base_url.clone(),
-                    format!("API キーの解決に失敗しました: {error:#}"),
-                    Some(
-                        "api_key/api_key_cmd の設定と secret manager の状態を確認してください"
-                            .to_owned(),
-                    ),
-                ));
-                results.insert(base_url, None);
-                continue;
+    // Every base_url's secret resolution + `/v1/models` fetch is
+    // independent of every other's, so they run concurrently instead of
+    // one at a time — with two configured endpoints where one is broken,
+    // the sequential version paid `CONNECTIVITY_TIMEOUT` twice in a row.
+    // Each endpoint accumulates its own `Check`s in `local_checks` rather
+    // than pushing straight into the shared `checks` so the ones for a
+    // still-running endpoint can never land between two checks from an
+    // endpoint that finished first: they're `extend`ed into `checks` after
+    // every endpoint has finished, in `ordered_base_urls`'s original
+    // order — `emit`'s text renderer groups by category assuming
+    // same-category checks are contiguous, and that order is also what
+    // existing tests read entries in.
+    let per_endpoint = futures_util::future::join_all(ordered_base_urls.into_iter().map(
+        |(base_url, api_key_source)| {
+            let cancellation = cancellation.clone();
+            async move {
+                let mut local_checks = Vec::new();
+                let outcome = check_one_endpoint(
+                    services,
+                    &base_url,
+                    &api_key_source,
+                    cancellation.as_ref(),
+                    &mut local_checks,
+                )
+                .await;
+                (base_url, outcome, local_checks)
             }
-        };
-        let model_ids =
-            fetch_models(&base_url, api_key.as_deref(), cancellation.as_ref(), checks).await?;
-        results.insert(base_url, model_ids);
+        },
+    ))
+    .await;
+
+    let mut results = HashMap::new();
+    for (base_url, outcome, local_checks) in per_endpoint {
+        checks.extend(local_checks);
+        match outcome {
+            Ok(model_ids) => {
+                results.insert(base_url, model_ids);
+            }
+            // Matches the previous sequential behavior of aborting the
+            // whole check on the first genuine interruption; which
+            // endpoint's cancellation is reported first now follows
+            // `ordered_base_urls`'s declared order rather than whichever
+            // happened to be cancelled first, which is immaterial — the
+            // command is exiting either way.
+            Err(error) => return Err(error),
+        }
     }
     Ok(results)
+}
+
+/// One endpoint's share of [`check_connectivity`]'s work: resolve its API
+/// key, then fetch its model list. Split out so it can run inside a
+/// per-endpoint future without the borrow-checker friction of mutating a
+/// shared `checks: &mut Vec<Check>` from several concurrent closures.
+async fn check_one_endpoint(
+    services: &AppServices,
+    base_url: &str,
+    api_key_source: &ApiKeySource,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    checks: &mut Vec<Check>,
+) -> Result<Option<HashSet<String>>> {
+    let api_key = match services
+        .secret_resolver
+        .resolve(api_key_source, cancellation.cloned())
+        .await
+    {
+        Ok(api_key) => api_key,
+        Err(error) => {
+            if is_interrupted(&error) {
+                return Err(error);
+            }
+            checks.push(Check::error(
+                "connectivity",
+                base_url.to_owned(),
+                format!("API キーの解決に失敗しました: {error:#}"),
+                Some(
+                    "api_key/api_key_cmd の設定と secret manager の状態を確認してください"
+                        .to_owned(),
+                ),
+            ));
+            return Ok(None);
+        }
+    };
+    fetch_models(base_url, api_key.as_deref(), cancellation, checks).await
 }
 
 async fn fetch_models(
@@ -615,11 +669,16 @@ fn check_models_on_server(
 }
 
 /// Checks 6. every `mcp_servers:` entry actually starts and initializes —
-/// issue #56's "6. mcp_servers: の各サーバーの起動・初期化" check. Each
-/// server is connected to (and its tools listed) one at a time, bounded by
-/// `MCP_CHECK_TIMEOUT` so a broken server can't make `doctor` hang; every
-/// connection this opens is shut down before returning, whether it
-/// succeeded or not.
+/// issue #56's "6. mcp_servers: の各サーバーの起動・初期化" check. Every
+/// server is connected to (and its tools listed) concurrently rather than
+/// one at a time — `McpRegistry::tools` already connects concurrently
+/// internally when given every name in one call, but that call fails the
+/// whole batch on the first server's error, which would lose the
+/// per-server diagnostic this check exists to produce; checking servers
+/// one future per name, each still bounded by `MCP_CHECK_TIMEOUT` so a
+/// broken server can't make `doctor` hang, keeps that diagnostic while
+/// still connecting every server in parallel. Every connection this opens
+/// is shut down before returning, whether it succeeded or not.
 async fn check_mcp_servers(file_config: &ConfigFile, checks: &mut Vec<Check>) {
     if file_config.mcp_servers.is_empty() {
         return;
@@ -629,35 +688,42 @@ async fn check_mcp_servers(file_config: &ConfigFile, checks: &mut Vec<Check>) {
 
     let mut names: Vec<&String> = servers.keys().collect();
     names.sort_unstable();
-    for name in names {
-        let outcome = tokio::time::timeout(
-            MCP_CHECK_TIMEOUT,
-            registry.tools(std::slice::from_ref(name), None),
-        )
-        .await;
-        match outcome {
-            Ok(Ok(tool_set)) => checks.push(Check::ok(
-                "mcp",
-                name.clone(),
-                format!(
-                    "起動・初期化に成功しました（{}個のツール）",
-                    tool_set.tools.len()
+    let server_checks = futures_util::future::join_all(names.into_iter().map(|name| {
+        let registry = &registry;
+        async move {
+            let outcome = tokio::time::timeout(
+                MCP_CHECK_TIMEOUT,
+                registry.tools(std::slice::from_ref(name), None),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(tool_set)) => Check::ok(
+                    "mcp",
+                    name.clone(),
+                    format!(
+                        "起動・初期化に成功しました（{}個のツール）",
+                        tool_set.tools.len()
+                    ),
                 ),
-            )),
-            Ok(Err(error)) => checks.push(Check::error(
-                "mcp",
-                name.clone(),
-                format!("{error:#}"),
-                Some("command/args/env、または url/headers の設定を確認してください".to_owned()),
-            )),
-            Err(_) => checks.push(Check::error(
-                "mcp",
-                name.clone(),
-                format!("{}秒でタイムアウトしました", MCP_CHECK_TIMEOUT.as_secs()),
-                Some("サーバーが正しく起動・応答するか手動で確認してください".to_owned()),
-            )),
+                Ok(Err(error)) => Check::error(
+                    "mcp",
+                    name.clone(),
+                    format!("{error:#}"),
+                    Some(
+                        "command/args/env、または url/headers の設定を確認してください".to_owned(),
+                    ),
+                ),
+                Err(_) => Check::error(
+                    "mcp",
+                    name.clone(),
+                    format!("{}秒でタイムアウトしました", MCP_CHECK_TIMEOUT.as_secs()),
+                    Some("サーバーが正しく起動・応答するか手動で確認してください".to_owned()),
+                ),
+            }
         }
-    }
+    }))
+    .await;
+    checks.extend(server_checks);
 
     registry.shutdown().await;
 }
