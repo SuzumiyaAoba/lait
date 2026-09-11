@@ -372,10 +372,6 @@ async fn run_chat(
         Some(name) => prompt::render_named(name, &prompt, &chat.var.var, &file_config)?,
         None => (prompt, None),
     };
-    let prompt = match attachment::read_file_attachments(&chat.files).await? {
-        Some(file_context) => format!("{prompt}\n\n{file_context}"),
-        None => prompt,
-    };
 
     let settings =
         chat::resolve_chat_settings(&chat.shared, prompt_model_fallback.as_deref(), &file_config)?;
@@ -386,9 +382,22 @@ async fn run_chat(
         .map(|path| schema::load_json_schema(path, &chat.schema_name))
         .transpose()?;
 
-    let system_prompt =
-        chat::resolve_system_prompt(&chat.shared, &file_config, Some(cancel.clone())).await?;
-    let image_urls = attachment::resolve_image_urls(&chat.images).await?;
+    // These three reads are independent of each other and of everything
+    // above: file attachments only need `chat.files`, the system prompt
+    // only needs `chat.shared`/`file_config`, and image URLs only need
+    // `chat.images`. Running them concurrently rather than one after
+    // another (as `workflow/exec.rs` already does for its own file+image
+    // pair via `tokio::try_join!`) shortens the wall-clock delay before the
+    // first token on e.g. `lait -f a.rs -f b.rs --image x.png "..."`.
+    let (file_context, system_prompt, image_urls) = tokio::try_join!(
+        attachment::read_file_attachments(&chat.files),
+        chat::resolve_system_prompt(&chat.shared, &file_config, Some(cancel.clone())),
+        attachment::resolve_image_urls(&chat.images),
+    )?;
+    let prompt = match file_context {
+        Some(file_context) => format!("{prompt}\n\n{file_context}"),
+        None => prompt,
+    };
     let session_history = chat::load_session_history(chat.shared.session.as_deref())?;
     let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
