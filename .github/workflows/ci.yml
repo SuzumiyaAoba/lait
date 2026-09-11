@@ -8,8 +8,16 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Rust checks
+  # Split from `test` (rather than one `checks` job running fmt/clippy then
+  # tests in sequence) so a clippy or fmt regression can never hide a test
+  # regression: the two used to share a job, and when clippy started
+  # failing on a newer toolchain, `cargo test` after it in the same step
+  # list never ran at all — a decisive test failure (a broken SIGINT
+  # checkpoint path) went undetected on `master` for several commits.
+  # Independent jobs run in parallel and both always report their own
+  # status regardless of the other's outcome.
+  lint:
+    name: Rust lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -30,6 +38,21 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
 
       - name: Run tests
         run: cargo test --locked
