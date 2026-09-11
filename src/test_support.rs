@@ -84,7 +84,12 @@ pub(crate) fn in_temp_dir<T>(label: &str, body: impl FnOnce() -> T) -> T {
 /// helpers actually take offloads to a plain OS thread (see
 /// `async_io::run_blocking`'s doc comment) rather than `tokio::spawn`, so
 /// nothing requires this function's own future, or the `MutexGuard`/
-/// `DirectoryGuard` it holds across the `.await`, to be `Send`.
+/// `DirectoryGuard` it holds across the `.await`, to be `Send`. clippy can't
+/// see that reasoning, only that a `std::sync::MutexGuard` crosses an
+/// `.await` point — hence the `#[allow]` below rather than switching to a
+/// `tokio::sync::Mutex`, which would suggest a runtime hazard that isn't
+/// actually present here.
+#[allow(clippy::await_holding_lock)]
 pub(crate) async fn in_temp_dir_async<T>(
     label: &str,
     body: impl std::future::Future<Output = T>,
