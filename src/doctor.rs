@@ -16,7 +16,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
     cli::DoctorArgs,
@@ -24,6 +24,10 @@ use crate::{
     engine::AppServices,
     llm, mcp,
 };
+
+mod report;
+
+use report::{Check, Status, emit};
 
 /// How long one `mcp_servers:` entry is given to start and initialize before
 /// being reported as failed. Much shorter than `mcp`'s own internal
@@ -34,80 +38,6 @@ const MCP_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long one `GET {base_url}/models` request is given.
 const CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum Status {
-    Ok,
-    Warn,
-    Error,
-}
-
-impl std::fmt::Display for Status {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Status::Ok => "OK",
-            Status::Warn => "WARN",
-            Status::Error => "NG",
-        })
-    }
-}
-
-/// One diagnostic finding. `category` groups related checks in the report
-/// (`config`/`env`/`model`/`connectivity`/`models_on_server`/`mcp`/`files`);
-/// `name` identifies what was checked within that category (a config key, a
-/// base URL, a server name, ...).
-#[derive(Debug, Serialize)]
-struct Check {
-    category: String,
-    name: String,
-    status: Status,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<String>,
-}
-
-impl Check {
-    fn ok(category: &str, name: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            category: category.to_owned(),
-            name: name.into(),
-            status: Status::Ok,
-            message: message.into(),
-            hint: None,
-        }
-    }
-
-    fn warn(
-        category: &str,
-        name: impl Into<String>,
-        message: impl Into<String>,
-        hint: Option<String>,
-    ) -> Self {
-        Self {
-            category: category.to_owned(),
-            name: name.into(),
-            status: Status::Warn,
-            message: message.into(),
-            hint,
-        }
-    }
-
-    fn error(
-        category: &str,
-        name: impl Into<String>,
-        message: impl Into<String>,
-        hint: Option<String>,
-    ) -> Self {
-        Self {
-            category: category.to_owned(),
-            name: name.into(),
-            status: Status::Error,
-            message: message.into(),
-            hint,
-        }
-    }
-}
 
 pub(crate) async fn run(
     args: DoctorArgs,
@@ -205,35 +135,6 @@ pub(crate) async fn run(
     if error_count > 0 {
         bail!("lait doctor found {error_count} error(s)");
     }
-    Ok(())
-}
-
-fn emit(checks: &[Check], json: bool) -> Result<()> {
-    let ok = checks.iter().filter(|c| c.status == Status::Ok).count();
-    let warn = checks.iter().filter(|c| c.status == Status::Warn).count();
-    let error = checks.iter().filter(|c| c.status == Status::Error).count();
-
-    if json {
-        let output = serde_json::json!({
-            "checks": checks,
-            "summary": {"ok": ok, "warn": warn, "error": error},
-        });
-        println!("{}", serde_json::to_string(&output)?);
-        return Ok(());
-    }
-
-    let mut last_category: Option<&str> = None;
-    for check in checks {
-        if last_category != Some(check.category.as_str()) {
-            println!("== {} ==", check.category);
-            last_category = Some(&check.category);
-        }
-        println!("  [{}] {}: {}", check.status, check.name, check.message);
-        if let Some(hint) = &check.hint {
-            println!("        hint: {hint}");
-        }
-    }
-    println!("\n{ok} OK, {warn} WARN, {error} NG");
     Ok(())
 }
 
