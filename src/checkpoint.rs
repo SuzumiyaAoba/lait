@@ -166,7 +166,7 @@ pub(crate) async fn save_cancellable(
 
 fn read(path: &Path) -> Result<Checkpoint> {
     let body = crate::async_io::read_to_string_sync(path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
+        .with_context(|| crate::storage::read_context(path))?;
     serde_json::from_str(&body)
         .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
 }
@@ -206,7 +206,7 @@ async fn load_path_cancellable(
                 cancelled,
                 crate::async_io::MAX_READ_BYTES,
             )
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
+            .with_context(|| crate::storage::read_context(&path))?;
             serde_json::from_str(&body)
                 .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
         },
@@ -230,7 +230,7 @@ pub(crate) fn list() -> Result<Vec<Checkpoint>> {
             continue;
         }
         if entry.is_symlink {
-            bail!("refusing to follow symbolic link '{}'", path.display());
+            return Err(jsonl::refusing_symlink(&path));
         }
         checkpoints.push(read(&path)?);
     }

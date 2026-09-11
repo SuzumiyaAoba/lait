@@ -28,30 +28,37 @@ use std::{
 #[cfg(not(unix))]
 use std::fs::Metadata;
 
-#[cfg(not(unix))]
-use anyhow::anyhow;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
 
 #[cfg(not(unix))]
-fn refusing_symlink(path: &Path) -> anyhow::Error {
+use crate::storage::read_dir_context;
+use crate::storage::{create_dir_context, read_context};
+
+/// Rejects a symlink found among directory entries this crate has already
+/// listed (`read_dir`'s `is_symlink` flag) — shared with `session::list` and
+/// `checkpoint::list`, which perform the same check outside this file and on
+/// every platform. Not to be confused with this module's own low-level,
+/// platform-specific symlink guards below (`unix_relative::refusing_symlink`,
+/// `check_final_path`'s inline `Err`), which run *before* a path is read and
+/// so cannot reuse a helper shaped around an already-known path.
+pub(crate) fn refusing_symlink(path: &Path) -> anyhow::Error {
     anyhow!("refusing to follow symbolic link '{}'", path.display())
 }
 
-/// The six `with_context`/`.context` message shapes this file repeats most
-/// (`open_parent`/`inspect`/`read`/`write`/`remove`/`open`, ~28 sites
-/// combined across `unix_relative` and the `#[cfg(unix)]`/`#[cfg(not(unix))]`
-/// pairs below it), matching `config::load::config_read_error_context`'s
-/// shape: a plain function returning the message, called as
-/// `.with_context(|| open_parent_context(path))`.
+/// The `with_context`/`.context` message shapes this file repeats most
+/// (`open_parent`/`inspect`/`open`, ~19 sites combined across `unix_relative`
+/// and the `#[cfg(unix)]`/`#[cfg(not(unix))]` pairs below it), matching
+/// `config::load::config_read_error_context`'s shape: a plain function
+/// returning the message, called as `.with_context(|| open_parent_context(path))`.
+/// `read`/`read directory`/`create directory` are shared more widely still
+/// (`cache`, `checkpoint`, `lint::targets`, `test_run` all perform the same
+/// actions), so those three live in `storage` instead — imported below.
 fn open_parent_context(path: &Path) -> String {
     format!("failed to open parent of '{}'", path.display())
 }
 fn inspect_context(path: &Path) -> String {
     format!("failed to inspect '{}'", path.display())
-}
-fn read_context(path: &Path) -> String {
-    format!("failed to read '{}'", path.display())
 }
 fn write_context(path: &Path) -> String {
     format!("failed to write to '{}'", path.display())
@@ -477,8 +484,7 @@ fn check_relative_parent(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn ensure_relative_dir(parent: &Path) -> Result<()> {
     check_relative_parent(&parent.join("session.jsonl"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| create_dir_context(parent))?;
     check_relative_parent(&parent.join("session.jsonl"))
 }
 
@@ -594,8 +600,7 @@ fn read_dir_relative(path: &Path) -> Result<Vec<RelativeDirEntry>> {
     if !directory_exists_relative(path)? {
         return Ok(Vec::new());
     }
-    let entries = fs::read_dir(path)
-        .with_context(|| format!("failed to read directory '{}'", path.display()))?;
+    let entries = fs::read_dir(path).with_context(|| read_dir_context(path))?;
     entries
         .map(|entry| {
             let entry = entry.with_context(|| {
@@ -622,8 +627,7 @@ pub(crate) fn append(path: &Path, records: impl IntoIterator<Item = impl Seriali
         return append_relative(path, records);
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| create_dir_context(parent))?;
     }
     let mut file = open_for_append(path).with_context(|| open_context(path))?;
     for record in records {

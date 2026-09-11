@@ -11,6 +11,23 @@ use anyhow::{Context, Result, bail};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Shared `with_context`/`.context` message shapes for plain filesystem
+/// reads, listings, and directory creation — the same three actions
+/// `write_atomic` below and several other modules (`cache`, `checkpoint`,
+/// `lint::targets`, `test_run`) all perform on paths outside their own
+/// control, repeated verbatim often enough (`config::load::config_read_error_context`
+/// set the precedent) to warrant one shared spelling per action rather than
+/// a `format!` at each call site.
+pub(crate) fn read_context(path: &Path) -> String {
+    format!("failed to read '{}'", path.display())
+}
+pub(crate) fn read_dir_context(path: &Path) -> String {
+    format!("failed to read directory '{}'", path.display())
+}
+pub(crate) fn create_dir_context(path: &Path) -> String {
+    format!("failed to create directory '{}'", path.display())
+}
+
 struct PendingFile(PathBuf);
 
 impl Drop for PendingFile {
@@ -27,8 +44,7 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| create_dir_context(parent))?;
     let name = path
         .file_name()
         .context("snapshot path must have a file name")?;

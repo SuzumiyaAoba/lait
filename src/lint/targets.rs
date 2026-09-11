@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::storage;
+
 /// Directory names `lait lint <DIR>` never descends into, even though they
 /// don't start with `.` (dot-directories, e.g. `.git`, are always skipped
 /// too) — scanning them would be slow, and their `.yml`/`.md` files
@@ -36,9 +38,9 @@ pub(super) fn expand_lint_targets(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 fn collect_lintable_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries = std::fs::read_dir(dir)
-        .with_context(|| format!("failed to read directory '{}'", dir.display()))?
+        .with_context(|| storage::read_dir_context(dir))?
         .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("failed to read directory '{}'", dir.display()))?;
+        .with_context(|| storage::read_dir_context(dir))?;
     // Deterministic traversal order, so directory expansion is stable across
     // runs/platforms (relied on by tests, and generally friendlier for CI
     // diffs than filesystem-dependent order).
@@ -74,12 +76,11 @@ fn collect_lintable_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 fn has_frontmatter_delimiter(path: &Path) -> Result<bool> {
     use std::io::BufRead;
 
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| storage::read_context(path))?;
     let mut first_line = String::new();
     std::io::BufReader::new(file)
         .read_line(&mut first_line)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
+        .with_context(|| storage::read_context(path))?;
     Ok(first_line.trim_end_matches(['\n', '\r']) == "---")
 }
 

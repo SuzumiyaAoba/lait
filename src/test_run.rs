@@ -19,7 +19,7 @@ use crate::{
     cli::{TestArgs, TestFormat},
     config::{self, ConfigFile, ConfigSource},
     engine::{AppServices, RunContext},
-    signal,
+    signal, storage,
     workflow::{
         self, WorkflowScope,
         exec::{RunStepsFrame, run_steps},
@@ -158,9 +158,9 @@ impl TestTargetCollector {
         }
 
         let mut entries: Vec<_> = std::fs::read_dir(path)
-            .with_context(|| format!("failed to read directory '{}'", path.display()))?
+            .with_context(|| storage::read_dir_context(path))?
             .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("failed to read directory '{}'", path.display()))?;
+            .with_context(|| storage::read_dir_context(path))?;
         entries.sort_by_key(std::fs::DirEntry::path);
         for entry in entries {
             check_discovery_cancellation(cancellation)?;

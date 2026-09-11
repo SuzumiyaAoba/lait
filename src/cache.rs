@@ -31,7 +31,7 @@ use crate::{
     async_io,
     cli::{CacheAction, CacheCommand},
     engine::SamplingOverrides,
-    response,
+    response, storage,
 };
 
 /// The directory every cache entry lives under, relative to the current
@@ -157,7 +157,7 @@ pub(crate) async fn load(
             Ok(body) => body,
             Err(error) if async_io::is_not_found(&error) => return Ok(None),
             Err(error) => {
-                return Err(error).with_context(|| format!("failed to read '{}'", path.display()));
+                return Err(error).with_context(|| storage::read_context(&path));
             }
         };
     let Ok(entry) = serde_json::from_str::<CacheEntry>(&body) else {
