@@ -3,13 +3,7 @@
 //! its retry/timeout handling). Router control flow and output aggregation
 //! live in `routers`; model calls go through `crate::engine`.
 
-use std::{
-    borrow::Cow,
-    future::Future,
-    path::{Path, PathBuf},
-    pin::Pin,
-    time::Duration,
-};
+use std::{borrow::Cow, future::Future, path::PathBuf, pin::Pin, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -18,14 +12,15 @@ use crate::{
     async_io, attachment,
     config::{self, ConfigFile},
     engine::{
-        AgentTurn, CapabilityOverrides, PromptTurn, RequestSettings, RunContext, SamplingOverrides,
-        call_agent, resolve_request_settings,
+        CapabilityOverrides, RequestSettings, RunContext, SamplingOverrides,
+        resolve_request_settings,
     },
-    jq, response, schema, template, workflow,
+    jq, template, workflow,
 };
 
 use super::WorkflowScope;
 
+mod nodes;
 mod routers;
 
 /// Attaches the `step '<label>'` context every step-level error carries, so
@@ -778,247 +773,27 @@ async fn resolve_attachments<'a>(
 /// Runs a single node (agent call, prompt call, sub-workflow, command, or
 /// `jq`/`write_file`-only data transform) and returns its output, with `jq`
 /// applied afterward if set. `label` is the calling `use:` site's label,
-/// used only for progress output/error messages.
+/// used only for progress output/error messages. The per-node-type action
+/// itself lives in `nodes::execute` — this wrapper adds only what applies
+/// uniformly across every node type: `jq`/`write_file`.
 async fn execute_step(
     node: &workflow::NodeDefinition,
     current_input: &str,
     context: StepContext<'_>,
 ) -> Result<String> {
+    // Cloned before `context` is moved into `nodes::execute` below — cheap
+    // (borrowed fields are `Copy`, `step_cancel` is an `Option<CancellationToken>`
+    // clone) and lets this wrapper keep what it needs for the jq/write_file
+    // tail without `nodes::execute` having to hand any of it back.
     let StepContext {
-        scope,
         env,
-        placement,
         label,
-        progress_prefix,
         steps_outputs,
         step_cancel,
-    } = context;
+        ..
+    } = context.clone();
 
-    let mut step_output = match node {
-        workflow::NodeDefinition::Prompt(prompt_node) => {
-            // Parsed once and shared with the `RenderScope` built below —
-            // `input_schema` validation and prompt/system_prompt rendering
-            // both need the same parsed value.
-            let input = template::parse_input(current_input);
-            if let Some(name_or_path) = &prompt_node.input_schema {
-                let schema = schema::resolve_named_schema_value_cancellable(
-                    &scope.json_schemas,
-                    name_or_path,
-                    step_cancel.clone(),
-                )
-                .await
-                .step(label)?;
-                schema::validate_input_against_schema(&schema, &input).step(label)?;
-            }
-
-            let settings =
-                resolve_step_settings(node, scope, &env.services.file_config, None, label)?
-                    .with_usage_label(label);
-
-            let response_format = match prompt_node.output_schema.as_deref() {
-                Some(name_or_path) => {
-                    let schema_name = prompt_node
-                        .schema_name
-                        .as_deref()
-                        .unwrap_or("structured_output");
-                    let response_format = match scope.json_schemas.get(name_or_path) {
-                        Some(entry) => {
-                            schema::build_response_format_from_entry_cancellable(
-                                entry,
-                                schema_name,
-                                step_cancel.clone(),
-                            )
-                            .await
-                        }
-                        None => {
-                            schema::load_json_schema_cancellable(
-                                Path::new(name_or_path),
-                                schema_name,
-                                step_cancel.clone(),
-                            )
-                            .await
-                        }
-                    };
-                    Some(response_format.step(label)?)
-                }
-                None => None,
-            };
-
-            // Built once and shared by both renders below: handlebars'
-            // `Context` owns a clone of `input`/`steps_outputs`/`env.vars`,
-            // so rendering `prompt`/`system_prompt` through one scope
-            // clones that data once instead of once per template.
-            let render_scope = template::RenderScope::new(&input, steps_outputs, &env.vars);
-            // A `system_prompt`-only node (no `prompt`) sends the current
-            // input unchanged as the user message, the same way an `agent`
-            // node's `current_input` passes straight through `call_agent`
-            // without going through `template::render`.
-            let prompt: Cow<'_, str> = match &prompt_node.prompt {
-                Some(prompt_template) => {
-                    Cow::Owned(render_scope.render(prompt_template).step(label)?)
-                }
-                None => Cow::Borrowed(current_input),
-            };
-            let (prompt, image_urls) = resolve_attachments(
-                prompt_node.files.as_deref(),
-                prompt_node.images.as_deref(),
-                &prompt,
-                label,
-                step_cancel.clone(),
-            )
-            .await?;
-            let system_prompt = prompt_node
-                .system_prompt
-                .as_deref()
-                .or(scope.defaults.system_prompt.as_deref())
-                .map(|system_prompt_template| render_scope.render(system_prompt_template))
-                .transpose()
-                .step(label)?;
-
-            let response = settings
-                .complete(
-                    env,
-                    &[],
-                    PromptTurn {
-                        system_prompt: system_prompt.as_deref(),
-                        history: &[],
-                        prompt: &prompt,
-                        image_urls: &image_urls,
-                    },
-                    response_format,
-                    step_cancel.clone(),
-                )
-                .await
-                .step(label)?;
-
-            response::render_response(&response, false, false).step(label)?
-        }
-        workflow::NodeDefinition::Agent(agent_node) => {
-            // Loaded through the registry's path cache (not
-            // `agent::load_agent` directly) so a `for_each`/`loop` body
-            // re-running this node reuses the parsed file and its resolved
-            // input schema instead of re-reading both from disk on every
-            // iteration.
-            let loaded = env
-                .services
-                .agent_registry
-                .load_path_cancellable(&agent_node.agent, step_cancel.clone())
-                .await
-                .step(label)?;
-            let agent_file = &loaded.file;
-
-            let input = template::parse_input(current_input);
-            loaded.validate_input(&input).step(label)?;
-
-            let settings = resolve_step_settings(
-                node,
-                scope,
-                &env.services.file_config,
-                Some(agent_file),
-                label,
-            )?
-            .with_usage_label(label);
-
-            let (prompt, image_urls) = resolve_attachments(
-                agent_node.files.as_deref(),
-                agent_node.images.as_deref(),
-                current_input,
-                label,
-                step_cancel.clone(),
-            )
-            .await?;
-
-            call_agent(
-                agent_file,
-                &settings,
-                env,
-                AgentTurn {
-                    input: &input,
-                    prompt: &prompt,
-                    image_urls: &image_urls,
-                },
-                steps_outputs,
-                std::slice::from_ref(&loaded.canonical_path),
-                step_cancel.clone(),
-            )
-            .await
-            .step(label)?
-        }
-        workflow::NodeDefinition::Workflow(workflow_node) => {
-            // Resolve cycles before opening a child file: a recursive FIFO
-            // reference must fail rather than waiting for a second writer.
-            let resolved_path = scope
-                .resolve_nested_path(&workflow_node.workflow, label, step_cancel.clone())
-                .await?;
-            // Cached by path for the lifetime of the run — a `for_each`/
-            // `loop` body re-running this node reuses the parsed file
-            // instead of re-reading and re-parsing the same YAML on every
-            // iteration (see `workflow::WorkflowRegistry`).
-            let sub_wf = env
-                .services
-                .workflow_registry
-                .load_path_cancellable(&resolved_path, step_cancel.clone())
-                .await
-                .step(label)?;
-            validate_execution_placement(&sub_wf.steps, placement).with_context(|| {
-                format!("step '{label}': workflow '{}'", resolved_path.display())
-            })?;
-            let sub_scope = scope.nested(resolved_path, &sub_wf);
-            announce_named_file(
-                &format!("{progress_prefix}    ->"),
-                sub_wf.name.as_deref(),
-                sub_wf.description.as_deref(),
-            );
-            // Isolated like an `agent:` call, not threaded like a `switch`
-            // case: the sub-workflow is a separate file with its own step
-            // ids, so it starts with an empty `steps_outputs` and its Flow
-            // (whether it ended via `stop`/`break` internally or just ran
-            // out of steps) is this step's own concern, not the caller's —
-            // only its final output crosses back.
-            let sub_progress_prefix = format!("{progress_prefix}    ");
-            let StepsOutcome { output: result, .. } = run_steps(
-                &sub_wf.steps,
-                current_input.to_string(),
-                workflow::StepOutputs::new(),
-                RunStepsFrame {
-                    scope: &sub_scope,
-                    env,
-                    start_counter: 0,
-                    progress_prefix: &sub_progress_prefix,
-                    cancellation: step_cancel.clone(),
-                    placement,
-                },
-            )
-            .await
-            .step(label)?;
-            result
-        }
-        workflow::NodeDefinition::Command(command_node) => {
-            let input = template::parse_input(current_input);
-            // One `RenderScope` for every argv element, instead of
-            // rebuilding a handlebars `Context` (a clone of `input`/
-            // `steps_outputs`/`env.vars`) per element.
-            let render_scope = template::RenderScope::new(&input, steps_outputs, &env.vars);
-            let rendered_argv: Vec<String> = command_node
-                .command
-                .iter()
-                .map(|arg| render_scope.render(arg))
-                .collect::<Result<_>>()
-                .step(label)?;
-            crate::process::run_command(&rendered_argv, current_input, step_cancel.clone())
-                .await
-                .step(label)?
-        }
-        workflow::NodeDefinition::Transform(_) => current_input.to_string(),
-        workflow::NodeDefinition::Ask(ask_node) => {
-            let input = template::parse_input(current_input);
-            let prompt =
-                template::render(&ask_node.prompt, &input, steps_outputs, &env.vars).step(label)?;
-            super::ask::run_ask(&prompt, ask_node, step_cancel.clone())
-                .await
-                .step(label)?
-        }
-    };
+    let mut step_output = nodes::execute(node, current_input, context).await?;
 
     let settings = node.settings();
     if let Some(filter) = settings.jq {
