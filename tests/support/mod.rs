@@ -19,6 +19,21 @@ pub(crate) const MINIMAL_PNG_BYTES: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02,
 ];
 
+/// A minimal, valid OpenAI-compatible chat-completion response body with
+/// `model`/`content` filled in — the shape every mock LLM server in this
+/// suite needs `MockServer` to return. Several test files used to each keep
+/// this as an identical file-local const (`model`/`content` hardcoded), and
+/// many more spelled the same literal inline; a change to the response
+/// shape the CLI actually parses no longer means editing every one of them.
+/// `content` is inserted as a raw JSON string body — pass a value that is
+/// already valid inside a JSON string (as every existing caller's literal
+/// content already was) rather than arbitrary text needing escaping.
+pub(crate) fn completion_body(model: &str, content: &str) -> String {
+    format!(
+        r#"{{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"{model}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{content}"}},"finish_reason":"stop"}}]}}"#
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct HttpRequest {
     pub(crate) method: String,

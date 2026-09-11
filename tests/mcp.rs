@@ -21,8 +21,6 @@ use support::{
 #[cfg(unix)]
 use support::next_temp_path;
 
-const CHAT_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
-
 #[cfg(unix)]
 const STDIO_MCP_BLOCKING_TOOL_SCRIPT: &str = r#"#!/bin/sh
 set -eu
@@ -772,7 +770,10 @@ fn rejects_a_repeated_tools_list_pagination_cursor() {
 
 #[test]
 fn retries_mcp_tool_listing_with_a_fresh_connection_after_a_failure() {
-    let llm_server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let llm_server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let (mcp_url, mcp_thread) = start_recovering_mcp_server();
     let config = ConfigDirectory::new(&format!("mcp_servers:\n  mock:\n    url: \"{mcp_url}\"\n",));
     let workflow = WorkflowFile::new(&format!(
@@ -983,7 +984,10 @@ fn successful_run_stops_and_reaps_its_stdio_mcp_descendant() {
     let marker = next_temp_path("lait-test-mcp-success-descendant", ".pid");
     let alive = next_temp_path("lait-test-mcp-success-descendant", ".alive");
     let config = stdio_mcp_config(&script, &marker, &alive);
-    let llm_server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let llm_server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let workflow = WorkflowFile::new(&format!(
         r#"
 default:

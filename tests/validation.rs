@@ -11,10 +11,9 @@ fn a_missing_file_named_cancelled_is_not_an_interrupted_run() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
 }
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use support::{
-    ConfigDirectory, JsonSchemaFile, LaitCommand, WorkflowFile, run_lait_workflow, test_command,
+    ConfigDirectory, JsonSchemaFile, LaitCommand, WorkflowFile, next_temp_path, run_lait_workflow,
+    test_command,
 };
 
 #[test]
@@ -37,14 +36,7 @@ fn reports_invalid_json_schema_file_with_path_context() {
 
 #[test]
 fn reports_missing_json_schema_file_with_path_context() {
-    let path = std::env::temp_dir().join(format!(
-        "lait-missing-schema-{}-{}.json",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos()
-    ));
+    let path = next_temp_path("lait-missing-schema", ".json");
     assert!(
         !path.exists(),
         "test schema path unexpectedly exists: {path:?}"

@@ -2,11 +2,12 @@ mod support;
 
 use support::{AgentMarkdownFile, ConfigDirectory, MockServer, test_command};
 
-const CHAT_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
-
 #[test]
 fn agent_run_appends_skill_content_after_the_agents_own_system_prompt() {
-    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let config = ConfigDirectory::new(&format!(
         "base_url: \"{}\"\ndefault:\n  model: test-model\nskills:\n  code-review: skill.md\n",
         server.base_url
@@ -45,7 +46,10 @@ fn agent_run_appends_skill_content_after_the_agents_own_system_prompt() {
 
 #[test]
 fn chat_appends_default_skills_with_no_system_prompt_of_its_own() {
-    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let config = ConfigDirectory::new(&format!(
         "base_url: \"{}\"\ndefault:\n  model: test-model\n  skills: [code-review]\nskills:\n  code-review: skill.md\n",
         server.base_url

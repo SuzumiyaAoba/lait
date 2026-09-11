@@ -2,11 +2,12 @@ mod support;
 
 use support::{ConfigDirectory, MockServer, test_command, without_json_whitespace};
 
-const RESPONSE: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
-
 #[test]
 fn sends_the_system_flag_as_a_system_message() {
-    let server = MockServer::start("200 OK", RESPONSE);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let output = test_command()
         .args(["--model", "test-model", "--base-url", &server.base_url])
         .args(["--system", "you are a translator"])
@@ -34,7 +35,10 @@ fn reads_the_system_prompt_from_a_file() {
     let system_path = config_dir.path().join("system.txt");
     std::fs::write(&system_path, "system from file\n").expect("failed to write system file");
 
-    let server = MockServer::start("200 OK", RESPONSE);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let output = test_command()
         .args(["--model", "test-model", "--base-url", &server.base_url])
         .arg("--system-file")
@@ -93,7 +97,10 @@ fn rejects_system_and_system_file_together() {
 fn falls_back_to_default_system_from_the_config_file() {
     let config_dir = ConfigDirectory::new("default:\n  system: config system prompt\n");
 
-    let server = MockServer::start("200 OK", RESPONSE);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let output = test_command()
         .current_dir(config_dir.path())
         .args(["--model", "test-model", "--base-url", &server.base_url])
@@ -115,7 +122,10 @@ fn falls_back_to_default_system_from_the_config_file() {
 fn the_system_flag_overrides_the_config_default() {
     let config_dir = ConfigDirectory::new("default:\n  system: config system prompt\n");
 
-    let server = MockServer::start("200 OK", RESPONSE);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let output = test_command()
         .current_dir(config_dir.path())
         .args(["--model", "test-model", "--base-url", &server.base_url])

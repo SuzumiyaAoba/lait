@@ -182,16 +182,8 @@ steps:
 
 #[test]
 fn a_workflow_step_cycle_is_rejected() {
-    let unique = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let a_path = std::env::temp_dir().join(format!("lait-test-cycle-a-{unique}.yml"));
-    let b_path = std::env::temp_dir().join(format!("lait-test-cycle-b-{unique}.yml"));
+    let a_path = support::next_temp_path("lait-test-cycle-a", ".yml");
+    let b_path = support::next_temp_path("lait-test-cycle-b", ".yml");
 
     std::fs::write(
         &a_path,

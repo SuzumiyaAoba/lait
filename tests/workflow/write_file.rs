@@ -6,15 +6,7 @@ fn write_file_writes_the_steps_output_without_changing_what_flows_downstream() {
         ("200 OK", CHAT_COMPLETION_BODY),
         ("200 OK", CHAT_COMPLETION_BODY),
     ]);
-    let unique = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let output_path = std::env::temp_dir().join(format!("lait-test-write-file-{unique}.txt"));
+    let output_path = support::next_temp_path("lait-test-write-file", ".txt");
     let workflow = WorkflowFile::new(&format!(
         r#"
 default:

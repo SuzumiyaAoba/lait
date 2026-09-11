@@ -276,10 +276,7 @@ steps:
 
 #[test]
 fn step_input_schema_reports_a_missing_schema_file_with_path_context() {
-    let missing_path = std::env::temp_dir().join(format!(
-        "lait-missing-input-schema-{}.json",
-        std::process::id()
-    ));
+    let missing_path = support::next_temp_path("lait-missing-input-schema", ".json");
     assert!(
         !missing_path.exists(),
         "test schema path unexpectedly exists: {missing_path:?}"

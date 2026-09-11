@@ -4,11 +4,12 @@ use support::{
     AgentMarkdownFile, ConfigDirectory, MockServer, next_temp_path, run_lait_agent, test_command,
 };
 
-const CHAT_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#;
-
 #[test]
 fn agent_run_sends_a_rendered_system_prompt_and_the_raw_input_as_the_user_message() {
-    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let config = ConfigDirectory::new(&format!(
         "base_url: \"{}\"\ndefault:\n  model: test-model\n",
         server.base_url
@@ -119,7 +120,10 @@ fn agent_run_rejects_input_missing_a_field_required_by_the_input_schema() {
 
 #[test]
 fn agent_run_emits_json_with_the_same_shape_as_chat() {
-    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let config = ConfigDirectory::new(&format!(
         "base_url: \"{}\"\ndefault:\n  model: test-model\n",
         server.base_url
@@ -149,7 +153,10 @@ fn agent_run_emits_json_with_the_same_shape_as_chat() {
 
 #[test]
 fn agent_run_writes_the_response_to_a_file_with_o() {
-    let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
+    let server = MockServer::start(
+        "200 OK",
+        &support::completion_body("test-model", "mock response"),
+    );
     let config = ConfigDirectory::new(&format!(
         "base_url: \"{}\"\ndefault:\n  model: test-model\n",
         server.base_url
