@@ -59,28 +59,14 @@ pub(crate) struct GlobalConfigDirectory {
 
 impl JsonSchemaFile {
     pub(crate) fn new(contents: &str) -> Self {
-        let mut path = None;
-        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
-            let candidate = next_temp_path("lait-test-schema", ".json");
-            let mut file = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("failed to write test JSON schema: {error}"),
-            };
-            file.write_all(contents.as_bytes())
-                .expect("failed to write test JSON schema");
-            path = Some(candidate);
-            break;
-        }
-        let path = path.unwrap_or_else(|| {
-            panic!(
-                "failed to create a unique test JSON schema path after {MAX_TEMP_PATH_ATTEMPTS} attempts"
-            )
-        });
+        let path =
+            create_unique_temp_path("lait-test-schema", ".json", "JSON schema", |candidate| {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(candidate)?
+                    .write_all(contents.as_bytes())
+            });
         Self { path }
     }
 }
@@ -93,28 +79,14 @@ impl Drop for JsonSchemaFile {
 
 impl WorkflowFile {
     pub(crate) fn new(contents: &str) -> Self {
-        let mut path = None;
-        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
-            let candidate = next_temp_path("lait-test-workflow", ".yml");
-            let mut file = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("failed to write test workflow file: {error}"),
-            };
-            file.write_all(contents.as_bytes())
-                .expect("failed to write test workflow file");
-            path = Some(candidate);
-            break;
-        }
-        let path = path.unwrap_or_else(|| {
-            panic!(
-                "failed to create a unique test workflow path after {MAX_TEMP_PATH_ATTEMPTS} attempts"
-            )
-        });
+        let path =
+            create_unique_temp_path("lait-test-workflow", ".yml", "workflow file", |candidate| {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(candidate)?
+                    .write_all(contents.as_bytes())
+            });
         Self { path }
     }
 }
@@ -127,27 +99,12 @@ impl Drop for WorkflowFile {
 
 impl AgentMarkdownFile {
     pub(crate) fn new(contents: &str) -> Self {
-        let mut path = None;
-        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
-            let candidate = next_temp_path("lait-test-agent", ".md");
-            let mut file = match OpenOptions::new()
+        let path = create_unique_temp_path("lait-test-agent", ".md", "agent file", |candidate| {
+            OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("failed to write test agent file: {error}"),
-            };
-            file.write_all(contents.as_bytes())
-                .expect("failed to write test agent file");
-            path = Some(candidate);
-            break;
-        }
-        let path = path.unwrap_or_else(|| {
-            panic!(
-                "failed to create a unique test agent path after {MAX_TEMP_PATH_ATTEMPTS} attempts"
-            )
+                .open(candidate)?
+                .write_all(contents.as_bytes())
         });
         Self { path }
     }
@@ -161,23 +118,10 @@ impl Drop for AgentMarkdownFile {
 
 impl ConfigDirectory {
     pub(crate) fn empty() -> Self {
-        let mut path = None;
-        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
-            let candidate = next_temp_path("lait-test-config", "");
-            match fs::create_dir(&candidate) {
-                Ok(()) => {
-                    path = Some(candidate);
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("failed to create test config directory: {error}"),
-            }
-        }
-        let path = path.unwrap_or_else(|| {
-            panic!(
-                "failed to create a unique test config directory after {MAX_TEMP_PATH_ATTEMPTS} attempts"
-            )
-        });
+        let path =
+            create_unique_temp_path("lait-test-config", "", "config directory", |candidate| {
+                fs::create_dir(candidate)
+            });
         Self { path }
     }
 
@@ -194,6 +138,34 @@ impl ConfigDirectory {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Creates a uniquely-named temporary path via [`next_temp_path`], retrying
+/// on a name collision up to `MAX_TEMP_PATH_ATTEMPTS` times. `create` does
+/// the actual filesystem work for one candidate path (writing a file,
+/// creating a directory, ...): return `Err` with `ErrorKind::AlreadyExists`
+/// to retry with a fresh candidate, any other `Err` aborts immediately.
+/// `what` names the kind of path in the panic message.
+///
+/// `JsonSchemaFile::new`/`WorkflowFile::new`/`AgentMarkdownFile::new`/
+/// `ConfigDirectory::empty`/`ScratchDir::new` used to each repeat this same
+/// 20-ish-line retry loop by hand, differing only in `prefix`/`suffix`/
+/// `what` and whether `create` wrote a file or made a directory.
+fn create_unique_temp_path(
+    prefix: &str,
+    suffix: &str,
+    what: &str,
+    mut create: impl FnMut(&Path) -> io::Result<()>,
+) -> PathBuf {
+    for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
+        let candidate = next_temp_path(prefix, suffix);
+        match create(&candidate) {
+            Ok(()) => return candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("failed to create test {what}: {error}"),
+        }
+    }
+    panic!("failed to create a unique test {what} path after {MAX_TEMP_PATH_ATTEMPTS} attempts")
 }
 
 pub(crate) fn next_temp_path(prefix: &str, suffix: &str) -> PathBuf {
@@ -258,23 +230,10 @@ pub(crate) struct ScratchDir {
 
 impl ScratchDir {
     pub(crate) fn new() -> Self {
-        let mut path = None;
-        for _ in 0..MAX_TEMP_PATH_ATTEMPTS {
-            let candidate = next_temp_path("lait-test-scratch", "");
-            match fs::create_dir(&candidate) {
-                Ok(()) => {
-                    path = Some(candidate);
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("failed to create test scratch directory: {error}"),
-            }
-        }
-        let path = path.unwrap_or_else(|| {
-            panic!(
-                "failed to create a unique test scratch directory after {MAX_TEMP_PATH_ATTEMPTS} attempts"
-            )
-        });
+        let path =
+            create_unique_temp_path("lait-test-scratch", "", "scratch directory", |candidate| {
+                fs::create_dir(candidate)
+            });
         Self { path }
     }
 
