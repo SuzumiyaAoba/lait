@@ -105,7 +105,7 @@ impl Cli {
     }
 
     /// Parse the process arguments without exiting on an error.
-    pub(crate) fn try_parse() -> Result<Self, clap::Error> {
+    fn try_parse() -> Result<Self, clap::Error> {
         Self::try_parse_from(std::env::args_os())
     }
 

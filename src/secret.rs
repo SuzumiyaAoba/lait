@@ -16,8 +16,8 @@ use crate::{
 /// consume unbounded memory. These defaults intentionally live here rather
 /// than in the YAML schema: they are execution-safety limits, not user
 /// credentials or endpoint settings.
-pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// One cached command spec's resolved value, or `None` while unresolved
 /// (never yet run, or the last run failed/was cancelled). The `Mutex`

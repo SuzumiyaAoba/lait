@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 /// The file `load_from_current_dir` reads, always resolved against the
 /// current directory (like `config::CONFIG_FILE_NAME`).
-pub(crate) const DOTENV_FILE_NAME: &str = ".env";
+const DOTENV_FILE_NAME: &str = ".env";
 
 /// Loads `.env` from the current directory into the process environment,
 /// setting **only variables that are not already set** — a variable exported

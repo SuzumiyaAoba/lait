@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 /// Keeping this aligned with file-backed input limits prevents a configured
 /// command (or a model-invoked shell tool) from turning an unbounded pipe into
 /// an unbounded allocation.
-pub(crate) const MAX_COMMAND_OUTPUT_BYTES: usize = crate::async_io::MAX_READ_BYTES;
+const MAX_COMMAND_OUTPUT_BYTES: usize = crate::async_io::MAX_READ_BYTES;
 
 /// A failed containment primitive must not make cancellation wait forever for
 /// a child that could not be killed. Normal SIGKILL/Job termination reaps well

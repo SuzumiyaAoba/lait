@@ -24,7 +24,12 @@ mod document;
 mod flow;
 mod nodes;
 
-pub(crate) use document::{CURRENT_WORKFLOW_VERSION, WorkflowDefaults, WorkflowDocument};
+pub(crate) use document::{WorkflowDefaults, WorkflowDocument};
+// Not `pub(crate)`: only `compile.rs` (a sibling submodule) reads this, via
+// `super::CURRENT_WORKFLOW_VERSION` — a private `use` is already visible
+// throughout `model` (including its descendants), so no `pub` is needed at
+// all here.
+use document::CURRENT_WORKFLOW_VERSION;
 pub(crate) use flow::{
     Control, FlowStep, ForEachDefinition, LoopCondition, LoopDefinition, OnErrorDefinition,
     ParallelDefinition, RetryDefinition, Router, SwitchDefinition,

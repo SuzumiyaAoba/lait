@@ -186,7 +186,7 @@ pub(crate) fn expand_env_placeholders(value: &str) -> Result<String> {
     expand_with(value, |name| std::env::var(name).ok())
 }
 
-pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// Resolves the endpoint a request goes to from the three layers every
 /// caller shares — explicit override > model-definition value > config

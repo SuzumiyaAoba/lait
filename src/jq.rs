@@ -150,7 +150,7 @@ pub(crate) type Steps = serde_json::Map<String, serde_json::Value>;
 /// a workflow timeout without leaving a detached thread running to completion.
 /// The check is also made around parsing/compilation and while rendering the
 /// collected values so cancellation cannot accidentally turn into success.
-pub(crate) fn apply_cancellable(
+fn apply_cancellable(
     filter_source: &str,
     input_json: &str,
     steps: &Steps,

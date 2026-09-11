@@ -78,7 +78,7 @@ pub(crate) struct LlmJudgeContext<'a> {
 /// `.title | length > 0` works against a JSON-producing workflow), anything
 /// else is wrapped as a JSON string value (so a plain-text assertion like
 /// `contains("結論")` works against ordinary text output too).
-pub(crate) fn normalize_jq_input(output: &str) -> String {
+fn normalize_jq_input(output: &str) -> String {
     if serde_json::from_str::<serde_json::Value>(output).is_ok() {
         output.to_owned()
     } else {

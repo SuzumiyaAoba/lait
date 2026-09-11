@@ -12,7 +12,7 @@ use super::{NodeMap, flow::RetryDefinition};
 /// `version:` is optional (omitted means "latest"); an explicit but
 /// unrecognized number is rejected outright rather than silently misparsed
 /// — see `super::parse_workflow`.
-pub(crate) const CURRENT_WORKFLOW_VERSION: u32 = 1;
+pub(super) const CURRENT_WORKFLOW_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
