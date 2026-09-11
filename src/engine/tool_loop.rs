@@ -13,7 +13,8 @@ use std::path::PathBuf;
 
 use crate::{llm, mcp, response, shell_tool, subagent};
 
-use super::{RunContext, ToolDecision, call_subagent_tool, tool_decision};
+use super::approval::{ToolDecision, tool_decision};
+use super::{RunContext, call_subagent_tool};
 
 /// Maximum number of independent calls dispatched for one model response.
 /// Approval remains sequential, while execution is bounded to avoid an
