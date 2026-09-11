@@ -34,6 +34,17 @@ struct LimitedWriter<'a> {
     exceeded: bool,
 }
 
+/// The single wording used whenever a rendered value or the accumulated
+/// output crosses a configured byte limit, regardless of which of this
+/// module's several checks caught it (a mid-value overflow inside
+/// [`LimitedWriter::write`], the newline separator between values in
+/// [`OutputWriter::render`], or the raw-string fast path in
+/// [`render_value_into`]) — so the user sees the same phrasing no matter
+/// which branch was taken for the same underlying condition.
+fn output_limit_exceeded_message(byte_limit: usize) -> String {
+    format!("jq rendered output exceeds the configured limit of {byte_limit} bytes")
+}
+
 impl LimitedWriter<'_> {
     fn new<'a>(
         bytes: &'a mut Vec<u8>,
@@ -61,21 +72,21 @@ impl io::Write for LimitedWriter<'_> {
             self.exceeded = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "jq rendered output exceeds the configured limit",
+                output_limit_exceeded_message(self.total_limit),
             ));
         };
         let Some(value_len) = next_len.checked_sub(self.value_start) else {
             self.exceeded = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "jq rendered output exceeds the configured limit",
+                output_limit_exceeded_message(self.total_limit),
             ));
         };
         if next_len > self.total_limit || value_len > self.value_limit {
             self.exceeded = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "jq rendered output exceeds the configured limit",
+                output_limit_exceeded_message(self.total_limit),
             ));
         }
         if self.bytes.capacity() < next_len {
@@ -119,15 +130,16 @@ impl OutputWriter<'_> {
             );
         }
         if self.values != 0 {
-            let next_len = self
-                .bytes
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("jq rendered output exceeds the configured limit"))?;
+            let next_len = self.bytes.len().checked_add(1).ok_or_else(|| {
+                anyhow!(
+                    "jq filter {filter_source:?} rendered output: {}",
+                    output_limit_exceeded_message(MAX_RENDERED_BYTES)
+                )
+            })?;
             if next_len > MAX_RENDERED_BYTES {
                 bail!(
-                    "jq filter {filter_source:?} rendered output exceeds the configured limit of {} bytes",
-                    MAX_RENDERED_BYTES
+                    "jq filter {filter_source:?} rendered output: {}",
+                    output_limit_exceeded_message(MAX_RENDERED_BYTES)
                 );
             }
             self.bytes.push(b'\n');
@@ -176,7 +188,7 @@ pub(super) fn render_value_into(
         // but jaq also permits a TStr containing invalid bytes. Reject by
         // the source byte count before `from_utf8_lossy` can expand it.
         if string_bytes.len() > value_limit {
-            bail!("jq rendered output exceeds the configured limit");
+            bail!(output_limit_exceeded_message(value_limit));
         }
         let mut writer = LimitedWriter::new(
             output_bytes,
@@ -187,7 +199,7 @@ pub(super) fn render_value_into(
         );
         write_raw_string(&mut writer, string_bytes).map_err(|error| {
             if writer.exceeded {
-                anyhow!("jq rendered output exceeds the configured limit")
+                anyhow!(output_limit_exceeded_message(writer.total_limit))
             } else {
                 anyhow!("failed to render jq output: {error}")
             }
@@ -205,7 +217,7 @@ pub(super) fn render_value_into(
     );
     jaq_json::write::write(&mut writer, &Default::default(), 0, value).map_err(|error| {
         if writer.exceeded {
-            anyhow!("jq rendered output exceeds the configured limit")
+            anyhow!(output_limit_exceeded_message(writer.total_limit))
         } else {
             anyhow!("failed to render jq output: {error}")
         }
