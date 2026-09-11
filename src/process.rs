@@ -98,169 +98,19 @@ impl Drop for CommandProcessTree {
 }
 
 #[cfg(windows)]
-mod windows_command_job {
-    use std::{
-        ffi::c_void,
-        io,
-        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
-        ptr,
-    };
-
-    type Bool = i32;
-
-    const CREATE_SUSPENDED: u32 = 0x0000_0004;
-    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
-    const THREAD_SUSPEND_RESUME: u32 = 0x0000_0002;
-    const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
-    const INVALID_RESUME_COUNT: u32 = u32::MAX;
-
-    #[repr(C)]
-    struct ThreadEntry32 {
-        size: u32,
-        usage: u32,
-        thread_id: u32,
-        owner_process_id: u32,
-        base_priority: i32,
-        delta_priority: i32,
-        flags: u32,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        #[link_name = "CreateJobObjectW"]
-        fn create_job_object_w(lp_job_attributes: *mut c_void, lp_name: *const u16) -> RawHandle;
-        #[link_name = "AssignProcessToJobObject"]
-        fn assign_process_to_job_object(job: RawHandle, process: RawHandle) -> Bool;
-        #[link_name = "TerminateJobObject"]
-        fn terminate_job_object(job: RawHandle, exit_code: u32) -> Bool;
-        #[link_name = "CreateToolhelp32Snapshot"]
-        fn create_toolhelp32_snapshot(flags: u32, process_id: u32) -> RawHandle;
-        #[link_name = "Thread32First"]
-        fn thread32_first(snapshot: RawHandle, entry: *mut ThreadEntry32) -> Bool;
-        #[link_name = "Thread32Next"]
-        fn thread32_next(snapshot: RawHandle, entry: *mut ThreadEntry32) -> Bool;
-        #[link_name = "OpenThread"]
-        fn open_thread(access: u32, inherit_handle: Bool, thread_id: u32) -> RawHandle;
-        #[link_name = "ResumeThread"]
-        fn resume_thread(thread: RawHandle) -> u32;
-        #[link_name = "CloseHandle"]
-        fn close_handle(handle: RawHandle) -> Bool;
-        #[link_name = "GetProcessId"]
-        fn get_process_id(process: RawHandle) -> u32;
-    }
-
-    pub(super) fn configure(command: &mut tokio::process::Command) {
-        // Keep the primary thread stopped until the process has been assigned
-        // to our Job Object.  Without this, a shell can create descendants in
-        // the interval between CreateProcess and AssignProcessToJobObject;
-        // those descendants would not inherit the job and would survive a
-        // later timeout.
-        command.creation_flags(CREATE_SUSPENDED);
-    }
-
-    fn resume_process(process: RawHandle) -> io::Result<()> {
-        let process_id = unsafe { get_process_id(process) };
-        if process_id == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let snapshot = unsafe { create_toolhelp32_snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-
-        let result = (|| {
-            let mut entry = ThreadEntry32 {
-                size: std::mem::size_of::<ThreadEntry32>() as u32,
-                usage: 0,
-                thread_id: 0,
-                owner_process_id: 0,
-                base_priority: 0,
-                delta_priority: 0,
-                flags: 0,
-            };
-            let mut found_thread = false;
-            let mut has_entry = unsafe { thread32_first(snapshot, &mut entry) } != 0;
-            while has_entry {
-                if entry.owner_process_id == process_id {
-                    found_thread = true;
-                    let thread = unsafe { open_thread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
-                    if thread.is_null() {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let resume_result = unsafe { resume_thread(thread) };
-                    let close_result = unsafe { close_handle(thread) };
-                    if resume_result == INVALID_RESUME_COUNT {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if close_result == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                has_entry = unsafe { thread32_next(snapshot, &mut entry) } != 0;
-            }
-
-            if !found_thread {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "suspended command thread was not found",
-                ));
-            }
-            Ok(())
-        })();
-        let close_result = unsafe { close_handle(snapshot) };
-        if result.is_ok() && close_result == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        result
-    }
-
-    pub(super) fn attach(process: RawHandle) -> io::Result<OwnedHandle> {
-        // A private, unnamed job has no ambient permissions or namespace
-        // concerns. The handle remains owned by CommandProcessTree until the
-        // command completes or cancellation cleanup runs.
-        let job = unsafe { create_job_object_w(ptr::null_mut(), ptr::null()) };
-        if job.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: CreateJobObjectW returned a newly-owned kernel handle.
-        let job = unsafe { OwnedHandle::from_raw_handle(job) };
-        let result = unsafe { assign_process_to_job_object(job.as_raw_handle(), process) };
-        if result == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if let Err(error) = resume_process(process) {
-            // The process is still suspended if resuming failed.  Terminate
-            // the Job before returning so a partially resumed process (or any
-            // descendant it managed to create) cannot escape this failed
-            // attach path.  The caller also kills/reaps the direct child.
-            let _ = unsafe { terminate_job_object(job.as_raw_handle(), 1) };
-            return Err(error);
-        }
-        Ok(job)
-    }
-
-    pub(super) fn terminate(job: RawHandle) -> io::Result<()> {
-        let result = unsafe { terminate_job_object(job, 1) };
-        if result == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-}
+mod job_windows;
 
 #[cfg(windows)]
 impl CommandProcessTree {
     fn configure(command: &mut tokio::process::Command) {
-        windows_command_job::configure(command);
+        job_windows::configure(command);
     }
 
     fn attach(child: &tokio::process::Child) -> Result<Self> {
         let process = child
             .raw_handle()
             .ok_or_else(|| anyhow!("command exited before its Windows job was attached"))?;
-        let job = windows_command_job::attach(process)
+        let job = job_windows::attach(process)
             .context("failed to assign command process to a Windows Job Object")?;
         Ok(Self {
             job,
@@ -269,7 +119,7 @@ impl CommandProcessTree {
     }
 
     fn kill(&self) -> std::io::Result<()> {
-        windows_command_job::terminate(std::os::windows::io::AsRawHandle::as_raw_handle(&self.job))
+        job_windows::terminate(std::os::windows::io::AsRawHandle::as_raw_handle(&self.job))
     }
 
     fn disarm(&mut self) {
@@ -541,6 +391,52 @@ struct ProcessRun<'a> {
     kill_descendants_after_exit: bool,
 }
 
+/// The four pieces of terminal state `run_process`'s `tokio::select!` loop
+/// accumulates as they each become available (child exit status, stdout,
+/// stderr) or changes once (`descendants_terminated`), out of the ~13 local
+/// bindings that function owns overall — bundled together (rather than left
+/// as four separate `let mut` bindings) purely to give the loop's "have we
+/// collected everything yet?" check and the post-loop conversion into
+/// [`CapturedOutput`] a named home; the `tokio::select!` loop itself is not
+/// restructured (see the design plan's C5 note on why splitting it further
+/// risks a race).
+#[derive(Default)]
+struct ProcessOutcome {
+    child_status: Option<Result<ExitStatus>>,
+    stdout_bytes: Option<Vec<u8>>,
+    stderr_bytes: Option<Vec<u8>>,
+    descendants_terminated: bool,
+}
+
+impl ProcessOutcome {
+    fn is_complete(&self) -> bool {
+        self.child_status.is_some() && self.stdout_bytes.is_some() && self.stderr_bytes.is_some()
+    }
+
+    /// Converts the loop's terminal state into the process's captured
+    /// output. The `ok_or_else` arms should be unreachable in practice —
+    /// the loop above only exits once [`Self::is_complete`] holds — but stay
+    /// as errors rather than `unwrap`/`expect` since they cross an `async`
+    /// cancellation boundary this function does not fully control.
+    fn into_captured_output(self, command_kind: &str) -> Result<CapturedOutput> {
+        let status = self
+            .child_status
+            .and_then(Result::ok)
+            .ok_or_else(|| anyhow!("{command_kind} completed without an exit status"))?;
+        let stdout = self
+            .stdout_bytes
+            .ok_or_else(|| anyhow!("{command_kind} completed without stdout"))?;
+        let stderr = self
+            .stderr_bytes
+            .ok_or_else(|| anyhow!("{command_kind} completed without stderr"))?;
+        Ok(CapturedOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
 async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
     let Some((program, args)) = request.argv.split_first() else {
         bail!(
@@ -641,13 +537,10 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
     let mut child_wait = Box::pin(child.wait());
     let deadline = request.timeout.map(tokio::time::sleep);
     tokio::pin!(deadline);
-    let mut child_status = None;
-    let mut stdout_bytes = None;
-    let mut stderr_bytes = None;
-    let mut descendants_terminated = false;
+    let mut outcome = ProcessOutcome::default();
 
     loop {
-        if child_status.is_some() && stdout_bytes.is_some() && stderr_bytes.is_some() {
+        if outcome.is_complete() {
             break;
         }
 
@@ -660,8 +553,8 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                 }
             } => {
                 drop(child_wait);
-                let cleanup = if child_status.as_ref().is_some_and(Result::is_ok) {
-                    if descendants_terminated {
+                let cleanup = if outcome.child_status.as_ref().is_some_and(Result::is_ok) {
+                    if outcome.descendants_terminated {
                         Ok(())
                     } else {
                         terminate_reaped_process_tree(&process_tree).await
@@ -680,24 +573,24 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                     ))),
                 };
             }
-            status = &mut child_wait, if child_status.is_none() => {
-                child_status = Some(
+            status = &mut child_wait, if outcome.child_status.is_none() => {
+                outcome.child_status = Some(
                     status.with_context(|| format!("failed to wait for {command_kind} '{program}'")),
                 );
             }
             result = join_reader_task(&mut read_stdout, request.command_kind, "stdout"), if read_stdout.is_some() => {
                 read_stdout = None;
                 match result {
-                    Ok(bytes) => stdout_bytes = Some(bytes),
+                    Ok(bytes) => outcome.stdout_bytes = Some(bytes),
                     Err(error) => {
-                        let child_reaped = child_status.as_ref().is_some_and(Result::is_ok);
+                        let child_reaped = outcome.child_status.as_ref().is_some_and(Result::is_ok);
                         drop(child_wait);
                         abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
                         if let Err(cleanup_error) = cleanup_after_reader_failure(
                             &process_tree,
                             &mut child,
                             child_reaped,
-                            descendants_terminated,
+                            outcome.descendants_terminated,
                         ).await {
                             return Err(error.context(format!(
                                 "failed to terminate {command_kind} process tree after output reader failure: {cleanup_error:#}"
@@ -710,16 +603,16 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
             result = join_reader_task(&mut read_stderr, request.command_kind, "stderr"), if read_stderr.is_some() => {
                 read_stderr = None;
                 match result {
-                    Ok(bytes) => stderr_bytes = Some(bytes),
+                    Ok(bytes) => outcome.stderr_bytes = Some(bytes),
                     Err(error) => {
-                        let child_reaped = child_status.as_ref().is_some_and(Result::is_ok);
+                        let child_reaped = outcome.child_status.as_ref().is_some_and(Result::is_ok);
                         drop(child_wait);
                         abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
                         if let Err(cleanup_error) = cleanup_after_reader_failure(
                             &process_tree,
                             &mut child,
                             child_reaped,
-                            descendants_terminated,
+                            outcome.descendants_terminated,
                         ).await {
                             return Err(error.context(format!(
                                 "failed to terminate {command_kind} process tree after output reader failure: {cleanup_error:#}"
@@ -743,7 +636,7 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                     timeout.as_secs_f64(),
                 );
                 drop(child_wait);
-                let cleanup = if child_status.as_ref().is_some_and(Result::is_ok) {
+                let cleanup = if outcome.child_status.as_ref().is_some_and(Result::is_ok) {
                     terminate_reaped_process_tree(&process_tree).await
                 } else {
                     terminate_command_process_tree(&process_tree, &mut child).await
@@ -758,8 +651,9 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
             }
         }
 
-        if child_status.as_ref().is_some_and(Result::is_err) {
-            let error = child_status
+        if outcome.child_status.as_ref().is_some_and(Result::is_err) {
+            let error = outcome
+                .child_status
                 .take()
                 .and_then(Result::err)
                 .unwrap_or_else(|| anyhow!("command wait failed without an error"));
@@ -776,8 +670,8 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
         }
 
         if request.kill_descendants_after_exit
-            && !descendants_terminated
-            && child_status.as_ref().is_some_and(Result::is_ok)
+            && !outcome.descendants_terminated
+            && outcome.child_status.as_ref().is_some_and(Result::is_ok)
         {
             if let Err(error) = terminate_reaped_process_tree(&process_tree).await {
                 abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
@@ -785,28 +679,14 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                     "failed to clean up {command_kind} process tree: {error}"
                 ));
             }
-            descendants_terminated = true;
+            outcome.descendants_terminated = true;
         }
     }
 
     drop(child_wait);
     abort_optional_task(&mut write_stdin).await;
-    let status = child_status
-        .take()
-        .and_then(Result::ok)
-        .ok_or_else(|| anyhow!("{command_kind} completed without an exit status"))?;
-    let stdout = stdout_bytes
-        .take()
-        .ok_or_else(|| anyhow!("{command_kind} completed without stdout"))?;
-    let stderr = stderr_bytes
-        .take()
-        .ok_or_else(|| anyhow!("{command_kind} completed without stderr"))?;
     process_tree.disarm();
-    Ok(CapturedOutput {
-        status,
-        stdout,
-        stderr,
-    })
+    outcome.into_captured_output(command_kind)
 }
 
 /// Runs a workflow/shell-tool command through the shared process runner.
