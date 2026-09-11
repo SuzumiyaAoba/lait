@@ -25,6 +25,7 @@ use jaq_core::{
     unwrap_valr,
 };
 use jaq_json::{Val, read};
+use serde::Deserialize;
 
 use crate::{async_io, template};
 
@@ -451,21 +452,29 @@ where
     Ok(())
 }
 
-/// Serializes a `Steps`-shaped global (`$steps` or `$vars`) and re-parses it
-/// as a jaq `Val`, bounding its size/structure the same way the jq input
-/// itself is bounded. `label` (`"$steps"`/`"$vars"`) names the global in the
-/// error text.
+/// Converts a `Steps`-shaped global (`$steps` or `$vars`) directly into a jaq
+/// `Val`, bounding its resulting structure the same way the jq input itself
+/// is bounded. `label` (`"$steps"`/`"$vars"`) names the global in the error
+/// text.
+///
+/// This used to go through `serde_json::to_string` followed by
+/// `read::parse_single` — a full JSON-text serialize-then-reparse round trip
+/// paid on every single jq call (every `when:` guard, every `jq:` node,
+/// every `for_each` item), where `value` is `steps_outputs`: the accumulated
+/// output of every named step so far, which for LLM workflows can be
+/// KB-to-MB sized and only grows as a run progresses. `Val` implements
+/// `serde::Deserialize` (the `jaq-json` "serde" feature enables this), and
+/// `serde_json::Map<String, Value>` implements `serde::Deserializer`
+/// directly over its own borrowed tree — so this walks `value` once, in
+/// memory, with no intermediate JSON text at all. The old `json.len() >
+/// MAX_INPUT_BYTES` pre-check existed to avoid parsing an oversized text
+/// blob; with no text produced there is nothing to pre-check, so
+/// `validate_value_structure` below — which bounds the resulting `Val`
+/// tree's depth/heap estimate directly — is now this function's only limit,
+/// same as it already is for the jq input value in `run_filter_with`.
 fn parse_global_var(value: &Steps, label: &str) -> Result<Val> {
-    let json = serde_json::to_string(value)
-        .map_err(|error| anyhow!("failed to serialize {label} data: {error}"))?;
-    if json.len() > MAX_INPUT_BYTES {
-        bail!(
-            "jq '{label}' data exceeds the configured limit of {} bytes",
-            MAX_INPUT_BYTES
-        );
-    }
-    let parsed = read::parse_single(json.as_bytes())
-        .map_err(|error| anyhow!("failed to parse {label} data as JSON: {error}"))?;
+    let parsed = Val::deserialize(value)
+        .map_err(|error| anyhow!("failed to convert {label} data to a jq value: {error}"))?;
     validate_value_structure(&parsed)
         .with_context(|| format!("jq '{label}' structure exceeds the configured memory limit"))?;
     Ok(parsed)
@@ -530,8 +539,18 @@ fn validate_filter_source(filter_source: &str) -> Result<()> {
 /// is preserved verbatim; plain text becomes a JSON string. This is kept in
 /// the blocking worker's closure so even the serialization of a very large
 /// plain-text input cannot block a Tokio executor thread.
+///
+/// The validity probe below only needs a yes/no answer, but deserializing
+/// into `serde_json::Value` builds a complete owned tree just to throw it
+/// away — for a large `input` (the previous step's output, potentially a
+/// sizeable model response), that is a full parse and allocation wasted on
+/// every call whose input happens to be valid JSON. `serde::de::IgnoredAny`
+/// still walks the whole input (so a truncated/invalid tail is still
+/// rejected exactly as before) but discards each value as it goes instead
+/// of materializing it, so this is `run_filter_with`'s own `read::
+/// parse_single` call doing the one real parse instead of two.
 fn normalize_input(input: &str) -> Result<String> {
-    if serde_json::from_str::<serde_json::Value>(input).is_ok() {
+    if serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok() {
         return Ok(input.to_owned());
     }
     serde_json::to_string(&template::parse_input(input))

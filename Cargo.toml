@@ -57,7 +57,7 @@ http = "1"
 libc = "0.2"
 process-wrap = { version = "9.1", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 jaq-core = "3.1.0"
-jaq-json = "2.0.2"
+jaq-json = { version = "2.0.2", features = ["serde"] }
 jaq-std = "3.0.2"
 reqwest = { version = "0.13", default-features = false }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
