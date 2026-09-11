@@ -107,11 +107,6 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      # aws-lc-sys (via rustls) assembles with NASM on MSVC targets.
-      - name: Install NASM
-        if: runner.os == 'Windows'
-        run: choco install nasm --yes
-
       - name: Run file lock tests
         run: 'cargo test --locked --bin lait file_lock::'
 
