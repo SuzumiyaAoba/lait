@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use futures_util::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::{
@@ -24,6 +25,12 @@ use crate::{
         exec::{RunStepsFrame, run_steps},
     },
 };
+
+/// Upper bound on concurrently in-flight test files — matches
+/// `engine::tool_loop::MAX_CONCURRENT_TOOL_CALLS`'s rationale: independent
+/// workflow runs, bounded so a large test suite doesn't open unbounded
+/// concurrent connections to a replay directory or configured endpoint.
+const TEST_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -362,10 +369,22 @@ pub(crate) async fn run(
     let file_config =
         Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let mut outcomes = Vec::with_capacity(targets.len());
-    for target in &targets {
-        outcomes.push(run_test_file(target, &file_config, cancel.clone()).await?);
-    }
+    // Each test file runs a whole workflow (potentially several model
+    // calls) independently of every other, so running them one at a time
+    // made a directory of N files cost N times a single file's wall clock.
+    // `run_test_file` already turns an ordinary test failure into an
+    // `Ok(TestOutcome { status: Fail, .. })` — only a genuine cancellation
+    // (SIGINT, a workflow deadline) surfaces as `Err` here — so
+    // `try_collect` short-circuits on cancellation exactly as the previous
+    // sequential `?` did, while every non-cancelled file still runs to
+    // completion and is reported, same as before.
+    let run_futures = targets
+        .iter()
+        .map(|target| run_test_file(target, &file_config, cancel.clone()));
+    let outcomes: Vec<TestOutcome> = futures_util::stream::iter(run_futures)
+        .buffered(TEST_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     match args.format {
         TestFormat::Text => print_text_report(&outcomes),
