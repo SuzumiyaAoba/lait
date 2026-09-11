@@ -43,7 +43,7 @@ unimplemented = "deny"
 
 [dependencies]
 anyhow = "1"
-async-openai = { version = "0.41.3", default-features = false, features = ["byot", "chat-completion", "rustls"] }
+async-openai = { version = "0.41.3", default-features = false, features = ["byot", "chat-completion", "rustls-no-provider"] }
 base64 = "0.23.1"
 bytes = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
@@ -61,6 +61,14 @@ jaq-json = { version = "2.0.2", features = ["serde"] }
 jaq-std = "3.0.2"
 reqwest = { version = "0.13", default-features = false }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# Selects the `ring` crypto provider (see `main`'s
+# `rustls::crypto::ring::default_provider().install_default()` call) instead
+# of rustls's default `aws-lc-rs`, whose `aws-lc-sys` build script needs a C/
+# assembly toolchain (see `scripts/makers-cargo.sh`'s and this workflow's now
+# largely dormant macOS/NASM workarounds). `async-openai`'s `rustls-no-provider`
+# feature (below) pulls in `rustls` without a provider baked in, so this crate
+# gets to pick the one actually installed at runtime.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
@@ -73,7 +81,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-jsonschema = "0.53.0"
+# `default-features = false` + `tls-ring` (replacing the default
+# `tls-aws-lc-rs`) so test builds don't pull in `aws-lc-sys` either — see the
+# `rustls`/`async-openai` comments above.
+jsonschema = { version = "0.53.0", default-features = false, features = ["resolve-http", "resolve-file", "idna", "tls-ring"] }
 
 # `panic = "abort"` is deliberately not set here: several tests rely on
 # catching a panic (or on ordinary unwinding during teardown), and `abort`
