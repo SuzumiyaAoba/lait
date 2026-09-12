@@ -3,7 +3,7 @@
 //! its retry/timeout handling). Router control flow and output aggregation
 //! live in `routers`; model calls go through `crate::engine`.
 
-use std::{borrow::Cow, future::Future, path::PathBuf, pin::Pin, time::Duration};
+use std::{borrow::Cow, future::Future, ops::ControlFlow, path::PathBuf, pin::Pin, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -12,7 +12,7 @@ use crate::{
     async_io, attachment,
     config::{self, ConfigFile},
     engine::{
-        CapabilityOverrides, RequestSettings, RunContext, SamplingOverrides,
+        CapabilityOverrides, EndpointOverrides, RequestSettings, RunContext, SamplingOverrides,
         resolve_request_settings,
     },
     jq, template, workflow,
@@ -236,13 +236,16 @@ impl<'a> RouterContext<'a> {
 /// child operations as well as passing the receiver into jq itself, so a
 /// cancellation cannot be lost merely because a router has no model node of
 /// its own.
+/// The single wording for every "a workflow's cancellation token fired"
+/// check in this module — [`check_workflow_cancellation`] and
+/// [`wait_retry_delay`]'s own zero-delay check and `select!` branch.
+const WORKFLOW_EXECUTION_CANCELLED: &str = "workflow execution was cancelled";
+
 fn check_workflow_cancellation(
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        bail!(crate::error::Interrupted::cancelled(
-            "workflow execution was cancelled"
-        ));
+        bail!(crate::error::cancelled(WORKFLOW_EXECUTION_CANCELLED));
     }
     Ok(())
 }
@@ -368,39 +371,21 @@ pub(crate) fn run_steps<'a>(
                 match attempt_result {
                     Ok(output) => state.output = output,
                     Err(error) => {
-                        let Some(on_error) = step.on_error() else {
-                            return Err(error);
-                        };
-                        eprintln!(
-                            "{progress_prefix}    -> step failed, running 'on_error': {error}"
-                        );
-                        let error_input = serde_json::json!({
-                            "error": format!("{error:#}"),
-                            "input": template::parse_input(&state.output),
-                        });
-                        let error_input_json = serde_json::to_string(&error_input)
-                            .context("failed to serialize 'on_error' input")?;
-                        let outcome = run_steps(
-                            &on_error.steps,
-                            error_input_json,
-                            state.steps_outputs,
-                            RunStepsFrame {
-                                scope,
-                                env,
-                                start_counter: counter,
-                                progress_prefix,
-                                cancellation: cancellation.clone(),
-                                placement,
-                            },
+                        match run_on_error_handler(
+                            step,
+                            error,
+                            counter,
+                            state,
+                            scope,
+                            env,
+                            progress_prefix,
+                            cancellation.clone(),
+                            placement,
                         )
-                        .await?;
-                        let flow = outcome.flow;
-                        state = outcome.into_state();
-                        if flow != Flow::Continue {
-                            // A handler's Break/Stop completes the failed site
-                            // before propagating to the enclosing control scope.
-                            state.record_output(step);
-                            return Ok(state.into_outcome(flow));
+                        .await?
+                        {
+                            ControlFlow::Break(outcome) => return Ok(outcome),
+                            ControlFlow::Continue(new_state) => state = new_state,
                         }
                     }
                 }
@@ -415,6 +400,60 @@ pub(crate) fn run_steps<'a>(
         }
         Ok(state.into_outcome(Flow::Continue))
     })
+}
+
+/// Runs `step`'s `on_error` handler after `error` (from the step's own
+/// retried attempts), producing either a [`StepsState`] for the outer loop
+/// in [`run_steps`] to continue with (`ControlFlow::Continue`, the handler
+/// itself completed normally) or a [`StepsOutcome`] for it to return
+/// immediately (`ControlFlow::Break`, the handler's own `Break`/`Stop` —
+/// recorded under `step`'s output first, the same recording `run_steps`'s
+/// own loop tail does for every other path, which this early return skips).
+/// Returns `Err(error)` unchanged (not a handler failure — there is none,
+/// since it never ran) when `step` has no `on_error` at all, so the original
+/// error propagates to `run_steps`'s own caller as-is.
+async fn run_on_error_handler(
+    step: &workflow::FlowStep,
+    error: anyhow::Error,
+    counter: usize,
+    mut state: StepsState,
+    scope: &WorkflowScope,
+    env: &RunContext,
+    progress_prefix: &str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    placement: ExecutionPlacement,
+) -> Result<ControlFlow<StepsOutcome, StepsState>> {
+    let Some(on_error) = step.on_error() else {
+        return Err(error);
+    };
+    eprintln!("{progress_prefix}    -> step failed, running 'on_error': {error}");
+    let error_input = serde_json::json!({
+        "error": format!("{error:#}"),
+        "input": template::parse_input(&state.output),
+    });
+    let error_input_json =
+        serde_json::to_string(&error_input).context("failed to serialize 'on_error' input")?;
+    let outcome = run_steps(
+        &on_error.steps,
+        error_input_json,
+        state.steps_outputs,
+        RunStepsFrame {
+            scope,
+            env,
+            start_counter: counter,
+            progress_prefix,
+            cancellation,
+            placement,
+        },
+    )
+    .await?;
+    let flow = outcome.flow;
+    state = outcome.into_state();
+    if flow != Flow::Continue {
+        state.record_output(step);
+        return Ok(ControlFlow::Break(state.into_outcome(flow)));
+    }
+    Ok(ControlFlow::Continue(state))
 }
 
 /// The upper bound on a single wait between retry attempts (see
@@ -476,13 +515,11 @@ async fn execute_step_with_retry(
 ) -> Result<String> {
     let StepContext {
         scope,
-        env,
-        placement,
         label,
         progress_prefix,
-        steps_outputs,
         step_cancel: workflow_cancel,
-    } = context;
+        ..
+    } = context.clone();
 
     let effective_retry = effective_retry(node, scope);
     let effective_timeout = effective_timeout(node, scope);
@@ -526,15 +563,7 @@ async fn execute_step_with_retry(
                 let execution = execute_step(
                     node,
                     current_input,
-                    StepContext {
-                        scope,
-                        env,
-                        placement,
-                        label,
-                        progress_prefix,
-                        steps_outputs,
-                        step_cancel: Some(node_cancel.clone()),
-                    },
+                    context.with_cancel(Some(node_cancel.clone())),
                 );
                 tokio::pin!(execution);
                 match tokio::time::timeout(Duration::from_secs(seconds), &mut execution).await {
@@ -542,9 +571,9 @@ async fn execute_step_with_retry(
                     Err(_) => {
                         node_cancel.cancel();
                         let _ = execution.await;
-                        Err(anyhow!(crate::error::Interrupted::timed_out(format!(
+                        Err(crate::error::timed_out(format!(
                             "step '{label}' timed out after {seconds}s (attempt {attempt}/{max_attempts})"
-                        ))))
+                        )))
                     }
                 }
             }
@@ -552,15 +581,7 @@ async fn execute_step_with_retry(
                 execute_step(
                     node,
                     current_input,
-                    StepContext {
-                        scope,
-                        env,
-                        placement,
-                        label,
-                        progress_prefix,
-                        steps_outputs,
-                        step_cancel: workflow_cancel.clone(),
-                    },
+                    context.with_cancel(workflow_cancel.clone()),
                 )
                 .await
             }
@@ -614,15 +635,13 @@ async fn wait_retry_delay(
     };
     if delay.is_zero() {
         if cancellation.is_cancelled() {
-            bail!(crate::error::Interrupted::cancelled(
-                "workflow execution was cancelled"
-            ));
+            bail!(crate::error::cancelled(WORKFLOW_EXECUTION_CANCELLED));
         }
         return Ok(());
     }
     tokio::select! {
         biased;
-        () = cancellation.cancelled() => bail!(crate::error::Interrupted::cancelled("workflow execution was cancelled")),
+        () = cancellation.cancelled() => bail!(crate::error::cancelled(WORKFLOW_EXECUTION_CANCELLED)),
         () = tokio::time::sleep(delay) => Ok(()),
     }
 }
@@ -644,6 +663,20 @@ struct StepContext<'a> {
     progress_prefix: &'a str,
     steps_outputs: &'a workflow::StepOutputs,
     step_cancel: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl<'a> StepContext<'a> {
+    /// Returns a copy of this context with `step_cancel` swapped for
+    /// `step_cancel` — used by `execute_step_with_retry` to hand
+    /// `execute_step` an attempt-scoped child token (when the node has an
+    /// effective `timeout`) or the unmodified workflow token (when it
+    /// doesn't), without repeating every other field at each call site.
+    fn with_cancel(&self, step_cancel: Option<tokio_util::sync::CancellationToken>) -> Self {
+        Self {
+            step_cancel,
+            ..self.clone()
+        }
+    }
 }
 
 /// Resolves the model/reasoning-effort settings for a node's model call,
@@ -726,13 +759,12 @@ pub(crate) fn resolve_step_settings(
         tools: scope.defaults.tools.clone(),
     };
     let capability_overrides =
-        CapabilityOverrides::fold(&[node_capability, agent_capability, workflow_capability]);
+        CapabilityOverrides::fold([node_capability, agent_capability, workflow_capability]);
 
     resolve_request_settings(
         model_name,
         overrides,
-        None,
-        None,
+        EndpointOverrides::default(),
         capability_overrides,
         &scope.models,
         file_config,

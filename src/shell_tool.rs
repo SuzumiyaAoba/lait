@@ -84,16 +84,22 @@ pub(crate) fn tools(names: &[String], tools_map: &config::ToolMap) -> Result<Too
 /// as `{{ input.<field> }}` — the same `input`/dotted-field access a
 /// workflow's own templates use), producing the argv `call` execs. Also used
 /// by `preview_argv`, for `--approve-tools`'s confirmation prompt.
+///
+/// One `RenderScope` for every argv element, instead of rebuilding a
+/// handlebars `Context` (a clone of `input`, plus the empty `steps`/`vars`
+/// maps) per element — mirrors `workflow::exec::nodes::execute_command`'s own
+/// fix for the same shape of call, applied here too.
 fn render_argv(
     definition: &config::ShellToolDefinition,
     input: &serde_json::Value,
 ) -> Result<Vec<String>> {
     let empty_steps = serde_json::Map::new();
     let empty_vars = serde_json::Map::new();
+    let render_scope = template::RenderScope::new(input, &empty_steps, &empty_vars);
     definition
         .command
         .iter()
-        .map(|part| template::render(part, input, &empty_steps, &empty_vars))
+        .map(|part| render_scope.render(part))
         .collect()
 }
 
@@ -137,9 +143,7 @@ fn parse_call_arguments(arguments_json: &str) -> Result<serde_json::Value> {
 
 fn ensure_not_cancelled(cancellation: Option<&tokio_util::sync::CancellationToken>) -> Result<()> {
     if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        bail!(crate::error::Interrupted::cancelled(
-            "shell tool call was cancelled"
-        ));
+        bail!(crate::error::cancelled("shell tool call was cancelled"));
     }
     Ok(())
 }

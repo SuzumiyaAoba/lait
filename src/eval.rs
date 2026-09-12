@@ -20,8 +20,8 @@ use crate::{
     cli::{EvalArgs, EvalFormat},
     config::{self, ConfigFile, ConfigSource, ModelMap},
     engine::{
-        AppServices, CapabilityOverrides, PromptTurn, RequestSettings, RunContext,
-        SamplingOverrides, resolve_request_settings,
+        AppServices, CapabilityOverrides, EndpointOverrides, PromptTurn, RequestSettings,
+        RunContext, SamplingOverrides, resolve_request_settings,
     },
     response, signal, template,
     workflow::{
@@ -157,8 +157,7 @@ async fn load_target(
             let settings = resolve_request_settings(
                 model.clone(),
                 SamplingOverrides::default(),
-                None,
-                None,
+                EndpointOverrides::default(),
                 CapabilityOverrides::default(),
                 &ModelMap::default(),
                 file_config,

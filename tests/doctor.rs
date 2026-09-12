@@ -3,15 +3,9 @@ mod support;
 #[cfg(unix)]
 use std::{process::Stdio, time::Duration};
 
-use support::{ConfigDirectory, MockServer, start_mock_mcp_server, test_command};
-
 #[cfg(unix)]
-fn send_sigint(pid: u32) {
-    // SAFETY: the pid belongs to the child spawned by this test.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGINT);
-    }
-}
+use support::send_sigint;
+use support::{ConfigDirectory, MockServer, start_mock_mcp_server, test_command};
 
 #[test]
 fn reports_an_unset_env_var_placeholder() {
@@ -143,6 +137,32 @@ fn reports_connectivity_success_and_a_model_present_on_the_server() {
     assert!(
         stdout.contains("[OK] models.local"),
         "the configured model id should be found on the server: {stdout}"
+    );
+}
+
+#[test]
+fn an_unparseable_models_response_reports_the_parse_error_as_a_hint() {
+    let server = MockServer::start("200 OK", "not a models list");
+    let config = ConfigDirectory::new(&format!(
+        "base_url: http://127.0.0.1:1\nmodels:\n  local:\n    - provider:\n        base_url: {}\n      model_id: test-model-id\n",
+        server.base_url,
+    ));
+    let output = test_command()
+        .current_dir(config.path())
+        .arg("doctor")
+        .output()
+        .expect("failed to execute lait doctor");
+    server.receive_request();
+    server.finish();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("応答をモデル一覧として解釈できませんでした"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("hint:"),
+        "the parse failure should surface a hint instead of being silently swallowed: {stdout}"
     );
 }
 

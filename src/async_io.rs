@@ -53,6 +53,26 @@ const BLOCKING_WORKER_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
 /// schemas). Attachment callers use their smaller combined budget.
 pub(crate) const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 
+/// The single wording used everywhere a read in this module crosses its
+/// configured byte limit (a shared [`ReadBudget`] running out, or a single
+/// file's own `max_bytes` cap in [`read_from_file`]'s several check sites) —
+/// mirrors `jq::limits::output_limit_exceeded_message`'s precedent for the
+/// same shape of duplication.
+fn read_limit_exceeded_message(byte_limit: usize) -> String {
+    format!("file contents exceed the configured read limit of {byte_limit} bytes")
+}
+
+/// The single wording for a blocking I/O operation cancelled while waiting
+/// for a worker slot ([`acquire_worker`]) or while running on one
+/// ([`run_blocking_with_pool`], at both the pre-check and the `select!`
+/// branch).
+const BLOCKING_IO_CANCELLED: &str = "blocking I/O was cancelled";
+
+/// The single wording for a file read cancelled mid-read — see
+/// [`read_file_with_budget`] and [`read_from_file`], its only two call
+/// sites.
+const FILE_READ_CANCELLED: &str = "file read was cancelled";
+
 /// Bytes already materialized by a group of related reads. Sharing this
 /// budget between concurrently-read attachments prevents each individual
 /// worker from staying within its own limit while the combined `Vec`s still
@@ -78,10 +98,7 @@ impl ReadBudget {
                 .checked_add(bytes)
                 .ok_or_else(|| anyhow::anyhow!("file read size exceeded the configured limit"))?;
             if next > self.limit {
-                bail!(
-                    "file contents exceed the configured read limit of {} bytes",
-                    self.limit
-                );
+                bail!(read_limit_exceeded_message(self.limit));
             }
             match self
                 .used
@@ -154,7 +171,7 @@ fn output_path_identity(path: &Path, cancelled: &AtomicBool) -> Result<PathBuf> 
     let mut links = 0;
     loop {
         if cancelled.load(Ordering::Acquire) {
-            bail!(crate::error::Interrupted::cancelled(
+            bail!(crate::error::cancelled(
                 "output path resolution was cancelled"
             ));
         }
@@ -260,7 +277,7 @@ async fn acquire_permit(
             permit.context("blocking I/O permit owner was closed")
         }
         () = cancellation.cancelled() => {
-            bail!(crate::error::Interrupted::cancelled("blocking I/O was cancelled"));
+            bail!(crate::error::cancelled(BLOCKING_IO_CANCELLED));
         }
         () = tokio::time::sleep(BLOCKING_WORKER_ACQUIRE_TIMEOUT) => {
             bail!("{saturated_message}");
@@ -309,9 +326,7 @@ where
         .is_some_and(CancellationToken::is_cancelled)
     {
         drop(permit);
-        bail!(crate::error::Interrupted::cancelled(
-            "blocking I/O was cancelled"
-        ));
+        bail!(crate::error::cancelled(BLOCKING_IO_CANCELLED));
     }
 
     let (sender, mut receiver) = tokio::sync::oneshot::channel();
@@ -349,7 +364,7 @@ where
         biased;
         () = cancellation.cancelled() => {
             cancel_worker(&cancelled, &mut receiver).await;
-            bail!(crate::error::Interrupted::cancelled("blocking I/O was cancelled"));
+            bail!(crate::error::cancelled(BLOCKING_IO_CANCELLED));
         }
         result = &mut receiver => {
             let result = result.context("blocking I/O worker was cancelled")??;
@@ -467,9 +482,7 @@ pub(crate) fn read_file_with_budget(
     wait_for_fifo_writer: bool,
 ) -> Result<Vec<u8>> {
     if cancelled.load(Ordering::Acquire) {
-        bail!(crate::error::Interrupted::cancelled(
-            "file read was cancelled"
-        ));
+        bail!(crate::error::cancelled(FILE_READ_CANCELLED));
     }
 
     #[cfg(unix)]
@@ -544,9 +557,7 @@ fn read_from_file(
 
     loop {
         if cancelled.load(Ordering::Acquire) {
-            bail!(crate::error::Interrupted::cancelled(
-                "file read was cancelled"
-            ));
+            bail!(crate::error::cancelled(FILE_READ_CANCELLED));
         }
 
         #[cfg(unix)]
@@ -556,10 +567,7 @@ fn read_from_file(
                 FifoEvent::WriterConnected => fifo_writer_seen = true,
                 FifoEvent::Data(byte) => {
                     if contents.len() >= max_bytes {
-                        bail!(
-                            "file contents exceed the configured read limit of {} bytes",
-                            max_bytes
-                        );
+                        bail!(read_limit_exceeded_message(max_bytes));
                     }
                     budget.claim(1)?;
                     contents.push(byte);
@@ -589,17 +597,11 @@ fn read_from_file(
             }
             Ok(read) if contents.len() >= max_bytes => {
                 let _ = read;
-                bail!(
-                    "file contents exceed the configured read limit of {} bytes",
-                    max_bytes
-                );
+                bail!(read_limit_exceeded_message(max_bytes));
             }
             Ok(read) => {
                 if read > max_bytes - contents.len() {
-                    bail!(
-                        "file contents exceed the configured read limit of {} bytes",
-                        max_bytes
-                    );
+                    bail!(read_limit_exceeded_message(max_bytes));
                 }
                 budget.claim(read)?;
                 contents.extend_from_slice(&buffer[..read]);
@@ -811,9 +813,7 @@ pub(crate) async fn write_output_file(
 /// attempting to write a device, named pipe, or reparse point.
 fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
-        bail!(crate::error::Interrupted::cancelled(
-            "output file write was cancelled"
-        ));
+        bail!(crate::error::cancelled("output file write was cancelled"));
     }
     #[cfg(unix)]
     {
@@ -821,9 +821,7 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
 
         let mut file = loop {
             if cancelled.load(Ordering::Acquire) {
-                bail!(crate::error::Interrupted::cancelled(
-                    "output file write was cancelled"
-                ));
+                bail!(crate::error::cancelled("output file write was cancelled"));
             }
             match OpenOptions::new()
                 .write(true)
@@ -892,9 +890,7 @@ fn write_output_file_blocking(path: &Path, output: &str, cancelled: &AtomicBool)
 /// a timed worker a bounded opportunity to observe cancellation.
 fn write_regular_output_file(file: &mut File, output: &str, cancelled: &AtomicBool) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
-        bail!(crate::error::Interrupted::cancelled(
-            "output file write was cancelled"
-        ));
+        bail!(crate::error::cancelled("output file write was cancelled"));
     }
     // Truncate only after the handle has been classified as a regular file.
     // A timeout after this point intentionally leaves an empty/partial file:
@@ -905,17 +901,13 @@ fn write_regular_output_file(file: &mut File, output: &str, cancelled: &AtomicBo
     file.set_len(0)?;
     for chunk in output.as_bytes().chunks(64 * 1024) {
         if cancelled.load(Ordering::Acquire) {
-            bail!(crate::error::Interrupted::cancelled(
-                "output file write was cancelled"
-            ));
+            bail!(crate::error::cancelled("output file write was cancelled"));
         }
         file.write_all(chunk)?;
     }
     file.flush()?;
     if cancelled.load(Ordering::Acquire) {
-        bail!(crate::error::Interrupted::cancelled(
-            "output file write was cancelled"
-        ));
+        bail!(crate::error::cancelled("output file write was cancelled"));
     }
     Ok(())
 }
@@ -935,9 +927,7 @@ fn write_nonblocking_special_file(
     let mut offset = 0;
     while offset < bytes.len() {
         if cancelled.load(Ordering::Acquire) {
-            bail!(crate::error::Interrupted::cancelled(
-                "output file write was cancelled"
-            ));
+            bail!(crate::error::cancelled("output file write was cancelled"));
         }
         match file.write(&bytes[offset..]) {
             Ok(0) => bail!("output file write made no progress"),
@@ -950,9 +940,7 @@ fn write_nonblocking_special_file(
         }
     }
     if cancelled.load(Ordering::Acquire) {
-        bail!(crate::error::Interrupted::cancelled(
-            "output file write was cancelled"
-        ));
+        bail!(crate::error::cancelled("output file write was cancelled"));
     }
     Ok(())
 }

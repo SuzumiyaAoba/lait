@@ -1,26 +1,6 @@
 mod support;
 
-use support::{MockServer, ScratchDir, test_command};
-
-fn workflow_yaml(base_url: &str) -> String {
-    format!(
-        r#"
-default:
-  model: local
-models:
-  local:
-    - provider:
-        base_url: "{base_url}"
-      model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-steps:
-  - use: call
-"#
-    )
-}
+use support::{MockServer, ScratchDir, test_command, workflow_yaml};
 
 const OK_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"recorded answer"},"finish_reason":"stop"}]}"#;
 

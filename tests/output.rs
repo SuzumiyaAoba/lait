@@ -1,6 +1,6 @@
 mod support;
 
-use support::{LaitCommand, MockServer, run_lait};
+use support::{LaitCommand, MockServer, completion_body, run_lait};
 
 #[test]
 fn hides_reasoning_without_show_reasoning_option() {
@@ -63,10 +63,7 @@ fn shows_legacy_reasoning_content_with_show_reasoning_option() {
 
 #[test]
 fn shows_only_final_content_when_reasoning_content_is_missing() {
-    let server = MockServer::start(
-        "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-    );
+    let server = MockServer::start("200 OK", &completion_body("test-model", "mock response"));
     let output = LaitCommand::new()
         .base_url(Some(&server.base_url))
         .flag_if("--show-reasoning", true)

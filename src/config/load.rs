@@ -187,6 +187,11 @@ pub(crate) async fn load_config_cancellable(
     }
 }
 
+/// The single wording for `resolve_config_path_cancellable`'s own pre-check
+/// and `find_config_upward_cancellable`'s per-ancestor-directory check —
+/// both cancel the same logical "look for a config file" operation.
+const CONFIG_LOOKUP_CANCELLED: &str = "configuration lookup was cancelled";
+
 /// Cancellation-aware counterpart to [`resolve_config_path`]. Search walks
 /// ancestor directories on the bounded filesystem worker so metadata checks
 /// cannot block signal handling on the Tokio runtime. Explicit and disabled
@@ -199,9 +204,7 @@ pub(crate) async fn resolve_config_path_cancellable(
         .as_ref()
         .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
     {
-        bail!(crate::error::Interrupted::cancelled(
-            "configuration lookup was cancelled"
-        ));
+        bail!(crate::error::cancelled(CONFIG_LOOKUP_CANCELLED));
     }
     match source {
         ConfigSource::Disabled => Ok(None),
@@ -228,9 +231,7 @@ fn find_config_upward_cancellable(
 
     for directory in start.ancestors() {
         if cancelled.load(Ordering::Acquire) {
-            bail!(crate::error::Interrupted::cancelled(
-                "configuration lookup was cancelled"
-            ));
+            bail!(crate::error::cancelled(CONFIG_LOOKUP_CANCELLED));
         }
         let candidate = directory.join(CONFIG_FILE_NAME);
         if candidate.is_file() {
@@ -281,7 +282,7 @@ async fn is_file_cancellable(
             use std::sync::atomic::Ordering;
 
             if cancelled.load(Ordering::Acquire) {
-                bail!(crate::error::Interrupted::cancelled(
+                bail!(crate::error::cancelled(
                     "configuration metadata lookup was cancelled"
                 ));
             }

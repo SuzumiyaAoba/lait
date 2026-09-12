@@ -1,10 +1,20 @@
-use super::types::{DefaultSettings, ToolPolicy};
+use super::types::{DefaultSettings, ResolvedModel, ToolPolicy};
 use super::{
     ApiKeySource, ConfigFile, ConfigSource, McpServerConfig, McpTransport, ShellToolDefinition,
     check_shell_tool_definition, load_config, load_config_cancellable, resolve_endpoint,
     resolve_model,
 };
 use std::collections::HashMap;
+
+/// A [`ResolvedModel`] fixture with only `base_url`/`api_key` set — the two
+/// fields `resolve_endpoint`'s own tests below exercise.
+fn resolved_model_with(base_url: Option<&str>, api_key: Option<&str>) -> ResolvedModel {
+    ResolvedModel {
+        base_url: base_url.map(str::to_owned),
+        api_key: api_key.map(str::to_owned),
+        ..ResolvedModel::default()
+    }
+}
 
 /// `load_config`'s project-file read goes through
 /// `async_io::read_to_string_sync` (via `load_config_at` ->
@@ -206,29 +216,15 @@ fn resolve_endpoint_selects_the_first_available_api_key_source() {
         api_key: Some("config-key".to_owned()),
         ..ConfigFile::default()
     };
-    let endpoint = resolve_endpoint(
-        None,
-        None,
-        Some("https://model.example/v1"),
-        Some("model-key"),
-        None,
-        &config,
-    )
-    .unwrap();
+    let model = resolved_model_with(Some("https://model.example/v1"), Some("model-key"));
+    let endpoint = resolve_endpoint(None, None, Some(&model), &config).unwrap();
     assert_eq!(
         endpoint.api_key,
         ApiKeySource::Literal("model-key".to_owned())
     );
 
-    let endpoint = resolve_endpoint(
-        None,
-        Some("override-key".to_owned()),
-        Some("https://model.example/v1"),
-        Some("model-key"),
-        None,
-        &config,
-    )
-    .unwrap();
+    let endpoint =
+        resolve_endpoint(None, Some("override-key".to_owned()), Some(&model), &config).unwrap();
     assert_eq!(
         endpoint.api_key,
         ApiKeySource::Literal("override-key".to_owned())
@@ -243,15 +239,8 @@ fn resolve_endpoint_keeps_api_key_commands_inert() {
         ])),
         ..ConfigFile::default()
     };
-    let endpoint = resolve_endpoint(
-        None,
-        None,
-        Some("https://model.example/v1"),
-        None,
-        None,
-        &config,
-    )
-    .unwrap();
+    let model = resolved_model_with(Some("https://model.example/v1"), None);
+    let endpoint = resolve_endpoint(None, None, Some(&model), &config).unwrap();
     assert_eq!(
         endpoint.api_key,
         ApiKeySource::Command(super::CommandSpec::Argv(vec![
@@ -268,12 +257,14 @@ fn resolve_endpoint_expands_only_the_winning_base_url_layer() {
         ..ConfigFile::default()
     };
 
+    let model = resolved_model_with(
+        Some("${model-base-url-must-not-be-read}"),
+        Some("${model-api-key-must-not-be-read}"),
+    );
     let endpoint = resolve_endpoint(
         Some("http://override.example/v1///".to_owned()),
         Some("override-key".to_owned()),
-        Some("${model-base-url-must-not-be-read}"),
-        Some("${model-api-key-must-not-be-read}"),
-        None,
+        Some(&model),
         &config,
     )
     .unwrap();
@@ -292,15 +283,8 @@ fn resolve_endpoint_does_not_expand_config_when_model_base_url_wins() {
         ..ConfigFile::default()
     };
 
-    let endpoint = resolve_endpoint(
-        None,
-        None,
-        Some("http://model.example/v1///"),
-        None,
-        None,
-        &config,
-    )
-    .unwrap();
+    let model = resolved_model_with(Some("http://model.example/v1///"), None);
+    let endpoint = resolve_endpoint(None, None, Some(&model), &config).unwrap();
 
     assert_eq!(endpoint.base_url, "http://model.example/v1");
     assert_eq!(endpoint.api_key, ApiKeySource::Absent);

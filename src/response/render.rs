@@ -14,23 +14,34 @@ struct JsonOutput<'a> {
     usage: Option<Usage>,
 }
 
+/// The presentation flags [`render_response`] needs: whether to render as
+/// `--json` and whether to include the model's reasoning text ahead of the
+/// final content (`--show-reasoning`). Bundled into one named struct because
+/// the two bare bools used to sit directly adjacent at every call site
+/// (`render_response(&response, false, false)`), letting one silently stand
+/// in for the other if swapped — the compiler cannot catch two `bool`s in
+/// the wrong order the way it would a type mismatch.
+pub(crate) struct RenderOptions {
+    pub(crate) as_json: bool,
+    pub(crate) show_reasoning: bool,
+}
+
 /// Renders a completed response for the CLI's text or JSON output mode.
 pub(crate) fn render_response(
     response: &ChatCompletionResponse,
-    as_json: bool,
-    show_reasoning: bool,
+    options: RenderOptions,
 ) -> Result<String> {
     let content = response_content(response).map_err(anyhow::Error::msg)?;
     let reasoning = response_reasoning(response);
 
-    if as_json {
+    if options.as_json {
         Ok(serde_json::to_string(&JsonOutput {
             content,
             reasoning,
             usage: response.usage,
         })?)
     } else {
-        Ok(format_response(content, reasoning, show_reasoning))
+        Ok(format_response(content, reasoning, options.show_reasoning))
     }
 }
 

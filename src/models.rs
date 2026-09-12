@@ -188,13 +188,27 @@ fn list_local(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
         ]);
     }
 
-    let mut widths = [0usize; 4];
-    for row in &table {
+    print_aligned_table(&table);
+    if default_is_alias {
+        println!("(* = default.model)");
+    } else if let Some(name) = default_model {
+        println!("default model: {name} (used as a raw model id)");
+    }
+    Ok(())
+}
+
+/// Prints `table` (its first row the header) as whitespace-aligned columns,
+/// each column's width the widest cell in it, columns separated by two
+/// spaces and trailing whitespace trimmed — the crate's only ASCII table
+/// formatter, used solely by [`list_local`].
+fn print_aligned_table<const N: usize>(table: &[[String; N]]) {
+    let mut widths = [0usize; N];
+    for row in table {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
         }
     }
-    for row in &table {
+    for row in table {
         let line = row
             .iter()
             .zip(widths)
@@ -203,12 +217,6 @@ fn list_local(args: &ModelsArgs, file_config: &ConfigFile) -> Result<()> {
             .join("  ");
         println!("{}", line.trim_end());
     }
-    if default_is_alias {
-        println!("(* = default.model)");
-    } else if let Some(name) = default_model {
-        println!("default model: {name} (used as a raw model id)");
-    }
-    Ok(())
 }
 
 /// The subset of a `GET /v1/models` response lait reads: the model ids.
@@ -236,8 +244,6 @@ async fn list_remote(
     let endpoint = crate::config::resolve_endpoint(
         args.endpoint.base_url.clone(),
         args.endpoint.api_key.clone(),
-        None,
-        None,
         None,
         file_config,
     )?;
@@ -293,9 +299,9 @@ where
         Some(cancellation) => {
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => Err(crate::error::Interrupted::cancelled(
+                () = cancellation.cancelled() => Err(crate::error::cancelled(
                     "models remote request was cancelled",
-                ).into()),
+                )),
                 result = future => result.map_err(anyhow::Error::new),
             }
         }

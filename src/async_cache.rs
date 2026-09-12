@@ -5,10 +5,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tokio::sync::OnceCell;
 
-use crate::{async_io, error::Interrupted};
+use crate::async_io;
 
 /// A lazily initialized, per-key asynchronous cache.
 ///
@@ -70,7 +70,7 @@ where
         {
             async_io::CancellationResult::Completed(result) => Ok(Arc::clone(result?)),
             async_io::CancellationResult::Cancelled => {
-                Err(anyhow!(Interrupted::cancelled(cancellation_message)))
+                Err(crate::error::cancelled(cancellation_message))
             }
         }
     }

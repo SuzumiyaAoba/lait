@@ -275,6 +275,53 @@ fn lint_detects_a_workflow_call_cycle() {
     );
 }
 
+/// A sub-workflow referenced by two sibling nodes (not a cycle) is loaded
+/// from disk once per reference before `LintCtx::loaded_workflows`, but this
+/// pins that the *lint itself* still runs fully for each reference site: the
+/// shared file's own "unused node" warning must be reported twice, each
+/// correctly attributed to the node that referenced it, not deduplicated
+/// away by the load cache.
+#[test]
+fn lint_reports_a_shared_sub_workflow_reference_from_each_referencing_node() {
+    let shared_path = next_temp_path("lait-test-lint-shared", ".yml");
+    let top_path = next_temp_path("lait-test-lint-top", ".yml");
+
+    std::fs::write(
+        &shared_path,
+        "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
+    )
+    .expect("failed to write shared sub-workflow file");
+    std::fs::write(
+        &top_path,
+        format!(
+            "nodes:\n  first:\n    type: workflow\n    workflow: {shared}\n  second:\n    type: workflow\n    workflow: {shared}\nsteps:\n  - use: first\n  - use: second\n",
+            shared = shared_path.file_name().unwrap().to_str().unwrap(),
+        ),
+    )
+    .expect("failed to write top-level workflow file");
+
+    let output = run_lait_lint(&[&top_path]);
+
+    std::fs::remove_file(&shared_path).ok();
+    std::fs::remove_file(&top_path).ok();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let unused_warnings = stdout.matches("'unused' is defined").count();
+    assert_eq!(
+        unused_warnings, 2,
+        "each of the two referencing nodes should surface the shared file's own unused-node \
+         warning independently, not share a single cached result: {stdout}"
+    );
+    let shared_name = shared_path.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        stdout
+            .matches(&format!("in 'workflow: {shared_name}'"))
+            .count(),
+        2,
+        "each reference site should attribute its own copy of the shared file's issues: {stdout}"
+    );
+}
+
 #[test]
 fn lint_flags_an_agent_referenced_by_a_node_that_does_not_exist() {
     let workflow = WorkflowFile::new(

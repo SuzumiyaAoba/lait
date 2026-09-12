@@ -123,14 +123,41 @@ pub(crate) fn search(query: &str) -> Result<Vec<(usize, HistoryEntry)>> {
     let mut number = 0_usize;
     jsonl::load_rev(&history_path()?, |entry: HistoryEntry| {
         number += 1;
-        if entry.prompt.to_lowercase().contains(&query)
-            || entry.response.to_lowercase().contains(&query)
+        if contains_case_insensitive(&entry.prompt, &query)
+            || contains_case_insensitive(&entry.response, &query)
         {
             matches.push((number, entry));
         }
         Ok(std::ops::ControlFlow::Continue(()))
     })?;
     Ok(matches)
+}
+
+/// Whether `haystack` contains `needle_lower` (already lowercased once by
+/// the caller) as a case-insensitive substring, without allocating a
+/// lowercased copy of `haystack` — unlike `haystack.to_lowercase().contains
+/// (needle_lower)`, which `search` visits once per history entry, and a
+/// response body can be tens of KB.
+///
+/// Takes the ASCII byte-comparison fast path whenever both sides are ASCII
+/// (a `history search <text>` query and most model output usually are);
+/// otherwise falls back to the always-correct `to_lowercase` + `contains`,
+/// since ASCII case folding does not fold non-ASCII scripts (e.g. "É"/"é")
+/// correctly.
+fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        let haystack = haystack.as_bytes();
+        let needle = needle_lower.as_bytes();
+        needle.len() <= haystack.len()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+    } else {
+        haystack.to_lowercase().contains(needle_lower)
+    }
 }
 
 fn print_entry(number: usize, entry: &HistoryEntry) {
@@ -223,7 +250,7 @@ pub(crate) fn run(args: HistoryArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{list, record, search, show, summarize};
+    use super::{contains_case_insensitive, list, record, search, show, summarize};
 
     /// Runs `body` with `HOME`/`XDG_DATA_HOME` temporarily pointed at a
     /// fresh, empty directory, so the history file resolves under an
@@ -337,6 +364,26 @@ mod tests {
             record("chat", None, "hello", "hi", None).unwrap();
             assert!(search("nope").unwrap().is_empty());
         });
+    }
+
+    /// `search` streams every entry through `contains_case_insensitive`
+    /// rather than allocating a lowercased copy of each prompt/response —
+    /// this pins its ASCII fast path and its non-ASCII fallback separately,
+    /// since only the ASCII path skips that allocation.
+    #[test]
+    fn contains_case_insensitive_matches_via_the_ascii_fast_path() {
+        assert!(contains_case_insensitive("translate to French", "french"));
+        assert!(!contains_case_insensitive("translate to French", "german"));
+        assert!(contains_case_insensitive("anything", ""));
+        assert!(!contains_case_insensitive("hi", "hello"));
+    }
+
+    #[test]
+    fn contains_case_insensitive_falls_back_correctly_for_non_ascii_text() {
+        // "É" only case-folds to "é" via Unicode rules, not ASCII byte
+        // comparison, so this only passes if the non-ASCII fallback runs.
+        assert!(contains_case_insensitive("Café École", "école"));
+        assert!(!contains_case_insensitive("Café École", "not present"));
     }
 
     #[test]

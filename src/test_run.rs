@@ -215,7 +215,7 @@ fn check_discovery_cancellation(
     use std::sync::atomic::Ordering;
 
     if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-        bail!(crate::error::Interrupted::cancelled(
+        bail!(crate::error::cancelled(
             "test target discovery was cancelled"
         ));
     }

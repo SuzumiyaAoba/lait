@@ -175,11 +175,10 @@ fn an_empty_command_list_is_a_lint_error() {
     // of which files are named on the command line — so a trivial workflow
     // file is enough to trigger it; see `lint::check_shell_tool_definitions`.
     let config = ConfigDirectory::new("tools:\n  broken:\n    command: []\n");
-    std::fs::write(
-        config.path().join("wf.yml"),
+    config.write(
+        "wf.yml",
         "nodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n",
-    )
-    .unwrap();
+    );
 
     let output = test_command()
         .current_dir(config.path())

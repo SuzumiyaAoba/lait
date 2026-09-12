@@ -11,10 +11,8 @@ fn empty_config() -> ConfigFile {
 
 fn lint_fixture(wf: &workflow::WorkflowFile, config: Option<&ConfigFile>) -> Vec<LintIssue> {
     let mut ctx = LintCtx::new(config);
-    let mut issues = Vec::new();
-    let mut visited = Vec::new();
-    lint_workflow_contents(wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
-    issues
+    lint_workflow_contents(wf, Path::new("."), &mut ctx);
+    ctx.issues
 }
 
 #[test]
@@ -244,10 +242,9 @@ fn skips_mcp_and_skill_checks_and_notes_it_when_there_is_no_config() {
         "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
     );
     let mut ctx = LintCtx::new(None);
-    let mut issues = Vec::new();
-    let mut visited = Vec::new();
-    lint_workflow_contents(&wf, Path::new("."), &mut ctx, &mut issues, &mut visited);
-    note_skipped_capability_check(&mut ctx, &mut issues);
+    lint_workflow_contents(&wf, Path::new("."), &mut ctx);
+    note_skipped_capability_check(&mut ctx);
+    let issues = ctx.issues;
     assert!(
         !issues
             .iter()

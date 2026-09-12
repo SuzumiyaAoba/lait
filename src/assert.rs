@@ -8,12 +8,14 @@
 //! message rather than silently skipping it; `lait eval` always passes one.
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::{
     config::{ConfigFile, ModelMap},
     engine::{
-        CapabilityOverrides, PromptTurn, RunContext, SamplingOverrides, resolve_request_settings,
+        CapabilityOverrides, EndpointOverrides, PromptTurn, RunContext, SamplingOverrides,
+        resolve_request_settings,
     },
     jq, response, schema,
 };
@@ -21,6 +23,19 @@ use crate::{
 /// The `llm_judge` pass/fail threshold when an assertion doesn't set its own
 /// `threshold:`.
 const DEFAULT_LLM_JUDGE_THRESHOLD: f64 = 0.7;
+
+/// The concurrency cap applied to independent assertion checks in
+/// [`evaluate`]. Deliberately kept low (rather than mirroring
+/// `engine::tool_loop::MAX_CONCURRENT_TOOL_CALLS`'s 8): `lait eval` already
+/// runs up to `eval::EVAL_CONCURRENCY` (8) cases/repeats concurrently, each
+/// of which can call [`evaluate`] independently, so the two caps multiply —
+/// a case with several `llm_judge` assertions could otherwise drive up to
+/// `EVAL_CONCURRENCY * MAX_CONCURRENT_ASSERTIONS` simultaneous model
+/// requests. At 4 the worst case is 32, a bounded and modest increase over
+/// the pre-parallelization baseline of ~8 (one in-flight model call per
+/// case, since assertions used to run one at a time), while still letting a
+/// case with 2-4 `llm_judge` assertions get most of the speedup.
+const MAX_CONCURRENT_ASSERTIONS: usize = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,8 +146,7 @@ async fn run_llm_judge(
     let settings = resolve_request_settings(
         model_name,
         SamplingOverrides::default(),
-        None,
-        None,
+        EndpointOverrides::default(),
         CapabilityOverrides::default(),
         &ModelMap::default(),
         judge.file_config,
@@ -167,13 +181,95 @@ async fn run_llm_judge(
     Ok(parsed.score)
 }
 
-/// Evaluates every entry in `assertions` against `output` in order, returning
-/// one [`AssertionFailure`] per entry that didn't hold (empty when every
-/// assertion passed). A `jq` expression's own evaluation error (bad syntax, a
-/// filter that doesn't produce exactly one value) and an `llm_judge` call's
-/// own failure (no judge context, a model error, an unparseable score) are
-/// both reported as a failure of that assertion rather than aborting the
-/// rest.
+/// Checks [`Assertion::Equals`], returning a failure message when `output`
+/// doesn't match `value` exactly.
+fn check_equals(value: &str, output: &str) -> Option<String> {
+    if output == value {
+        None
+    } else {
+        Some(format!(
+            "expected output to equal {value:?}, got {output:?}"
+        ))
+    }
+}
+
+/// Checks [`Assertion::Contains`], returning a failure message when `output`
+/// doesn't contain `value` as a plain-text substring.
+fn check_contains(value: &str, output: &str) -> Option<String> {
+    if output.contains(value) {
+        None
+    } else {
+        Some(format!(
+            "expected output to contain {value:?}, got {output:?}"
+        ))
+    }
+}
+
+/// Checks [`Assertion::Jq`], returning a failure message when the expression
+/// evaluates to `false` or fails outright (bad syntax, a filter that doesn't
+/// produce exactly one value).
+async fn check_jq(
+    expr: &str,
+    input_json: &str,
+    empty_steps: &jq::Steps,
+    output: &str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Option<String> {
+    match jq::apply_bool_cancellable_async(expr, input_json, empty_steps, empty_steps, cancellation)
+        .await
+    {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "jq expression `{expr}` was false for output {output:?}"
+        )),
+        Err(error) => Some(format!("jq expression `{expr}` failed: {error:#}")),
+    }
+}
+
+/// Checks [`Assertion::LlmJudge`], returning a failure message when no judge
+/// context is available, the judge call itself fails, or the score falls
+/// short of `threshold`.
+async fn check_llm_judge(
+    judge: Option<&LlmJudgeContext<'_>>,
+    criteria: &str,
+    model: Option<&str>,
+    threshold: Option<f64>,
+    output: &str,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Option<String> {
+    let Some(judge_context) = judge else {
+        return Some(
+            "llm_judge assertions are not supported here (no judge model \
+             available in this context; use `lait eval`)"
+                .to_owned(),
+        );
+    };
+    let threshold = threshold.unwrap_or(DEFAULT_LLM_JUDGE_THRESHOLD);
+    match run_llm_judge(judge_context, criteria, output, model, cancellation).await {
+        Ok(score) if score >= threshold => None,
+        Ok(score) => Some(format!(
+            "llm_judge score {score:.2} is below threshold {threshold:.2} \
+             for criteria {criteria:?}"
+        )),
+        Err(error) => Some(format!("llm_judge evaluation failed: {error:#}")),
+    }
+}
+
+/// Evaluates every entry in `assertions` against `output`, returning one
+/// [`AssertionFailure`] per entry that didn't hold, in `assertions`' original
+/// order (empty when every assertion passed). A `jq` expression's own
+/// evaluation error (bad syntax, a filter that doesn't produce exactly one
+/// value) and an `llm_judge` call's own failure (no judge context, a model
+/// error, an unparseable score) are both reported as a failure of that
+/// assertion rather than aborting the rest.
+///
+/// Assertions are independent (no short-circuiting, no shared mutable
+/// state), so they run with a fixed concurrency cap
+/// ([`MAX_CONCURRENT_ASSERTIONS`]) rather than one at a time — an `llm_judge`
+/// assertion is a full model round trip, and a test/eval case with several
+/// of them used to pay for that serially. `buffered` (not
+/// `buffer_unordered`) preserves `assertions`' order, so the `position` on
+/// each result still lines up with its original 1-based index.
 pub(crate) async fn evaluate(
     assertions: &[Assertion],
     judge: Option<&LlmJudgeContext<'_>>,
@@ -182,87 +278,50 @@ pub(crate) async fn evaluate(
 ) -> Vec<AssertionFailure> {
     let input_json = normalize_jq_input(output);
     let empty_steps = jq::Steps::new();
-    let mut failures = Vec::new();
-    for (index, assertion) in assertions.iter().enumerate() {
-        let position = index + 1;
-        match assertion {
-            Assertion::Equals { value } => {
-                if output != value {
-                    failures.push(AssertionFailure {
-                        position,
-                        message: format!("expected output to equal {value:?}, got {output:?}"),
-                    });
+    let input_json = &input_json;
+    let empty_steps = &empty_steps;
+
+    let checks = assertions.iter().map(move |assertion| {
+        let cancellation = cancellation.clone();
+        async move {
+            match assertion {
+                Assertion::Equals { value } => check_equals(value, output),
+                Assertion::Contains { value } => check_contains(value, output),
+                Assertion::Jq { expr } => {
+                    check_jq(expr, input_json, empty_steps, output, cancellation).await
                 }
-            }
-            Assertion::Contains { value } => {
-                if !output.contains(value.as_str()) {
-                    failures.push(AssertionFailure {
-                        position,
-                        message: format!("expected output to contain {value:?}, got {output:?}"),
-                    });
-                }
-            }
-            Assertion::Jq { expr } => {
-                match jq::apply_bool_cancellable_async(
-                    expr,
-                    &input_json,
-                    &empty_steps,
-                    &empty_steps,
-                    cancellation.clone(),
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => failures.push(AssertionFailure {
-                        position,
-                        message: format!("jq expression `{expr}` was false for output {output:?}"),
-                    }),
-                    Err(error) => failures.push(AssertionFailure {
-                        position,
-                        message: format!("jq expression `{expr}` failed: {error:#}"),
-                    }),
-                }
-            }
-            Assertion::LlmJudge {
-                criteria,
-                model,
-                threshold,
-            } => match judge {
-                None => failures.push(AssertionFailure {
-                    position,
-                    message: "llm_judge assertions are not supported here (no judge model \
-                              available in this context; use `lait eval`)"
-                        .to_owned(),
-                }),
-                Some(judge_context) => {
-                    let threshold = threshold.unwrap_or(DEFAULT_LLM_JUDGE_THRESHOLD);
-                    match run_llm_judge(
-                        judge_context,
+                Assertion::LlmJudge {
+                    criteria,
+                    model,
+                    threshold,
+                } => {
+                    check_llm_judge(
+                        judge,
                         criteria,
-                        output,
                         model.as_deref(),
-                        cancellation.clone(),
+                        *threshold,
+                        output,
+                        cancellation,
                     )
                     .await
-                    {
-                        Ok(score) if score >= threshold => {}
-                        Ok(score) => failures.push(AssertionFailure {
-                            position,
-                            message: format!(
-                                "llm_judge score {score:.2} is below threshold {threshold:.2} \
-                                 for criteria {criteria:?}"
-                            ),
-                        }),
-                        Err(error) => failures.push(AssertionFailure {
-                            position,
-                            message: format!("llm_judge evaluation failed: {error:#}"),
-                        }),
-                    }
                 }
-            },
+            }
         }
-    }
-    failures
+    });
+
+    futures_util::stream::iter(checks)
+        .buffered(MAX_CONCURRENT_ASSERTIONS)
+        .collect::<Vec<Option<String>>>()
+        .await
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            message.map(|message| AssertionFailure {
+                position: index + 1,
+                message,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -374,6 +433,46 @@ mod tests {
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].position, 1);
         assert_eq!(failures[1].position, 2);
+    }
+
+    /// With 6 assertions and a concurrency cap of [`MAX_CONCURRENT_ASSERTIONS`]
+    /// (4), this spans at least two `buffered` windows, so it would catch a
+    /// regression to `buffer_unordered` (which does not preserve order) or
+    /// any indexing mistake in how `position` is derived from the original
+    /// list.
+    #[tokio::test]
+    async fn preserves_failure_order_and_count_across_multiple_buffered_windows() {
+        let assertions = vec![
+            Assertion::Equals {
+                value: "no-match-1".to_owned(),
+            },
+            Assertion::Contains {
+                value: "結論".to_owned(),
+            },
+            Assertion::Jq {
+                expr: "contains(\"never\")".to_owned(),
+            },
+            Assertion::Equals {
+                value: "actual".to_owned(),
+            },
+            Assertion::Contains {
+                value: "no-match-2".to_owned(),
+            },
+            Assertion::Jq {
+                expr: "contains(\"missing\")".to_owned(),
+            },
+        ];
+        let failures = evaluate(&assertions, None, "actual", None).await;
+        // Positions 1 (equals mismatch), 2 (contains mismatch), 3 (jq
+        // false), 5 (contains mismatch), and 6 (jq false) fail; only 4
+        // (equals an exact match) passes.
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.position)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 5, 6]
+        );
     }
 
     #[tokio::test]

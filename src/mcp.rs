@@ -72,6 +72,12 @@ const MAX_TOOL_METADATA_BYTES: usize = 16 * 1024 * 1024;
 /// distinct cursors.
 const MAX_TOOL_LIST_PAGES: usize = 128;
 
+/// The single wording used by every "an MCP round trip observed
+/// cancellation" site in this module and [`registry`] — `connect`'s own
+/// pre-check and `select!` branch, and `registry`'s connection/tool-list
+/// round trips.
+const MCP_OPERATION_CANCELLED: &str = "MCP operation was cancelled";
+
 /// The app-level "this run was cancelled" signal threaded down from
 /// `app.rs`, distinct from this module's own [`CancellationToken`] uses
 /// below (each of those represents one MCP I/O operation's own timeout, not
@@ -206,19 +212,21 @@ where
         biased;
         result = &mut serve => {
             if cancellation.is_cancelled() {
-                return Err(anyhow!(crate::error::Interrupted::cancelled("MCP operation was cancelled")));
+                return Err(crate::error::cancelled(MCP_OPERATION_CANCELLED));
             }
             result.map_err(|error| anyhow!("failed to initialize MCP server '{name}': {error}"))
         }
         _ = tokio::time::sleep(MCP_IO_TIMEOUT) => {
             cancellation.cancel();
             let _ = serve.await;
-            Err(anyhow!(crate::error::Interrupted::timed_out(format!("timed out after {}s while initializing MCP server '{name}'",
-                MCP_IO_TIMEOUT.as_secs()))))
+            Err(crate::error::timed_out(format!(
+                "timed out after {}s while initializing MCP server '{name}'",
+                MCP_IO_TIMEOUT.as_secs()
+            )))
         }
         _ = cancellation.cancelled() => {
             let _ = serve.await;
-            Err(anyhow!(crate::error::Interrupted::cancelled("MCP operation was cancelled")))
+            Err(crate::error::cancelled(MCP_OPERATION_CANCELLED))
         }
     }
 }
@@ -232,9 +240,7 @@ async fn connect(
     cancellation: CancellationToken,
 ) -> Result<McpConnection> {
     if cancellation.is_cancelled() {
-        return Err(anyhow!(crate::error::Interrupted::cancelled(
-            "MCP operation was cancelled"
-        )));
+        return Err(crate::error::cancelled(MCP_OPERATION_CANCELLED));
     }
     match transport {
         config::McpTransport::Stdio {

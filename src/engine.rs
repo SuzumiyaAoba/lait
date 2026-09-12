@@ -34,7 +34,7 @@ mod tool_loop;
 
 pub(crate) use context::{AppServices, RunContext};
 use settings::{EndpointAttempt, is_fallback_eligible};
-pub(crate) use settings::{agent_file_settings, resolve_request_settings};
+pub(crate) use settings::{EndpointOverrides, agent_file_settings, resolve_request_settings};
 use stream::{StreamOutcome, stream_response};
 use tool_loop::ToolLoop;
 
@@ -76,6 +76,34 @@ impl SamplingOverrides {
             max_tokens: layers.iter().find_map(|layer| layer.max_tokens),
         }
     }
+
+    /// `resolve_request_settings`'s tail of the fallback chain [`fold`] does
+    /// not cover: `resolved_model`'s own defaults, then
+    /// `lait.config.yml`'s `default:` block — each field falling back
+    /// independently, same as `fold`.
+    ///
+    /// [`fold`]: Self::fold
+    pub(crate) fn resolve(
+        self,
+        resolved_model: &config::ResolvedModel,
+        default: &config::DefaultSettings,
+    ) -> Self {
+        Self {
+            reasoning_effort: self
+                .reasoning_effort
+                .or(resolved_model.reasoning_effort)
+                .or(default.reasoning_effort),
+            temperature: self
+                .temperature
+                .or(resolved_model.temperature)
+                .or(default.temperature),
+            top_p: self.top_p.or(resolved_model.top_p).or(default.top_p),
+            max_tokens: self
+                .max_tokens
+                .or(resolved_model.max_tokens)
+                .or(default.max_tokens),
+        }
+    }
 }
 
 /// The `mcp`/`max_tool_rounds`/`skills`/`subagents`/`tools` knobs a caller
@@ -97,16 +125,66 @@ pub(crate) struct CapabilityOverrides {
 
 impl CapabilityOverrides {
     /// Folds `layers` field by field in priority order — see
-    /// `SamplingOverrides::fold`, which this mirrors.
-    pub(crate) fn fold(layers: &[Self]) -> Self {
-        Self {
-            mcp: layers.iter().find_map(|layer| layer.mcp.clone()),
-            max_tool_rounds: layers.iter().find_map(|layer| layer.max_tool_rounds),
-            skills: layers.iter().find_map(|layer| layer.skills.clone()),
-            subagents: layers.iter().find_map(|layer| layer.subagents.clone()),
-            tools: layers.iter().find_map(|layer| layer.tools.clone()),
+    /// `SamplingOverrides::fold`, which this mirrors, except `layers` is
+    /// taken by value: unlike `SamplingOverrides`' `Copy` fields, each field
+    /// here is a `Vec<String>` the caller already owns (built fresh per
+    /// call, one per layer). A borrowed `&[Self]` would need its own
+    /// `.clone()` to move a winning field out of a `&Self` — on top of the
+    /// clone the caller already pays constructing its owned `Self` layers —
+    /// so every field would be cloned twice. Taking ownership here instead
+    /// lets each field move out of whichever layer supplies it, exactly
+    /// once, in one pass over `layers`.
+    pub(crate) fn fold<const N: usize>(layers: [Self; N]) -> Self {
+        let mut folded = Self::default();
+        for layer in layers {
+            folded.mcp = folded.mcp.or(layer.mcp);
+            folded.max_tool_rounds = folded.max_tool_rounds.or(layer.max_tool_rounds);
+            folded.skills = folded.skills.or(layer.skills);
+            folded.subagents = folded.subagents.or(layer.subagents);
+            folded.tools = folded.tools.or(layer.tools);
+        }
+        folded
+    }
+
+    /// `resolve_request_settings`'s tail of the fallback chain [`fold`] does
+    /// not cover: `lait.config.yml`'s `default:` block, with every
+    /// list-valued field defaulted to empty rather than left `None` — unlike
+    /// `max_tool_rounds`, which [`ResolvedCapabilities`] keeps as a raw
+    /// `Option` since its caller still has to validate it before choosing
+    /// [`DEFAULT_MAX_TOOL_ROUNDS`].
+    ///
+    /// [`fold`]: Self::fold
+    pub(crate) fn resolve(self, default: &config::DefaultSettings) -> ResolvedCapabilities {
+        ResolvedCapabilities {
+            mcp: self.mcp.or_else(|| default.mcp.clone()).unwrap_or_default(),
+            max_tool_rounds: self.max_tool_rounds.or(default.max_tool_rounds),
+            skills: self
+                .skills
+                .or_else(|| default.skills.clone())
+                .unwrap_or_default(),
+            subagents: self
+                .subagents
+                .or_else(|| default.subagents.clone())
+                .unwrap_or_default(),
+            tools: self
+                .tools
+                .or_else(|| default.tools.clone())
+                .unwrap_or_default(),
         }
     }
+}
+
+/// [`CapabilityOverrides::resolve`]'s result — every field already merged
+/// with `lait.config.yml`'s `default:` block, except `max_tool_rounds`,
+/// which stays a raw `Option<usize>` because its caller must validate it
+/// (`llm::validate_max_tool_rounds`) before substituting
+/// [`DEFAULT_MAX_TOOL_ROUNDS`].
+pub(crate) struct ResolvedCapabilities {
+    pub(crate) mcp: Vec<String>,
+    pub(crate) max_tool_rounds: Option<usize>,
+    pub(crate) skills: Vec<String>,
+    pub(crate) subagents: Vec<String>,
+    pub(crate) tools: Vec<String>,
 }
 
 /// The new-turn inputs shared by `RequestSettings::complete`/
@@ -455,6 +533,72 @@ impl RequestSettings {
     /// actually served the request — the cache represents "what would this
     /// logical request return", not which of possibly several endpoints
     /// happened to answer it.
+    /// `--replay`'s lookup path: every request is answered from
+    /// `replay_dir`'s cassettes, or the run fails outright (see
+    /// `cassette::load`) — `None` when `--replay` isn't active, so
+    /// `complete_recorded` falls through to its cache/network paths.
+    async fn try_replay(
+        &self,
+        env: &RunContext,
+        content_key: &Option<String>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Option<response::ChatCompletionResponse>> {
+        let Some(replay_dir) = env.policy.cassette.replay_dir() else {
+            return Ok(None);
+        };
+        let key = require_content_key(content_key);
+        let response =
+            cassette::load(replay_dir, key, &self.resolved_model.model_id, cancellation).await?;
+        env.usage.record_response(&self.usage_label, &response);
+        Ok(Some(response))
+    }
+
+    /// The response disk cache's read path — skipped entirely while
+    /// `--record`ing (a cache hit would otherwise skip the network call
+    /// `--record` needs to actually observe; the later cache *save* stays
+    /// harmless there). A hit returns `Some` without recording usage (see
+    /// `complete_recorded`'s doc comment: a cache hit is not a network
+    /// request, so `--show-usage` must not count it); a miss or read failure
+    /// (logged at `debug`, treated the same as a miss) returns `None` so the
+    /// caller falls through to an actual request.
+    async fn try_cache(
+        &self,
+        env: &RunContext,
+        content_key: &Option<String>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Option<response::ChatCompletionResponse>> {
+        if !(env.policy.cache.enabled() && env.policy.cassette.record_dir().is_none()) {
+            return Ok(None);
+        }
+        let cache_key = require_content_key(content_key);
+        match cache::load(
+            cache_key,
+            env.policy.cache.ttl(),
+            chrono::Utc::now(),
+            cancellation,
+        )
+        .await
+        {
+            Ok(Some(response)) => {
+                eprintln!("note: cache hit for {}", self.usage_label);
+                tracing::debug!(cache_key = %cache_key, "response cache hit");
+                Ok(Some(response))
+            }
+            Ok(None) => {
+                tracing::debug!(cache_key = %cache_key, "response cache miss");
+                Ok(None)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    cache_key = %cache_key,
+                    error = %error,
+                    "failed to read response cache entry; treating it as a miss",
+                );
+                Ok(None)
+            }
+        }
+    }
+
     async fn complete_recorded(
         &self,
         env: &RunContext,
@@ -484,47 +628,17 @@ impl RequestSettings {
             None
         };
 
-        // `--replay` never touches the network or the response cache: every
-        // request is answered from `replay_dir`'s cassettes, or the run
-        // fails outright (see `cassette::load`).
-        if let Some(replay_dir) = env.policy.cassette.replay_dir() {
-            let key = require_content_key(&content_key);
-            let response = cassette::load(
-                replay_dir,
-                key,
-                &self.resolved_model.model_id,
-                cancellation.clone(),
-            )
-            .await?;
-            env.usage.record_response(&self.usage_label, &response);
+        if let Some(response) = self
+            .try_replay(env, &content_key, cancellation.clone())
+            .await?
+        {
             return Ok(response);
         }
-
-        // A cache hit would otherwise skip the network call `--record` needs
-        // to actually observe, so cache lookup (not the later cache *save*,
-        // which stays harmless) is skipped while recording.
-        if env.policy.cache.enabled() && env.policy.cassette.record_dir().is_none() {
-            let cache_key = require_content_key(&content_key);
-            match cache::load(
-                cache_key,
-                env.policy.cache.ttl(),
-                chrono::Utc::now(),
-                cancellation.clone(),
-            )
-            .await
-            {
-                Ok(Some(response)) => {
-                    eprintln!("note: cache hit for {}", self.usage_label);
-                    tracing::debug!(cache_key = %cache_key, "response cache hit");
-                    return Ok(response);
-                }
-                Ok(None) => tracing::debug!(cache_key = %cache_key, "response cache miss"),
-                Err(error) => tracing::debug!(
-                    cache_key = %cache_key,
-                    error = %error,
-                    "failed to read response cache entry; treating it as a miss",
-                ),
-            }
+        if let Some(response) = self
+            .try_cache(env, &content_key, cancellation.clone())
+            .await?
+        {
+            return Ok(response);
         }
 
         let mut endpoint = EndpointAttempt::primary(self);
@@ -549,7 +663,13 @@ impl RequestSettings {
                     env.usage.record_response(&self.usage_label, &response);
                     if env.policy.cache.enabled()
                         && let Some(cache_key) = &content_key
-                        && let Err(error) = cache::save(cache_key, &response, chrono::Utc::now())
+                        && let Err(error) = cache::save(
+                            cache_key,
+                            &response,
+                            chrono::Utc::now(),
+                            cancellation.clone(),
+                        )
+                        .await
                     {
                         tracing::debug!(error = %error, "failed to write response cache entry");
                     }
@@ -564,7 +684,9 @@ impl RequestSettings {
                             tools,
                             response_format.as_ref(),
                             &response,
-                        )?;
+                            cancellation.clone(),
+                        )
+                        .await?;
                     }
                     return Ok(response);
                 }
@@ -789,7 +911,10 @@ impl RequestSettings {
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Option<Cow<'a, str>>> {
         let skills_text = skill_cache.render(&self.skills, cancellation).await?;
-        Ok(with_skills(system_prompt, skills_text.as_deref()))
+        Ok(with_skills(
+            system_prompt,
+            skills_text.as_deref().map(String::as_str),
+        ))
     }
 
     /// The prologue shared by `complete`/`complete_stream`: resolves the
@@ -890,7 +1015,13 @@ pub(crate) async fn call_agent(
             cancellation,
         )
         .await?;
-    response::render_response(&response, false, false)
+    response::render_response(
+        &response,
+        response::RenderOptions {
+            as_json: false,
+            show_reasoning: false,
+        },
+    )
 }
 
 /// The maximum recursive subagent-calling depth (a subagent whose own
@@ -1033,9 +1164,40 @@ pub(crate) fn call_subagent_tool<'a>(
 #[cfg(test)]
 mod tests {
     use super::context::{CachePolicy, CancellationSource, CassettePolicy, RunContext};
-    use super::{AppServices, stream_response};
+    use super::{AppServices, CapabilityOverrides, stream_response};
     use std::{path::PathBuf, sync::Arc, time::Duration};
     use tokio_util::sync::CancellationToken;
+
+    /// `CapabilityOverrides::fold` picks each field independently from the
+    /// first layer (in priority order) that sets it, moving fields out
+    /// instead of cloning them — this pins that behavior across a field the
+    /// first layer sets, a field only a later layer sets, and a field no
+    /// layer sets.
+    #[test]
+    fn capability_overrides_fold_picks_the_first_layer_that_sets_each_field_independently() {
+        let highest_priority = CapabilityOverrides {
+            mcp: Some(vec!["from-first".to_owned()]),
+            ..Default::default()
+        };
+        let lower_priority = CapabilityOverrides {
+            mcp: Some(vec!["from-second".to_owned()]),
+            skills: Some(vec!["skill-a".to_owned()]),
+            ..Default::default()
+        };
+        let lowest_priority = CapabilityOverrides {
+            skills: Some(vec!["ignored".to_owned()]),
+            tools: Some(vec!["tool-a".to_owned()]),
+            ..Default::default()
+        };
+
+        let folded = CapabilityOverrides::fold([highest_priority, lower_priority, lowest_priority]);
+
+        assert_eq!(folded.mcp, Some(vec!["from-first".to_owned()]));
+        assert_eq!(folded.skills, Some(vec!["skill-a".to_owned()]));
+        assert_eq!(folded.tools, Some(vec!["tool-a".to_owned()]));
+        assert_eq!(folded.subagents, None);
+        assert_eq!(folded.max_tool_rounds, None);
+    }
 
     /// A regression test for the bug `stream_response`'s cancellation
     /// parameter fixes: before this, a stream that never produced another

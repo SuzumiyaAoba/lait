@@ -12,7 +12,10 @@ use crate::{
     async_io,
     cli::SharedChatArgs,
     config::{self, ConfigFile, ModelMap},
-    engine::{CapabilityOverrides, RequestSettings, SamplingOverrides, resolve_request_settings},
+    engine::{
+        CapabilityOverrides, EndpointOverrides, RequestSettings, SamplingOverrides,
+        resolve_request_settings,
+    },
     report, response, session,
 };
 
@@ -160,8 +163,10 @@ pub(crate) fn resolve_chat_settings(
             top_p: shared.top_p,
             max_tokens: shared.max_tokens,
         },
-        shared.endpoint.base_url.clone(),
-        shared.endpoint.api_key.clone(),
+        EndpointOverrides {
+            base_url: shared.endpoint.base_url.clone(),
+            api_key: shared.endpoint.api_key.clone(),
+        },
         CapabilityOverrides {
             mcp: (!shared.mcp.is_empty()).then(|| shared.mcp.clone()),
             max_tool_rounds: None,

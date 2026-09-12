@@ -3,15 +3,9 @@ mod support;
 #[cfg(unix)]
 use std::{process::Stdio, time::Duration};
 
-use support::{ConfigDirectory, MockServer, test_command};
-
 #[cfg(unix)]
-fn send_sigint(pid: u32) {
-    // SAFETY: the pid belongs to the child spawned by this test.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGINT);
-    }
-}
+use support::send_sigint;
+use support::{ConfigDirectory, MockServer, test_command};
 
 const CONFIG: &str = r#"
 default:
@@ -52,6 +46,24 @@ fn lists_configured_aliases_and_marks_the_default() {
     assert!(
         stdout.contains("other") && stdout.contains("other-model"),
         "every alias should be listed: {stdout}"
+    );
+
+    // Column widths are per-column: the MODEL_ID column should start at the
+    // same character offset on the header and every data row, regardless of
+    // how long each row's own NAME cell is (`*local` vs `other`).
+    let lines: Vec<&str> = stdout.lines().collect();
+    let model_id_column = lines[0]
+        .find("MODEL_ID")
+        .expect("header should contain MODEL_ID");
+    assert_eq!(
+        lines[1].find("test-model-id"),
+        Some(model_id_column),
+        "MODEL_ID column should be aligned across rows: {stdout}"
+    );
+    assert_eq!(
+        lines[2].find("other-model"),
+        Some(model_id_column),
+        "MODEL_ID column should be aligned across rows: {stdout}"
     );
 }
 

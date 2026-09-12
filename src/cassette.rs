@@ -55,10 +55,16 @@ fn entry_path(dir: &Path, key: &str) -> PathBuf {
 
 /// Saves one request/response pair to `dir` under `key` (see `cache::key`),
 /// atomically (temp file in the same directory, then `rename` — see
-/// `cache::save`/`checkpoint::save_cancellable`). Creates `dir` (and any missing parent
+/// `cache::save`/`checkpoint::save_cancellable`) on the bounded blocking I/O
+/// worker (`async_io::run_blocking`). Creates `dir` (and any missing parent
 /// directories) if it doesn't already exist.
+///
+/// Goes through `run_blocking` for the same reason `cache::save` does — see
+/// its doc comment. Serializes synchronously first, borrowing every
+/// argument, and only the resulting `body`/`path` (owned, so they can move
+/// onto the worker thread) cross onto it.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn save(
+pub(crate) async fn save(
     dir: &Path,
     key: &str,
     base_url: &str,
@@ -67,6 +73,7 @@ pub(crate) fn save(
     tools: &[ChatCompletionTools],
     response_format: Option<&ResponseFormat>,
     response: &response::ChatCompletionResponse,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     let entry = CassetteEntryRef {
         recorded_at: chrono::Utc::now(),
@@ -82,9 +89,14 @@ pub(crate) fn save(
     let body =
         serde_json::to_string_pretty(&entry).context("failed to serialize cassette entry")?;
     let path = entry_path(dir, key);
-    crate::storage::write_atomic(&path, body.as_bytes())
-        .with_context(|| format!("failed to save cassette entry to '{}'", path.display()))?;
-    Ok(())
+    async_io::run_blocking(
+        move |_| {
+            crate::storage::write_atomic(&path, body.as_bytes())
+                .with_context(|| format!("failed to save cassette entry to '{}'", path.display()))
+        },
+        cancellation,
+    )
+    .await
 }
 
 /// Reads back the cassette entry for `key` in `dir`. Unlike `cache::load`, a
@@ -160,7 +172,9 @@ mod tests {
             &[],
             None,
             &response,
+            None,
         )
+        .await
         .expect("save should succeed");
 
         let loaded = load(dir.path(), "key-1", "model-a", None)
@@ -213,8 +227,8 @@ mod tests {
         assert!(error.to_string().contains("bad-key.json"), "{error}");
     }
 
-    #[test]
-    fn save_creates_missing_directories() {
+    #[tokio::test]
+    async fn save_creates_missing_directories() {
         let dir = tempfile_dir();
         let nested = dir.path().join("nested").join("cassettes");
         let response = sample_response("hi");
@@ -227,7 +241,9 @@ mod tests {
             &[],
             None,
             &response,
+            None,
         )
+        .await
         .expect("save should create missing directories");
         assert!(nested.join("k.json").is_file());
     }

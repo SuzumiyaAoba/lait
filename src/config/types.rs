@@ -492,7 +492,7 @@ pub(crate) struct Endpoint {
     pub(crate) api_key: ApiKeySource,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ResolvedModel {
     pub(crate) model_id: String,
     pub(crate) base_url: Option<String>,

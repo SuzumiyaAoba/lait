@@ -1,30 +1,10 @@
 mod support;
 
-use support::{MockServer, ScratchDir, test_command};
+use support::{MockServer, ScratchDir, test_command, workflow_yaml};
 
 fn model_config(base_url: &str) -> String {
     format!(
         "models:\n  m:\n    - provider:\n        base_url: \"{base_url}\"\n      model_id: model-a\n"
-    )
-}
-
-fn workflow_yaml(base_url: &str) -> String {
-    format!(
-        r#"
-default:
-  model: local
-models:
-  local:
-    - provider:
-        base_url: "{base_url}"
-      model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-steps:
-  - use: call
-"#
     )
 }
 

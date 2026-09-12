@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 
 use crate::{
     async_io, chat, checkpoint,
@@ -107,6 +107,90 @@ fn top_level_step_labels(steps: &[workflow::FlowStep]) -> Vec<String> {
         .collect()
 }
 
+/// Rejects a `--resume` target that cannot resume against this invocation:
+/// checkpointed against a different workflow file, or a run that already
+/// completed. A no-op when `resumed` is `None` (a fresh run, not a resume).
+fn check_resume_compatible(
+    resumed: Option<&checkpoint::Checkpoint>,
+    workflow_path: &str,
+) -> Result<()> {
+    let Some(resumed) = resumed else {
+        return Ok(());
+    };
+    if resumed.workflow_path != workflow_path {
+        bail!(
+            "run '{}' was checkpointed against workflow '{}', not '{workflow_path}'; pass \
+             the same FILE to resume it",
+            resumed.run_id,
+            resumed.workflow_path,
+        );
+    }
+    if resumed.status == checkpoint::RunStatus::Completed {
+        bail!(
+            "run '{}' already completed; nothing to resume",
+            resumed.run_id
+        );
+    }
+    Ok(())
+}
+
+/// Resolves the initial prompt, run vars, and starting [`Progress`] a run
+/// begins from — a `--resume` target restores all three from its checkpoint
+/// (unless `--var` overrides its saved vars), while a fresh run resolves the
+/// prompt from `PROMPT`/stdin and starts `Progress` at the beginning.
+async fn resolve_run_start(
+    run_args: &RunArgs,
+    resumed: Option<&checkpoint::Checkpoint>,
+    top_level_labels: &[String],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(String, serde_json::Map<String, serde_json::Value>, Progress)> {
+    match resumed {
+        Some(resumed) => {
+            checkpoint::check_resumable(top_level_labels, resumed)?;
+            eprintln!(
+                "==> resuming run '{}' from step {}/{}",
+                resumed.run_id,
+                resumed.completed_index + 1,
+                top_level_labels.len(),
+            );
+            let vars = if run_args.var.var.is_empty() {
+                resumed.vars.clone()
+            } else {
+                workflow::build_vars(&run_args.var.var)?
+            };
+            Ok((
+                resumed.initial_prompt.clone(),
+                vars,
+                Progress {
+                    completed_index: resumed.completed_index,
+                    counter: resumed.counter,
+                    input: resumed.current_input.clone(),
+                    outputs: resumed.steps_outputs.clone(),
+                },
+            ))
+        }
+        None => {
+            let prompt = chat::resolve_input_with_stdin_cancellable(
+                run_args.prompt.clone(),
+                Some(cancel.clone()),
+            )
+            .await?
+            .ok_or_else(super::missing_prompt_error)?;
+            let vars = workflow::build_vars(&run_args.var.var)?;
+            Ok((
+                prompt.clone(),
+                vars,
+                Progress {
+                    completed_index: 0,
+                    counter: 0,
+                    input: prompt,
+                    outputs: workflow::StepOutputs::new(),
+                },
+            ))
+        }
+    }
+}
+
 pub(super) async fn run_workflow(
     run_args: RunArgs,
     config_source: ConfigSource,
@@ -130,73 +214,15 @@ pub(super) async fn run_workflow(
         Some(run_id) => Some(checkpoint::load_cancellable(run_id, Some(cancel.clone())).await?),
         None => None,
     };
-    if let Some(resumed) = &resumed {
-        if resumed.workflow_path != workflow_path {
-            bail!(
-                "run '{}' was checkpointed against workflow '{}', not '{workflow_path}'; pass \
-                 the same FILE to resume it",
-                resumed.run_id,
-                resumed.workflow_path,
-            );
-        }
-        if resumed.status == checkpoint::RunStatus::Completed {
-            bail!(
-                "run '{}' already completed; nothing to resume",
-                resumed.run_id
-            );
-        }
-    }
+    check_resume_compatible(resumed.as_ref(), &workflow_path)?;
 
     let mut wf = workflow::load_workflow_cancellable(&resolved_file, Some(cancel.clone())).await?;
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
     let scope = WorkflowScope::top_level(&mut wf, &resolved_file, Some(cancel.clone())).await?;
     let top_level_labels = top_level_step_labels(&wf.steps);
 
-    let (initial_prompt, vars, progress) = match &resumed {
-        Some(resumed) => {
-            checkpoint::check_resumable(&top_level_labels, resumed)?;
-            eprintln!(
-                "==> resuming run '{}' from step {}/{}",
-                resumed.run_id,
-                resumed.completed_index + 1,
-                top_level_labels.len(),
-            );
-            let vars = if run_args.var.var.is_empty() {
-                resumed.vars.clone()
-            } else {
-                workflow::build_vars(&run_args.var.var)?
-            };
-            (
-                resumed.initial_prompt.clone(),
-                vars,
-                Progress {
-                    completed_index: resumed.completed_index,
-                    counter: resumed.counter,
-                    input: resumed.current_input.clone(),
-                    outputs: resumed.steps_outputs.clone(),
-                },
-            )
-        }
-        None => {
-            let prompt = chat::resolve_input_with_stdin_cancellable(
-                run_args.prompt.clone(),
-                Some(cancel.clone()),
-            )
-            .await?
-            .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
-            let vars = workflow::build_vars(&run_args.var.var)?;
-            (
-                prompt.clone(),
-                vars,
-                Progress {
-                    completed_index: 0,
-                    counter: 0,
-                    input: prompt,
-                    outputs: workflow::StepOutputs::new(),
-                },
-            )
-        }
-    };
+    let (initial_prompt, vars, progress) =
+        resolve_run_start(&run_args, resumed.as_ref(), &top_level_labels, &cancel).await?;
     let run_id = match &resumed {
         Some(resumed) => resumed.run_id.clone(),
         None => checkpoint::generate_run_id(),

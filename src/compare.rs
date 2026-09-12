@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use futures_util::future::join_all;
 use serde::Serialize;
 
@@ -14,8 +14,8 @@ use crate::{
     cli::CompareArgs,
     config::{self, ConfigSource, ModelMap},
     engine::{
-        AppServices, CapabilityOverrides, PromptTurn, RunContext, SamplingOverrides,
-        resolve_request_settings,
+        AppServices, CapabilityOverrides, EndpointOverrides, PromptTurn, RunContext,
+        SamplingOverrides, resolve_request_settings,
     },
     response, signal,
 };
@@ -48,7 +48,7 @@ pub(crate) async fn run(
     let prompt =
         chat::resolve_input_with_stdin_cancellable(args.prompt.clone(), Some(cancel.clone()))
             .await?
-            .ok_or_else(|| anyhow!("a PROMPT is required; provide one or pipe input via stdin"))?;
+            .ok_or_else(crate::app::missing_prompt_error)?;
 
     let sampling = SamplingOverrides {
         reasoning_effort: args.reasoning_effort,
@@ -62,8 +62,7 @@ pub(crate) async fn run(
         let settings = resolve_request_settings(
             model_name.clone(),
             sampling,
-            None,
-            None,
+            EndpointOverrides::default(),
             CapabilityOverrides::default(),
             &ModelMap::default(),
             &file_config,

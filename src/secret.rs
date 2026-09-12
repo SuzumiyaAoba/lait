@@ -139,7 +139,7 @@ impl SecretResolver {
 }
 
 fn cancellation_error() -> anyhow::Error {
-    crate::error::Interrupted::cancelled("api_key_cmd resolution was cancelled").into()
+    crate::error::cancelled("api_key_cmd resolution was cancelled")
 }
 
 fn ensure_not_cancelled(cancellation: Option<&tokio_util::sync::CancellationToken>) -> Result<()> {

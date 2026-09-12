@@ -1,6 +1,6 @@
 mod support;
 
-use support::{MockServer, WorkflowFile, test_command, without_json_whitespace};
+use support::{MockServer, WorkflowFile, completion_body, test_command, without_json_whitespace};
 
 const RESPONSE_WITH_USAGE: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}"#;
 
@@ -27,10 +27,7 @@ fn show_usage_prints_the_reported_usage_to_stderr() {
 
 #[test]
 fn show_usage_reports_when_the_server_stays_silent() {
-    let server = MockServer::start(
-        "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-    );
+    let server = MockServer::start("200 OK", &completion_body("test-model", "mock response"));
     let output = test_command()
         .args(["--model", "test-model", "--base-url", &server.base_url])
         .arg("--show-usage")

@@ -20,6 +20,10 @@ use fs2::FileExt;
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// The single wording for `ExclusiveLease::acquire`'s two cancellation
+/// checks (the up-front check and the one inside its poll loop).
+const OUTPUT_FILE_LOCK_CANCELLED: &str = "regular output file lock was cancelled";
+
 /// An exclusive advisory lease on an already-open regular file.
 ///
 /// The lease is held until this value is dropped, including when the caller's
@@ -37,18 +41,14 @@ impl ExclusiveLease {
     /// truncating or writing the file.
     pub(crate) fn acquire(file: &File, cancelled: &AtomicBool) -> Result<Self> {
         if cancelled.load(Ordering::Acquire) {
-            bail!(crate::error::Interrupted::cancelled(
-                "regular output file lock was cancelled"
-            ));
+            bail!(crate::error::cancelled(OUTPUT_FILE_LOCK_CANCELLED));
         }
         let lock_file = file
             .try_clone()
             .context("failed to clone regular output file for locking")?;
         loop {
             if cancelled.load(Ordering::Acquire) {
-                bail!(crate::error::Interrupted::cancelled(
-                    "regular output file lock was cancelled"
-                ));
+                bail!(crate::error::cancelled(OUTPUT_FILE_LOCK_CANCELLED));
             }
             match lock_file.try_lock_exclusive() {
                 Ok(()) => return Ok(ExclusiveLease { file: lock_file }),

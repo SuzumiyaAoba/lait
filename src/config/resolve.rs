@@ -207,11 +207,13 @@ const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 pub(crate) fn resolve_endpoint(
     base_url_override: Option<String>,
     api_key_override: Option<String>,
-    model_base_url: Option<&str>,
-    model_api_key: Option<&str>,
-    model_api_key_cmd: Option<&CommandSpec>,
+    resolved_model: Option<&ResolvedModel>,
     file_config: &ConfigFile,
 ) -> Result<Endpoint> {
+    let model_base_url = resolved_model.and_then(|model| model.base_url.as_deref());
+    let model_api_key = resolved_model.and_then(|model| model.api_key.as_deref());
+    let model_api_key_cmd = resolved_model.and_then(|model| model.api_key_cmd.as_ref());
+
     // Select the source before expanding it. Apart from avoiding needless
     // work, this is important for precedence: an unset `${VAR}` in a lower
     // priority source must not make a request fail when an override already

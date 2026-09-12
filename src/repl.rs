@@ -11,8 +11,8 @@ use async_openai::types::chat::ChatCompletionRequestMessage;
 
 use crate::{
     async_io, chat,
-    cli::ChatReplArgs,
-    config::{self, ConfigSource},
+    cli::{ChatReplArgs, SharedChatArgs},
+    config::{self, ConfigFile, ConfigSource},
     engine::{AppServices, PromptTurn, RequestSettings, RunContext},
     llm, response, signal, usage,
 };
@@ -113,40 +113,21 @@ pub(crate) async fn run(
             }
 
             if let Some(command) = parse_meta_command(line) {
-                match command {
-                    MetaCommand::Exit => break,
-                    MetaCommand::Clear => {
-                        history.clear();
-                        eprintln!("(history cleared — a --session log, if any, is unaffected)");
-                    }
-                    MetaCommand::Model(name) if !name.is_empty() => {
-                        shared.model = Some(name.to_owned());
-                        settings = None;
-                        eprintln!("(model set to '{name}')");
-                    }
-                    MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
-                    MetaCommand::System(text) if !text.is_empty() => {
-                        system_prompt = Some(text.to_owned());
-                        eprintln!("(system prompt updated)");
-                    }
-                    MetaCommand::System(_) => eprintln!("usage: /system <text>"),
-                    MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+                if apply_meta_command(
+                    command,
+                    &mut history,
+                    &mut shared,
+                    &mut settings,
+                    &mut system_prompt,
+                ) {
+                    break;
                 }
                 continue;
             }
 
-            if settings.is_none() {
-                settings = match chat::resolve_chat_settings(&shared, None, &file_config) {
-                    Ok(resolved) => Some(resolved),
-                    Err(error) => {
-                        eprintln!("lait: {error:#}");
-                        continue;
-                    }
-                };
-            }
-            let settings = settings
-                .as_ref()
-                .expect("just resolved above, or the loop continued before reaching here");
+            let Some(settings) = ensure_settings(&mut settings, &shared, &file_config) else {
+                continue;
+            };
 
             match run_turn(
                 settings,
@@ -182,6 +163,65 @@ pub(crate) async fn run(
         Ok::<(), anyhow::Error>(())
     };
     services.finish(repl).await
+}
+
+/// Applies one parsed [`MetaCommand`], mutating REPL state as needed and
+/// printing the same status line the loop always has. Returns `true` when
+/// the REPL should exit (`/exit`); every other command is fully handled here
+/// and the caller should `continue` its loop either way.
+fn apply_meta_command(
+    command: MetaCommand<'_>,
+    history: &mut Vec<ChatCompletionRequestMessage>,
+    shared: &mut SharedChatArgs,
+    settings: &mut Option<RequestSettings>,
+    system_prompt: &mut Option<String>,
+) -> bool {
+    match command {
+        MetaCommand::Exit => return true,
+        MetaCommand::Clear => {
+            history.clear();
+            eprintln!("(history cleared — a --session log, if any, is unaffected)");
+        }
+        MetaCommand::Model(name) if !name.is_empty() => {
+            shared.model = Some(name.to_owned());
+            *settings = None;
+            eprintln!("(model set to '{name}')");
+        }
+        MetaCommand::Model(_) => eprintln!("usage: /model <name>"),
+        MetaCommand::System(text) if !text.is_empty() => {
+            *system_prompt = Some(text.to_owned());
+            eprintln!("(system prompt updated)");
+        }
+        MetaCommand::System(_) => eprintln!("usage: /system <text>"),
+        MetaCommand::Unknown(name) => eprintln!("unknown command: /{name}"),
+    }
+    false
+}
+
+/// Resolves `*settings` if unset — invalidated by `/model`, or never set on
+/// this REPL's first turn — and returns a reference to it. Resolved lazily
+/// like this (rather than up front) so a `--model`-less invocation still
+/// drops into the REPL instead of erroring immediately, and cached across
+/// turns after that since nothing here changes turn to turn except in
+/// response to `/model`. Returns `None` when resolution itself failed (a bad
+/// `/model` name, no model set at all) — reported here so the caller can
+/// simply `continue` its loop rather than needing its own error-handling
+/// branch or an `.expect()` on an invariant this function already keeps.
+fn ensure_settings<'a>(
+    settings: &'a mut Option<RequestSettings>,
+    shared: &SharedChatArgs,
+    file_config: &ConfigFile,
+) -> Option<&'a RequestSettings> {
+    if settings.is_none() {
+        match chat::resolve_chat_settings(shared, None, file_config) {
+            Ok(resolved) => *settings = Some(resolved),
+            Err(error) => {
+                eprintln!("lait: {error:#}");
+                return None;
+            }
+        }
+    }
+    settings.as_ref()
 }
 
 /// Runs one `lait chat` turn: streams the response to stdout, driving the

@@ -269,69 +269,43 @@ impl McpRegistry {
         self.check_tool_is_allowed(server_name, tool_name)?;
         let connection = self.connection(server_name, cancellation.clone()).await?;
 
-        let arguments = if arguments_json.trim().is_empty() {
-            None
-        } else {
-            let value: serde_json::Value =
-                serde_json::from_str(arguments_json).with_context(|| {
-                    format!("failed to parse arguments for tool call '{qualified_name}' as JSON")
-                })?;
-            match value {
-                serde_json::Value::Object(object) => Some(object),
-                serde_json::Value::Null => None,
-                _ => bail!(
-                    "arguments for tool call '{qualified_name}' must be a JSON object, got {value}"
-                ),
-            }
-        };
+        let arguments = parse_tool_arguments(qualified_name, arguments_json)?;
 
         let params = CallToolRequestParams::new(tool_name.clone());
         let params = match arguments {
             Some(arguments) => params.with_arguments(arguments),
             None => params,
         };
-        let result = match await_cancellation(
+        // Every failure case below evicts the connection before returning:
+        // a service-level error can leave it protocol-out-of-sync, a timeout
+        // can still be executing in the remote/stdio server, and dropping
+        // only the call future on cancellation does not stop that in-flight
+        // work either — none of the three should let a later call reuse this
+        // exact connection and risk duplicating a side effect. The match
+        // below only decides *which* error occurred (or short-circuits to
+        // success); the shared eviction happens once, after it.
+        let error = match await_cancellation(
             tokio::time::timeout(MCP_IO_TIMEOUT, connection.call_tool(params)),
             cancellation,
         )
         .await
         {
-            CancellationResult::Completed(Ok(Ok(result))) => result,
-            CancellationResult::Completed(Ok(Err(error))) => {
-                // A service-level error means the request did not produce a
-                // usable result.  Evict the connection as transport/protocol
-                // failures can leave it out of sync, and make sure the
-                // caller receives the actual error rather than trying to
-                // render the nested `Result` as a tool result.
-                self.invalidate_connection(server_name, &connection).await;
-                return Err(anyhow!(
-                    "MCP server '{server_name}' failed while running tool '{tool_name}': {error}"
-                ));
+            CancellationResult::Completed(Ok(Ok(result))) => {
+                return Ok(render_tool_result(result));
             }
-            CancellationResult::Completed(Err(_)) => {
-                // The outer `timeout` above reports an `Elapsed`, not an MCP
-                // service error.  A timed-out request can still be executing
-                // in a remote/stdio server, so close and evict this service
-                // before any retry can reuse it.
-                self.invalidate_connection(server_name, &connection).await;
-                return Err(anyhow!(crate::error::Interrupted::timed_out(format!(
-                    "MCP server '{server_name}' timed out after {}s while running tool '{tool_name}'",
-                    MCP_IO_TIMEOUT.as_secs()
-                ))));
-            }
-            CancellationResult::Cancelled => {
-                // Dropping only the call future does not stop a stdio
-                // server's in-flight work. Cancel and evict the exact
-                // connection so a later call cannot reuse that service and
-                // accidentally duplicate a side effect.
-                self.invalidate_connection(server_name, &connection).await;
-                return Err(anyhow!(crate::error::Interrupted::cancelled(format!(
-                    "MCP server '{server_name}' was cancelled while running tool '{tool_name}'"
-                ))));
-            }
+            CancellationResult::Completed(Ok(Err(error))) => anyhow!(
+                "MCP server '{server_name}' failed while running tool '{tool_name}': {error}"
+            ),
+            CancellationResult::Completed(Err(_)) => crate::error::timed_out(format!(
+                "MCP server '{server_name}' timed out after {}s while running tool '{tool_name}'",
+                MCP_IO_TIMEOUT.as_secs()
+            )),
+            CancellationResult::Cancelled => crate::error::cancelled(format!(
+                "MCP server '{server_name}' was cancelled while running tool '{tool_name}'"
+            )),
         };
-
-        Ok(render_tool_result(result))
+        self.invalidate_connection(server_name, &connection).await;
+        Err(error)
     }
 
     /// Enforces `mcp_servers.<name>.allowed_tools`, if the server's config
@@ -380,9 +354,7 @@ impl McpRegistry {
             .as_ref()
             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
-            return Err(anyhow!(crate::error::Interrupted::cancelled(
-                "MCP operation was cancelled"
-            )));
+            return Err(crate::error::cancelled(super::MCP_OPERATION_CANCELLED));
         }
 
         loop {
@@ -435,9 +407,7 @@ impl McpRegistry {
                     if cancelled {
                         connection.shutdown().await;
                         self.remove_connection_cell(name, &cell).await;
-                        return Err(anyhow!(crate::error::Interrupted::cancelled(
-                            "MCP operation was cancelled"
-                        )));
+                        return Err(crate::error::cancelled(super::MCP_OPERATION_CANCELLED));
                     }
                     if connection.is_closing() {
                         connection.wait_closed().await;
@@ -529,6 +499,27 @@ impl McpRegistry {
     }
 }
 
+/// Parses `arguments_json` (the raw string a model's tool call carries) into
+/// the JSON object [`CallToolRequestParams::with_arguments`] expects: empty/
+/// whitespace-only or a JSON `null` both mean "no arguments" (`None`); any
+/// other non-object value is rejected rather than silently coerced.
+fn parse_tool_arguments(
+    qualified_name: &str,
+    arguments_json: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    if arguments_json.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(arguments_json).with_context(|| {
+        format!("failed to parse arguments for tool call '{qualified_name}' as JSON")
+    })?;
+    match value {
+        serde_json::Value::Object(object) => Ok(Some(object)),
+        serde_json::Value::Null => Ok(None),
+        _ => bail!("arguments for tool call '{qualified_name}' must be a JSON object, got {value}"),
+    }
+}
+
 /// Lists every tool a server exposes, following `next_cursor` pagination
 /// until the server reports none left.
 async fn list_all_tools(
@@ -556,15 +547,15 @@ async fn list_all_tools(
         {
             CancellationResult::Completed(Ok(result)) => result,
             CancellationResult::Completed(Err(error)) => {
-                return Err(anyhow!(crate::error::Interrupted::timed_out(format!(
+                return Err(crate::error::timed_out(format!(
                     "MCP server timed out after {}s while listing tools (page {pages}): {error}",
                     MCP_IO_TIMEOUT.as_secs()
-                ))));
+                )));
             }
             CancellationResult::Cancelled => {
-                return Err(anyhow!(crate::error::Interrupted::cancelled(
-                    "MCP operation was cancelled while listing tools"
-                )));
+                return Err(crate::error::cancelled(
+                    "MCP operation was cancelled while listing tools",
+                ));
             }
         };
         let result = result.map_err(|error| anyhow!("{error}"))?;
@@ -599,9 +590,40 @@ async fn list_all_tools(
     Ok(tools)
 }
 
+/// The single wording for "the running byte total (across every tool's
+/// description and both schemas) overflowed `usize`" — see
+/// `metadata_count_overflowed` below for why this stays one string instead
+/// of the 4 independent `anyhow!`/`io::Error` literals it used to be.
+const METADATA_BYTE_COUNT_OVERFLOWED: &str = "MCP tool metadata byte count overflowed";
+
+fn metadata_count_overflowed() -> anyhow::Error {
+    anyhow!(METADATA_BYTE_COUNT_OVERFLOWED)
+}
+
+/// The single wording for "the cumulative tool metadata total exceeds
+/// `MAX_TOOL_METADATA_BYTES`" — always names the actual configured limit,
+/// never `ByteCounter`'s `limit` field (see its doc comment for why that
+/// field is the wrong number to report).
+fn metadata_limit_exceeded_message() -> String {
+    format!(
+        "MCP tool descriptions and schemas exceed the cumulative limit of \
+         {MAX_TOOL_METADATA_BYTES} bytes"
+    )
+}
+
 /// A writer used to measure serialized JSON without allocating a second copy
 /// of a potentially large schema. It fails as soon as the caller's remaining
 /// metadata budget is exhausted.
+///
+/// `limit` is that *remaining* budget (`MAX_TOOL_METADATA_BYTES` minus
+/// whatever has already been counted for earlier tools/fields in
+/// `tool_metadata_bytes`), not the configured limit itself. Reporting
+/// `limit` verbatim in a user-facing message used to make an error like "the
+/// schema exceeds the 40-byte metadata limit" when the real configured limit
+/// is 16 MiB — accurate about the local budget, misleading about "the
+/// limit". `write` therefore raises a limit-agnostic marker on overflow, and
+/// `tool_metadata_bytes` (which knows the real limit) is what turns that
+/// into `metadata_limit_exceeded_message()`.
 struct ByteCounter {
     bytes: usize,
     limit: usize,
@@ -610,15 +632,12 @@ struct ByteCounter {
 impl std::io::Write for ByteCounter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let Some(next) = self.bytes.checked_add(bytes.len()) else {
-            return Err(io::Error::other("MCP tool metadata byte count overflowed"));
+            return Err(io::Error::other(METADATA_BYTE_COUNT_OVERFLOWED));
         };
         if next > self.limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "MCP tool descriptions and schemas exceed the {}-byte metadata limit",
-                    self.limit
-                ),
+                "MCP tool metadata exceeds the remaining byte budget",
             ));
         }
         self.bytes = next;
@@ -632,9 +651,7 @@ impl std::io::Write for ByteCounter {
 
 fn serialized_json_bytes<T: serde::Serialize>(value: &T, limit: usize) -> Result<usize> {
     let mut counter = ByteCounter { bytes: 0, limit };
-    serde_json::to_writer(&mut counter, value)
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("MCP tool schema exceeds the {limit}-byte metadata limit"))?;
+    serde_json::to_writer(&mut counter, value).map_err(anyhow::Error::from)?;
     Ok(counter.bytes)
 }
 
@@ -643,11 +660,9 @@ fn tool_metadata_bytes(tool: &Tool, used: usize) -> Result<usize> {
     if let Some(description) = &tool.description {
         total = total
             .checked_add(description.len())
-            .ok_or_else(|| anyhow!("MCP tool metadata byte count overflowed"))?;
+            .ok_or_else(metadata_count_overflowed)?;
         if total > MAX_TOOL_METADATA_BYTES {
-            bail!(
-                "MCP tool descriptions and schemas exceed the cumulative limit of {MAX_TOOL_METADATA_BYTES} bytes"
-            );
+            bail!(metadata_limit_exceeded_message());
         }
     }
 
@@ -657,21 +672,23 @@ fn tool_metadata_bytes(tool: &Tool, used: usize) -> Result<usize> {
     {
         let remaining = MAX_TOOL_METADATA_BYTES
             .checked_sub(total)
-            .ok_or_else(|| anyhow!("MCP tool metadata byte count overflowed"))?;
-        let schema_bytes = serialized_json_bytes(schema.as_ref(), remaining)?;
+            .ok_or_else(metadata_count_overflowed)?;
+        let schema_bytes = serialized_json_bytes(schema.as_ref(), remaining)
+            .with_context(metadata_limit_exceeded_message)?;
         total = total
             .checked_add(schema_bytes)
-            .ok_or_else(|| anyhow!("MCP tool metadata byte count overflowed"))?;
+            .ok_or_else(metadata_count_overflowed)?;
     }
     Ok(total)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{McpRegistry, serialized_json_bytes};
+    use super::{MAX_TOOL_METADATA_BYTES, McpRegistry, serialized_json_bytes, tool_metadata_bytes};
     use crate::config::McpServerConfig;
+    use rmcp::model::Tool;
     use serde_json::json;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
     fn server_with_allowed_tools(allowed_tools: Option<Vec<String>>) -> McpRegistry {
         let mut servers = HashMap::new();
@@ -730,6 +747,30 @@ mod tests {
         );
         let error = serialized_json_bytes(&schema, exact_size - 1)
             .expect_err("schema over the remaining metadata budget must fail");
-        assert!(error.to_string().contains("metadata limit"));
+        assert!(error.to_string().contains("byte budget"));
+    }
+
+    /// Regression test: `tool_metadata_bytes` used to report `ByteCounter`'s
+    /// `limit` field verbatim, which is the *remaining* budget after earlier
+    /// tools/fields have already been counted — not `MAX_TOOL_METADATA_BYTES`
+    /// itself. A schema that blows a small remaining budget must still name
+    /// the actual configured limit, not that (much smaller) remaining number.
+    #[test]
+    fn schema_over_the_remaining_budget_reports_the_configured_limit() {
+        let used = MAX_TOOL_METADATA_BYTES - 10;
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".to_owned(), json!("object"));
+        let tool = Tool::new(Cow::Borrowed("t"), Cow::Borrowed(""), schema);
+
+        let error = tool_metadata_bytes(&tool, used).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&MAX_TOOL_METADATA_BYTES.to_string()),
+            "error should name the configured limit: {message}"
+        );
+        assert!(
+            !message.contains("10-byte"),
+            "error must not report the remaining budget as if it were the limit: {message}"
+        );
     }
 }

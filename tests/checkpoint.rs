@@ -60,8 +60,7 @@ fn run_ids(dir: &ConfigDirectory) -> Vec<String> {
 #[test]
 fn checkpoint_records_the_first_step_and_resume_does_not_rerun_it() {
     let dir = ConfigDirectory::empty();
-    fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW)
-        .expect("failed to write test workflow");
+    dir.write("workflow.yml", TWO_STEP_WORKFLOW);
 
     let output = test_command()
         .current_dir(dir.path())
@@ -91,8 +90,7 @@ fn checkpoint_records_the_first_step_and_resume_does_not_rerun_it() {
 
     // Fix the workflow (as if the user edited it after seeing the failure)
     // and resume: step 1 ('mark') must not run again.
-    fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW_FIXED)
-        .expect("failed to rewrite test workflow");
+    dir.write("workflow.yml", TWO_STEP_WORKFLOW_FIXED);
 
     let resumed = test_command()
         .current_dir(dir.path())
@@ -118,8 +116,8 @@ fn checkpoint_records_the_first_step_and_resume_does_not_rerun_it() {
 #[test]
 fn a_stopped_nested_router_checkpoints_only_completed_named_outputs() {
     let dir = ConfigDirectory::empty();
-    fs::write(
-        dir.path().join("workflow.yml"),
+    dir.write(
+        "workflow.yml",
         r#"
 steps:
   - id: outer
@@ -144,8 +142,7 @@ steps:
                                   - id: halt
                                     stop: true
 "#,
-    )
-    .expect("failed to write test workflow");
+    );
 
     let output = test_command()
         .current_dir(dir.path())
@@ -181,8 +178,7 @@ steps:
 #[test]
 fn resume_fails_clearly_for_an_unknown_run_id() {
     let dir = ConfigDirectory::empty();
-    fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW_FIXED)
-        .expect("failed to write test workflow");
+    dir.write("workflow.yml", TWO_STEP_WORKFLOW_FIXED);
 
     let output = test_command()
         .current_dir(dir.path())
@@ -204,8 +200,7 @@ fn resume_fails_clearly_for_an_unknown_run_id() {
 #[test]
 fn resume_rejects_a_different_workflow_file_than_the_one_checkpointed() {
     let dir = ConfigDirectory::empty();
-    fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW)
-        .expect("failed to write test workflow");
+    dir.write("workflow.yml", TWO_STEP_WORKFLOW);
 
     let failed = test_command()
         .current_dir(dir.path())
@@ -221,8 +216,7 @@ fn resume_rejects_a_different_workflow_file_than_the_one_checkpointed() {
     assert!(!failed.status.success());
     let run_id = &run_ids(&dir)[0];
 
-    fs::write(dir.path().join("other.yml"), TWO_STEP_WORKFLOW_FIXED)
-        .expect("failed to write a second workflow file");
+    dir.write("other.yml", TWO_STEP_WORKFLOW_FIXED);
 
     let output = test_command()
         .current_dir(dir.path())
@@ -241,8 +235,7 @@ fn resume_rejects_a_different_workflow_file_than_the_one_checkpointed() {
 #[test]
 fn resuming_an_already_completed_run_fails_clearly() {
     let dir = ConfigDirectory::empty();
-    fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW_FIXED)
-        .expect("failed to write test workflow");
+    dir.write("workflow.yml", TWO_STEP_WORKFLOW_FIXED);
 
     let output = test_command()
         .current_dir(dir.path())
@@ -272,8 +265,7 @@ fn resuming_an_already_completed_run_fails_clearly() {
 #[test]
 fn runs_list_reports_no_runs_before_any_checkpoint_and_the_run_after_one() {
     let dir = ConfigDirectory::empty();
-    fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW_FIXED)
-        .expect("failed to write test workflow");
+    dir.write("workflow.yml", TWO_STEP_WORKFLOW_FIXED);
 
     let empty = test_command()
         .current_dir(dir.path())
@@ -314,8 +306,7 @@ fn runs_list_reports_no_runs_before_any_checkpoint_and_the_run_after_one() {
 #[test]
 fn a_run_without_checkpoint_records_nothing() {
     let dir = ConfigDirectory::empty();
-    fs::write(dir.path().join("workflow.yml"), TWO_STEP_WORKFLOW_FIXED)
-        .expect("failed to write test workflow");
+    dir.write("workflow.yml", TWO_STEP_WORKFLOW_FIXED);
 
     let output = test_command()
         .current_dir(dir.path())
@@ -330,8 +321,8 @@ fn a_run_without_checkpoint_records_nothing() {
 #[test]
 fn resume_reuses_the_recorded_vars_when_var_is_not_repeated() {
     let dir = ConfigDirectory::empty();
-    fs::write(
-        dir.path().join("workflow.yml"),
+    dir.write(
+        "workflow.yml",
         r#"
 nodes:
   mark:
@@ -348,8 +339,7 @@ steps:
   - use: fail
   - use: greet
 "#,
-    )
-    .expect("failed to write test workflow");
+    );
 
     let failed = test_command()
         .current_dir(dir.path())
@@ -367,8 +357,8 @@ steps:
     assert!(!failed.status.success());
     let run_id = &run_ids(&dir)[0];
 
-    fs::write(
-        dir.path().join("workflow.yml"),
+    dir.write(
+        "workflow.yml",
         r#"
 nodes:
   mark:
@@ -385,8 +375,7 @@ steps:
   - use: fail
   - use: greet
 "#,
-    )
-    .expect("failed to rewrite test workflow");
+    );
 
     let resumed = test_command()
         .current_dir(dir.path())
@@ -420,7 +409,7 @@ steps:
   - use: fail
   - use: greet
 "#;
-    fs::write(dir.path().join("workflow.yml"), broken).expect("failed to write test workflow");
+    dir.write("workflow.yml", broken);
 
     let failed = test_command()
         .current_dir(dir.path())
@@ -468,8 +457,8 @@ steps:
 
     // Fix the workflow and resume once more without --var: the persisted
     // override ('universe'), not the original value, must be used.
-    fs::write(
-        dir.path().join("workflow.yml"),
+    dir.write(
+        "workflow.yml",
         r#"
 nodes:
   mark:
@@ -486,8 +475,7 @@ steps:
   - use: fail
   - use: greet
 "#,
-    )
-    .expect("failed to rewrite test workflow");
+    );
 
     let resumed = test_command()
         .current_dir(dir.path())

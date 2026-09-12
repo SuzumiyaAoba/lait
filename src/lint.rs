@@ -16,9 +16,10 @@
 //! rest of a tree after one bad file.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use anyhow::{Result, bail};
@@ -163,6 +164,72 @@ struct RegistryEntry {
     exists: bool,
 }
 
+/// Lints every file in `files` (each an independent `lint_file` call — no
+/// shared mutable state, since each gets its own fresh `LintCtx`), spread
+/// across a small, bounded set of OS threads instead of one at a time on the
+/// calling thread. `lint` has no async runtime to reach for (see `run`'s doc
+/// comment), and the file discovery/parsing this does is exactly the CPU +
+/// disk-read shaped workload `std::thread::scope` suits: no futures runtime
+/// needed, and results are joined and returned before this function returns,
+/// so no thread outlives the scope.
+///
+/// Files are split into contiguous chunks (not one thread per file) so a
+/// `lait lint` over a directory of hundreds of files doesn't spawn hundreds
+/// of OS threads; each chunk is linted sequentially by its own thread, and
+/// chunk order matches `files`' order, so the returned reports stay in the
+/// same order `files` came in (matching the previous sequential behavior,
+/// which callers/tests rely on for stable output).
+fn lint_files_concurrently(files: &[PathBuf], config: Option<&ConfigFile>) -> Vec<LintReport> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(files.len());
+    let chunk_size = files.len().div_ceil(worker_count);
+
+    fn lint_chunk(chunk: &[PathBuf], config: Option<&ConfigFile>) -> Vec<LintReport> {
+        chunk
+            .iter()
+            .map(|file| {
+                lint_file(file, config).unwrap_or_else(|error| LintReport {
+                    file: file.clone(),
+                    issues: vec![LintIssue::error(format!("{error:#}"))],
+                })
+            })
+            .collect()
+    }
+
+    std::thread::scope(|scope| {
+        let handles: Vec<(&[PathBuf], std::thread::ScopedJoinHandle<Vec<LintReport>>)> = files
+            .chunks(chunk_size)
+            .map(|chunk| (chunk, scope.spawn(move || lint_chunk(chunk, config))))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|(chunk, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    // `lint_file` doesn't panic under normal operation, but a
+                    // worker thread panic must not silently drop every
+                    // report the rest of its chunk would have produced.
+                    chunk
+                        .iter()
+                        .map(|file| LintReport {
+                            file: file.clone(),
+                            issues: vec![LintIssue::error(
+                                "internal error: the lint worker thread for this file panicked"
+                                    .to_owned(),
+                            )],
+                        })
+                        .collect()
+                })
+            })
+            .collect()
+    })
+}
+
 impl LintRun {
     fn collect(files: &[PathBuf], config_source: &ConfigSource) -> Result<Self> {
         // An absent config skips capability checks; an existing empty config
@@ -183,15 +250,7 @@ impl LintRun {
             })
             .collect();
         registry.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        let reports = files
-            .iter()
-            .map(|file| {
-                lint_file(file, config).unwrap_or_else(|error| LintReport {
-                    file: file.clone(),
-                    issues: vec![LintIssue::error(format!("{error:#}"))],
-                })
-            })
-            .collect();
+        let reports = lint_files_concurrently(&files, config);
         Ok(Self {
             config_display: config_path
                 .as_deref()
@@ -239,14 +298,44 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     }
 }
 
-/// Threaded through every check in one `lint_file` call: `config` is looked
+/// Threaded through every check in one `lint_file` call. `config` is looked
 /// up by every `mcp:`/`skills:` name check, and `skipped_capability_check` is
 /// set the first time one of those checks has no `config` to check against,
 /// so the report can note it once rather than repeat the same caveat next to
-/// every name.
+/// every name. `issues` and `visited` used to be separate `&mut` parameters
+/// threaded through every function below (`lint_node`/`lint_workflow_node`/
+/// `lint_sub_workflow`/`check_capability_name_lists`/`check_capability_names`
+/// each took both); folding them in here removes that repetition the same
+/// way `workflow::dryrun::DryRunContext` bundles its own call-spanning,
+/// mostly-invariant state. `base_dir`/`json_schemas` stay as explicit
+/// parameters instead, since — unlike `issues`/`visited` — they actually
+/// change with every `workflow:` node recursed into (each sub-workflow file
+/// has its own directory and its own `json_schemas:` block).
 struct LintCtx<'a> {
     config: Option<&'a ConfigFile>,
     skipped_capability_check: bool,
+    issues: Vec<LintIssue>,
+    /// Canonical paths of every workflow file currently being linted, top to
+    /// bottom of the current `workflow:` chain — mirrors
+    /// `WorkflowScope::nested`'s cycle/depth-cap bookkeeping at `run` time
+    /// (see `check_workflow_nesting`).
+    visited: Vec<PathBuf>,
+    /// Sub-workflow files already loaded during this `lint_file` call, keyed
+    /// by canonical path: a `workflow:` file referenced by more than one
+    /// sibling node (not a cycle — a cycle is rejected before this cache is
+    /// consulted) would otherwise be re-read and re-parsed from disk once
+    /// per reference. Mirrors `workflow::WorkflowRegistry`'s per-path cache
+    /// at `run` time, which `lint` had no equivalent of until now. `Rc`
+    /// rather than `Arc`: a `LintCtx` never leaves the single thread
+    /// `lint_file` runs it on, even when `LintRun::collect` lints several
+    /// files concurrently (each file gets its own `LintCtx`).
+    ///
+    /// This only avoids the duplicate disk read + YAML parse — every
+    /// reference site still fully re-walks the (shared) parsed tree via
+    /// `lint_workflow_contents`, since two reference sites can have
+    /// different `visited` chains (affecting cycle detection) and each
+    /// needs its own "in 'workflow: X'" message attribution.
+    loaded_workflows: HashMap<PathBuf, Rc<workflow::WorkflowFile>>,
 }
 
 impl<'a> LintCtx<'a> {
@@ -254,6 +343,9 @@ impl<'a> LintCtx<'a> {
         Self {
             config,
             skipped_capability_check: false,
+            issues: Vec::new(),
+            visited: Vec::new(),
+            loaded_workflows: HashMap::new(),
         }
     }
 }
@@ -272,19 +364,18 @@ fn yaml_error_line(error: &anyhow::Error) -> Option<usize> {
 }
 
 fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
-    let mut issues = Vec::new();
     let mut ctx = LintCtx::new(config);
 
     match workflow::load_workflow(path) {
         Err(error) => {
             let line = yaml_error_line(&error);
-            issues.push(LintIssue::error(format!("{error:#}")).with_line(line));
+            ctx.issues
+                .push(LintIssue::error(format!("{error:#}")).with_line(line));
         }
         Ok(wf) => {
             // Seeded with this file's own canonical path so a `workflow:`
             // chain that loops back to it is caught the same way
             // `WorkflowScope::nested` catches it at `run` time.
-            let mut visited = Vec::new();
             let canonical = match std::fs::canonicalize(path) {
                 Ok(canonical) => Some(canonical),
                 Err(error) => {
@@ -295,7 +386,7 @@ fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
                     // inspect a different set of sub-workflow files than
                     // `run` actually would. Surface it instead of silently
                     // linting under a possibly-wrong base directory.
-                    issues.push(LintIssue::warning(format!(
+                    ctx.issues.push(LintIssue::warning(format!(
                         "failed to canonicalize '{}' ({error}); sub-workflow \
                          resolution falls back to its non-canonical parent \
                          directory, which may differ from what `lait run` uses",
@@ -316,41 +407,41 @@ fn lint_workflow_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
                 .or_else(|| path.parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| PathBuf::from("."));
             if let Some(canonical) = canonical {
-                visited.push(canonical);
+                ctx.visited.push(canonical);
             }
-            lint_workflow_contents(&wf, &base_dir, &mut ctx, &mut issues, &mut visited);
+            lint_workflow_contents(&wf, &base_dir, &mut ctx);
         }
     }
 
-    note_skipped_capability_check(&mut ctx, &mut issues);
+    note_skipped_capability_check(&mut ctx);
     LintReport {
         file: path.to_path_buf(),
-        issues,
+        issues: ctx.issues,
     }
 }
 
 fn lint_agent_file(path: &Path, config: Option<&ConfigFile>) -> LintReport {
-    let mut issues = Vec::new();
     let mut ctx = LintCtx::new(config);
 
     match agent::load_agent(path) {
         Err(error) => {
             let line = yaml_error_line(&error);
-            issues.push(LintIssue::error(format!("{error:#}")).with_line(line));
+            ctx.issues
+                .push(LintIssue::error(format!("{error:#}")).with_line(line));
         }
-        Ok(agent_file) => lint_agent_contents("the agent", &agent_file, &mut ctx, &mut issues),
+        Ok(agent_file) => lint_agent_contents("the agent", &agent_file, &mut ctx),
     }
 
-    note_skipped_capability_check(&mut ctx, &mut issues);
+    note_skipped_capability_check(&mut ctx);
     LintReport {
         file: path.to_path_buf(),
-        issues,
+        issues: ctx.issues,
     }
 }
 
-fn note_skipped_capability_check(ctx: &mut LintCtx, issues: &mut Vec<LintIssue>) {
+fn note_skipped_capability_check(ctx: &mut LintCtx) {
     if ctx.skipped_capability_check {
-        issues.push(LintIssue::warning(format!(
+        ctx.issues.push(LintIssue::warning(format!(
             "'mcp'/'skills'/'subagents'/'tools' names were not checked because no {} was found \
              (or --no-config was used)",
             config::CONFIG_FILE_NAME
@@ -365,18 +456,12 @@ fn note_skipped_capability_check(ctx: &mut LintCtx, issues: &mut Vec<LintIssue>)
 /// at `run` time. Recurses into every `workflow:` node's sub-workflow file
 /// (resolved against `base_dir`, the directory `wf`'s own file lives in) and
 /// every `agent:` node's agent file.
-fn lint_workflow_contents(
-    wf: &workflow::WorkflowFile,
-    base_dir: &Path,
-    ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-    visited: &mut Vec<PathBuf>,
-) {
+fn lint_workflow_contents(wf: &workflow::WorkflowFile, base_dir: &Path, ctx: &mut LintCtx) {
     let mut used_node_ids = HashSet::new();
-    walk_steps(&wf.steps, &mut used_node_ids, issues);
+    walk_steps(&wf.steps, &mut used_node_ids, &mut ctx.issues);
     for node_id in wf.nodes.keys() {
         if !used_node_ids.contains(node_id.as_str()) {
-            issues.push(LintIssue::warning(format!(
+            ctx.issues.push(LintIssue::warning(format!(
                 "node '{node_id}' is defined in 'nodes:' but never referenced by a step's 'use'"
             )));
         }
@@ -389,27 +474,18 @@ fn lint_workflow_contents(
         wf.default.subagents.as_deref(),
         wf.default.tools.as_deref(),
         ctx,
-        issues,
     );
     if let Some(system_prompt) = &wf.default.system_prompt {
         check_prompt_template(
             "the workflow's 'default'",
             "'system_prompt' template",
             system_prompt,
-            issues,
+            &mut ctx.issues,
         );
     }
 
     for (node_id, node) in &wf.nodes {
-        lint_node(
-            node_id,
-            node,
-            base_dir,
-            &wf.json_schemas,
-            ctx,
-            issues,
-            visited,
-        );
+        lint_node(node_id, node, base_dir, &wf.json_schemas, ctx);
     }
 }
 
@@ -489,21 +565,18 @@ fn check_jq(filter: &str, description: &str, issues: &mut Vec<LintIssue>) {
 /// across every node type (`jq`/`mcp`/`skills`/`subagents`/`tools`). Mirrors
 /// `workflow::exec::nodes::execute`'s shape: one dispatcher, one function per
 /// `workflow::NodeDefinition` variant.
-#[allow(clippy::too_many_arguments)]
 fn lint_node(
     node_id: &str,
     node: &workflow::NodeDefinition,
     base_dir: &Path,
     json_schemas: &schema::JsonSchemaMap,
     ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-    visited: &mut Vec<PathBuf>,
 ) {
     let node_context = format!("node '{node_id}'");
     let settings = node.settings();
 
     if let Some(filter) = settings.jq {
-        check_jq(filter, &format!("{node_context}: 'jq'"), issues);
+        check_jq(filter, &format!("{node_context}: 'jq'"), &mut ctx.issues);
     }
     check_capability_name_lists(
         &node_context,
@@ -512,25 +585,35 @@ fn lint_node(
         settings.subagents,
         settings.tools,
         ctx,
-        issues,
     );
 
     match node {
         workflow::NodeDefinition::Prompt(prompt) => {
-            lint_prompt_node(node_id, &node_context, prompt, json_schemas, issues);
+            lint_prompt_node(
+                node_id,
+                &node_context,
+                prompt,
+                json_schemas,
+                &mut ctx.issues,
+            );
         }
         workflow::NodeDefinition::Agent(agent_node) => {
-            lint_agent_node(node_id, agent_node, ctx, issues);
+            lint_agent_node(node_id, agent_node, ctx);
         }
         workflow::NodeDefinition::Workflow(workflow_node) => {
-            lint_workflow_node(node_id, workflow_node, base_dir, ctx, issues, visited);
+            lint_workflow_node(node_id, workflow_node, base_dir, ctx);
         }
         workflow::NodeDefinition::Command(command) => {
-            lint_command_node(&node_context, command, issues);
+            lint_command_node(&node_context, command, &mut ctx.issues);
         }
         workflow::NodeDefinition::Transform(_) => {}
         workflow::NodeDefinition::Ask(ask) => {
-            check_prompt_template(&node_context, "'prompt' template", &ask.prompt, issues);
+            check_prompt_template(
+                &node_context,
+                "'prompt' template",
+                &ask.prompt,
+                &mut ctx.issues,
+            );
         }
     }
 }
@@ -584,24 +667,16 @@ fn lint_prompt_node(
     }
 }
 
-fn lint_agent_node(
-    node_id: &str,
-    agent_node: &workflow::AgentNode,
-    ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-) {
+fn lint_agent_node(node_id: &str, agent_node: &workflow::AgentNode, ctx: &mut LintCtx) {
     // Matches `execute_step`: `agent:` is loaded as given, relative
     // to the current working directory (unlike `workflow:`, which
     // resolves against the workflow file's own directory) — see
     // `AgentNode::agent`'s doc comment.
     match agent::load_agent(&agent_node.agent) {
-        Ok(agent_file) => lint_agent_contents(
-            &format!("node '{node_id}''s agent"),
-            &agent_file,
-            ctx,
-            issues,
-        ),
-        Err(error) => issues.push(LintIssue::error(format!(
+        Ok(agent_file) => {
+            lint_agent_contents(&format!("node '{node_id}''s agent"), &agent_file, ctx);
+        }
+        Err(error) => ctx.issues.push(LintIssue::error(format!(
             "node '{node_id}' has 'agent: {}' (resolved relative to the current working \
              directory, not this workflow file), which failed to load: {error:#}",
             agent_node.agent.display()
@@ -614,17 +689,8 @@ fn lint_workflow_node(
     workflow_node: &workflow::WorkflowNode,
     base_dir: &Path,
     ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-    visited: &mut Vec<PathBuf>,
 ) {
-    lint_sub_workflow(
-        node_id,
-        &workflow_node.workflow,
-        base_dir,
-        ctx,
-        issues,
-        visited,
-    );
+    lint_sub_workflow(node_id, &workflow_node.workflow, base_dir, ctx);
 }
 
 fn lint_command_node(
@@ -709,19 +775,12 @@ fn check_unrecognized_schema_types(
     }
 }
 
-fn lint_sub_workflow(
-    node_id: &str,
-    sub_workflow_path: &Path,
-    base_dir: &Path,
-    ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-    visited: &mut Vec<PathBuf>,
-) {
+fn lint_sub_workflow(node_id: &str, sub_workflow_path: &Path, base_dir: &Path, ctx: &mut LintCtx) {
     let resolved = base_dir.join(sub_workflow_path);
     let canonical = match std::fs::canonicalize(&resolved) {
         Ok(canonical) => canonical,
         Err(error) => {
-            issues.push(LintIssue::error(format!(
+            ctx.issues.push(LintIssue::error(format!(
                 "node '{node_id}' has 'workflow: {}', which could not be resolved: {error}",
                 sub_workflow_path.display()
             )));
@@ -731,8 +790,8 @@ fn lint_sub_workflow(
     // Shares `WorkflowScope::nested`'s cycle/depth-cap check, so a
     // non-cyclic-but-arbitrarily-deep or cyclic `workflow:` chain is flagged
     // here the same way it would fail at `run` time.
-    if let Err(error) = check_workflow_nesting(visited, &canonical) {
-        issues.push(LintIssue::error(match error {
+    if let Err(error) = check_workflow_nesting(&ctx.visited, &canonical) {
+        ctx.issues.push(LintIssue::error(match error {
             NestingDepthError::Cycle => format!(
                 "node '{node_id}' has 'workflow: {}', which would create a cycle ('{}' is \
                  already being linted)",
@@ -748,36 +807,49 @@ fn lint_sub_workflow(
         return;
     }
 
-    match workflow::load_workflow(&resolved) {
-        Err(error) => issues.push(LintIssue::error(format!(
-            "node '{node_id}' has 'workflow: {}', which failed to load: {error:#}",
-            sub_workflow_path.display()
-        ))),
-        Ok(sub_wf) => {
-            let sub_base_dir = canonical
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            visited.push(canonical);
-            // `lint_workflow_contents` pushes straight into `issues`, so
-            // without this, a message from `sub_workflow_path`'s own
-            // 'nodes:'/'steps:' (e.g. an unused-node warning, whose node ids
-            // are only unique within their own file) would print under the
-            // top-level file's header with nothing saying which file it
-            // actually came from. Prefix every message this recursive call
-            // adds with the sub-workflow's path to attribute it.
-            let issues_before = issues.len();
-            lint_workflow_contents(&sub_wf, &sub_base_dir, ctx, issues, visited);
-            for issue in &mut issues[issues_before..] {
-                issue.message = format!(
-                    "in 'workflow: {}': {}",
-                    sub_workflow_path.display(),
-                    issue.message
-                );
+    // See `LintCtx::loaded_workflows`'s doc comment: this only skips the
+    // disk read + YAML parse on a repeat reference, not the lint itself.
+    let sub_wf = match ctx.loaded_workflows.get(&canonical) {
+        Some(cached) => Rc::clone(cached),
+        None => match workflow::load_workflow(&resolved) {
+            Err(error) => {
+                ctx.issues.push(LintIssue::error(format!(
+                    "node '{node_id}' has 'workflow: {}', which failed to load: {error:#}",
+                    sub_workflow_path.display()
+                )));
+                return;
             }
-            visited.pop();
-        }
+            Ok(loaded) => {
+                let loaded = Rc::new(loaded);
+                ctx.loaded_workflows
+                    .insert(canonical.clone(), Rc::clone(&loaded));
+                loaded
+            }
+        },
+    };
+
+    let sub_base_dir = canonical
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    ctx.visited.push(canonical);
+    // `lint_workflow_contents` pushes straight into `ctx.issues`, so
+    // without this, a message from `sub_workflow_path`'s own
+    // 'nodes:'/'steps:' (e.g. an unused-node warning, whose node ids
+    // are only unique within their own file) would print under the
+    // top-level file's header with nothing saying which file it
+    // actually came from. Prefix every message this recursive call
+    // adds with the sub-workflow's path to attribute it.
+    let issues_before = ctx.issues.len();
+    lint_workflow_contents(&sub_wf, &sub_base_dir, ctx);
+    for issue in &mut ctx.issues[issues_before..] {
+        issue.message = format!(
+            "in 'workflow: {}': {}",
+            sub_workflow_path.display(),
+            issue.message
+        );
     }
+    ctx.visited.pop();
 }
 
 /// Checks the parts of an agent file that `agent::load_agent` doesn't
@@ -787,30 +859,25 @@ fn lint_sub_workflow(
 /// `context` names where this agent file came from in a lint message (e.g.
 /// `"the agent"` for a top-level `agent run`/`agent lint` target, or `"node
 /// 'x''s agent"` for a workflow node's `agent:`).
-fn lint_agent_contents(
-    context: &str,
-    agent_file: &AgentFile,
-    ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
-) {
+fn lint_agent_contents(context: &str, agent_file: &AgentFile, ctx: &mut LintCtx) {
     check_prompt_template(
         context,
         "system prompt template",
         &agent_file.system_prompt_template,
-        issues,
+        &mut ctx.issues,
     );
 
     check_schema_entry(
         context,
         "input_schema",
         agent_file.input_schema.as_ref(),
-        issues,
+        &mut ctx.issues,
     );
     check_schema_entry(
         context,
         "output_schema",
         agent_file.output_schema.as_ref(),
-        issues,
+        &mut ctx.issues,
     );
     // `structured_output: true` requires `output_schema` (checked at parse
     // time by `agent::parse_agent`), so this is reached only when a
@@ -820,7 +887,7 @@ fn lint_agent_contents(
     if agent_file.structured_output
         && let Err(error) = schema::validate_schema_name(agent_file.schema_name())
     {
-        issues.push(LintIssue::error(format!(
+        ctx.issues.push(LintIssue::error(format!(
             "{context} has an invalid 'schema_name': {error:#}"
         )));
     }
@@ -832,7 +899,6 @@ fn lint_agent_contents(
         agent_file.subagents.as_deref(),
         agent_file.tools.as_deref(),
         ctx,
-        issues,
     );
 }
 
@@ -845,12 +911,7 @@ fn lint_agent_contents(
 /// cannot know in advance which tool, if any, the model will actually try
 /// to call — an `allowed_tools` list that is merely non-empty could still
 /// reject some calls at runtime with no way to tell in advance.
-fn check_mcp_allowed_tools_not_empty(
-    context: &str,
-    names: Option<&[String]>,
-    ctx: &LintCtx,
-    issues: &mut Vec<LintIssue>,
-) {
+fn check_mcp_allowed_tools_not_empty(context: &str, names: Option<&[String]>, ctx: &mut LintCtx) {
     let Some(names) = names else { return };
     let Some(config) = ctx.config else { return };
     for name in names {
@@ -858,7 +919,7 @@ fn check_mcp_allowed_tools_not_empty(
             && let Some(allowed_tools) = &server.allowed_tools
             && allowed_tools.is_empty()
         {
-            issues.push(LintIssue::warning(format!(
+            ctx.issues.push(LintIssue::warning(format!(
                 "{context} references MCP server '{name}', whose 'allowed_tools' in {} is an empty list; every tool call to it will be rejected at runtime",
                 config::CONFIG_FILE_NAME
             )));
@@ -881,7 +942,6 @@ fn check_capability_name_lists(
     subagents: Option<&[String]>,
     tools: Option<&[String]>,
     ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
 ) {
     check_capability_names(
         context,
@@ -890,9 +950,8 @@ fn check_capability_name_lists(
         mcp,
         |config, name| config.mcp_servers.contains_key(name),
         ctx,
-        issues,
     );
-    check_mcp_allowed_tools_not_empty(context, mcp, ctx, issues);
+    check_mcp_allowed_tools_not_empty(context, mcp, ctx);
     check_capability_names(
         context,
         "skill",
@@ -900,7 +959,6 @@ fn check_capability_name_lists(
         skills,
         |config, name| config.skills.contains_key(name),
         ctx,
-        issues,
     );
     check_capability_names(
         context,
@@ -909,7 +967,6 @@ fn check_capability_name_lists(
         subagents,
         |config, name| config.agents.contains_key(name),
         ctx,
-        issues,
     );
     check_capability_names(
         context,
@@ -918,7 +975,6 @@ fn check_capability_name_lists(
         tools,
         |config, name| config.tools.contains_key(name),
         ctx,
-        issues,
     );
 }
 
@@ -935,7 +991,6 @@ fn check_capability_names(
     names: Option<&[String]>,
     contains: impl Fn(&ConfigFile, &str) -> bool,
     ctx: &mut LintCtx,
-    issues: &mut Vec<LintIssue>,
 ) {
     let Some(names) = names else { return };
     if names.is_empty() {
@@ -947,7 +1002,7 @@ fn check_capability_names(
     };
     for name in names {
         if !contains(config, name) {
-            issues.push(LintIssue::error(format!(
+            ctx.issues.push(LintIssue::error(format!(
                 "{context} references unknown {kind} '{name}'; define it under '{field}' in {}",
                 config::CONFIG_FILE_NAME
             )));

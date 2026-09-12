@@ -173,13 +173,24 @@ pub(crate) async fn load(
 }
 
 /// Writes `response` to `key`'s cache entry, atomically (temp file in the
-/// same directory, then `rename` — see `storage::write_atomic`). `now`
-/// becomes the entry's `created_at` — see `load`'s doc comment for why it's
-/// a parameter rather than read internally.
-pub(crate) fn save(
+/// same directory, then `rename` — see `storage::write_atomic`) on the
+/// bounded blocking I/O worker (`async_io::run_blocking`). `now` becomes the
+/// entry's `created_at` — see `load`'s doc comment for why it's a parameter
+/// rather than read internally.
+///
+/// Goes through `run_blocking` for the same reason `load` goes through
+/// `async_io::read_to_string_cancellable` — see its doc comment: a cache
+/// write runs on every `complete_recorded` call, including from concurrent
+/// workflow branches (`for_each`/`parallel`), so it must not block the Tokio
+/// executor thread those branches share. Serializes synchronously first —
+/// fast, since [`CacheEntryRef`] borrows `response` rather than cloning it,
+/// so this is CPU work, not I/O — and only the write itself crosses onto the
+/// worker (mirrors `checkpoint::save_cancellable`).
+pub(crate) async fn save(
     key: &str,
     response: &response::ChatCompletionResponse,
     now: chrono::DateTime<chrono::Utc>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     let path = entry_path(key);
     let entry = CacheEntryRef {
@@ -187,9 +198,14 @@ pub(crate) fn save(
         response,
     };
     let body = serde_json::to_string_pretty(&entry).context("failed to serialize cache entry")?;
-    crate::storage::write_atomic(&path, body.as_bytes())
-        .with_context(|| format!("failed to save cache entry to '{}'", path.display()))?;
-    Ok(())
+    async_io::run_blocking(
+        move |_| {
+            crate::storage::write_atomic(&path, body.as_bytes())
+                .with_context(|| format!("failed to save cache entry to '{}'", path.display()))
+        },
+        cancellation,
+    )
+    .await
 }
 
 /// Deletes every cached response under `CACHE_DIR`. A missing directory
@@ -268,7 +284,9 @@ mod tests {
         crate::test_support::in_temp_dir_async("lait-cache-ttl", async {
             let saved_at = chrono::Utc::now();
             let response = sample_response();
-            save("ttl-key", &response, saved_at).expect("save should succeed");
+            save("ttl-key", &response, saved_at, None)
+                .await
+                .expect("save should succeed");
 
             // Just inside the TTL: still a hit.
             let just_before_expiry = saved_at + chrono::Duration::seconds(59);

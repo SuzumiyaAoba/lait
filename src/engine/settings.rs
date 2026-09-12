@@ -19,8 +19,21 @@ use crate::{
 };
 
 use super::{
-    CapabilityOverrides, DEFAULT_MAX_TOOL_ROUNDS, RequestSettings, RunContext, SamplingOverrides,
+    CapabilityOverrides, DEFAULT_MAX_TOOL_ROUNDS, RequestSettings, ResolvedCapabilities,
+    RunContext, SamplingOverrides,
 };
+
+/// A `--base-url`/`--api-key` override, bundled together because every
+/// caller that sets one always sources both from the same place
+/// (`SharedChatArgs::endpoint`, for chat's own CLI flags) and every other
+/// caller — resolving a model alias's or agent file's own endpoint instead —
+/// omits both. See `resolve_request_settings`'s doc comment for why setting
+/// either collapses `fallback_candidates` to a single entry.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct EndpointOverrides {
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+}
 
 /// Classifies whether `error` is worth falling back from, for
 /// `RequestSettings::complete_recorded`/`complete_stream`'s
@@ -135,12 +148,16 @@ fn api_key_source_name(source: &config::ApiKeySource) -> &'static str {
 pub(crate) fn resolve_request_settings(
     model_name: String,
     overrides: SamplingOverrides,
-    base_url_override: Option<String>,
-    api_key_override: Option<String>,
+    endpoint_overrides: EndpointOverrides,
     capability_overrides: CapabilityOverrides,
     local_models: &ModelMap,
     file_config: &ConfigFile,
 ) -> Result<RequestSettings> {
+    let EndpointOverrides {
+        base_url: base_url_override,
+        api_key: api_key_override,
+    } = endpoint_overrides;
+
     // A `--base-url`/`--api-key` override pins every attempt to the same
     // endpoint regardless of which model-definition entry it came from, so
     // fallback candidates (each with their own `base_url`) would be
@@ -165,30 +182,11 @@ pub(crate) fn resolve_request_settings(
     let endpoint = config::resolve_endpoint(
         base_url_override,
         api_key_override,
-        resolved_model.base_url.as_deref(),
-        resolved_model.api_key.as_deref(),
-        resolved_model.api_key_cmd.as_ref(),
+        Some(&resolved_model),
         file_config,
     )?;
     let config::Endpoint { base_url, api_key } = endpoint;
-    let sampling = SamplingOverrides {
-        reasoning_effort: overrides
-            .reasoning_effort
-            .or(resolved_model.reasoning_effort)
-            .or(file_config.default.reasoning_effort),
-        temperature: overrides
-            .temperature
-            .or(resolved_model.temperature)
-            .or(file_config.default.temperature),
-        top_p: overrides
-            .top_p
-            .or(resolved_model.top_p)
-            .or(file_config.default.top_p),
-        max_tokens: overrides
-            .max_tokens
-            .or(resolved_model.max_tokens)
-            .or(file_config.default.max_tokens),
-    };
+    let sampling = overrides.resolve(&resolved_model, &file_config.default);
     // Catches an out-of-range value from any layer `workflow::validate`
     // cannot see on its own (a config file's `models:`/`default:`), on top of
     // whatever it already rejected at workflow parse time for values sourced
@@ -204,27 +202,15 @@ pub(crate) fn resolve_request_settings(
         &request_context,
     )?;
 
-    let mcp = capability_overrides
-        .mcp
-        .or_else(|| file_config.default.mcp.clone())
-        .unwrap_or_default();
-    let max_tool_rounds = capability_overrides
-        .max_tool_rounds
-        .or(file_config.default.max_tool_rounds);
+    let ResolvedCapabilities {
+        mcp,
+        max_tool_rounds,
+        skills,
+        subagents,
+        tools,
+    } = capability_overrides.resolve(&file_config.default);
     llm::validate_max_tool_rounds(max_tool_rounds, &request_context)?;
     let max_tool_rounds = max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
-    let skills = capability_overrides
-        .skills
-        .or_else(|| file_config.default.skills.clone())
-        .unwrap_or_default();
-    let subagents = capability_overrides
-        .subagents
-        .or_else(|| file_config.default.subagents.clone())
-        .unwrap_or_default();
-    let tools = capability_overrides
-        .tools
-        .or_else(|| file_config.default.tools.clone())
-        .unwrap_or_default();
 
     tracing::debug!(
         model_id = %resolved_model.model_id,
@@ -296,8 +282,7 @@ pub(crate) fn agent_file_settings(
             top_p: agent_file.top_p,
             max_tokens: agent_file.max_tokens,
         },
-        None,
-        None,
+        EndpointOverrides::default(),
         CapabilityOverrides {
             mcp: agent_file.mcp.clone(),
             max_tool_rounds: agent_file.max_tool_rounds,

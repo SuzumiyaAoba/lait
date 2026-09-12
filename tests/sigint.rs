@@ -4,24 +4,13 @@ use std::fs;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use support::{ConfigDirectory, test_command};
-
-/// Sends SIGINT directly to `pid` — the same signal a terminal's Ctrl-C
-/// delivers to its foreground process, approximated here without needing an
-/// actual controlling terminal in the test harness.
-fn send_sigint(pid: u32) {
-    // SAFETY: `pid` is a live child we own (`Child::id()`), and `kill(2)`
-    // with SIGINT has no memory-safety preconditions beyond a valid pid.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGINT);
-    }
-}
+use support::{ConfigDirectory, send_sigint, test_command};
 
 #[test]
 fn sigint_cancels_a_running_workflow_and_saves_a_checkpoint() {
     let dir = ConfigDirectory::empty();
-    fs::write(
-        dir.path().join("workflow.yml"),
+    dir.write(
+        "workflow.yml",
         r#"
 nodes:
   mark:
@@ -34,8 +23,7 @@ steps:
   - use: mark
   - use: slow
 "#,
-    )
-    .expect("failed to write test workflow");
+    );
 
     let child = test_command()
         .current_dir(dir.path())
@@ -203,8 +191,8 @@ fn sigint_cancels_bare_chat_waiting_for_fifo_input() {
 #[test]
 fn workflow_timeout_cancels_a_run_that_exceeds_the_budget() {
     let dir = ConfigDirectory::empty();
-    fs::write(
-        dir.path().join("workflow.yml"),
+    dir.write(
+        "workflow.yml",
         r#"
 default:
   workflow_timeout: 1
@@ -215,8 +203,7 @@ nodes:
 steps:
   - use: slow
 "#,
-    )
-    .expect("failed to write test workflow");
+    );
 
     let started = Instant::now();
     let output = test_command()
@@ -245,11 +232,7 @@ steps:
 #[test]
 fn workflow_timeout_rejects_a_zero_value() {
     let dir = ConfigDirectory::empty();
-    fs::write(
-        dir.path().join("workflow.yml"),
-        "default:\n  workflow_timeout: 0\nnodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n",
-    )
-    .expect("failed to write test workflow");
+    dir.write("workflow.yml", "default:\n  workflow_timeout: 0\nnodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n");
 
     let output = test_command()
         .current_dir(dir.path())

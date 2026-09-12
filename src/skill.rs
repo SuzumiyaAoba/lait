@@ -6,7 +6,13 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::{async_cache::AsyncCache, async_io, config, error::Interrupted, frontmatter, registry};
+use crate::{async_cache::AsyncCache, async_io, config, frontmatter, registry};
+
+/// The single wording used everywhere this module reports a cancelled skill
+/// render — both the immediate pre-checks (`bail!(error::cancelled(..))`)
+/// and `AsyncCache::get_or_try_init`'s own `cancellation_message` argument,
+/// which previously had to be kept in sync with those by hand.
+const SKILL_RENDERING_CANCELLED: &str = "skill rendering was cancelled";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,6 +148,15 @@ fn format_skill(skill: &SkillFile) -> String {
 pub(crate) struct SkillCache {
     skills_map: Arc<config::SkillMap>,
     sections: AsyncCache<String, String>,
+    /// `render`'s own combined-text result, cached by its exact `names` list
+    /// (order matters — it's the order sections are joined in). Sections
+    /// were already cached per-name, but the `"\n\n"`-joined combination of
+    /// them was rebuilt from scratch on every single `render` call for the
+    /// same `skills:` list — every `for_each`/`loop` iteration re-walks and
+    /// re-joins the same `Vec<Arc<String>>`. Caching the join result too
+    /// turns a repeat `render` call for the same list into a refcount bump,
+    /// same as a repeat `section` call already was.
+    joined: AsyncCache<Vec<String>, String>,
 }
 
 impl SkillCache {
@@ -149,6 +164,7 @@ impl SkillCache {
         Self {
             skills_map,
             sections: AsyncCache::new(),
+            joined: AsyncCache::new(),
         }
     }
 
@@ -167,11 +183,16 @@ impl SkillCache {
     /// Markdown body may legitimately contain `{{`/`}}` (e.g. in a code
     /// sample), and `template::render` treats an undefined variable as a
     /// hard error.
+    ///
+    /// Returns `Arc<String>` rather than `String` so a cached hit (see
+    /// `joined`) is a refcount bump instead of a full copy of the combined
+    /// text — `engine::with_skills`'s caller only ever needs to borrow it for
+    /// the span of building one request's messages.
     pub(crate) async fn render(
         &self,
         names: &[String],
         cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<Arc<String>>> {
         if names.is_empty() {
             return Ok(None);
         }
@@ -179,19 +200,30 @@ impl SkillCache {
             .as_ref()
             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
-            anyhow::bail!(Interrupted::cancelled("skill rendering was cancelled"));
+            anyhow::bail!(crate::error::cancelled(SKILL_RENDERING_CANCELLED));
         }
-        let sections = futures_util::future::try_join_all(
-            names
-                .iter()
-                .map(|name| self.section(name, cancellation.clone())),
-        )
-        .await?;
-        let joined = sections
-            .iter()
-            .map(|section| section.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let joined = self
+            .joined
+            .get_or_try_init(
+                names.to_vec(),
+                cancellation.clone(),
+                || async {
+                    let sections = futures_util::future::try_join_all(
+                        names
+                            .iter()
+                            .map(|name| self.section(name, cancellation.clone())),
+                    )
+                    .await?;
+                    let joined = sections
+                        .iter()
+                        .map(|section| section.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    Ok(Arc::new(joined))
+                },
+                SKILL_RENDERING_CANCELLED,
+            )
+            .await?;
         Ok(Some(joined))
     }
 
@@ -219,11 +251,11 @@ impl SkillCache {
                         .as_ref()
                         .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
                     {
-                        anyhow::bail!(Interrupted::cancelled("skill rendering was cancelled"));
+                        anyhow::bail!(crate::error::cancelled(SKILL_RENDERING_CANCELLED));
                     }
                     Ok(Arc::new(format_skill(&skill)))
                 },
-                "skill rendering was cancelled",
+                SKILL_RENDERING_CANCELLED,
             )
             .await?;
         Ok(section)
@@ -270,6 +302,30 @@ mod tests {
         let skills_map = HashMap::new();
         let cache = SkillCache::new(Arc::new(skills_map));
         assert!(cache.render(&[], None).await.unwrap().is_none());
+    }
+
+    /// A second `render` call for the same `names` list must reuse the
+    /// already-joined text (a refcount bump) instead of re-joining the
+    /// per-name sections from scratch — see `SkillCache::joined`'s doc
+    /// comment. `Arc::ptr_eq` distinguishes that from two calls merely
+    /// producing equal-but-freshly-allocated strings.
+    #[tokio::test]
+    async fn a_repeat_render_call_for_the_same_names_reuses_the_cached_join() {
+        let path = crate::test_support::unique_temp_path("lait-test-skill-join-cache", ".md");
+        fs::write(&path, "---\n---\nbody\n").unwrap();
+        let mut skills_map = HashMap::new();
+        skills_map.insert("s".to_owned(), path.clone());
+        let cache = SkillCache::new(Arc::new(skills_map));
+        let names = vec!["s".to_owned()];
+
+        let first = cache.render(&names, None).await.unwrap().unwrap();
+        let second = cache.render(&names, None).await.unwrap().unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "expected the second call to reuse the cached joined text"
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[tokio::test]

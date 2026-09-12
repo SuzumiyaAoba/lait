@@ -2,7 +2,9 @@ mod support;
 
 use std::time::Duration;
 
-use support::{JsonSchemaFile, LaitCommand, MockServer, run_lait, without_json_whitespace};
+use support::{
+    JsonSchemaFile, LaitCommand, MockServer, completion_body, run_lait, without_json_whitespace,
+};
 
 #[test]
 fn sends_prompt_to_openai_compatible_chat_completions() {
@@ -90,10 +92,7 @@ fn sends_strict_json_schema_response_format() {
 
 #[test]
 fn cli_reasoning_effort_overrides_environment() {
-    let server = MockServer::start(
-        "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-    );
+    let server = MockServer::start("200 OK", &completion_body("test-model", "mock response"));
     let output = LaitCommand::new()
         .base_url(Some(&server.base_url))
         .opt_arg("--reasoning-effort", Some("high"))
@@ -113,10 +112,7 @@ fn cli_reasoning_effort_overrides_environment() {
 
 #[test]
 fn sends_none_reasoning_effort_when_explicitly_requested() {
-    let server = MockServer::start(
-        "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-    );
+    let server = MockServer::start("200 OK", &completion_body("test-model", "mock response"));
     let output = LaitCommand::new()
         .base_url(Some(&server.base_url))
         .opt_arg("--reasoning-effort", Some("none"))
@@ -135,10 +131,7 @@ fn sends_none_reasoning_effort_when_explicitly_requested() {
 
 #[test]
 fn sends_reasoning_effort_from_environment() {
-    let server = MockServer::start(
-        "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-    );
+    let server = MockServer::start("200 OK", &completion_body("test-model", "mock response"));
     let output = LaitCommand::new()
         .base_url(Some(&server.base_url))
         .env("LLM_REASONING_EFFORT", "minimal")
@@ -157,10 +150,7 @@ fn sends_reasoning_effort_from_environment() {
 
 #[test]
 fn sends_temperature_top_p_and_max_tokens_when_set() {
-    let server = MockServer::start(
-        "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-    );
+    let server = MockServer::start("200 OK", &completion_body("test-model", "mock response"));
     let output = LaitCommand::new()
         .base_url(Some(&server.base_url))
         .opt_arg("--temperature", Some("0.7"))
@@ -186,10 +176,7 @@ fn sends_temperature_top_p_and_max_tokens_when_set() {
 
 #[test]
 fn omits_temperature_top_p_and_max_tokens_when_unset() {
-    let server = MockServer::start(
-        "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-    );
+    let server = MockServer::start("200 OK", &completion_body("test-model", "mock response"));
     let output = LaitCommand::new()
         .base_url(Some(&server.base_url))
         .prompt("hello")
@@ -254,10 +241,7 @@ fn retries_a_429_response_and_succeeds_on_the_next_attempt() {
             "429 Too Many Requests",
             r#"{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}"#,
         ),
-        (
-            "200 OK",
-            r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"mock response"},"finish_reason":"stop"}]}"#,
-        ),
+        ("200 OK", &completion_body("test-model", "mock response")),
     ]);
     let output = run_lait(Some(&server.base_url), None, "hello");
     let first_request = server.receive_request();

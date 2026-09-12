@@ -32,6 +32,27 @@ impl fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
+/// Builds a ready-to-return `anyhow::Error` wrapping a cancellation
+/// [`Interrupted`] — the one spelling every cancellation call site in the
+/// crate should use. `Interrupted::cancelled` only returns `Self`, so
+/// lifting it into the `anyhow::Error` almost every call site actually needs
+/// used to be done six different ways across the crate (`bail!(Interrupted
+/// ::cancelled(..))`, `Err(anyhow!(Interrupted::cancelled(..)))`,
+/// `Err(anyhow::Error::new(..))`, `.into()`, a bare `Err(Interrupted::
+/// cancelled(..))`, and a short-import `bail!(Interrupted::cancelled(..))`),
+/// with the choice of import (`crate::error::Interrupted` fully qualified vs.
+/// a local `use`) varying just as much. Prefer `bail!(error::cancelled(".."))`
+/// at a call site that returns `Result` (or `return Err(error::cancelled(".."))`
+/// where `bail!` isn't available, e.g. inside a `match`/`select!` arm).
+pub(crate) fn cancelled(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Interrupted::cancelled(message))
+}
+
+/// The elapsed-deadline counterpart to [`cancelled`] — see its doc comment.
+pub(crate) fn timed_out(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Interrupted::timed_out(message))
+}
+
 /// Clap owns usage errors (2); the signal handler owns SIGINT (130).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitKind {

@@ -48,74 +48,9 @@ pub(crate) async fn run(
     crate::signal::spawn_handler(cancellation.clone());
     let mut checks = Vec::new();
 
-    // Mirrors `lint::run`'s own "is there a config at all" detection: unlike
-    // `config::load_config`, which returns an empty `ConfigFile` both when
-    // `lait.config.yml` is absent and when `--no-config` was passed, this
-    // check needs to tell those two apart from "found but failed to parse".
-    let config_path =
-        config::resolve_config_path_cancellable(&config_source, Some(cancellation.clone())).await?;
-    let global_config_present = matches!(config_source, ConfigSource::Search)
-        && config::global_config_exists_cancellable(Some(cancellation.clone())).await?;
-    let config_present = config_path.is_some() || global_config_present;
-
-    let file_config =
-        match config::load_config_cancellable(&config_source, Some(cancellation.clone())).await {
-            Ok(file_config) => {
-                if config_present {
-                    checks.push(Check::ok(
-                        "config",
-                        config::CONFIG_FILE_NAME,
-                        "読み込み・パースに成功しました",
-                    ));
-                } else {
-                    checks.push(Check::warn(
-                        "config",
-                        config::CONFIG_FILE_NAME,
-                        "設定ファイルが見つかりません（デフォルト設定で動作します）",
-                        Some(format!(
-                            "プロジェクトルートに {} を作成するか `lait init` を実行してください",
-                            config::CONFIG_FILE_NAME
-                        )),
-                    ));
-                }
-                Some(Arc::new(file_config))
-            }
-            Err(error) => {
-                if is_interrupted(&error) {
-                    return Err(error);
-                }
-                checks.push(Check::error(
-                    "config",
-                    config::CONFIG_FILE_NAME,
-                    format!("{error:#}"),
-                    Some(format!(
-                        "{} の構文を確認してください",
-                        config::CONFIG_FILE_NAME
-                    )),
-                ));
-                None
-            }
-        };
-
+    let file_config = check_config_load(&config_source, &cancellation, &mut checks).await?;
     match &file_config {
-        Some(file_config) => {
-            check_env_placeholders(file_config, &mut checks);
-            check_default_model(file_config, &mut checks);
-            let uses = resolve_endpoint_uses(file_config);
-            let services = Arc::new(AppServices::new(Arc::clone(file_config)));
-            let server_models = services
-                .clone()
-                .finish(check_connectivity(
-                    &uses,
-                    &services,
-                    Some(cancellation.clone()),
-                    &mut checks,
-                ))
-                .await?;
-            check_models_on_server(&uses, &server_models, &mut checks);
-            check_mcp_servers(file_config, &mut checks).await;
-            check_registry_files(file_config, &mut checks);
-        }
+        Some(file_config) => run_all_checks(file_config, &cancellation, &mut checks).await?,
         None => {
             checks.push(Check::warn(
                 "config",
@@ -135,6 +70,94 @@ pub(crate) async fn run(
     if error_count > 0 {
         bail!("lait doctor found {error_count} error(s)");
     }
+    Ok(())
+}
+
+/// Loads the config file the same way [`run`]'s remaining checks need it
+/// (`Arc`-wrapped, `None` when it failed to parse), pushing the "config"
+/// check that reports which of the three outcomes happened: found and
+/// parsed, absent (falls back to defaults), or found but unparseable. Mirrors
+/// `lint::run`'s own "is there a config at all" detection: unlike
+/// `config::load_config`, which returns an empty `ConfigFile` both when
+/// `lait.config.yml` is absent and when `--no-config` was passed, this check
+/// needs to tell those two apart from "found but failed to parse". Propagates
+/// (rather than reporting as a check) a `crate::error::Interrupted` error,
+/// matching every other cancellable step in [`run`].
+async fn check_config_load(
+    config_source: &ConfigSource,
+    cancellation: &tokio_util::sync::CancellationToken,
+    checks: &mut Vec<Check>,
+) -> Result<Option<Arc<ConfigFile>>> {
+    let config_path =
+        config::resolve_config_path_cancellable(config_source, Some(cancellation.clone())).await?;
+    let global_config_present = matches!(config_source, ConfigSource::Search)
+        && config::global_config_exists_cancellable(Some(cancellation.clone())).await?;
+    let config_present = config_path.is_some() || global_config_present;
+
+    match config::load_config_cancellable(config_source, Some(cancellation.clone())).await {
+        Ok(file_config) => {
+            if config_present {
+                checks.push(Check::ok(
+                    "config",
+                    config::CONFIG_FILE_NAME,
+                    "読み込み・パースに成功しました",
+                ));
+            } else {
+                checks.push(Check::warn(
+                    "config",
+                    config::CONFIG_FILE_NAME,
+                    "設定ファイルが見つかりません（デフォルト設定で動作します）",
+                    Some(format!(
+                        "プロジェクトルートに {} を作成するか `lait init` を実行してください",
+                        config::CONFIG_FILE_NAME
+                    )),
+                ));
+            }
+            Ok(Some(Arc::new(file_config)))
+        }
+        Err(error) => {
+            if is_interrupted(&error) {
+                return Err(error);
+            }
+            checks.push(Check::error(
+                "config",
+                config::CONFIG_FILE_NAME,
+                format!("{error:#}"),
+                Some(format!(
+                    "{} の構文を確認してください",
+                    config::CONFIG_FILE_NAME
+                )),
+            ));
+            Ok(None)
+        }
+    }
+}
+
+/// Runs checks 2-7 (env placeholders, default model, connectivity, model
+/// presence, MCP servers, agent/skill file references) once a config file
+/// has successfully loaded — the checks [`run`] skips entirely (with a
+/// single "skipped" warning) when [`check_config_load`] returns `None`.
+async fn run_all_checks(
+    file_config: &Arc<ConfigFile>,
+    cancellation: &tokio_util::sync::CancellationToken,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    check_env_placeholders(file_config, checks);
+    check_default_model(file_config, checks);
+    let uses = resolve_endpoint_uses(file_config);
+    let services = Arc::new(AppServices::new(Arc::clone(file_config)));
+    let server_models = services
+        .clone()
+        .finish(check_connectivity(
+            &uses,
+            &services,
+            Some(cancellation.clone()),
+            checks,
+        ))
+        .await?;
+    check_models_on_server(&uses, &server_models, checks);
+    check_mcp_servers(file_config, checks).await;
+    check_registry_files(file_config, checks);
     Ok(())
 }
 
@@ -274,7 +297,7 @@ struct EndpointUse {
 /// by `check_env_placeholders`) is skipped here rather than reported again.
 fn resolve_endpoint_uses(file_config: &ConfigFile) -> Vec<EndpointUse> {
     let mut uses = Vec::new();
-    if let Ok(endpoint) = config::resolve_endpoint(None, None, None, None, None, file_config) {
+    if let Ok(endpoint) = config::resolve_endpoint(None, None, None, file_config) {
         uses.push(EndpointUse {
             label: "top-level".to_owned(),
             model_id: None,
@@ -289,14 +312,8 @@ fn resolve_endpoint_uses(file_config: &ConfigFile) -> Vec<EndpointUse> {
         let Ok(Some(resolved)) = config::resolve_model_alias(name, &file_config.models) else {
             continue;
         };
-        let Ok(endpoint) = config::resolve_endpoint(
-            None,
-            None,
-            resolved.base_url.as_deref(),
-            resolved.api_key.as_deref(),
-            resolved.api_key_cmd.as_ref(),
-            file_config,
-        ) else {
+        let Ok(endpoint) = config::resolve_endpoint(None, None, Some(&resolved), file_config)
+        else {
             continue;
         };
         uses.push(EndpointUse {
@@ -492,12 +509,12 @@ async fn fetch_models(
             ));
             Ok(Some(ids))
         }
-        Err(_) => {
+        Err(error) => {
             checks.push(Check::warn(
                 "connectivity",
                 base_url.to_owned(),
                 "接続には成功しましたが、応答をモデル一覧として解釈できませんでした",
-                None,
+                Some(format!("{error:#}")),
             ));
             Ok(None)
         }
@@ -521,9 +538,9 @@ where
         Some(cancellation) => {
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => Err(crate::error::Interrupted::cancelled(
+                () = cancellation.cancelled() => Err(crate::error::cancelled(
                     "doctor connectivity check was cancelled",
-                ).into()),
+                )),
                 result = future => result.map_err(anyhow::Error::new),
             }
         }

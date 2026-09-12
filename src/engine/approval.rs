@@ -79,7 +79,7 @@ pub(super) async fn tool_decision(
         ToolApprovalAnswer::Always => {
             env.always_approved_tools
                 .lock()
-                .expect("always_approved_tools lock poisoned")
+                .expect("always_approved_tools lock should not be poisoned")
                 .insert(qualified_name.to_owned());
             // Keep the lease through the cache update so a concurrent caller
             // cannot observe the old cache state and prompt a second time.
@@ -98,7 +98,7 @@ pub(super) async fn tool_decision(
 fn always_approved(env: &RunContext, qualified_name: &str) -> bool {
     env.always_approved_tools
         .lock()
-        .expect("always_approved_tools lock poisoned")
+        .expect("always_approved_tools lock should not be poisoned")
         .contains(qualified_name)
 }
 
@@ -114,9 +114,7 @@ async fn acquire_approval_gate(
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
-                    Err(crate::error::Interrupted::cancelled(
-                        "tool approval was cancelled",
-                    ).into())
+                    Err(crate::error::cancelled("tool approval was cancelled"))
                 }
                 lease = gate.lock_owned() => Ok(lease),
             }

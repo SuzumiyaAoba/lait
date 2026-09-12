@@ -50,6 +50,45 @@ pub(super) async fn execute(
     }
 }
 
+/// Resolves a `prompt` node's `output_schema:`, if it sets one, into the
+/// Structured Output `response_format` the request carries — by name against
+/// `scope.json_schemas` first (a workflow's own `json_schemas:` map), falling
+/// back to loading it as a file path otherwise. `None` when the node has no
+/// `output_schema:`.
+async fn resolve_response_format(
+    prompt_node: &workflow::PromptNode,
+    scope: &workflow::WorkflowScope,
+    context: &StepContext<'_>,
+    label: &str,
+) -> Result<Option<async_openai::types::chat::ResponseFormat>> {
+    let Some(name_or_path) = prompt_node.output_schema.as_deref() else {
+        return Ok(None);
+    };
+    let schema_name = prompt_node
+        .schema_name
+        .as_deref()
+        .unwrap_or("structured_output");
+    let response_format = match scope.json_schemas.get(name_or_path) {
+        Some(entry) => {
+            schema::build_response_format_from_entry_cancellable(
+                entry,
+                schema_name,
+                context.step_cancel.clone(),
+            )
+            .await
+        }
+        None => {
+            schema::load_json_schema_cancellable(
+                Path::new(name_or_path),
+                schema_name,
+                context.step_cancel.clone(),
+            )
+            .await
+        }
+    };
+    Ok(Some(response_format.step(label)?))
+}
+
 async fn execute_prompt(
     node: &workflow::NodeDefinition,
     prompt_node: &workflow::PromptNode,
@@ -81,34 +120,7 @@ async fn execute_prompt(
     let settings = resolve_step_settings(node, scope, &env.services.file_config, None, label)?
         .with_usage_label(label);
 
-    let response_format = match prompt_node.output_schema.as_deref() {
-        Some(name_or_path) => {
-            let schema_name = prompt_node
-                .schema_name
-                .as_deref()
-                .unwrap_or("structured_output");
-            let response_format = match scope.json_schemas.get(name_or_path) {
-                Some(entry) => {
-                    schema::build_response_format_from_entry_cancellable(
-                        entry,
-                        schema_name,
-                        context.step_cancel.clone(),
-                    )
-                    .await
-                }
-                None => {
-                    schema::load_json_schema_cancellable(
-                        Path::new(name_or_path),
-                        schema_name,
-                        context.step_cancel.clone(),
-                    )
-                    .await
-                }
-            };
-            Some(response_format.step(label)?)
-        }
-        None => None,
-    };
+    let response_format = resolve_response_format(prompt_node, scope, context, label).await?;
 
     // Built once and shared by both renders below: handlebars'
     // `Context` owns a clone of `input`/`steps_outputs`/`env.vars`,
@@ -155,7 +167,14 @@ async fn execute_prompt(
         .await
         .step(label)?;
 
-    response::render_response(&response, false, false).step(label)
+    response::render_response(
+        &response,
+        response::RenderOptions {
+            as_json: false,
+            show_reasoning: false,
+        },
+    )
+    .step(label)
 }
 
 async fn execute_agent(

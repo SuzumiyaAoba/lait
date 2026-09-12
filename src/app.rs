@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use async_openai::types::chat::{ChatCompletionRequestMessage, ResponseFormat};
 
 use crate::{
     agent, attachment, chat, checkpoint,
@@ -35,8 +36,9 @@ use crate::{
     config::{self, ConfigSource, ModelMap},
     docgen, doctor,
     engine::{
-        AgentTurn, AppServices, CapabilityOverrides, PromptTurn, RunContext, SamplingOverrides,
-        agent_file_settings, call_agent, resolve_request_settings,
+        AgentTurn, AppServices, CapabilityOverrides, EndpointOverrides, PromptTurn,
+        RequestSettings, RunContext, SamplingOverrides, agent_file_settings, call_agent,
+        resolve_request_settings,
     },
     history, lint, prompt, repl, report, response, schema, skill, subagent, template, test_run,
     usage,
@@ -446,14 +448,63 @@ fn finish_chat_run(
 /// Runs a single-shot chat request with an already-resolved `prompt` — see
 /// `run_chat_or_repl`, the only caller, for how `prompt` was resolved (a
 /// CLI argument and/or piped stdin).
-async fn run_chat(
-    chat: ChatArgs,
+/// Display/output policy derived from `--quiet`/`--show-reasoning`/
+/// `--show-usage`/`--render`/`-o`, shared by [`run_chat`]'s streaming and
+/// non-streaming completion paths.
+struct ChatDisplayPolicy<'a> {
+    show_reasoning: bool,
+    show_usage: bool,
+    render_enabled: bool,
+    /// `-o -` is an explicit "stdout", the same as no `-o` at all.
+    output_path: Option<&'a std::path::Path>,
+}
+
+impl<'a> ChatDisplayPolicy<'a> {
+    fn resolve(chat: &'a ChatArgs, file_config: &config::ConfigFile) -> Self {
+        // `--quiet` keeps the response body and drops every note around it.
+        Self {
+            show_reasoning: chat.shared.show_reasoning && !chat.quiet,
+            show_usage: chat.shared.reporting.show_usage && !chat.quiet,
+            render_enabled: chat.output.render || file_config.default.render.unwrap_or(false),
+            output_path: chat
+                .output
+                .output
+                .as_deref()
+                .filter(|path| path.as_os_str() != "-"),
+        }
+    }
+}
+
+/// Everything [`run_chat`] needs to send its one completion request, built
+/// by [`prepare_chat_request`]: config, resolved model/sampling settings,
+/// the fully assembled prompt (template-rendered and file-attachment-
+/// appended), and the run's services/context/display policy.
+struct ChatRequest<'a> {
+    file_config: Arc<config::ConfigFile>,
+    settings: RequestSettings,
+    response_format: Option<ResponseFormat>,
+    prompt: String,
+    system_prompt: Option<String>,
+    session_history: Vec<ChatCompletionRequestMessage>,
+    image_urls: Vec<String>,
+    services: Arc<AppServices>,
+    env: RunContext,
+    display: ChatDisplayPolicy<'a>,
+}
+
+/// Resolves everything a chat completion request needs, ahead of actually
+/// sending it: `-p`/`--prompt-name` template rendering, model/sampling
+/// settings, the JSON Schema `--json-schema` requests, file attachments/
+/// system prompt/image URLs (read concurrently — see the `tokio::try_join!`
+/// below), session history, and the run's services/context.
+async fn prepare_chat_request<'a>(
+    chat: &'a ChatArgs,
     prompt: String,
     config_source: ConfigSource,
     cache_override: Option<bool>,
     approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
-) -> Result<()> {
+) -> Result<ChatRequest<'a>> {
     let file_config =
         Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
@@ -494,17 +545,50 @@ async fn run_chat(
     };
     let session_history = chat::load_session_history(chat.shared.session.as_deref())?;
     let (services, env) = build_run_context(&file_config, cache_override, approve_tools, cancel);
+    let display = ChatDisplayPolicy::resolve(chat, &file_config);
 
-    // `--quiet` keeps the response body and drops every note around it.
-    let show_reasoning = chat.shared.show_reasoning && !chat.quiet;
-    let show_usage = chat.shared.reporting.show_usage && !chat.quiet;
-    let render_enabled = chat.output.render || file_config.default.render.unwrap_or(false);
-    // `-o -` is an explicit "stdout", the same as no `-o` at all.
-    let output_path = chat
-        .output
-        .output
-        .as_deref()
-        .filter(|path| path.as_os_str() != "-");
+    Ok(ChatRequest {
+        file_config,
+        settings,
+        response_format,
+        prompt,
+        system_prompt,
+        session_history,
+        image_urls,
+        services,
+        env,
+        display,
+    })
+}
+
+async fn run_chat(
+    chat: ChatArgs,
+    prompt: String,
+    config_source: ConfigSource,
+    cache_override: Option<bool>,
+    approve_tools: bool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let ChatRequest {
+        file_config,
+        settings,
+        response_format,
+        prompt,
+        system_prompt,
+        session_history,
+        image_urls,
+        services,
+        env,
+        display,
+    } = prepare_chat_request(
+        &chat,
+        prompt,
+        config_source,
+        cache_override,
+        approve_tools,
+        cancel,
+    )
+    .await?;
 
     let turn = PromptTurn {
         system_prompt: system_prompt.as_deref(),
@@ -520,9 +604,9 @@ async fn run_chat(
                 &[],
                 turn,
                 response_format,
-                show_usage,
-                show_reasoning,
-                output_path,
+                display.show_usage,
+                display.show_reasoning,
+                display.output_path,
                 Some(env.operation_token()),
             ))
             .await?;
@@ -539,7 +623,7 @@ async fn run_chat(
             &prompt,
             &outcome.content,
             &env,
-            show_usage,
+            display.show_usage,
         );
     }
 
@@ -553,23 +637,37 @@ async fn run_chat(
         ))
         .await?;
 
-    match output_path {
+    match display.output_path {
         Some(path) => {
             // The file gets the body alone; reasoning, when requested,
             // becomes a stderr note like usage.
-            if show_reasoning && let Some(reasoning) = response::response_reasoning(&response) {
+            if display.show_reasoning
+                && let Some(reasoning) = response::response_reasoning(&response)
+            {
                 eprintln!("Reasoning:\n{reasoning}\n");
             }
-            let body = response::render_response(&response, chat.output.json, false)?;
+            let body = response::render_response(
+                &response,
+                response::RenderOptions {
+                    as_json: chat.output.json,
+                    show_reasoning: false,
+                },
+            )?;
             report::emit_output(&body, Some(path), false)?;
         }
         None => {
-            let output = response::render_response(&response, chat.output.json, show_reasoning)?;
+            let output = response::render_response(
+                &response,
+                response::RenderOptions {
+                    as_json: chat.output.json,
+                    show_reasoning: display.show_reasoning,
+                },
+            )?;
             // `--json`'s output is machine-readable and never rendered as
             // Markdown; `chat.stream`'s branch above already returned before
             // reaching here, so `--render` never has to reckon with a
-            // partial streamed response either — see `render::maybe_render`.
-            report::emit_output(&output, None, !chat.output.json && render_enabled)?;
+            // partial streamed response either — see `report::maybe_render`.
+            report::emit_output(&output, None, !chat.output.json && display.render_enabled)?;
         }
     }
     let content = response::content_text(&response);
@@ -580,7 +678,7 @@ async fn run_chat(
         &prompt,
         content,
         &env,
-        show_usage,
+        display.show_usage,
     )
 }
 
@@ -589,6 +687,15 @@ async fn run_chat(
 /// neither a positional argument nor piped stdin supplied one.
 fn missing_input_error() -> anyhow::Error {
     anyhow!("an INPUT is required; provide one or pipe input via stdin")
+}
+
+/// Shared by `workflow_run::run_workflow` and `compare::run`: both resolve
+/// `PROMPT` the same way (`chat::resolve_input_with_stdin_cancellable`) and
+/// fail identically when neither a positional argument nor piped stdin
+/// supplied one. `pub(crate)` (unlike [`missing_input_error`]) because
+/// `compare` is a sibling module of `app`, not a descendant.
+pub(crate) fn missing_prompt_error() -> anyhow::Error {
+    anyhow!("a PROMPT is required; provide one or pipe input via stdin")
 }
 
 /// Runs `lait prompt run <NAME> [INPUT]` (`lait prompt list` is handled
@@ -639,8 +746,7 @@ async fn run_prompt(
     let settings = resolve_request_settings(
         model_name,
         SamplingOverrides::default(),
-        None,
-        None,
+        EndpointOverrides::default(),
         CapabilityOverrides::default(),
         &ModelMap::default(),
         &file_config,
@@ -657,7 +763,13 @@ async fn run_prompt(
             Some(env.operation_token()),
         ))
         .await?;
-    let output = response::render_response(&response, false, false)?;
+    let output = response::render_response(
+        &response,
+        response::RenderOptions {
+            as_json: false,
+            show_reasoning: false,
+        },
+    )?;
     finish_prompt_or_agent_run(
         "prompt",
         &output,

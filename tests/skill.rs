@@ -12,11 +12,7 @@ fn agent_run_appends_skill_content_after_the_agents_own_system_prompt() {
         "base_url: \"{}\"\ndefault:\n  model: test-model\nskills:\n  code-review: skill.md\n",
         server.base_url
     ));
-    std::fs::write(
-        config.path().join("skill.md"),
-        "---\nname: code-review\ndescription: reviews a diff for bugs\n---\nLook for off-by-one errors.\n",
-    )
-    .expect("failed to write test skill file");
+    config.write("skill.md", "---\nname: code-review\ndescription: reviews a diff for bugs\n---\nLook for off-by-one errors.\n");
     let agent = AgentMarkdownFile::new(
         "---\nname: city-fact\nskills: [code-review]\n---\nYou are a helpful assistant.\nCity: {{ input.city }}\n",
     );
@@ -54,11 +50,7 @@ fn chat_appends_default_skills_with_no_system_prompt_of_its_own() {
         "base_url: \"{}\"\ndefault:\n  model: test-model\n  skills: [code-review]\nskills:\n  code-review: skill.md\n",
         server.base_url
     ));
-    std::fs::write(
-        config.path().join("skill.md"),
-        "---\n---\nLook for off-by-one errors.\n",
-    )
-    .expect("failed to write test skill file");
+    config.write("skill.md", "---\n---\nLook for off-by-one errors.\n");
 
     let output = test_command()
         .current_dir(config.path())

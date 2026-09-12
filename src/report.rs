@@ -9,15 +9,41 @@
 //! module's [`finish_run`] is for the three `run_*` entry points that don't
 //! have a session concept.
 
-use std::path::Path;
+use std::{borrow::Cow, io::IsTerminal, path::Path, sync::LazyLock};
 
 use anyhow::{Context, Result};
 
 use crate::{
     config::ConfigFile,
-    history, render, response,
+    history, response,
     usage::{self, UsageTally},
 };
+
+/// `termimad::MadSkin::default()` is a fixed, stateless style table (no
+/// per-render configuration ever varies it here), so it's built once and
+/// shared instead of reconstructed on every rendered response.
+/// `Send + Sync` holds because every field is either a `Copy` style/color
+/// type or a `&'static` reference (`skin.rs`'s struct definition) — nothing
+/// interior-mutable, so sharing one instance across renders is safe.
+static SKIN: LazyLock<termimad::MadSkin> = LazyLock::new(termimad::MadSkin::default);
+
+const _: fn() = || {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<termimad::MadSkin>();
+};
+
+/// Renders `content` as Markdown for terminal display (`--render`/
+/// `default.render`, see docs/usage/ja/output.md) when `enabled` and stdout
+/// is a terminal; otherwise returns `content` unchanged. Returns a borrow of
+/// `content` in the common (disabled, or non-TTY) path instead of an owned
+/// copy — [`emit_output`], its only caller, only ever needs to print the
+/// result once, immediately, so there is nothing for the copy to buy.
+fn maybe_render(content: &str, enabled: bool) -> Cow<'_, str> {
+    if !enabled || !std::io::stdout().is_terminal() {
+        return Cow::Borrowed(content);
+    }
+    Cow::Owned(SKIN.term_text(content).to_string())
+}
 
 /// Writes `body` to stdout — Markdown-rendered when `render_enabled` — or to
 /// `output_path` verbatim with a trailing newline. The chat streamed path
@@ -38,13 +64,20 @@ pub(crate) fn emit_output(
 ) -> Result<()> {
     match output_path {
         Some(path) => {
-            let mut written = body.to_owned();
-            written.push('\n');
-            std::fs::write(path, written)
-                .with_context(|| format!("failed to write the response to '{}'", path.display()))
+            // Writes `body`'s bytes directly, then a trailing newline,
+            // instead of `body.to_owned()` + `push('\n')` — a response body
+            // can be sizeable, and that used to copy all of it just to
+            // append one byte.
+            use std::io::Write as _;
+            (|| {
+                let mut file = std::fs::File::create(path)?;
+                file.write_all(body.as_bytes())?;
+                file.write_all(b"\n")
+            })()
+            .with_context(|| format!("failed to write the response to '{}'", path.display()))
         }
         None => {
-            println!("{}", render::maybe_render(body, render_enabled));
+            println!("{}", maybe_render(body, render_enabled));
             Ok(())
         }
     }
@@ -130,4 +163,18 @@ pub(crate) fn finish_run(
         usage::print_usage_summary(usage_tally);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maybe_render;
+
+    #[test]
+    fn maybe_render_returns_content_unchanged_when_disabled() {
+        // Also covers the enabled-but-not-a-terminal case: `cargo test`
+        // runs with stdout captured (not a real TTY), so `enabled: true`
+        // here exercises exactly that fallback too.
+        assert_eq!(maybe_render("# Heading", false), "# Heading");
+        assert_eq!(maybe_render("# Heading", true), "# Heading");
+    }
 }

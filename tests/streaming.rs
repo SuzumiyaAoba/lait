@@ -97,11 +97,7 @@ fn stream_appends_default_skills_to_the_system_prompt() {
         "base_url: \"{}\"\ndefault:\n  model: test-model\n  skills: [code-review]\nskills:\n  code-review: skill.md\n",
         server.base_url
     ));
-    std::fs::write(
-        config.path().join("skill.md"),
-        "---\n---\nLook for off-by-one errors.\n",
-    )
-    .expect("failed to write test skill file");
+    config.write("skill.md", "---\n---\nLook for off-by-one errors.\n");
 
     let output = test_command()
         .current_dir(config.path())

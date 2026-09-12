@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use std::path::Path;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::{async_io, error::Interrupted, llm, response};
+use crate::{async_io, llm, response};
 
 /// What one streamed model round produced.
 #[derive(Debug)]
@@ -49,7 +49,7 @@ where
         let chunk = match async_io::await_cancellation(stream.next(), cancellation.clone()).await {
             async_io::CancellationResult::Cancelled => {
                 flush_outputs(content_sink, reasoning_sink.as_deref_mut()).await?;
-                bail!(Interrupted::cancelled("streamed completion was cancelled"));
+                bail!(crate::error::cancelled("streamed completion was cancelled"));
             }
             async_io::CancellationResult::Completed(None) => break,
             async_io::CancellationResult::Completed(Some(chunk)) => chunk?,
@@ -281,6 +281,9 @@ mod tests {
         .await
         .expect_err("cancelled stream should fail");
 
-        assert!(error.downcast_ref::<Interrupted>().is_some(), "{error}");
+        assert!(
+            error.downcast_ref::<crate::error::Interrupted>().is_some(),
+            "{error}"
+        );
     }
 }

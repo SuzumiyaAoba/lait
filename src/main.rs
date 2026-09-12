@@ -33,7 +33,6 @@ mod process;
 mod prompt;
 mod reasoning;
 mod registry;
-mod render;
 mod repl;
 mod report;
 mod response;

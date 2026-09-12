@@ -696,6 +696,12 @@ fn visit_lines_reverse(
     // yet found their leading '\n' — the incomplete prefix of what will
     // become a complete line once joined with more of the file's start.
     let mut pending: Vec<u8> = Vec::new();
+    // Reused across every outer-loop iteration below (`.clear()` +
+    // `.resize()` reuses its existing capacity instead of a fresh
+    // `CHUNK_SIZE`-sized heap allocation per chunk) — a `history search`
+    // over a large log otherwise allocates one 64KiB buffer per chunk it
+    // scans, only to discard it a few lines later.
+    let mut chunk: Vec<u8> = Vec::with_capacity(CHUNK_SIZE as usize);
 
     let emit = |bytes: &[u8], visit: &mut dyn FnMut(&str) -> Result<ControlFlow<()>>| {
         if bytes.is_empty() {
@@ -713,7 +719,8 @@ fn visit_lines_reverse(
         position -= chunk_len;
         file.seek(std::io::SeekFrom::Start(position))
             .context("failed to seek in file")?;
-        let mut chunk = vec![0_u8; chunk_len as usize];
+        chunk.clear();
+        chunk.resize(chunk_len as usize, 0);
         file.read_exact(&mut chunk)
             .context("failed to read file chunk")?;
         chunk.extend_from_slice(&pending);
@@ -733,8 +740,12 @@ fn visit_lines_reverse(
                 None => {
                     // No '\n' left in this chunk: everything from 0..end is
                     // an incomplete prefix, carried into the next (earlier)
-                    // chunk.
-                    pending = chunk[..end].to_vec();
+                    // chunk. `pending` was just cleared above, so this is
+                    // its only write this iteration — equivalent to
+                    // `pending = chunk[..end].to_vec()`, but reusing
+                    // `pending`'s existing capacity instead of allocating a
+                    // new `Vec` every iteration.
+                    pending.extend_from_slice(&chunk[..end]);
                     break;
                 }
             }

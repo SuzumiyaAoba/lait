@@ -403,9 +403,9 @@ where
 {
     match crate::async_io::await_cancellation(future, cancellation).await {
         crate::async_io::CancellationResult::Completed(result) => Ok(result?),
-        crate::async_io::CancellationResult::Cancelled => bail!(
-            crate::error::Interrupted::cancelled("LLM completion was cancelled")
-        ),
+        crate::async_io::CancellationResult::Cancelled => {
+            bail!(crate::error::cancelled("LLM completion was cancelled"))
+        }
     }
 }
 

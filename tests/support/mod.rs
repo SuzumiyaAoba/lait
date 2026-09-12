@@ -34,6 +34,30 @@ pub(crate) fn completion_body(model: &str, content: &str) -> String {
     )
 }
 
+/// A minimal one-node, one-step workflow (`nodes.call` echoes `{{ input }}`
+/// unchanged) pointed at `base_url` — the fixture `tests/test_cmd.rs`,
+/// `tests/record_replay.rs`, and `tests/eval.rs` each used to keep as an
+/// identical file-local copy.
+pub(crate) fn workflow_yaml(base_url: &str) -> String {
+    format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{base_url}"
+      model_id: workflow-model
+nodes:
+  call:
+    type: prompt
+    prompt: "{{{{ input }}}}"
+steps:
+  - use: call
+"#
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct HttpRequest {
     pub(crate) method: String,
@@ -152,6 +176,18 @@ impl ConfigDirectory {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Writes `contents` to `relative_path` under this directory, creating
+    /// any missing parent directories, and returns the full path written.
+    /// Mirrors `ScratchDir::write`.
+    pub(crate) fn write(&self, relative_path: &str, contents: &str) -> PathBuf {
+        let full_path = self.path.join(relative_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create config directory subdirectory");
+        }
+        fs::write(&full_path, contents).expect("failed to write test config directory file");
+        full_path
     }
 }
 
@@ -345,7 +381,7 @@ impl MockServer {
                 request_sender
                     .send(request)
                     .map_err(|_| io::Error::other("test receiver was dropped"))?;
-                write_response(&mut stream, status, response_body)?;
+                write_response(&mut stream, status, "application/json", response_body)?;
             }
 
             if let Some((status, response_body)) = last_response {
@@ -355,7 +391,12 @@ impl MockServer {
                             continue;
                         };
                         let _ = request_sender.send(request);
-                        let _ = write_response(&mut stream, &status, &response_body);
+                        let _ = write_response(
+                            &mut stream,
+                            &status,
+                            "application/json",
+                            &response_body,
+                        );
                     }
                 });
             }
@@ -392,12 +433,7 @@ impl MockServer {
 
             thread::sleep(delay);
 
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len(),
-            );
-            stream.write_all(response.as_bytes())?;
-            stream.flush()
+            write_response(&mut stream, &status, "application/json", &response_body)
         });
 
         Self {
@@ -455,12 +491,7 @@ impl MockServer {
                     .send(request)
                     .map_err(|_| io::Error::other("test receiver was dropped"))?;
 
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+                write_response(&mut stream, "200 OK", "text/event-stream", body)?;
             }
             Ok(())
         });
@@ -494,12 +525,18 @@ impl MockServer {
     }
 }
 
-/// Writes a canned `status`/`response_body` HTTP response to `stream`,
-/// shared by every `MockServer` constructor that replies with a fixed JSON
-/// body.
-fn write_response(stream: &mut TcpStream, status: &str, response_body: &str) -> io::Result<()> {
+/// Writes a canned `status`/`content_type`/`response_body` HTTP response to
+/// `stream` — shared by every `MockServer` constructor, each of which used
+/// to build this same three-header response by hand (`application/json` for
+/// most, `text/event-stream` for `start_stream_sequence`'s SSE body).
+fn write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    response_body: &str,
+) -> io::Result<()> {
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
         response_body.len(),
     );
     stream.write_all(response.as_bytes())?;
@@ -659,14 +696,8 @@ pub(crate) fn start_mock_mcp_server_with_list_cursor(
                 ),
                 other => panic!("mock MCP server received an unexpected method '{other}'"),
             };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len(),
-            );
-            stream
-                .write_all(response.as_bytes())
+            write_response(&mut stream, status, "application/json", &response_body)
                 .expect("failed to write mock response");
-            stream.flush().expect("failed to flush mock response");
         }
     });
     (format!("http://{addr}/mcp"), handle)
@@ -823,4 +854,18 @@ pub(crate) fn without_json_whitespace(value: &str) -> String {
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .collect()
+}
+
+/// Sends SIGINT directly to `pid` — the same signal a terminal's Ctrl-C
+/// delivers to its foreground process, approximated here without needing an
+/// actual controlling terminal in the test harness. `tests/models.rs`,
+/// `tests/doctor.rs`, and `tests/sigint.rs` each used to keep an identical
+/// copy of this.
+#[cfg(unix)]
+pub(crate) fn send_sigint(pid: u32) {
+    // SAFETY: `pid` is a live child we own (`Child::id()`), and `kill(2)`
+    // with SIGINT has no memory-safety preconditions beyond a valid pid.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
 }

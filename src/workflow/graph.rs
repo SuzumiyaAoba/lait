@@ -290,16 +290,14 @@ fn render_router(
                 format!("[{label}]\nloop: {condition}\nmax_iterations: {max_iterations}"),
                 NodeShape::Decision,
             );
-            let since = builder.nodes.len();
-            let (body_entry, body_exits) = render_chain(&loop_def.steps, builder);
-            if let Some(body_entry) = body_entry {
-                builder.add_edge(&loop_id, &body_entry, Some("iterate".to_owned()));
-                for exit in body_exits {
-                    builder.add_edge(&exit, &loop_id, Some("next iteration".to_owned()));
-                }
-            }
-            builder.add_subgraph(format!("[{label}] loop body"), since);
-            (Some(loop_id.clone()), vec![loop_id])
+            render_self_looping_body(
+                loop_id,
+                &loop_def.steps,
+                "iterate",
+                "next iteration",
+                format!("[{label}] loop body"),
+                builder,
+            )
         }
         Router::ForEach(for_each) => {
             let mut node_label = format!("[{label}]\nfor_each: {}", for_each.items);
@@ -307,18 +305,43 @@ fn render_router(
                 node_label.push_str(&format!("\nmax_concurrency: {max_concurrency}"));
             }
             let for_each_id = builder.add_node(node_label, NodeShape::Decision);
-            let since = builder.nodes.len();
-            let (body_entry, body_exits) = render_chain(&for_each.steps, builder);
-            if let Some(body_entry) = body_entry {
-                builder.add_edge(&for_each_id, &body_entry, Some("per item".to_owned()));
-                for exit in body_exits {
-                    builder.add_edge(&exit, &for_each_id, Some("next item".to_owned()));
-                }
-            }
-            builder.add_subgraph(format!("[{label}] for_each body"), since);
-            (Some(for_each_id.clone()), vec![for_each_id])
+            render_self_looping_body(
+                for_each_id,
+                &for_each.steps,
+                "per item",
+                "next item",
+                format!("[{label}] for_each body"),
+                builder,
+            )
         }
     }
+}
+
+/// Shared by `Router::Loop`/`Router::ForEach`: both are a single decision
+/// node whose body chain feeds back into itself (its exits become its own
+/// re-entry edges, labeled `iterate_label`), wrapped in one subgraph — unlike
+/// `Router::Switch`/`Router::Parallel`, which fan out into multiple sibling
+/// chains instead of looping a single one. `enter_label` names the
+/// node-to-body edge (e.g. "iterate" vs "per item"); `iterate_label` names
+/// each body-exit-to-node edge (e.g. "next iteration" vs "next item").
+fn render_self_looping_body(
+    node_id: String,
+    steps: &[FlowStep],
+    enter_label: &str,
+    iterate_label: &str,
+    subgraph_title: String,
+    builder: &mut GraphBuilder,
+) -> (Option<String>, Vec<String>) {
+    let since = builder.nodes.len();
+    let (body_entry, body_exits) = render_chain(steps, builder);
+    if let Some(body_entry) = body_entry {
+        builder.add_edge(&node_id, &body_entry, Some(enter_label.to_owned()));
+        for exit in body_exits {
+            builder.add_edge(&exit, &node_id, Some(iterate_label.to_owned()));
+        }
+    }
+    builder.add_subgraph(subgraph_title, since);
+    (Some(node_id.clone()), vec![node_id])
 }
 
 fn render_mermaid(model: &GraphModel) -> String {
