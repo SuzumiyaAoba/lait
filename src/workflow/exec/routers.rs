@@ -484,6 +484,19 @@ async fn run_for_each_item<'a>(
 /// `execute_bounded`. `steps_outputs` itself is captured by the closure by
 /// reference and cloned once per item as that closure runs, so the original
 /// binding survives to be returned in `ForEachItemsOutcome` below untouched.
+///
+/// Behavior change from the eager version this replaced: that version
+/// serialized every item (`value_to_input_text`) into a `Vec<String>` up
+/// front, via `.collect::<Result<Vec<_>>>()?`, before starting *any* item's
+/// `run_steps` — so an unserializable item anywhere in `items` was
+/// guaranteed to abort before a single item ran. Here, `run_for_each_item`
+/// serializes its own item lazily, only once `buffered` polls its future —
+/// so up to `max_concurrency - 1` earlier items may have already run their
+/// full `for_each.steps` (real side effects: file writes, model calls, ...)
+/// before a later item's serialization failure surfaces and cancels the
+/// rest via `try_collect`. In practice this is very low-risk: item
+/// serialization only fails when the item's own `serde_json::to_string`
+/// fails, which does not happen for values produced by `jq`/JSON parsing.
 async fn execute_concurrent_items<'a>(
     for_each: &'a workflow::ForEachDefinition,
     items: Vec<serde_json::Value>,

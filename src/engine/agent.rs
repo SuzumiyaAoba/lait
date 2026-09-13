@@ -26,8 +26,9 @@ pub(crate) struct AgentTurn<'a> {
 }
 
 impl<'a> AgentTurn<'a> {
-    /// A turn with no image attachments — every caller but `execute_step`'s
-    /// agent branch, which has a node's own `images:` to resolve.
+    /// A turn with no image attachments — every caller but
+    /// `workflow::exec::nodes::execute_agent`, which has a node's own
+    /// `images:` to resolve.
     pub(crate) fn simple(input: &'a serde_json::Value, prompt: &'a str) -> Self {
         Self {
             input,
@@ -39,9 +40,10 @@ impl<'a> AgentTurn<'a> {
 
 /// Renders an agent's system prompt against `turn.input`, calls the model
 /// with `turn.prompt` as the user message, and renders the response. Shared
-/// by `run_agent`, `execute_step`'s agent branch, and `call_subagent_tool`.
-/// `active_agent_paths` is threaded straight through to `settings.complete`
-/// — see its doc comment; every caller but `call_subagent_tool` passes `&[]`.
+/// by `app::run_agent`, `workflow::exec::nodes::execute_agent`, and
+/// `call_subagent_tool`. `active_agent_paths` is threaded straight through
+/// to `settings.complete` — see its doc comment; every caller but
+/// `call_subagent_tool` passes `&[]`.
 pub(crate) async fn call_agent(
     agent_file: &AgentFile,
     settings: &RequestSettings,

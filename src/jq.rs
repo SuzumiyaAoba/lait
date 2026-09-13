@@ -162,20 +162,22 @@ const MAX_VALUE_DEPTH: usize = 1024;
 /// before this type existed — a checkpoint written by an older build must
 /// still resume-load.
 ///
-/// Measured effect (debug build, macOS, `/usr/bin/time -l`, see the P7
-/// benchmark commit for the exact workflows): a `loop` of 1000 iterations
-/// against a ~1MB accumulated `$steps` dropped from ~1.15s/~14.6MB peak to
-/// ~0.70s/~10MB peak (with `execute_loop`'s matching `mem::take` fix, not
-/// this type alone). A 500-item concurrent `for_each` (`max_concurrency:
-/// 4`) with an empty `$steps` — isolating the lazy-future-generation
-/// benefit from this type's own effect — dropped peak memory from ~21MB to
-/// ~6.7MB. The same `for_each` against a ~1MB `$steps` with a `when:` guard
-/// on every item (forcing a jq call, and so the `parse_global_var`
-/// re-conversion this type does *not* address — see this module's `Val:
-/// !Send` note) improved only ~4%, dominated by that unaddressed cost: this
-/// type mostly *defers* a for_each/parallel item's copy to its first write
-/// rather than eliminating it (see `record_step_output`'s one write site) —
-/// real, but smaller than "no more clones" would suggest.
+/// Measured effect (debug build, macOS, `/usr/bin/time -l`; against a mock
+/// OpenAI-compatible server, scratch workflows not committed — each mock
+/// step returns a ~100KB response so `$steps` accumulates to roughly the
+/// size quoted below): a `loop` of 1000 iterations against a ~1MB
+/// accumulated `$steps` dropped from ~1.15s/~14.6MB peak to ~0.70s/~10MB
+/// peak (with `execute_loop`'s matching `mem::take` fix, not this type
+/// alone). A 500-item concurrent `for_each` (`max_concurrency: 4`) with an
+/// empty `$steps` — isolating the lazy-future-generation benefit from this
+/// type's own effect — dropped peak memory from ~21MB to ~6.7MB. The same
+/// `for_each` against a ~1MB `$steps` with a `when:` guard on every item
+/// (forcing a jq call, and so the `parse_global_var` re-conversion this
+/// type does *not* address — see this module's `Val: !Send` note) improved
+/// only ~4%, dominated by that unaddressed cost: this type mostly *defers*
+/// a for_each/parallel item's copy to its first write rather than
+/// eliminating it (see `record_step_output`'s one write site) — real, but
+/// smaller than "no more clones" would suggest.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct Steps(Arc<serde_json::Map<String, serde_json::Value>>);
