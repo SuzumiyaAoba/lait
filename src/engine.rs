@@ -54,11 +54,13 @@ pub(crate) struct RequestSettings {
     /// Further `models:` alias definitions to fall back to, in order, when
     /// the primary endpoint above fails with a retryable error (a
     /// connection failure/timeout, or a 5xx/429/408 response) — see
-    /// `complete_recorded`/`complete_stream`'s shared `attempt_with_fallback`
-    /// and `docs/usage/ja/config.md`'s フォールバック section. Empty when
-    /// `model_name` wasn't resolved from a `models:` alias, or a
-    /// `--base-url`/`--api-key` override collapsed every candidate into one
-    /// (see `resolve_request_settings`).
+    /// `transport::complete_recorded`/`transport::stream_endpoint`, each of
+    /// which drives its own fallback loop over this list (an `async`
+    /// closure-based shared loop was tried and reverted — see that commit's
+    /// message for why), and `docs/usage/ja/config.md`'s フォールバック
+    /// section. Empty when `model_name` wasn't resolved from a `models:`
+    /// alias, or a `--base-url`/`--api-key` override collapsed every
+    /// candidate into one (see `resolve_request_settings`).
     pub(crate) fallback_candidates: Vec<config::FallbackCandidate>,
     pub(crate) sampling: SamplingOverrides,
     /// Names of `mcp_servers:` entries whose tools this request may call.
