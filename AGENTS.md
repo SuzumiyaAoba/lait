@@ -27,6 +27,20 @@ Use standard `rustfmt` formatting (four-space indentation) and keep Clippy warni
 
 Unit tests are colocated in `#[cfg(test)]` modules; behavior-level coverage belongs in `tests/*.rs`. Name tests descriptively, such as `rejects_invalid_schema`. Prefer `tests/support` mock servers and temporary fixtures over real network calls or shared files. No explicit coverage threshold is configured. Once a module's inline `mod tests { ... }` body grows to roughly 400 lines, externalize it into a sibling `<module>/tests.rs` file (`#[cfg(test)] mod tests;` in the parent, mirroring how a `<module>/` directory already groups a module with its submodules) — see `src/async_io/tests.rs`, `src/schema/tests.rs`, `src/cli/tests.rs`, `src/lint/tests.rs`, `src/config/tests.rs`, and `src/jq/tests.rs` for precedent.
 
+## Refactoring Conventions
+
+When splitting a module `<name>.rs` into a `<name>/` directory, decide the shape mechanically: if, after moving code out, the parent file still holds anything besides `mod` declarations and `pub(crate) use` re-exports (a type definition, a function, an `impl` block, a constant), keep `<name>.rs` as a facade alongside `<name>/` (as `src/config.rs`+`src/config/` does); if nothing but `mod`/`use` remains, collapse to `<name>/mod.rs` (as `src/workflow/mod.rs` does). This describes the existing 12-vs-4 split rather than introducing a new one — don't reclassify modules that predate this rule.
+
+A split's new file should keep external call sites referring to items the same way they did before (`pub(crate) use` re-export), give new items the narrowest visibility that works (`pub(super)` over `pub(crate)`), and carry a `//!` doc comment explaining why the split happened. When a name would collide with an existing module (e.g. a `workflow` submodule holding workflow-specific lint rules, next to the crate's own `workflow` module), suffix it and say why in the doc comment (`lint/workflow_lint.rs` is the precedent). Splitting a type's `impl` block across files without moving the type itself is an established technique (`impl RequestSettings` spans `src/engine.rs` and `src/engine/settings.rs`) — prefer it over introducing a new type solely to relocate methods.
+
+The following are deliberate design choices, not oversights — don't "fix" them without a specific reason tied to new evidence:
+- `engine` and `workflow` depend on each other (subagent/workflow nesting is genuinely mutually recursive); this cycle is not a defect.
+- `engine/stream.rs` flushes stdout on every streamed chunk — intentional for perceived latency during interactive output; file output already buffers instead.
+- `serde_json`'s `preserve_order` feature is relied on for output stability elsewhere in the crate, even though a specific cache key computation doesn't need it.
+- `async_io`'s per-operation OS thread (rather than `tokio::spawn_blocking`) exists so a blocking read can be cancelled without leaking a task that outlives its owner; don't route more call sites through it than actually need cancellable FIFO-aware reads.
+
+Performance changes should be justified with a measurement, not intuition: build a baseline in a separate `git worktree` at the pre-change commit, build both with `cargo build --release --locked`, and compare with `/usr/bin/time -l` (median of at least 3 runs). Keep benchmark fixtures (YAML workflows, mock servers) out of the commit — construct them under `/tmp` for the measurement and discard them.
+
 ## Commits and Pull Requests
 
 Use the history’s Conventional Commit-style prefixes (`feat:`, `fix:`, `refactor:`, `docs:`, `build:`, `chore:`); use `feat!:` for breaking changes and append PR references like `(#34)` when applicable. PRs should explain purpose and behavior, list verification commands, link issues with `Closes #N`, and include tests and documentation updates for user-visible changes. Screenshots are only needed when they clarify a website/UI change.
