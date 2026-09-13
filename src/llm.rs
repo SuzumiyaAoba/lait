@@ -63,6 +63,21 @@ pub(crate) struct CompletionRequest<'a> {
     /// The MCP-derived tools available to the model this round. Empty means
     /// "don't send a `tools:` field at all", not "send an empty list" —
     /// some servers treat the two differently.
+    ///
+    /// Deliberately a borrow, not an owned `Vec`, even though `engine::
+    /// tool_loop::ToolLoop` (the one caller that issues more than one
+    /// request per set of tools) holds its tool list as an owned `Vec` for
+    /// the whole loop: owning it here too would only move the per-round
+    /// `.to_vec()` this type's `complete`/`complete_stream` currently do
+    /// (see their call sites) from this struct's construction to
+    /// `ToolLoop`'s own call site — it would still need to clone its `Vec`
+    /// into each round's owned `CompletionRequest`, since the same tool set
+    /// is reused across every round in the loop. The copy this avoids is
+    /// only the very last round's, not the ones in between. Actually
+    /// eliminating the per-round clone needs a different shape — building
+    /// one `CompletionRequest` up front and mutating just `messages` (which
+    /// does change every round) between rounds — not a borrowed-vs-owned
+    /// change to this field alone.
     pub(crate) tools: &'a [ChatCompletionTools],
     /// Ask a streamed response to append a final, choiceless chunk carrying
     /// the whole request's `usage` (`stream_options: {"include_usage":
