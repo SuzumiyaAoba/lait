@@ -391,25 +391,37 @@ impl ProcessOutcome {
     }
 }
 
-async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
-    let Some((program, args)) = request.argv.split_first() else {
-        bail!(
-            "{} must include at least one argv element",
-            request.command_kind
-        );
-    };
-    let command_kind = request.command_kind;
-    if request
-        .cancellation
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        bail!(crate::error::cancelled(format!(
-            "{} '{program}' was cancelled",
-            request.command_kind
-        )));
-    }
+/// Everything one `run_process` invocation owns for the lifetime of the
+/// child it spawned: the child itself, the OS containment primitive attached
+/// to it, its stdin writer and stdout/stderr reader tasks, and the guard that
+/// aborts those tasks if the session is ever dropped without finishing. See
+/// [`spawn_contained`], the sole producer.
+struct ProcessSession {
+    child: tokio::process::Child,
+    process_tree: CommandProcessTree,
+    write_stdin: Option<JoinHandle<Result<()>>>,
+    read_stdout: Option<JoinHandle<Result<Vec<u8>>>>,
+    read_stderr: Option<JoinHandle<Result<Vec<u8>>>>,
+    _task_guard: AbortOnDrop,
+}
 
+/// Spawns `program`/`args` under process-tree containment and wires up its
+/// stdin writer and stdout/stderr reader tasks — the setup phase of
+/// `run_process`, factored out so its four early-failure paths (attach
+/// failure, missing stdin/stdout/stderr pipe) sit next to what they clean up
+/// instead of being interleaved with the `select!` loop that follows them.
+///
+/// This doesn't change what those paths do, and in particular doesn't lean
+/// on `CommandProcessTree`'s own `Drop` to replace them: `Drop` only calls
+/// `kill()` once and does not await a reap, so an early return here still
+/// calls `terminate_command_process_tree` explicitly wherever the code being
+/// moved already did, exactly as before this was its own function.
+async fn spawn_contained(
+    program: &str,
+    args: &[String],
+    request: &ProcessRun<'_>,
+) -> Result<ProcessSession> {
+    let command_kind = request.command_kind;
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
@@ -424,7 +436,7 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run {command_kind} '{program}'"))?;
-    let mut process_tree = match CommandProcessTree::attach(&child) {
+    let process_tree = match CommandProcessTree::attach(&child) {
         Ok(process_tree) => process_tree,
         Err(error) => {
             let _ = child.start_kill();
@@ -464,13 +476,13 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
         return Err(error);
     };
 
-    let mut read_stdout = Some(spawn_output_reader(
+    let read_stdout = Some(spawn_output_reader(
         stdout,
         request.command_kind,
         "stdout",
         request.max_output_bytes,
     ));
-    let mut read_stderr = Some(spawn_output_reader(
+    let read_stderr = Some(spawn_output_reader(
         stderr,
         request.command_kind,
         "stderr",
@@ -487,6 +499,51 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
         task_handles.push(read_stderr.abort_handle());
     }
     let _task_guard = AbortOnDrop::new(task_handles);
+
+    Ok(ProcessSession {
+        child,
+        process_tree,
+        write_stdin,
+        read_stdout,
+        read_stderr,
+        _task_guard,
+    })
+}
+
+async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
+    let Some((program, args)) = request.argv.split_first() else {
+        bail!(
+            "{} must include at least one argv element",
+            request.command_kind
+        );
+    };
+    let command_kind = request.command_kind;
+    if request
+        .cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        bail!(crate::error::cancelled(format!(
+            "{} '{program}' was cancelled",
+            request.command_kind
+        )));
+    }
+
+    // Destructured immediately into locals (in the same order the fields
+    // were originally declared as separate `let mut` bindings) rather than
+    // kept as a `session.field` — the `select!` loop below borrows several
+    // of these mutably at once (e.g. `&mut child` alongside
+    // `&mut read_stdout`), which only works as disjoint field borrows on
+    // plain locals, not through a struct value a `&mut self` method could
+    // ever be called on.
+    let ProcessSession {
+        mut child,
+        mut process_tree,
+        mut write_stdin,
+        mut read_stdout,
+        mut read_stderr,
+        _task_guard,
+    } = spawn_contained(program, args, &request).await?;
 
     let mut child_wait = Box::pin(child.wait());
     let deadline = request.timeout.map(tokio::time::sleep);
