@@ -543,3 +543,120 @@ fn parse_json_rpc_error(body: &[u8]) -> Option<rmcp::model::ServerJsonRpcMessage
         .ok()
         .filter(|message| matches!(message, rmcp::model::ServerJsonRpcMessage::Error(_)))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use http::{HeaderName, HeaderValue};
+    use rmcp::transport::{
+        common::http_header::{HEADER_LAST_EVENT_ID, HEADER_SESSION_ID},
+        streamable_http_client::StreamableHttpError,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::{LimitedHttpClient, parse_json_rpc_error};
+
+    /// Neither `reqwest::Client::new()` nor `.get(..)` performs any network
+    /// I/O — a `RequestBuilder` stays inert until `.send()` or `.build()` —
+    /// so `apply_custom_headers` is testable as a pure header-map transform
+    /// without a live/mock server, unlike the rest of this file's methods
+    /// (which all need a real or mocked `reqwest::Response`; see
+    /// `tests/mcp.rs` for that behavior-level coverage).
+    /// `main::install_crypto_provider`'s test-side equivalent: `reqwest::
+    /// Client::new()` eagerly builds a TLS connector even though these tests
+    /// never actually connect, so it panics without a rustls crypto provider
+    /// installed process-wide. Idempotent (an already-installed provider's
+    /// `Err` is ignored, exactly like the production call site), so every
+    /// test in this module can call it independently.
+    fn install_crypto_provider_for_tests() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn client() -> LimitedHttpClient {
+        install_crypto_provider_for_tests();
+        LimitedHttpClient::new(reqwest::Client::new(), 1024, CancellationToken::new())
+    }
+
+    fn request_builder() -> reqwest::RequestBuilder {
+        install_crypto_provider_for_tests();
+        reqwest::Client::new().get("http://mcp.invalid/")
+    }
+
+    #[test]
+    fn reserved_headers_are_rejected() {
+        for reserved in ["accept", HEADER_SESSION_ID, HEADER_LAST_EVENT_ID] {
+            let mut headers = HashMap::new();
+            headers.insert(
+                HeaderName::from_bytes(reserved.as_bytes()).unwrap(),
+                HeaderValue::from_static("x"),
+            );
+            let error = client()
+                .apply_custom_headers(request_builder(), headers)
+                .unwrap_err();
+            assert!(
+                matches!(error, StreamableHttpError::ReservedHeaderConflict(_)),
+                "{reserved}: {error:?}"
+            );
+        }
+    }
+
+    /// `mcp-protocol-version` is listed among the reserved names but is the
+    /// one intentional exception — rmcp injects it into the header map after
+    /// initialization and expects a caller-supplied value to pass through.
+    #[test]
+    fn mcp_protocol_version_header_is_allowed_through() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            HeaderName::from_static("mcp-protocol-version"),
+            HeaderValue::from_static("2025-01-01"),
+        );
+        let request = client()
+            .apply_custom_headers(request_builder(), headers)
+            .expect("mcp-protocol-version must pass through");
+        let built = request.build().expect("request should build");
+        assert_eq!(
+            built.headers().get("mcp-protocol-version").unwrap(),
+            "2025-01-01"
+        );
+    }
+
+    #[test]
+    fn a_non_reserved_custom_header_is_applied() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_static("value"),
+        );
+        let request = client()
+            .apply_custom_headers(request_builder(), headers)
+            .expect("non-reserved header should be applied");
+        let built = request.build().expect("request should build");
+        assert_eq!(built.headers().get("x-custom").unwrap(), "value");
+    }
+
+    #[test]
+    fn parse_json_rpc_error_extracts_only_error_messages() {
+        let error_message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32000, "message": "boom"}
+        });
+        let parsed = parse_json_rpc_error(error_message.to_string().as_bytes());
+        assert!(matches!(
+            parsed,
+            Some(rmcp::model::ServerJsonRpcMessage::Error(_))
+        ));
+    }
+
+    #[test]
+    fn parse_json_rpc_error_ignores_non_error_messages_and_invalid_json() {
+        let response_message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        });
+        assert!(parse_json_rpc_error(response_message.to_string().as_bytes()).is_none());
+        assert!(parse_json_rpc_error(b"not json").is_none());
+    }
+}
