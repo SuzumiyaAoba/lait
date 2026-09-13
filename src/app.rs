@@ -494,9 +494,9 @@ struct ChatRequest<'a> {
 
 /// Resolves everything a chat completion request needs, ahead of actually
 /// sending it: `-p`/`--prompt-name` template rendering, model/sampling
-/// settings, the JSON Schema `--json-schema` requests, file attachments/
-/// system prompt/image URLs (read concurrently — see the `tokio::try_join!`
-/// below), session history, and the run's services/context.
+/// settings, then the JSON Schema, file attachments, system prompt, image
+/// URLs, and session history (all read concurrently — see the
+/// `tokio::try_join!` below), and finally the run's services/context.
 async fn prepare_chat_request<'a>(
     chat: &'a ChatArgs,
     prompt: String,
@@ -521,29 +521,48 @@ async fn prepare_chat_request<'a>(
     let settings =
         chat::resolve_chat_settings(&chat.shared, prompt_model_fallback.as_deref(), &file_config)?;
 
-    let response_format = chat
-        .json_schema
-        .as_deref()
-        .map(|path| schema::load_json_schema(path, &chat.schema_name))
-        .transpose()?;
-
-    // These three reads are independent of each other and of everything
-    // above: file attachments only need `chat.files`, the system prompt
-    // only needs `chat.shared`/`file_config`, and image URLs only need
-    // `chat.images`. Running them concurrently rather than one after
-    // another (as `workflow/exec.rs` already does for its own file+image
-    // pair via `tokio::try_join!`) shortens the wall-clock delay before the
-    // first token on e.g. `lait -f a.rs -f b.rs --image x.png "..."`.
-    let (file_context, system_prompt, image_urls) = tokio::try_join!(
+    // These five reads are independent of each other and of everything
+    // above: the JSON Schema only needs `chat.json_schema`/`chat.schema_name`,
+    // file attachments only need `chat.files`, the system prompt only needs
+    // `chat.shared`/`file_config`, image URLs only need `chat.images`, and
+    // the session history only needs `chat.shared.session`. Running them
+    // concurrently rather than one after another (as `workflow/exec.rs`
+    // already does for its own file+image pair via `tokio::try_join!`)
+    // shortens the wall-clock delay before the first token on e.g.
+    // `lait -f a.rs -f b.rs --image x.png --json-schema s.json "..."`.
+    //
+    // Behavior note: when two of these fail at once, which error surfaces
+    // is now whichever `try_join!` polls to a `Result::Err` first rather
+    // than a fixed left-to-right order (`try_join!` itself cancels the
+    // remaining futures on the first error but does not guarantee polling
+    // order across unrelated futures) — none of these five reads name each
+    // other in their error text, so there is no risk of a confusing partial
+    // message, only a different tie-break among independent failures.
+    let (response_format, file_context, system_prompt, image_urls, session_history) = tokio::try_join!(
+        async {
+            match chat.json_schema.as_deref() {
+                Some(path) => schema::load_json_schema_cancellable(
+                    path,
+                    &chat.schema_name,
+                    Some(cancel.clone()),
+                )
+                .await
+                .map(Some),
+                None => Ok(None),
+            }
+        },
         attachment::read_file_attachments(&chat.files),
         chat::resolve_system_prompt(&chat.shared, &file_config, Some(cancel.clone())),
         attachment::resolve_image_urls(&chat.images),
+        chat::load_session_history_cancellable(
+            chat.shared.session.as_deref(),
+            Some(cancel.clone())
+        ),
     )?;
     let prompt = match file_context {
         Some(file_context) => format!("{prompt}\n\n{file_context}"),
         None => prompt,
     };
-    let session_history = chat::load_session_history(chat.shared.session.as_deref())?;
     let (services, env) = build_run_context(&file_config, cache_override, approve_tools, cancel);
     let display = ChatDisplayPolicy::resolve(chat, &file_config);
 
@@ -792,21 +811,36 @@ async fn run_agent(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    let raw_input =
-        chat::resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
-            .await?
-            .ok_or_else(missing_input_error)?;
-    let agent_file = agent::load_agent_cancellable(&args.file, Some(cancel.clone())).await?;
-    let canonical_agent_path = crate::async_io::canonicalize(&args.file, Some(cancel.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "failed to resolve agent file path '{}'",
-                args.file.display()
-            )
-        })?;
-    let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+    // These four reads are independent of each other: stdin/argument input
+    // resolution only needs `args.input`, loading and canonicalizing the
+    // agent file only need `args.file`, and config loading only needs
+    // `config_source`. Running them concurrently rather than one after
+    // another shortens the wall-clock delay before the agent actually
+    // starts.
+    //
+    // Behavior note: when two of these fail at once, which error surfaces
+    // is now whichever `try_join!` polls to a `Result::Err` first rather
+    // than a fixed left-to-right order (stdin/input, then agent file, then
+    // config) — none of these four reads name each other in their error
+    // text, so there is no risk of a confusing partial message, only a
+    // different tie-break among independent failures.
+    let (raw_input, agent_file, canonical_agent_path, config) = tokio::try_join!(
+        chat::resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone())),
+        agent::load_agent_cancellable(&args.file, Some(cancel.clone())),
+        async {
+            crate::async_io::canonicalize(&args.file, Some(cancel.clone()))
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to resolve agent file path '{}'",
+                        args.file.display()
+                    )
+                })
+        },
+        config::load_config_cancellable(&config_source, Some(cancel.clone())),
+    )?;
+    let raw_input = raw_input.ok_or_else(missing_input_error)?;
+    let file_config = Arc::new(config);
 
     announce_named_file(
         "==>",

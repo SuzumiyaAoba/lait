@@ -195,3 +195,24 @@ pub(crate) fn load_session_history(
         None => Ok(Vec::new()),
     }
 }
+
+/// Cancellation-aware counterpart to [`load_session_history`], used by
+/// `app::prepare_chat_request` so a `--session` load — reading and
+/// deserializing a JSONL file that only grows over the session's lifetime —
+/// runs on the same bounded blocking-worker pool as, and concurrently with,
+/// the request's other independent reads (file attachments/system prompt/
+/// image URLs) instead of blocking ahead of them on the calling task.
+pub(crate) async fn load_session_history_cancellable(
+    session_name: Option<&str>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Vec<ChatCompletionRequestMessage>> {
+    let Some(name) = session_name else {
+        return Ok(Vec::new());
+    };
+    let name = name.to_owned();
+    async_io::run_blocking(
+        move |_cancelled| session::to_request_messages(&session::load(&name)?),
+        cancellation,
+    )
+    .await
+}

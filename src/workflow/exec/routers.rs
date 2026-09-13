@@ -208,10 +208,21 @@ async fn execute_loop<'a>(
             "{}    -> iteration {iterations_run}/{max_iterations}",
             context.progress_prefix
         );
+        // `iteration_input`/`steps_outputs` are unconditionally overwritten
+        // by `result`/`new_steps_outputs` right below on every path out of
+        // this iteration (including the `Flow::Stop` early return, which
+        // reads the post-assignment values), so both can be moved out
+        // instead of cloned — the same reasoning `execute_sequential_items`
+        // already applies to its own `steps_outputs.clone()`. On the `?`
+        // failing this iteration, both locals are simply dropped: a `loop`
+        // is a router step (see `run_steps`'s `step.router()` branch), so
+        // its failure propagates straight past `run_steps`'s `on_error`
+        // handling (which only wraps `step.call()`) — nothing upstream
+        // reads these post-take values on that path.
         let outcome = run_steps(
             &loop_def.steps,
-            iteration_input.clone(),
-            steps_outputs.clone(),
+            std::mem::take(&mut iteration_input),
+            std::mem::take(&mut steps_outputs),
             context.frame(loop_counter, context.progress_prefix),
         )
         .await?;
@@ -429,6 +440,50 @@ async fn execute_sequential_items<'a>(
     })
 }
 
+/// One `for_each` concurrent item's body: serializes `item` and runs
+/// `for_each.steps` against it. Split out of `execute_concurrent_items` as
+/// its own `async fn` because building this future inline inside
+/// `Iterator::map`'s closure fails to type-check when the closure's argument
+/// is a *borrowed* item (`&serde_json::Value` from `items.iter()`) — rustc's
+/// closure-return-type inference cannot unify the borrow's lifetime with the
+/// one `run_steps` needs ("implementation of `FnOnce` is not general
+/// enough"), a known limitation around closures whose return type captures
+/// their argument's lifetime. Taking `item`/`item_prefix` by value (the
+/// caller uses `items.into_iter()`, not `.iter()`) removes the borrowed
+/// lifetime from the closure's argument entirely, which sidesteps it.
+async fn run_for_each_item<'a>(
+    for_each: &'a workflow::ForEachDefinition,
+    item: serde_json::Value,
+    item_prefix: String,
+    steps_outputs: workflow::StepOutputs,
+    context: &RouterContext<'a>,
+) -> Result<StepsOutcome> {
+    let item_input = value_to_input_text(&item, "failed to serialize a 'for_each' item")?;
+    run_steps(
+        &for_each.steps,
+        item_input,
+        steps_outputs,
+        context
+            .frame(0, &item_prefix)
+            .with_placement(ExecutionPlacement::ConcurrentItems),
+    )
+    .await
+}
+
+/// Builds and runs one [`run_for_each_item`] future per item, lazily: the
+/// futures aren't collected into a `Vec` up front (that used to mean an
+/// item's input serialization, its progress-prefix `String`, *and* a full
+/// deep clone of `steps_outputs` all happened for every item before the
+/// first one could even start polling — a `for_each` with
+/// `max_concurrency: 4` over 500 items paid the clone 500 times, not 4).
+/// `items.iter().enumerate().map` stays a plain `Iterator`; `stream::iter` +
+/// `buffered(max_concurrency)` pulls from it only as concurrency slots free
+/// up, so at most `max_concurrency` items' worth of input/prefix/
+/// `steps_outputs` clone are ever live at once — same pattern as
+/// `test_run.rs`'s `run_futures` and `engine/tool_loop.rs`'s
+/// `execute_bounded`. `steps_outputs` itself is captured by the closure by
+/// reference and cloned once per item as that closure runs, so the original
+/// binding survives to be returned in `ForEachItemsOutcome` below untouched.
 async fn execute_concurrent_items<'a>(
     for_each: &'a workflow::ForEachDefinition,
     items: Vec<serde_json::Value>,
@@ -437,24 +492,10 @@ async fn execute_concurrent_items<'a>(
     max_concurrency: usize,
     context: &RouterContext<'a>,
 ) -> Result<ForEachItemsOutcome> {
-    let item_inputs: Vec<String> = items
-        .iter()
-        .map(|item| value_to_input_text(item, "failed to serialize a 'for_each' item"))
-        .collect::<Result<Vec<_>>>()?;
-    let item_prefixes: Vec<String> = (0..item_inputs.len())
-        .map(|index| format!("{}[item-{}] ", context.progress_prefix, index + 1))
-        .collect();
-    let mut item_futures = Vec::with_capacity(item_prefixes.len());
-    for (item_input, item_prefix) in item_inputs.into_iter().zip(&item_prefixes) {
-        item_futures.push(run_steps(
-            &for_each.steps,
-            item_input,
-            steps_outputs.clone(),
-            context
-                .frame(0, item_prefix)
-                .with_placement(ExecutionPlacement::ConcurrentItems),
-        ));
-    }
+    let item_futures = items.into_iter().enumerate().map(|(index, item)| {
+        let item_prefix = format!("{}[item-{}] ", context.progress_prefix, index + 1);
+        run_for_each_item(for_each, item, item_prefix, steps_outputs.clone(), context)
+    });
     let item_results: Vec<StepsOutcome> = futures_util::stream::iter(item_futures)
         .buffered(max_concurrency)
         .try_collect()

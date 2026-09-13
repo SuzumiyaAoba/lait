@@ -1,12 +1,13 @@
 //! JSON Schema loading and validation: a workflow's top-level `json_schemas:`
 //! map ([`JsonSchemaMap`]/[`JsonSchemaEntry`]), `--json-schema`/`response_format:`
 //! resolution into an OpenAI-compatible [`ResponseFormat`], and `lait schema`
-//! itself ([`run`]). Every load path exists in a sync and a `_cancellable`
-//! async twin (`load_schema_value`/`_cancellable`, `resolve_named_schema_value`/
-//! `_cancellable`, `load_json_schema`/`_cancellable`) sharing a pure parsing
-//! core (`parse_schema_entry_contents`/`parse_json_schema_contents`) — only
-//! the read (`async_io::read_to_string_sync` vs. the cancellable worker)
-//! differs between them.
+//! itself ([`run`]). `load_schema_value`/`resolve_named_schema_value` (used by
+//! the sync `lait lint`/agent-loading paths) each exist in a sync and a
+//! `_cancellable` async twin sharing a pure parsing core
+//! (`parse_schema_entry_contents`); `load_json_schema_cancellable` (used by
+//! every request/workflow-node path, all of them already async) has only the
+//! async form, sharing its own pure parsing core
+//! (`parse_json_schema_contents`).
 
 use std::{
     collections::HashMap,
@@ -325,23 +326,19 @@ fn validate_value_against_schema(
     Ok(())
 }
 
-/// The pure part of loading a file-backed Structured Outputs schema, shared
-/// by [`load_json_schema`]/[`load_json_schema_cancellable`]: only the read
-/// differs between them.
+/// The pure, read-independent part of loading a file-backed Structured
+/// Outputs schema, shared by every caller of [`load_json_schema_cancellable`].
 fn parse_json_schema_contents(contents: &str, path: &Path, name: &str) -> Result<ResponseFormat> {
     let schema = serde_json::from_str::<serde_json::Value>(contents)
         .with_context(|| parse_schema_context(path.display()))?;
     build_json_schema(schema, name)
 }
 
-pub(crate) fn load_json_schema(path: &Path, name: &str) -> Result<ResponseFormat> {
-    let contents =
-        async_io::read_to_string_sync(path).with_context(|| read_schema_context(path.display()))?;
-    parse_json_schema_contents(&contents, path, name)
-}
-
-/// Cancellation-aware counterpart to [`load_json_schema`], used for a
-/// workflow node's file-backed `output_schema`.
+/// Loads a file-backed Structured Outputs schema for `--json-schema`/a
+/// workflow node's file-backed `output_schema`. Cancellation-aware so a
+/// `--json-schema` read joins the same `tokio::try_join!` as the request's
+/// other independent reads (see `app::prepare_chat_request`) instead of
+/// blocking ahead of it on a dedicated call.
 pub(crate) async fn load_json_schema_cancellable(
     path: &Path,
     name: &str,
