@@ -107,11 +107,53 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      # Each of these filters is a module path, not a fixed test count: if a
+      # future refactor renames or moves the module, `cargo test --bin lait
+      # <filter>` silently matches zero tests and still exits 0 — the
+      # platform-specific coverage this job exists for (native file locks,
+      # cancellable/FIFO-aware IO, and the six `#[cfg(unix)]`/
+      # `#[cfg(not(unix))]` pairs in `jsonl`) would then vanish without this
+      # job ever turning red. `-- --list` plus a non-zero-count check catches
+      # that before the real run. `shell: bash` is explicit because these
+      # steps use bash syntax and GitHub Actions defaults `windows-latest`
+      # `run:` steps to `pwsh`.
       - name: Run file lock tests
-        run: 'cargo test --locked --bin lait file_lock::'
+        shell: bash
+        run: |
+          count=$(cargo test --locked --bin lait file_lock:: -- --list 2>/dev/null | grep -c ': test$')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no tests matched filter 'file_lock::' — was the module renamed or moved?"
+            exit 1
+          fi
+          echo "matched $count test(s)"
+          cargo test --locked --bin lait file_lock::
 
       - name: Run cancellable filesystem tests
-        run: 'cargo test --locked --bin lait async_io::'
+        shell: bash
+        run: |
+          count=$(cargo test --locked --bin lait async_io:: -- --list 2>/dev/null | grep -c ': test$')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no tests matched filter 'async_io::' — was the module renamed or moved?"
+            exit 1
+          fi
+          echo "matched $count test(s)"
+          cargo test --locked --bin lait async_io::
+
+      # New: `jsonl` has six `#[cfg(unix)]`/`#[cfg(not(unix))]` function
+      # pairs (see `src/jsonl/mod.rs`'s module doc), and this crate's own
+      # inline `jsonl::tests` are platform-independent — running them here
+      # exercises the `#[cfg(not(unix))]` arm on `windows-latest` for the
+      # first time at PR time rather than only at a tag build.
+      - name: Run jsonl tests
+        shell: bash
+        run: |
+          count=$(cargo test --locked --bin lait jsonl:: -- --list 2>/dev/null | grep -c ': test$')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no tests matched filter 'jsonl::' — was the module renamed or moved?"
+            exit 1
+          fi
+          echo "matched $count test(s)"
+          cargo test --locked --bin lait jsonl::
 
   website:
     name: Website checks
