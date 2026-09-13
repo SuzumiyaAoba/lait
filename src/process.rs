@@ -8,7 +8,7 @@
 use std::{process::ExitStatus, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -23,10 +23,12 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = crate::async_io::MAX_READ_BYTES;
 /// within this bound; an elapsed bound is surfaced as a cleanup error.
 const COMMAND_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
+mod capture;
 #[cfg(windows)]
 mod job_windows;
 mod tree;
 
+use capture::{CapturedOutput, join_reader_task, spawn_output_reader};
 use tree::CommandProcessTree;
 
 /// Terminates a command's process tree and reaps its direct child. The
@@ -88,58 +90,6 @@ async fn terminate_command_process_tree(
         return Err(anyhow::Error::new(error).context("failed to reap command"));
     }
     Ok(())
-}
-
-/// Captures one command stream while enforcing the same 16 MiB budget used by
-/// file-backed inputs. Reading in bounded chunks lets the caller observe an
-/// oversized stream as soon as the first chunk crosses the limit.
-async fn read_limited<R>(
-    mut reader: R,
-    command_kind: &'static str,
-    stream_name: &'static str,
-    max_output_bytes: usize,
-) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; CHUNK_SIZE];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .await
-            .with_context(|| format!("failed to read {command_kind} {stream_name}"))?;
-        if read == 0 {
-            return Ok(bytes);
-        }
-        let Some(next_len) = bytes.len().checked_add(read) else {
-            bail!("{command_kind} {stream_name} output size overflowed");
-        };
-        if next_len > max_output_bytes {
-            bail!(
-                "{command_kind} {stream_name} output exceeds the configured limit of {max_output_bytes} bytes"
-            );
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-}
-
-fn spawn_output_reader<R>(
-    reader: R,
-    command_kind: &'static str,
-    stream_name: &'static str,
-    max_output_bytes: usize,
-) -> JoinHandle<Result<Vec<u8>>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(read_limited(
-        reader,
-        command_kind,
-        stream_name,
-        max_output_bytes,
-    ))
 }
 
 /// Aborts spawned Tokio tasks if their owning command future is dropped. A
@@ -306,33 +256,6 @@ async fn terminate_reaped_process_tree(process_tree: &CommandProcessTree) -> Res
 enum StdinMode<'a> {
     Pipe(&'a str),
     Null,
-}
-
-struct CapturedOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn join_reader_result(
-    result: std::result::Result<Result<Vec<u8>>, tokio::task::JoinError>,
-    command_kind: &'static str,
-    stream_name: &'static str,
-) -> Result<Vec<u8>> {
-    result
-        .with_context(|| format!("{command_kind} {stream_name} reader task panicked"))?
-        .with_context(|| format!("failed to read {stream_name} from {command_kind}"))
-}
-
-async fn join_reader_task(
-    reader: &mut Option<JoinHandle<Result<Vec<u8>>>>,
-    command_kind: &'static str,
-    stream_name: &'static str,
-) -> Result<Vec<u8>> {
-    let Some(reader) = reader.as_mut() else {
-        bail!("{command_kind} {stream_name} reader task was unavailable");
-    };
-    join_reader_result(reader.await, command_kind, stream_name)
 }
 
 struct ProcessRun<'a> {
