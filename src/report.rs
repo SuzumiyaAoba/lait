@@ -95,12 +95,8 @@ pub(crate) fn emit_run_output(
     output: &crate::cli::OutputArgs,
     file_config: &ConfigFile,
 ) -> Result<()> {
-    // `-o -` is an explicit "stdout", the same as no `-o` at all.
-    let output_path = output
-        .output
-        .as_deref()
-        .filter(|path| path.as_os_str() != "-");
-    let render_enabled = output.render || file_config.default.render.unwrap_or(false);
+    let output_path = output.output_path();
+    let render_enabled = output.render_enabled(file_config.default.render.unwrap_or(false));
     if output.json {
         let json = response::render_text_json(body, usage)?;
         emit_output(&json, output_path, false)

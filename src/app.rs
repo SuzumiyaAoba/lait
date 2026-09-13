@@ -471,12 +471,10 @@ impl<'a> ChatDisplayPolicy<'a> {
         Self {
             show_reasoning: chat.shared.show_reasoning && !chat.quiet,
             show_usage: chat.shared.reporting.show_usage && !chat.quiet,
-            render_enabled: chat.output.render || file_config.default.render.unwrap_or(false),
-            output_path: chat
+            render_enabled: chat
                 .output
-                .output
-                .as_deref()
-                .filter(|path| path.as_os_str() != "-"),
+                .render_enabled(file_config.default.render.unwrap_or(false)),
+            output_path: chat.output.output_path(),
         }
     }
 }

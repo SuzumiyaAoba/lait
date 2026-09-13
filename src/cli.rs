@@ -11,7 +11,7 @@
 //! turn a parsed `Command` into behavior; this module owns only the shape of
 //! the arguments, not their dispatch.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::reasoning::ReasoningEffort;
 use clap::{
@@ -547,6 +547,32 @@ pub(crate) struct OutputArgs {
     /// lait.config.yml when this is unset.
     #[arg(long)]
     pub(crate) render: bool,
+}
+
+impl OutputArgs {
+    /// `-o -` means "write to stdout", the same as omitting `-o` entirely —
+    /// the Unix convention for "the standard stream" applied to an *output*
+    /// path (`chat::resolve_input_with_stdin_cancellable` applies the same
+    /// `"-"` convention to an *input* positional, where it means "read from
+    /// stdin" instead — same character, opposite direction, so it is not
+    /// shared as one constant). `report::emit_run_output` and
+    /// `app::ChatDisplayPolicy::resolve` used to each spell this filter out
+    /// themselves.
+    pub(crate) fn output_path(&self) -> Option<&Path> {
+        self.output
+            .as_deref()
+            .filter(|path| path.as_os_str() != "-")
+    }
+
+    /// Whether to render the response as Markdown: `--render` itself, or a
+    /// config-file default supplied by the caller when this run's own flag
+    /// wasn't set. Takes that default as a plain `bool` (`default.render`
+    /// already resolved, not `&config::ConfigFile`) so `cli` — already
+    /// depended on *by* `config` for `ConfigSource::from(&Cli)` — doesn't
+    /// gain a dependency back onto it.
+    pub(crate) fn render_enabled(&self, default_render: bool) -> bool {
+        self.render || default_render
+    }
 }
 
 #[derive(Debug, Args)]
