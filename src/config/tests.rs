@@ -376,3 +376,81 @@ fn expands_placeholders_in_stdio_env_and_args() {
         McpTransport::Http { .. } => panic!("expected a stdio transport"),
     }
 }
+
+/// The rest of the `${VAR}`-expanded field boundary AGENTS.md's Security and
+/// Configuration section documents for `mcp_servers[]`: `command`/`args`/
+/// `cwd` (stdio) — `env` above already covers the sixth field.
+#[test]
+fn expands_placeholders_in_stdio_command_args_and_cwd() {
+    // SAFETY: single-threaded test-only env mutation, restored immediately.
+    unsafe {
+        std::env::set_var("LAIT_TEST_MCP_COMMAND", "npx");
+        std::env::set_var("LAIT_TEST_MCP_ARG", "--flag");
+        std::env::set_var("LAIT_TEST_MCP_CWD", "/tmp");
+    }
+    let mut config = stdio_config("${LAIT_TEST_MCP_COMMAND}");
+    config.args = vec!["${LAIT_TEST_MCP_ARG}".to_owned()];
+    config.cwd = Some("${LAIT_TEST_MCP_CWD}".to_owned());
+    let transport = config.resolve_transport("test").unwrap();
+    unsafe {
+        std::env::remove_var("LAIT_TEST_MCP_COMMAND");
+        std::env::remove_var("LAIT_TEST_MCP_ARG");
+        std::env::remove_var("LAIT_TEST_MCP_CWD");
+    }
+    match transport {
+        McpTransport::Stdio {
+            command, args, cwd, ..
+        } => {
+            assert_eq!(command, "npx");
+            assert_eq!(args, vec!["--flag".to_owned()]);
+            assert_eq!(cwd.as_deref(), Some("/tmp"));
+        }
+        McpTransport::Http { .. } => panic!("expected a stdio transport"),
+    }
+}
+
+/// The HTTP transport's half of the same field boundary: `url`/`headers`.
+#[test]
+fn expands_placeholders_in_http_url_and_headers() {
+    // SAFETY: single-threaded test-only env mutation, restored immediately.
+    unsafe {
+        std::env::set_var("LAIT_TEST_MCP_URL", "https://mcp.example/endpoint");
+        std::env::set_var("LAIT_TEST_MCP_HEADER", "secret-token");
+    }
+    let mut config = http_config("${LAIT_TEST_MCP_URL}");
+    config.headers.insert(
+        "Authorization".to_owned(),
+        "Bearer ${LAIT_TEST_MCP_HEADER}".to_owned(),
+    );
+    let transport = config.resolve_transport("test").unwrap();
+    unsafe {
+        std::env::remove_var("LAIT_TEST_MCP_URL");
+        std::env::remove_var("LAIT_TEST_MCP_HEADER");
+    }
+    match transport {
+        McpTransport::Http { url, headers } => {
+            assert_eq!(url, "https://mcp.example/endpoint");
+            assert_eq!(
+                headers.get("Authorization").map(String::as_str),
+                Some("Bearer secret-token")
+            );
+        }
+        McpTransport::Stdio { .. } => panic!("expected an http transport"),
+    }
+}
+
+/// The other side of the same boundary: `default.system` is deliberately
+/// outside the `${VAR}`-expanded field list (AGENTS.md's Security and
+/// Configuration section) — prompt text is not where a secret belongs.
+/// Parsing must never attempt to look up a placeholder found there, so a
+/// name that isn't set in the environment still round-trips byte-for-byte
+/// instead of failing to load the whole config file.
+#[test]
+fn default_system_placeholder_is_never_expanded() {
+    let yaml = "default:\n  system: \"${LAIT_TEST_UNSET_SYSTEM_PLACEHOLDER}\"\n";
+    let config: ConfigFile = serde_yaml::from_str(yaml).expect("should parse without expanding");
+    assert_eq!(
+        config.default.system.as_deref(),
+        Some("${LAIT_TEST_UNSET_SYSTEM_PLACEHOLDER}")
+    );
+}
