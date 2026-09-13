@@ -70,11 +70,17 @@ impl AgentFile {
     }
 }
 
+fn read_agent_context(path_or_name: impl std::fmt::Display) -> String {
+    format!("failed to read agent file '{path_or_name}'")
+}
+fn parse_agent_context(path_or_name: impl std::fmt::Display) -> String {
+    format!("failed to parse agent file '{path_or_name}'")
+}
+
 pub(crate) fn load_agent(path: &Path) -> Result<AgentFile> {
-    let contents = async_io::read_to_string_sync(path)
-        .with_context(|| format!("failed to read agent file '{}'", path.display()))?;
-    parse_agent(&contents)
-        .with_context(|| format!("failed to parse agent file '{}'", path.display()))
+    let contents =
+        async_io::read_to_string_sync(path).with_context(|| read_agent_context(path.display()))?;
+    parse_agent(&contents).with_context(|| parse_agent_context(path.display()))
 }
 
 /// Loads an agent file through the cancellation-aware filesystem worker used
@@ -87,9 +93,8 @@ pub(crate) async fn load_agent_cancellable(
     let contents =
         async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
             .await
-            .with_context(|| format!("failed to read agent file '{}'", path.display()))?;
-    parse_agent(&contents)
-        .with_context(|| format!("failed to parse agent file '{}'", path.display()))
+            .with_context(|| read_agent_context(path.display()))?;
+    parse_agent(&contents).with_context(|| parse_agent_context(path.display()))
 }
 
 fn parse_agent(contents: &str) -> Result<AgentFile> {

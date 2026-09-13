@@ -164,11 +164,18 @@ pub(crate) async fn save_cancellable(
     .await
 }
 
+/// The pure part of reading back a checkpoint, shared by [`read`]/
+/// [`load_path_cancellable`]: only the read (`async_io::read_to_string_sync`
+/// vs. the cancellable, FIFO-aware worker) differs between them.
+fn parse_checkpoint(body: &str, path: &Path) -> Result<Checkpoint> {
+    serde_json::from_str(body)
+        .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
+}
+
 fn read(path: &Path) -> Result<Checkpoint> {
     let body = crate::async_io::read_to_string_sync(path)
         .with_context(|| crate::storage::read_context(path))?;
-    serde_json::from_str(&body)
-        .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
+    parse_checkpoint(&body, path)
 }
 
 /// Loads run `run_id`'s checkpoint, failing with a clear error when it
@@ -207,8 +214,7 @@ async fn load_path_cancellable(
                 crate::async_io::MAX_READ_BYTES,
             )
             .with_context(|| crate::storage::read_context(&path))?;
-            serde_json::from_str(&body)
-                .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
+            parse_checkpoint(&body, &path)
         },
         cancellation,
     )
