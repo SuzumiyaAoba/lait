@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     async_io,
     cli::{CacheAction, CacheCommand},
-    engine::SamplingOverrides,
+    overrides::SamplingOverrides,
     response, storage,
 };
 
@@ -234,7 +234,7 @@ pub(crate) fn run(command: CacheCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{key, load, save};
-    use crate::engine::SamplingOverrides;
+    use crate::overrides::SamplingOverrides;
     use crate::response;
 
     /// `load` now reads through `async_io::read_to_string_cancellable`

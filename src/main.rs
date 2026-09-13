@@ -29,6 +29,7 @@ mod logging;
 mod mcp;
 mod models;
 mod nesting;
+mod overrides;
 mod process;
 mod prompt;
 mod reasoning;
