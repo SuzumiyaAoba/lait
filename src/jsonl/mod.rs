@@ -21,7 +21,7 @@
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, Write},
+    io::{BufWriter, Read, Seek, Write},
     path::Path,
 };
 
@@ -169,12 +169,8 @@ fn append_relative(path: &Path, records: impl IntoIterator<Item = impl Serialize
         ensure_relative_dir(parent)?;
     }
     check_final_path(path)?;
-    let mut file = open_for_append(path).with_context(|| open_context(path))?;
-    for record in records {
-        let line = serde_json::to_string(&record).context("failed to serialize a log entry")?;
-        writeln!(file, "{line}").with_context(|| write_context(path))?;
-    }
-    Ok(())
+    let file = open_for_append(path).with_context(|| open_context(path))?;
+    write_records(file, path, records)
 }
 
 /// Opens a relative path for reading through the platform's no-follow-symlink
@@ -277,12 +273,33 @@ pub(crate) fn append(path: &Path, records: impl IntoIterator<Item = impl Seriali
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| create_dir_context(parent))?;
     }
-    let mut file = open_for_append(path).with_context(|| open_context(path))?;
+    let file = open_for_append(path).with_context(|| open_context(path))?;
+    write_records(file, path, records)
+}
+
+/// Shared by [`append`], the `#[cfg(not(unix))]` half of [`append_relative`],
+/// and `unix_relative::append` (via `super::write_records`, since a private
+/// item is visible to a descendant module): serializes each of `records`
+/// straight into a buffered writer over the already-opened append-mode
+/// `file` (no intermediate `String` per record, unlike a `serde_json::
+/// to_string` + `writeln!` per record) and flushes once at the end, so a
+/// call writing several records in one go reaches the OS as one write
+/// rather than one per record — which also makes a multi-record `append`
+/// call closer to atomic with respect to a concurrent reader/writer sharing
+/// this path, not just faster.
+fn write_records(
+    file: File,
+    path: &Path,
+    records: impl IntoIterator<Item = impl Serialize>,
+) -> Result<()> {
+    let mut writer = BufWriter::new(file);
     for record in records {
-        let line = serde_json::to_string(&record).context("failed to serialize a log entry")?;
-        writeln!(file, "{line}").with_context(|| write_context(path))?;
+        serde_json::to_writer(&mut writer, &record).context("failed to serialize a log entry")?;
+        writer
+            .write_all(b"\n")
+            .with_context(|| write_context(path))?;
     }
-    Ok(())
+    writer.flush().with_context(|| write_context(path))
 }
 
 /// `path`'s contents, or an empty string when it doesn't exist yet — the

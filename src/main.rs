@@ -52,23 +52,26 @@ mod usage;
 mod workflow;
 mod xdg;
 
-fn main() {
-    // `rustls` (pulled in via `async-openai`'s `rustls-no-provider` feature)
-    // needs a `CryptoProvider` installed process-wide before any TLS
-    // connection is made; without one, the first HTTPS request panics
-    // instead of failing gracefully. Installed here, first thing in `main`,
-    // rather than lazily on the async/model-request path: today only the
-    // async lane ever makes a network request, but a future sync subcommand
-    // that does would otherwise panic in production with nothing in CI to
-    // catch it, since `cargo check`/`clippy` cannot see a missing runtime
-    // installation. `ring` (rather than rustls's default `aws-lc-rs`) is
-    // selected via this crate's own `rustls` dependency in `Cargo.toml`,
-    // specifically to avoid `aws-lc-sys`'s C/assembly build requirement —
-    // see the comment there. The `Err` case only means a provider was
-    // already installed (impossible this early, but harmless either way),
-    // never that installation is unsupported here.
+/// Installs the process-wide `rustls` `CryptoProvider` — needed before any
+/// TLS connection is made, or the first HTTPS request panics instead of
+/// failing gracefully. `ring` (rather than rustls's default `aws-lc-rs`) is
+/// selected via this crate's own `rustls` dependency in `Cargo.toml`,
+/// specifically to avoid `aws-lc-sys`'s C/assembly build requirement — see
+/// the comment there. The `Err` case only means a provider was already
+/// installed (impossible at this function's one call site, but harmless
+/// either way), never that installation is unsupported here.
+///
+/// Called from `main`'s `Dispatch::Async` arm, not unconditionally at the
+/// top of `main` — only that lane ever makes a network request today. If a
+/// future `SyncCommand` starts talking TLS, call this at its own entry point
+/// in `app::run_blocking` too: `cargo check`/`clippy` cannot see a missing
+/// runtime installation, so this has to be an explicit call at every lane
+/// that needs it, not something to fall back to lazily discovering by panic.
+fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
 
+fn main() {
     // `.env` must be loaded before `Cli::parse()` runs (clap's `env = ...`
     // fallbacks read the process environment at parse time), so `--no-env`
     // is detected from the raw command line here; the `Cli` flag of the
@@ -118,6 +121,7 @@ fn main() {
             }
         }
         app::Dispatch::Async(async_command) => {
+            install_crypto_provider();
             // `--cache`/`--no-cache`/`--approve-tools` are global flags on
             // `Cli` itself, so they're read here rather than re-derived at
             // each async handler's own call site.

@@ -10,6 +10,7 @@
 //! filter's input value.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     mem::size_of,
     sync::{
@@ -623,11 +624,18 @@ fn validate_filter_source(filter_source: &str) -> Result<()> {
 /// rejected exactly as before) but discards each value as it goes instead
 /// of materializing it, so this is `run_filter_with`'s own `read::
 /// parse_single` call doing the one real parse instead of two.
-fn normalize_input(input: &str) -> Result<String> {
+///
+/// Returns `Cow` rather than `String` for the same reason: valid JSON is
+/// already exactly what jq should see, so the caller only needs to borrow
+/// `input` right back — `Cow::Borrowed` skips the copy that a `-> String`
+/// return type would have forced via `.to_owned()`. Only the plain-text
+/// path (which must build a new JSON string quoting the input) allocates.
+fn normalize_input(input: &str) -> Result<Cow<'_, str>> {
     if serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok() {
-        return Ok(input.to_owned());
+        return Ok(Cow::Borrowed(input));
     }
     serde_json::to_string(&template::parse_input(input))
+        .map(Cow::Owned)
         .context("failed to serialize plain-text jq input")
 }
 

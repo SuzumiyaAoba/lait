@@ -51,6 +51,22 @@ use stdio::{ManagedStdioTransport, owned_process_command};
 /// forever when no workflow timeout exists.
 const MCP_IO_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Shared by every HTTP-transport `mcp_servers:` entry — mirrors
+/// `llm::HTTP_CLIENT`'s reasoning: a `reqwest::Client` owns a connection
+/// pool, and building one per server (as this used to) means each pays its
+/// own fresh TCP/TLS handshake even though the timeout/redirect policy below
+/// is identical for all of them (only `custom_headers`/the URL, applied to
+/// the transport config rather than the client itself, vary per server).
+/// `reqwest::Client` is cheap to `clone()` (an `Arc` internally), so sharing
+/// this one instance across `connect` calls is the intended usage.
+static MCP_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(MCP_IO_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("the fixed MCP HTTP client configuration should always be valid")
+});
+
 /// Maximum bytes in one HTTP response body received from an MCP server.  The
 /// limit applies to both content-length responses and chunked/SSE streams.
 const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -292,11 +308,7 @@ async fn connect(
                 rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
                     .custom_headers(header_map)
                     .max_sse_event_size(MAX_HTTP_RESPONSE_BODY_BYTES);
-            let http_client = reqwest::Client::builder()
-                .timeout(MCP_IO_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .with_context(|| format!("failed to configure MCP server '{name}' HTTP client"))?;
+            let http_client = MCP_HTTP_CLIENT.clone();
             let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
                 LimitedHttpClient::new(
                     http_client,

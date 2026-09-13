@@ -9,14 +9,14 @@
 
 use super::{
     RelativeDirEntry, inspect_context, open_context, open_parent_context, read_context,
-    remove_context, write_context,
+    remove_context,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::{
     ffi::{CStr, CString, OsString},
     fs::File,
-    io::{self, Write},
+    io,
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -202,13 +202,9 @@ fn check_final(directory: &File, name: &CString, path: &Path) -> io::Result<Opti
 pub(super) fn append(path: &Path, records: impl IntoIterator<Item = impl Serialize>) -> Result<()> {
     let (directory, name) = open_parent(path, true).with_context(|| open_parent_context(path))?;
     check_final(&directory, &name, path).with_context(|| inspect_context(path))?;
-    let mut file =
+    let file =
         open_file_at(&directory, &name, APPEND_FLAGS, 0o666).with_context(|| open_context(path))?;
-    for record in records {
-        let line = serde_json::to_string(&record).context("failed to serialize a log entry")?;
-        writeln!(file, "{line}").with_context(|| write_context(path))?;
-    }
-    Ok(())
+    super::write_records(file, path, records)
 }
 
 /// Opens `path` for reading through the no-follow-symlink `openat`
