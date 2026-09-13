@@ -93,3 +93,37 @@ jsonschema = { version = "0.53.0", default-features = false, features = ["resolv
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Two independent levers for the debug profile (`cargo check`/`build`/`test`
+# with no `--release`), previously left at cargo's own defaults:
+#
+# - `debug = "line-tables-only"` keeps enough debug info for a panic
+#   backtrace to show file/line (what this crate's own tests and any user's
+#   `RUST_BACKTRACE=1` run need), while dropping the much larger variable/
+#   type debug info `cargo`'s default `debug = true` also generates — that
+#   extra data is what a source-level debugger (lldb/gdb stepping through
+#   local variables) needs, which this project's own edit/build/test loop
+#   does not rely on. Less debug info to emit and link measurably shortens
+#   incremental rebuilds, which is the loop `cargo check`/`test` run in for
+#   every edit.
+# - `[profile.dev.package."*"] opt-level = 2` optimizes every *dependency*
+#   (not this crate's own code, which stays unoptimized for fast
+#   incremental recompiles) once, the first time it's built; from then on
+#   its already-optimized .rlib is reused as-is across every subsequent
+#   `cargo check`/`build`/`test` invocation, incremental or not — unlike
+#   `debug`, this is a one-time cost paid on the first (or next dependency-
+#   changing) build, not on every edit. It matters here specifically
+#   because `cargo test` spawns the built `lait` binary as a real subprocess
+#   dozens of times across `tests/*.rs`'s ~40 integration test binaries;
+#   unoptimized dependency code (JSON parsing, YAML parsing, TLS, hashing)
+#   in every one of those spawned processes is what this targets. If this
+#   ever measures as a net loss in this project's own CI (unlikely, since
+#   `Swatinem/rust-cache` reuses `target/` across pushes there, hiding the
+#   one-time cost entirely — see AGENTS.md's "Refactoring Conventions" for
+#   the measurement protocol used to add these two lines), drop the
+#   dependency opt-level to 1 before removing it outright.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
