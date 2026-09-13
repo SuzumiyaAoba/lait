@@ -81,12 +81,24 @@ impl Check {
     }
 }
 
-pub(super) fn emit(checks: &[Check], json: bool) -> Result<()> {
+/// Which of `emit`'s two renderings to use — a call site reading
+/// `DoctorFormat::Json` says what it means, unlike the bare `bool` this
+/// replaced (`emit(&checks, true)` didn't). Not CLI-facing (`--json` stays a
+/// plain flag; see AGENTS.md's stance against changing the CLI surface) —
+/// `doctor::run` maps `DoctorArgs::json` to a variant right before calling
+/// `emit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DoctorFormat {
+    Text,
+    Json,
+}
+
+pub(super) fn emit(checks: &[Check], format: DoctorFormat) -> Result<()> {
     let ok = checks.iter().filter(|c| c.status == Status::Ok).count();
     let warn = checks.iter().filter(|c| c.status == Status::Warn).count();
     let error = checks.iter().filter(|c| c.status == Status::Error).count();
 
-    if json {
+    if format == DoctorFormat::Json {
         let output = serde_json::json!({
             "checks": checks,
             "summary": {"ok": ok, "warn": warn, "error": error},

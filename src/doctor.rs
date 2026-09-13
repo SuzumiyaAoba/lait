@@ -26,7 +26,7 @@ mod report;
 
 use config_checks::{check_default_model, check_env_placeholders};
 use connectivity::{check_connectivity, check_models_on_server, resolve_endpoint_uses};
-use report::{Check, Status, emit};
+use report::{Check, DoctorFormat, Status, emit};
 
 /// How long one `mcp_servers:` entry is given to start and initialize before
 /// being reported as failed. Much shorter than `mcp`'s own internal
@@ -57,7 +57,12 @@ pub(crate) async fn run(
         }
     }
 
-    emit(&checks, args.json)?;
+    let format = if args.json {
+        DoctorFormat::Json
+    } else {
+        DoctorFormat::Text
+    };
+    emit(&checks, format)?;
 
     let error_count = checks
         .iter()

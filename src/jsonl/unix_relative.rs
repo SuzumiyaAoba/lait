@@ -82,10 +82,20 @@ fn open_dir_at(parent: &File, name: &CString) -> io::Result<File> {
     }
 }
 
-fn open_child_dir(parent: &File, name: &CString, create: bool) -> io::Result<File> {
+/// Whether a missing intermediate directory should be created — given a
+/// name instead of a bare `true`/`false` at each of `open_child_dir`'s
+/// call sites, so e.g. `append`'s `OpenIntent::Create` reads as a policy
+/// choice rather than an unlabeled literal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenIntent {
+    Existing,
+    Create,
+}
+
+fn open_child_dir(parent: &File, name: &CString, intent: OpenIntent) -> io::Result<File> {
     let result = match open_dir_at(parent, name) {
         Ok(directory) => Ok(directory),
-        Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if intent == OpenIntent::Create && error.kind() == io::ErrorKind::NotFound => {
             let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) };
             if result < 0 {
                 let mkdir_error = io::Error::last_os_error();
@@ -109,23 +119,23 @@ fn open_child_dir(parent: &File, name: &CString, create: bool) -> io::Result<Fil
     }
 }
 
-fn open_directory(path: &Path, create: bool) -> io::Result<File> {
+fn open_directory(path: &Path, intent: OpenIntent) -> io::Result<File> {
     let names = relative_names(path)?;
     let mut directory = open_current_dir()?;
     for name in names {
-        directory = open_child_dir(&directory, &name, create)?;
+        directory = open_child_dir(&directory, &name, intent)?;
     }
     Ok(directory)
 }
 
-fn open_parent(path: &Path, create: bool) -> io::Result<(File, CString)> {
+fn open_parent(path: &Path, intent: OpenIntent) -> io::Result<(File, CString)> {
     let names = relative_names(path)?;
     let (basename, parents) = names
         .split_last()
         .ok_or_else(|| invalid_path(path, "must name a file"))?;
     let mut directory = open_current_dir()?;
     for name in parents {
-        directory = open_child_dir(&directory, name, create)?;
+        directory = open_child_dir(&directory, name, intent)?;
     }
     Ok((directory, basename.clone()))
 }
@@ -200,7 +210,8 @@ fn check_final(directory: &File, name: &CString, path: &Path) -> io::Result<Opti
 }
 
 pub(super) fn append(path: &Path, records: impl IntoIterator<Item = impl Serialize>) -> Result<()> {
-    let (directory, name) = open_parent(path, true).with_context(|| open_parent_context(path))?;
+    let (directory, name) =
+        open_parent(path, OpenIntent::Create).with_context(|| open_parent_context(path))?;
     check_final(&directory, &name, path).with_context(|| inspect_context(path))?;
     let file =
         open_file_at(&directory, &name, APPEND_FLAGS, 0o666).with_context(|| open_context(path))?;
@@ -214,7 +225,7 @@ pub(super) fn append(path: &Path, records: impl IntoIterator<Item = impl Seriali
 /// (a bounded read from the end — see its doc comment) both build on.
 /// `None` means "doesn't exist yet", not an error.
 pub(super) fn open(path: &Path) -> Result<Option<File>> {
-    let (directory, name) = match open_parent(path, false) {
+    let (directory, name) = match open_parent(path, OpenIntent::Existing) {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -231,7 +242,7 @@ pub(super) fn open(path: &Path) -> Result<Option<File>> {
 }
 
 pub(super) fn path_exists(path: &Path) -> Result<bool> {
-    let (directory, name) = match open_parent(path, false) {
+    let (directory, name) = match open_parent(path, OpenIntent::Existing) {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
@@ -244,7 +255,7 @@ pub(super) fn path_exists(path: &Path) -> Result<bool> {
 }
 
 pub(super) fn directory_exists(path: &Path) -> Result<bool> {
-    let Some((directory, name)) = (match open_parent(path, false) {
+    let Some((directory, name)) = (match open_parent(path, OpenIntent::Existing) {
         Ok(value) => Some(value),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -264,7 +275,8 @@ pub(super) fn directory_exists(path: &Path) -> Result<bool> {
 }
 
 pub(super) fn remove(path: &Path) -> Result<()> {
-    let (directory, name) = open_parent(path, false).with_context(|| open_parent_context(path))?;
+    let (directory, name) =
+        open_parent(path, OpenIntent::Existing).with_context(|| open_parent_context(path))?;
     if check_final(&directory, &name, path)
         .with_context(|| inspect_context(path))?
         .is_none()
@@ -279,7 +291,7 @@ pub(super) fn remove(path: &Path) -> Result<()> {
 }
 
 pub(super) fn read_dir(path: &Path) -> Result<Vec<RelativeDirEntry>> {
-    let directory = match open_directory(path, false) {
+    let directory = match open_directory(path, OpenIntent::Existing) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
