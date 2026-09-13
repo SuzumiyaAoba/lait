@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 mod render;
 mod stream;
 
-pub(crate) use render::{RenderOptions, render_response, render_text_json};
+pub(crate) use render::{RenderOptions, render_plain, render_response, render_text_json};
 pub(crate) use stream::{
     ChatCompletionStreamChunk, StreamToolCallAccumulator, stream_chunk_deltas,
     stream_chunk_tool_call_deltas,

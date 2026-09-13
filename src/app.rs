@@ -782,13 +782,7 @@ async fn run_prompt(
             Some(env.operation_token()),
         ))
         .await?;
-    let output = response::render_response(
-        &response,
-        response::RenderOptions {
-            as_json: false,
-            show_reasoning: false,
-        },
-    )?;
+    let output = response::render_plain(&response)?;
     finish_prompt_or_agent_run(
         "prompt",
         &output,

@@ -421,27 +421,18 @@ async fn check_one_endpoint(
     cancellation: Option<&tokio_util::sync::CancellationToken>,
     checks: &mut Vec<Check>,
 ) -> Result<Option<HashSet<String>>> {
-    let api_key = match services
-        .secret_resolver
-        .resolve(api_key_source, cancellation.cloned())
-        .await
-    {
-        Ok(api_key) => api_key,
-        Err(error) => {
-            if is_interrupted(&error) {
-                return Err(error);
-            }
-            checks.push(Check::error(
-                "connectivity",
-                base_url.to_owned(),
-                format!("API キーの解決に失敗しました: {error:#}"),
-                Some(
-                    "api_key/api_key_cmd の設定と secret manager の状態を確認してください"
-                        .to_owned(),
-                ),
-            ));
-            return Ok(None);
-        }
+    let Some(api_key) = connectivity_step(
+        services
+            .secret_resolver
+            .resolve(api_key_source, cancellation.cloned())
+            .await,
+        base_url,
+        |error| format!("API キーの解決に失敗しました: {error:#}"),
+        Some("api_key/api_key_cmd の設定と secret manager の状態を確認してください".to_owned()),
+        checks,
+    )?
+    else {
+        return Ok(None);
     };
     fetch_models(base_url, api_key.as_deref(), cancellation, checks).await
 }
@@ -458,36 +449,26 @@ async fn fetch_models(
         request = request.bearer_auth(api_key);
     }
 
-    let response = match await_with_cancellation(request.send(), cancellation).await {
-        Ok(response) => response,
-        Err(error) => {
-            if is_interrupted(&error) {
-                return Err(error);
-            }
-            checks.push(Check::error(
-                "connectivity",
-                base_url.to_owned(),
-                format!("接続に失敗しました: {error:#}"),
-                Some("base_url とサーバーの起動状態を確認してください".to_owned()),
-            ));
-            return Ok(None);
-        }
+    let Some(response) = connectivity_step(
+        await_with_cancellation(request.send(), cancellation).await,
+        base_url,
+        |error| format!("接続に失敗しました: {error:#}"),
+        Some("base_url とサーバーの起動状態を確認してください".to_owned()),
+        checks,
+    )?
+    else {
+        return Ok(None);
     };
     let status = response.status();
-    let body = match await_with_cancellation(response.text(), cancellation).await {
-        Ok(body) => body,
-        Err(error) => {
-            if is_interrupted(&error) {
-                return Err(error);
-            }
-            checks.push(Check::error(
-                "connectivity",
-                base_url.to_owned(),
-                format!("応答の読み取りに失敗しました: {error:#}"),
-                None,
-            ));
-            return Ok(None);
-        }
+    let Some(body) = connectivity_step(
+        await_with_cancellation(response.text(), cancellation).await,
+        base_url,
+        |error| format!("応答の読み取りに失敗しました: {error:#}"),
+        None,
+        checks,
+    )?
+    else {
+        return Ok(None);
     };
     if !status.is_success() {
         checks.push(Check::error(
@@ -515,6 +496,37 @@ async fn fetch_models(
                 base_url.to_owned(),
                 "接続には成功しましたが、応答をモデル一覧として解釈できませんでした",
                 Some(format!("{error:#}")),
+            ));
+            Ok(None)
+        }
+    }
+}
+
+/// Unwraps one step of `check_one_endpoint`/`fetch_models`'s fallible
+/// pipeline (resolving an API key, sending the request, reading its body):
+/// a cancellation propagates unchanged (`?` at the call site), an ordinary
+/// failure pushes a `Check::error` under the shared `"connectivity"`
+/// category and yields `None` for the caller to `return Ok(None)` on, and
+/// success yields `Some(value)` to keep going with. `message`/`hint` are the
+/// only things that differ between the three call sites this replaces.
+fn connectivity_step<T>(
+    result: Result<T>,
+    base_url: &str,
+    message: impl FnOnce(&anyhow::Error) -> String,
+    hint: Option<String>,
+    checks: &mut Vec<Check>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            if is_interrupted(&error) {
+                return Err(error);
+            }
+            checks.push(Check::error(
+                "connectivity",
+                base_url.to_owned(),
+                message(&error),
+                hint,
             ));
             Ok(None)
         }

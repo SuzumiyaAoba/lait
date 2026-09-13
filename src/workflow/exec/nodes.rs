@@ -167,14 +167,7 @@ async fn execute_prompt(
         .await
         .step(label)?;
 
-    response::render_response(
-        &response,
-        response::RenderOptions {
-            as_json: false,
-            show_reasoning: false,
-        },
-    )
-    .step(label)
+    response::render_plain(&response).step(label)
 }
 
 async fn execute_agent(

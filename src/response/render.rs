@@ -45,6 +45,24 @@ pub(crate) fn render_response(
     }
 }
 
+/// Renders a completed response as plain text with no reasoning preamble —
+/// `render_response(response, RenderOptions { as_json: false, show_reasoning:
+/// false })`, spelled out identically at three call sites
+/// (`app::run_prompt`, `engine::agent::call_agent`,
+/// `workflow::exec::nodes::execute_prompt`) before this helper existed. Not
+/// for `app::run_chat`'s two call sites, which vary `as_json`/
+/// `show_reasoning` with `--json`/`--show-reasoning` and so need
+/// `render_response` directly.
+pub(crate) fn render_plain(response: &ChatCompletionResponse) -> Result<String> {
+    render_response(
+        response,
+        RenderOptions {
+            as_json: false,
+            show_reasoning: false,
+        },
+    )
+}
+
 /// Renders already-extracted text using the same shape as a completed
 /// response's `--json` representation.
 pub(crate) fn render_text_json(content: &str, usage: Option<Usage>) -> Result<String> {

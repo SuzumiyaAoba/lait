@@ -107,6 +107,28 @@ pub(crate) struct NodeSettings<'a> {
     pub(crate) write_file: Option<&'a Path>,
 }
 
+/// `NodeSettings` for a node kind that has only `retry`/`timeout`/`jq`/
+/// `write_file` and no model/capability fields — `CommandNode`,
+/// `TransformNode`, and `AskNode` share this exact field set (same names,
+/// same types) but are three distinct structs, so `NodeDefinition::settings`
+/// can't match them together with a single `|` pattern; this helper keeps
+/// their three otherwise-identical match arms to one call each instead of
+/// three near-identical struct literals.
+fn control_only_settings<'a>(
+    retry: Option<&'a RetryDefinition>,
+    timeout: Option<u64>,
+    jq: Option<&'a str>,
+    write_file: Option<&'a Path>,
+) -> NodeSettings<'a> {
+    NodeSettings {
+        retry,
+        timeout,
+        jq,
+        write_file,
+        ..NodeSettings::default()
+    }
+}
+
 /// `type: prompt` — sends `prompt` (rendered as a handlebars template) and/or
 /// `system_prompt` to the model. At least one of the two is required: a
 /// `prompt` node that sends neither has nothing to distinguish it from
@@ -408,27 +430,24 @@ impl NodeDefinition {
                 write_file: node.write_file.as_deref(),
                 ..NodeSettings::default()
             },
-            Self::Command(node) => NodeSettings {
-                retry: node.retry.as_ref(),
-                timeout: node.timeout,
-                jq: node.jq.as_deref(),
-                write_file: node.write_file.as_deref(),
-                ..NodeSettings::default()
-            },
-            Self::Transform(node) => NodeSettings {
-                retry: node.retry.as_ref(),
-                timeout: node.timeout,
-                jq: node.jq.as_deref(),
-                write_file: node.write_file.as_deref(),
-                ..NodeSettings::default()
-            },
-            Self::Ask(node) => NodeSettings {
-                retry: node.retry.as_ref(),
-                timeout: node.timeout,
-                jq: node.jq.as_deref(),
-                write_file: node.write_file.as_deref(),
-                ..NodeSettings::default()
-            },
+            Self::Command(node) => control_only_settings(
+                node.retry.as_ref(),
+                node.timeout,
+                node.jq.as_deref(),
+                node.write_file.as_deref(),
+            ),
+            Self::Transform(node) => control_only_settings(
+                node.retry.as_ref(),
+                node.timeout,
+                node.jq.as_deref(),
+                node.write_file.as_deref(),
+            ),
+            Self::Ask(node) => control_only_settings(
+                node.retry.as_ref(),
+                node.timeout,
+                node.jq.as_deref(),
+                node.write_file.as_deref(),
+            ),
         }
     }
 
