@@ -357,7 +357,10 @@ fn rejects_a_server_with_both_command_and_url() {
 
 #[test]
 fn expands_placeholders_in_stdio_env_and_args() {
-    // SAFETY: single-threaded test-only env mutation, restored immediately.
+    // SAFETY: `set_var`/`remove_var` are racy against any other thread
+    // reading the environment at the same instant, but this variable name is
+    // unique to this test and nothing else in the suite reads it, so no
+    // concurrently running test can observe an unexpected value.
     unsafe {
         std::env::set_var("LAIT_TEST_MCP_TOKEN", "secret");
     }
@@ -382,7 +385,10 @@ fn expands_placeholders_in_stdio_env_and_args() {
 /// `cwd` (stdio) — `env` above already covers the sixth field.
 #[test]
 fn expands_placeholders_in_stdio_command_args_and_cwd() {
-    // SAFETY: single-threaded test-only env mutation, restored immediately.
+    // SAFETY: `set_var`/`remove_var` are racy against any other thread
+    // reading the environment at the same instant, but this variable name is
+    // unique to this test and nothing else in the suite reads it, so no
+    // concurrently running test can observe an unexpected value.
     unsafe {
         std::env::set_var("LAIT_TEST_MCP_COMMAND", "npx");
         std::env::set_var("LAIT_TEST_MCP_ARG", "--flag");
@@ -412,7 +418,10 @@ fn expands_placeholders_in_stdio_command_args_and_cwd() {
 /// The HTTP transport's half of the same field boundary: `url`/`headers`.
 #[test]
 fn expands_placeholders_in_http_url_and_headers() {
-    // SAFETY: single-threaded test-only env mutation, restored immediately.
+    // SAFETY: `set_var`/`remove_var` are racy against any other thread
+    // reading the environment at the same instant, but this variable name is
+    // unique to this test and nothing else in the suite reads it, so no
+    // concurrently running test can observe an unexpected value.
     unsafe {
         std::env::set_var("LAIT_TEST_MCP_URL", "https://mcp.example/endpoint");
         std::env::set_var("LAIT_TEST_MCP_HEADER", "secret-token");
