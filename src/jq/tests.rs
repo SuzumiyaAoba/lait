@@ -397,3 +397,104 @@ fn check_syntax_does_not_require_a_value_to_run_against() {
     // field that isn't a number) still passes a syntax-only check.
     assert!(super::check_syntax(".foo / 0").is_ok());
 }
+
+/// P8-4 (A-1'): a filter whose source never mentions `$steps` must produce
+/// the exact same result whether `$steps` is empty or holds a large amount
+/// of data — `run_filter_with` skips converting `$steps` into a jaq value at
+/// all in this case, so this pins that the skip is invisible to the filter's
+/// actual output, not just "doesn't crash".
+#[test]
+fn filter_without_steps_reference_evaluates_identically() {
+    let empty_steps = no_steps();
+    let mut populated_steps = Steps::new();
+    for index in 0..500 {
+        populated_steps.insert(
+            format!("step-{index}"),
+            serde_json::json!({"ok": true, "payload": "x".repeat(200)}),
+        );
+    }
+
+    let with_empty = apply_cancellable(
+        ".value",
+        r#"{"value": 42}"#,
+        &empty_steps,
+        &no_vars(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let with_populated = apply_cancellable(
+        ".value",
+        r#"{"value": 42}"#,
+        &populated_steps,
+        &no_vars(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+
+    assert_eq!(with_empty, with_populated);
+    assert_eq!(with_empty, "42");
+}
+
+/// The regression counterpart to the previous test: a filter that
+/// genuinely reads `$steps` (and, combined here, `$vars`) must keep working
+/// once the skip is in place — the two globals' `uses_steps`/`uses_vars`
+/// flags must each be set correctly, independently of each other.
+#[test]
+fn filter_referencing_steps_still_sees_them() {
+    let steps = steps_with("check", serde_json::json!({"ok": true}));
+    let vars = vars_with("lang", serde_json::json!("ja"));
+    assert_eq!(
+        apply_cancellable(
+            "[$steps.check.ok, $vars.lang]",
+            "null",
+            &steps,
+            &vars,
+            &AtomicBool::new(false)
+        )
+        .unwrap(),
+        r#"[true,"ja"]"#
+    );
+}
+
+/// A filter that merely contains the *text* `$steps` inside a jq string
+/// literal (not an actual variable reference) is not, and cannot be,
+/// distinguished from a real reference by a plain substring search — the
+/// filter still compiles and evaluates the same value it always did,
+/// because the substring match only decides whether the global gets
+/// *constructed*, never whether the filter's own logic can use it. This
+/// pins that a false-positive match is harmless, not that it doesn't occur.
+#[test]
+fn string_literal_mentioning_steps_is_treated_conservatively() {
+    assert_eq!(
+        apply_cancellable(
+            r#""$steps""#,
+            "null",
+            &no_steps(),
+            &no_vars(),
+            &AtomicBool::new(false)
+        )
+        .unwrap(),
+        "$steps"
+    );
+}
+
+/// `Vars::new`'s two slots are positional (`$steps` first, `$vars` second —
+/// see `compiled_filter`'s `with_global_vars`), not name-keyed, so a filter
+/// referencing only the *second* slot while the first is left as the
+/// substituted `Val::Null` (unused because this filter never mentions
+/// `$steps`) must still read its own slot correctly.
+#[test]
+fn unused_global_slot_does_not_break_evaluation() {
+    let vars = vars_with("lang", serde_json::json!("ja"));
+    assert_eq!(
+        apply_cancellable(
+            "$vars.lang",
+            "null",
+            &no_steps(),
+            &vars,
+            &AtomicBool::new(false)
+        )
+        .unwrap(),
+        "ja"
+    );
+}

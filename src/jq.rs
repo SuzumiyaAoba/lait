@@ -61,7 +61,17 @@ const _: fn() = || {
 /// across a whole directory tree rather than one workflow — still bounded
 /// by the number of distinct filter strings on disk, and the process exits
 /// once linting finishes, so this is not a genuine leak.
-static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CompiledFilter>>>> =
+/// A compiled filter plus whether its own source text ever mentions
+/// `$steps`/`$vars` — see [`compiled_filter`]'s doc comment for why a
+/// substring search is a sound proxy for "does this filter read the
+/// global", and [`run_filter_with`] for how the two `bool`s are used.
+struct CachedFilter {
+    filter: Arc<CompiledFilter>,
+    uses_steps: bool,
+    uses_vars: bool,
+}
+
+static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CachedFilter>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Parses and compiles `filter_source` (defs/funs prelude plus the filter
@@ -73,7 +83,19 @@ static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CompiledFilter>>>> =
 /// The prelude and `with_global_vars(["$steps", "$vars"])` are fixed across
 /// every caller (`run_filter_with` and `check_syntax` alike), so neither
 /// needs to be part of the cache key.
-fn compiled_filter(filter_source: &str) -> Result<Arc<CompiledFilter>> {
+///
+/// Also records whether `filter_source` mentions `$steps`/`$vars` at all
+/// (see [`CachedFilter`]), computed once here rather than on every
+/// [`run_filter_with`] call. jq has no syntax for constructing a variable
+/// name dynamically — a global reference is always the literal token
+/// `$steps`/`$vars` somewhere in the source, including inside a string
+/// interpolation like `"\($steps.a)"` — so a plain substring search never
+/// produces a false negative. A string *literal* that merely contains the
+/// text `"$steps"` (with no `$` — jq string literals cannot themselves
+/// interpolate a bare `$name` without the interpolation syntax) is the only
+/// possible false positive, and it only costs the global a construction
+/// that then goes unused, never a missing one.
+fn compiled_filter(filter_source: &str) -> Result<Arc<CachedFilter>> {
     if let Some(filter) = FILTER_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -108,12 +130,16 @@ fn compiled_filter(filter_source: &str) -> Result<Arc<CompiledFilter>> {
         .compile(modules)
         .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
 
-    let filter = Arc::new(filter);
+    let cached = Arc::new(CachedFilter {
+        filter: Arc::new(filter),
+        uses_steps: filter_source.contains("$steps"),
+        uses_vars: filter_source.contains("$vars"),
+    });
     FILTER_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(filter_source.to_owned(), Arc::clone(&filter));
-    Ok(filter)
+        .insert(filter_source.to_owned(), Arc::clone(&cached));
+    Ok(cached)
 }
 
 /// jq is intentionally run in a bounded worker rather than on Tokio's
@@ -179,6 +205,15 @@ const MAX_VALUE_DEPTH: usize = 1024;
 /// a for_each/parallel item's copy to its first write rather than
 /// eliminating it (see `record_step_output`'s one write site) — real, but
 /// smaller than "no more clones" would suggest.
+///
+/// P8-4 addressed that remaining cost directly: `compiled_filter`/
+/// `CachedFilter` record whether a filter's source text mentions `$steps`/
+/// `$vars` at all, and `run_filter_with` skips the `parse_global_var`
+/// conversion entirely when it doesn't — the common case for a `when:`
+/// guard that only inspects the current item. The ~4% case above (a guard
+/// that does read `$steps` on every item) still pays the full conversion,
+/// since that cost is inherent to actually using the value, not an
+/// artifact of how it was stored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct Steps(Arc<serde_json::Map<String, serde_json::Value>>);
@@ -499,16 +534,40 @@ where
     validate_value_structure(&input)
         .context("jq input structure exceeds the configured memory limit")?;
     check_cancelled_opt(cancelled)?;
-    let steps_val = parse_global_var(steps, "$steps")?;
-    check_cancelled_opt(cancelled)?;
-    let vars_val = parse_global_var(vars, "$vars")?;
+
+    let cached = compiled_filter(filter_source)?;
     check_cancelled_opt(cancelled)?;
 
-    let filter = compiled_filter(filter_source)?;
+    // Skip converting a `Steps` value into a jaq `Val` tree (`parse_global_var`
+    // walks the whole thing — see its doc comment) when `filter_source`
+    // never references the corresponding global. This is the "$steps
+    // conversion on every `for_each` item, even for a `when:` guard that
+    // never reads it" cost `Steps`'s `Arc`-wrapping (P7-3) left
+    // unaddressed — see that struct's doc comment for the measurement that
+    // found it. `Vars::new` is positional, not name-keyed, so the unused
+    // slot is simply never read; substituting `Val::Null` for it is safe
+    // regardless of which position it occupies.
+    let steps_val = if cached.uses_steps {
+        parse_global_var(steps, "$steps")?
+    } else {
+        Val::Null
+    };
+    check_cancelled_opt(cancelled)?;
+    let vars_val = if cached.uses_vars {
+        parse_global_var(vars, "$vars")?
+    } else {
+        Val::Null
+    };
     check_cancelled_opt(cancelled)?;
 
-    let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([steps_val, vars_val]));
-    for (output_count, result) in filter.id.run((ctx, input)).map(unwrap_valr).enumerate() {
+    let ctx = Ctx::<data::JustLut<Val>>::new(&cached.filter.lut, Vars::new([steps_val, vars_val]));
+    for (output_count, result) in cached
+        .filter
+        .id
+        .run((ctx, input))
+        .map(unwrap_valr)
+        .enumerate()
+    {
         check_cancelled_opt(cancelled)?;
         if output_count >= MAX_OUTPUT_VALUES {
             bail!(
