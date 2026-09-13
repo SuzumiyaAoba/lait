@@ -88,7 +88,7 @@ fn main() {
         // threads, so no other thread can be reading the environment yet —
         // see `load_from_current_dir`'s safety contract.
         if let Err(error) = unsafe { dotenv::load_from_current_dir() } {
-            exit_with_error(error, false);
+            exit_with_error(error, None);
         }
     }
 
@@ -107,9 +107,11 @@ fn main() {
     let dispatch = app::classify(cli.command);
     // The command-specific exit policy: all lint failures are validation
     // errors. Derived from `dispatch` (not re-matched from `cli.command`,
-    // which is already moved) so this can never drift from what `classify`
-    // itself decided.
-    let is_lint = matches!(dispatch, app::Dispatch::Sync(app::SyncCommand::Lint(_)));
+    // which is already moved) so this can never drift from what `error::
+    // classify` itself decided — `Some(..)` forces that exit kind
+    // unconditionally, `None` lets `error::classify` inspect the error itself.
+    let forced_exit_kind = matches!(dispatch, app::Dispatch::Sync(app::SyncCommand::Lint(_)))
+        .then_some(error::ExitKind::Validation);
 
     match dispatch {
         // The purely local subcommands (completions/man/init/lint/local
@@ -118,7 +120,7 @@ fn main() {
         // where that cost is felt on every new shell.
         app::Dispatch::Sync(sync_command) => {
             if let Err(error) = app::run_blocking(sync_command, config_source) {
-                exit_with_error(error, is_lint);
+                exit_with_error(error, forced_exit_kind);
             }
         }
         app::Dispatch::Async(async_command) => {
@@ -142,7 +144,7 @@ fn main() {
                 Ok(runtime) => runtime,
                 Err(error) => exit_with_error(
                     anyhow::Error::new(error).context("failed to start the async runtime"),
-                    is_lint,
+                    forced_exit_kind,
                 ),
             };
             if let Err(error) = runtime.block_on(app::run(
@@ -153,20 +155,20 @@ fn main() {
                 approve_tools,
                 cancel,
             )) {
-                exit_with_error(error, is_lint);
+                exit_with_error(error, forced_exit_kind);
             }
         }
     }
 }
 
-fn exit_with_error(error: anyhow::Error, is_lint: bool) -> ! {
+fn exit_with_error(error: anyhow::Error, forced_exit_kind: Option<error::ExitKind>) -> ! {
     eprintln!("lait: {error:#}");
     // An explicit SIGINT keeps the conventional shell exit code; execution
     // deadlines and programmatic cancellation use the typed error policy.
     let code = if signal::received() {
         signal::SIGINT_EXIT_CODE
     } else {
-        error::classify(&error, is_lint) as i32
+        error::classify(&error, forced_exit_kind) as i32
     };
     std::process::exit(code);
 }

@@ -97,16 +97,19 @@ pub(crate) enum ExitKind {
 /// (`main::exit_with_error` calls this and casts the result to `i32`).
 /// Deliberately classifies by error *type* via `downcast_ref`/`chain().any`
 /// rather than by matching message text — a wording change elsewhere in the
-/// crate should never silently change a user's exit code. `is_lint` (set by
-/// `main` from `Command::Lint` before `cli.command` is moved — see
-/// `app.rs`'s module doc on why that classification is currently
-/// duplicated) forces `Validation` unconditionally: `lait lint` reports
-/// every issue as part of its normal output, so *any* error reaching this
-/// far means the run itself failed to validate cleanly, not that something
-/// crashed.
-pub(crate) fn classify(error: &anyhow::Error, is_lint: bool) -> ExitKind {
-    if is_lint {
-        return ExitKind::Validation;
+/// crate should never silently change a user's exit code. `forced`, when
+/// `Some`, skips that classification entirely and returns the given kind —
+/// `main` passes `Some(ExitKind::Validation)` for `Command::Lint` (decided
+/// from `dispatch` before `cli.command` is moved), since `lait lint` reports
+/// every issue as part of its normal output, so *any* error reaching this far
+/// means the run itself failed to validate cleanly, not that something
+/// crashed. Spelling this as `Option<ExitKind>` rather than a bare
+/// `is_lint: bool` makes "lint always forces Validation" explicit at the
+/// call site instead of requiring this doc comment to explain what the flag
+/// does.
+pub(crate) fn classify(error: &anyhow::Error, forced: Option<ExitKind>) -> ExitKind {
+    if let Some(forced) = forced {
+        return forced;
     }
     if is_interrupted(error) {
         return ExitKind::Interrupted;
@@ -131,18 +134,18 @@ mod tests {
             Interrupted::timed_out("期限"),
         ] {
             let error = anyhow::Error::new(interruption).context("step failed");
-            assert_eq!(classify(&error, false), ExitKind::Interrupted);
-            assert_eq!(classify(&error, true), ExitKind::Validation);
+            assert_eq!(classify(&error, None), ExitKind::Interrupted);
+            assert_eq!(
+                classify(&error, Some(ExitKind::Validation)),
+                ExitKind::Validation
+            );
         }
     }
 
     #[test]
     fn incidental_words_do_not_classify_an_error_as_an_interruption() {
         for message in ["cannot open cancelled.yml", "server says: timed out"] {
-            assert_eq!(
-                classify(&anyhow::anyhow!(message), false),
-                ExitKind::General
-            );
+            assert_eq!(classify(&anyhow::anyhow!(message), None), ExitKind::General);
         }
     }
 
@@ -162,7 +165,7 @@ mod tests {
     fn typed_context_preserves_interruption_policy_and_underlying_cause() {
         let error =
             anyhow::anyhow!("cleanup failed").context(Interrupted::cancelled("command stopped"));
-        assert_eq!(classify(&error, false), ExitKind::Interrupted);
+        assert_eq!(classify(&error, None), ExitKind::Interrupted);
         assert!(format!("{error:#}").contains("cleanup failed"));
     }
 
@@ -170,15 +173,12 @@ mod tests {
     fn yaml_and_api_errors_keep_their_categories() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>("[").unwrap_err();
         assert_eq!(
-            classify(&anyhow::Error::new(yaml).context("file"), false),
+            classify(&anyhow::Error::new(yaml).context("file"), None),
             ExitKind::Validation
         );
         let api = OpenAIError::StreamError(Box::new(
             async_openai::error::StreamError::EventStream("cancelled by upstream".into()),
         ));
-        assert_eq!(
-            classify(&anyhow::Error::new(api), false),
-            ExitKind::ModelApi
-        );
+        assert_eq!(classify(&anyhow::Error::new(api), None), ExitKind::ModelApi);
     }
 }
