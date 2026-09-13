@@ -40,6 +40,14 @@ pkg-fmt = "zip"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+# Added once the crate's last `unreachable!()` (lint/report.rs's
+# `run_structured`) was removed by narrowing its parameter type
+# (`StructuredFormat`, which has no `Text` variant to fall through to) —
+# see that module's doc comment. Verified crate-wide by grep, same as the
+# three lints above; `cargo clippy`'s own check would additionally catch a
+# match arm that merely panics without the macro, but that's out of scope
+# for a grep-only local gate.
+unreachable = "deny"
 
 [dependencies]
 anyhow = "1"

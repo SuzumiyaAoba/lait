@@ -9,7 +9,20 @@ use anyhow::{Context, Result, bail};
 
 use crate::config;
 
-use super::{LintFormat, LintRun, Severity};
+use super::{LintRun, Severity};
+
+/// `run_structured`'s two renderings — split out of the CLI-facing
+/// `cli::LintFormat` (which keeps its `Text` variant for `clap::ValueEnum`,
+/// since that derive requires a fieldless enum and `--format text` must stay
+/// a valid flag value) so this function's parameter type has no `Text`
+/// variant to render. That removed the crate's only `unreachable!()` — see
+/// `lint::run`, which maps `LintFormat::Json`/`Github` to this at the call
+/// site instead of passing `LintFormat` straight through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StructuredFormat {
+    Json,
+    Github,
+}
 
 /// Runs `lait lint`'s `--format text` (the default) rendering.
 pub(super) fn run_text(run: &LintRun) -> Result<()> {
@@ -82,12 +95,11 @@ impl Finding {
 }
 
 /// Runs `lait lint`'s `--format json`/`--format github` rendering.
-pub(super) fn run_structured(run: &LintRun, format: LintFormat) -> Result<()> {
+pub(super) fn run_structured(run: &LintRun, format: StructuredFormat) -> Result<()> {
     let findings = findings(run);
     match format {
-        LintFormat::Json => print_json_findings(&findings)?,
-        LintFormat::Github => print_github_findings(&findings),
-        LintFormat::Text => unreachable!("text has its own renderer"),
+        StructuredFormat::Json => print_json_findings(&findings)?,
+        StructuredFormat::Github => print_github_findings(&findings),
     }
     if run.has_errors() {
         bail!(

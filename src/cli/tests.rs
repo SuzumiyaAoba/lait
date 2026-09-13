@@ -71,7 +71,14 @@ fn hides_reasoning_by_default() {
 
 #[test]
 fn accepts_all_reasoning_effort_values() {
-    for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+    for (effort, expected) in [
+        ("none", ReasoningEffort::None),
+        ("minimal", ReasoningEffort::Minimal),
+        ("low", ReasoningEffort::Low),
+        ("medium", ReasoningEffort::Medium),
+        ("high", ReasoningEffort::High),
+        ("xhigh", ReasoningEffort::Xhigh),
+    ] {
         let cli = Cli::try_parse_from([
             "lait",
             "--model",
@@ -82,18 +89,7 @@ fn accepts_all_reasoning_effort_values() {
         ])
         .expect("reasoning effort should be accepted");
 
-        assert_eq!(
-            cli.chat.shared.reasoning_effort,
-            Some(match effort {
-                "none" => ReasoningEffort::None,
-                "minimal" => ReasoningEffort::Minimal,
-                "low" => ReasoningEffort::Low,
-                "medium" => ReasoningEffort::Medium,
-                "high" => ReasoningEffort::High,
-                "xhigh" => ReasoningEffort::Xhigh,
-                _ => unreachable!(),
-            })
-        );
+        assert_eq!(cli.chat.shared.reasoning_effort, Some(expected));
     }
 }
 

@@ -305,7 +305,8 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
     let run = LintRun::collect(&lint_args.files, &config_source)?;
     match lint_args.format {
         LintFormat::Text => report::run_text(&run),
-        LintFormat::Json | LintFormat::Github => report::run_structured(&run, lint_args.format),
+        LintFormat::Json => report::run_structured(&run, report::StructuredFormat::Json),
+        LintFormat::Github => report::run_structured(&run, report::StructuredFormat::Github),
     }
 }
 
