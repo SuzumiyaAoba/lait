@@ -23,6 +23,7 @@ mod transport;
 pub(crate) use agent::{AgentTurn, call_agent, call_subagent_tool, value_to_input_text};
 pub(crate) use context::{AppServices, RunContext};
 pub(crate) use settings::{EndpointOverrides, agent_file_settings, resolve_request_settings};
+pub(crate) use transport::StreamOptions;
 
 // Defined in the crate-root `overrides` module (not a submodule of this one)
 // so `cache::key` can depend on `SamplingOverrides` without depending on all

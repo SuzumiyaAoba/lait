@@ -24,14 +24,16 @@ use crate::{async_io, response};
 
 /// The request side of a cassette entry, kept only for human inspection —
 /// matching a replay request to its cassette is entirely done by filename
-/// (the content hash), so this is never read back by [`load`].
+/// (the content hash), so this is never read back by [`load`]. Also doubles
+/// as [`save`]'s parameter struct: the caller builds one of these instead of
+/// passing its five fields individually.
 #[derive(Debug, Serialize)]
-struct CassetteRequestRef<'a> {
-    base_url: &'a str,
-    model_id: &'a str,
-    messages: &'a [ChatCompletionRequestMessage],
-    tools: &'a [ChatCompletionTools],
-    response_format: Option<&'a ResponseFormat>,
+pub(crate) struct CassetteRequestRef<'a> {
+    pub(crate) base_url: &'a str,
+    pub(crate) model_id: &'a str,
+    pub(crate) messages: &'a [ChatCompletionRequestMessage],
+    pub(crate) tools: &'a [ChatCompletionTools],
+    pub(crate) response_format: Option<&'a ResponseFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,27 +65,16 @@ fn entry_path(dir: &Path, key: &str) -> PathBuf {
 /// its doc comment. Serializes synchronously first, borrowing every
 /// argument, and only the resulting `body`/`path` (owned, so they can move
 /// onto the worker thread) cross onto it.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn save(
     dir: &Path,
     key: &str,
-    base_url: &str,
-    model_id: &str,
-    messages: &[ChatCompletionRequestMessage],
-    tools: &[ChatCompletionTools],
-    response_format: Option<&ResponseFormat>,
+    request: CassetteRequestRef<'_>,
     response: &response::ChatCompletionResponse,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     let entry = CassetteEntryRef {
         recorded_at: chrono::Utc::now(),
-        request: CassetteRequestRef {
-            base_url,
-            model_id,
-            messages,
-            tools,
-            response_format,
-        },
+        request,
         response,
     };
     let body =
@@ -141,7 +132,7 @@ pub(crate) async fn load(
 
 #[cfg(test)]
 mod tests {
-    use super::{load, save};
+    use super::{CassetteRequestRef, load, save};
     use crate::response::ChatCompletionResponse;
 
     fn sample_response(content: &str) -> ChatCompletionResponse {
@@ -166,11 +157,13 @@ mod tests {
         save(
             dir.path(),
             "key-1",
-            "http://x",
-            "model-a",
-            &[],
-            &[],
-            None,
+            CassetteRequestRef {
+                base_url: "http://x",
+                model_id: "model-a",
+                messages: &[],
+                tools: &[],
+                response_format: None,
+            },
             &response,
             None,
         )
@@ -235,11 +228,13 @@ mod tests {
         save(
             &nested,
             "k",
-            "http://x",
-            "model-a",
-            &[],
-            &[],
-            None,
+            CassetteRequestRef {
+                base_url: "http://x",
+                model_id: "model-a",
+                messages: &[],
+                tools: &[],
+                response_format: None,
+            },
             &response,
             None,
         )

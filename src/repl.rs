@@ -13,7 +13,7 @@ use crate::{
     async_io, chat,
     cli::{ChatReplArgs, SharedChatArgs},
     config::{self, ConfigFile, ConfigSource},
-    engine::{AppServices, PromptTurn, RequestSettings, RunContext},
+    engine::{AppServices, PromptTurn, RequestSettings, RunContext, StreamOptions},
     llm, response, signal, usage,
 };
 
@@ -255,9 +255,11 @@ async fn run_turn(
             &[],
             turn,
             None,
-            show_usage,
-            show_reasoning,
-            None,
+            StreamOptions {
+                include_usage: show_usage,
+                show_reasoning,
+                output_path: None,
+            },
             Some(env.operation_token()),
         )
         .await?;

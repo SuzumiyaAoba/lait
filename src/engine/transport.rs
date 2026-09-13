@@ -90,6 +90,16 @@ fn check_tool_name_collisions(
     Ok(())
 }
 
+/// The streaming-only options `complete_stream` needs beyond what `complete`
+/// already takes (`response_format`/`turn`/`cancellation`/...) — grouped so
+/// the method stays within clippy's argument-count lint without losing any
+/// of `include_usage`/`show_reasoning`/`output_path`'s independent meaning.
+pub(crate) struct StreamOptions<'a> {
+    pub(crate) include_usage: bool,
+    pub(crate) show_reasoning: bool,
+    pub(crate) output_path: Option<&'a Path>,
+}
+
 impl RequestSettings {
     /// Builds an `llm::CompletionRequest` from these settings' sampling
     /// parameters (the same for every request `self` ever builds, and never
@@ -440,11 +450,13 @@ impl RequestSettings {
                         cassette::save(
                             record_dir,
                             key,
-                            &endpoint.base_url,
-                            &endpoint.model_id,
-                            messages,
-                            tools,
-                            response_format.as_ref(),
+                            cassette::CassetteRequestRef {
+                                base_url: &endpoint.base_url,
+                                model_id: &endpoint.model_id,
+                                messages,
+                                tools,
+                                response_format: response_format.as_ref(),
+                            },
                             &response,
                             cancellation.clone(),
                         )
@@ -540,21 +552,23 @@ impl RequestSettings {
     /// `complete` — see its doc comment. Returns the *last* round's
     /// [`StreamOutcome`] (the one whose content was actually the final
     /// answer) — an intermediate round's content, if any, was still streamed
-    /// to `output_path` as it arrived, exactly like the final round's, since
-    /// there is no way to know a round is not the last one until after it
-    /// has already finished streaming.
-    #[allow(clippy::too_many_arguments)]
+    /// to `stream.output_path` as it arrived, exactly like the final round's,
+    /// since there is no way to know a round is not the last one until after
+    /// it has already finished streaming.
     pub(crate) async fn complete_stream(
         &self,
         env: &RunContext,
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
-        include_usage: bool,
-        show_reasoning: bool,
-        output_path: Option<&Path>,
+        stream: StreamOptions<'_>,
         cancellation: Option<CancellationToken>,
     ) -> Result<StreamOutcome> {
+        let StreamOptions {
+            include_usage,
+            show_reasoning,
+            output_path,
+        } = stream;
         let messages = self
             .initial_turn_messages(env, turn, cancellation.clone())
             .await?;

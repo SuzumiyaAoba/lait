@@ -14,7 +14,7 @@ use crate::{
     attachment, chat,
     cli::{ChatArgs, ChatReplArgs},
     config::{self, ConfigSource},
-    engine::{AppServices, PromptTurn, RequestSettings, RunContext},
+    engine::{AppServices, PromptTurn, RequestSettings, RunContext, StreamOptions},
     prompt, repl, report, response, schema, usage,
 };
 
@@ -284,9 +284,11 @@ async fn run_chat(
                 &[],
                 turn,
                 response_format,
-                display.show_usage,
-                display.show_reasoning,
-                display.output_path,
+                StreamOptions {
+                    include_usage: display.show_usage,
+                    show_reasoning: display.show_reasoning,
+                    output_path: display.output_path,
+                },
                 Some(env.operation_token()),
             ))
             .await?;

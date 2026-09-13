@@ -10,12 +10,11 @@ use std::{ops::ControlFlow, time::Duration};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{engine::RunContext, template, workflow};
+use crate::{template, workflow};
 
 use super::{
-    ExecutionPlacement, Flow, RunStepsFrame, StepsOutcome, StepsState,
-    WORKFLOW_EXECUTION_CANCELLED, WorkflowScope, check_workflow_cancellation, execute_step,
-    run_steps, settings::StepContext,
+    Flow, RouterContext, RunStepsFrame, StepsOutcome, StepsState, WORKFLOW_EXECUTION_CANCELLED,
+    WorkflowScope, check_workflow_cancellation, execute_step, run_steps, settings::StepContext,
 };
 
 /// Runs `step`'s `on_error` handler after `error` (from the step's own
@@ -33,15 +32,12 @@ pub(super) async fn run_on_error_handler(
     error: anyhow::Error,
     counter: usize,
     mut state: StepsState,
-    scope: &WorkflowScope,
-    env: &RunContext,
-    progress_prefix: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
-    placement: ExecutionPlacement,
+    router_context: &RouterContext<'_>,
 ) -> Result<ControlFlow<StepsOutcome, StepsState>> {
     let Some(on_error) = step.on_error() else {
         return Err(error);
     };
+    let progress_prefix = router_context.progress_prefix;
     eprintln!("{progress_prefix}    -> step failed, running 'on_error': {error}");
     let error_input = serde_json::json!({
         "error": format!("{error:#}"),
@@ -54,12 +50,12 @@ pub(super) async fn run_on_error_handler(
         error_input_json,
         state.steps_outputs,
         RunStepsFrame {
-            scope,
-            env,
+            scope: router_context.scope,
+            env: router_context.env,
             start_counter: counter,
             progress_prefix,
-            cancellation,
-            placement,
+            cancellation: router_context.cancellation.clone(),
+            placement: router_context.placement,
         },
     )
     .await?;

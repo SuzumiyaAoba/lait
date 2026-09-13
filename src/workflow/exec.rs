@@ -370,18 +370,8 @@ pub(crate) fn run_steps<'a>(
                 match attempt_result {
                     Ok(output) => state.output = output,
                     Err(error) => {
-                        match run_on_error_handler(
-                            step,
-                            error,
-                            counter,
-                            state,
-                            scope,
-                            env,
-                            progress_prefix,
-                            cancellation.clone(),
-                            placement,
-                        )
-                        .await?
+                        match run_on_error_handler(step, error, counter, state, &router_context)
+                            .await?
                         {
                             ControlFlow::Break(outcome) => return Ok(outcome),
                             ControlFlow::Continue(new_state) => state = new_state,
