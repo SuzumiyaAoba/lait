@@ -355,3 +355,6 @@ pub(super) fn read_dir(path: &Path) -> Result<Vec<RelativeDirEntry>> {
     }
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests;
