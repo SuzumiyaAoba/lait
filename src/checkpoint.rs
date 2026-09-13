@@ -347,6 +347,41 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Before `workflow::StepOutputs` became a copy-on-write wrapper over
+    /// `Arc<serde_json::Map<..>>` (P7-3), `steps_outputs` was a plain
+    /// `serde_json::Map` and serialized as a bare JSON object.
+    /// `#[serde(transparent)]` on the new wrapper keeps that exact on-disk
+    /// shape, so a checkpoint written by an older build (no extra wrapper
+    /// layer around `steps_outputs`) must still resume-load unchanged.
+    #[test]
+    fn read_parses_a_pre_arc_wrapped_steps_outputs_shape() {
+        let path =
+            crate::test_support::unique_temp_path("lait-checkpoint-legacy-steps-shape", ".json");
+        std::fs::write(
+            &path,
+            r#"{
+                "run_id": "test-run",
+                "workflow_path": "workflow.yml",
+                "initial_prompt": "hi",
+                "vars": {},
+                "top_level_labels": ["a", "b"],
+                "completed_index": 1,
+                "counter": 1,
+                "current_input": "hi",
+                "steps_outputs": {"extract": {"city": "Tokyo"}},
+                "status": "failed"
+            }"#,
+        )
+        .unwrap();
+
+        let checkpoint = read(&path).unwrap();
+        assert_eq!(
+            checkpoint.steps_outputs.get("extract"),
+            Some(&serde_json::json!({"city": "Tokyo"}))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     fn checkpoint_with(top_level_labels: Vec<&str>, completed_index: usize) -> Checkpoint {
         Checkpoint {
             run_id: "test-run".to_owned(),
@@ -357,7 +392,7 @@ mod tests {
             completed_index,
             counter: completed_index,
             current_input: "hi".to_owned(),
-            steps_outputs: serde_json::Map::new(),
+            steps_outputs: crate::workflow::StepOutputs::new(),
             status: RunStatus::Failed,
         }
     }

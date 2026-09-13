@@ -147,7 +147,13 @@ pub(crate) struct RunContext {
     pub(crate) services: Arc<AppServices>,
     cancellation: CancellationSource,
     pub(crate) usage: usage::UsageTally,
-    pub(crate) vars: serde_json::Map<String, serde_json::Value>,
+    // `workflow::StepOutputs` (not a plain `serde_json::Map`) even though
+    // this is `$vars`/`{{ vars.* }}`, not step output: both share the same
+    // copy-on-write-over-`Arc` type (see its doc comment), and `vars` is set
+    // once per run by `with_vars` and never mutated afterward, so every jq
+    // call's `vars.clone()` (`jq::run_cancellable_async`) becomes a refcount
+    // bump instead of a deep copy of a value that was never going to change.
+    pub(crate) vars: workflow::StepOutputs,
     pub(super) policy: RunPolicy,
     pub(crate) always_approved_tools: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Serializes interactive tool approval across every tool loop that
@@ -166,7 +172,7 @@ impl RunContext {
             services,
             cancellation: CancellationSource::new(root_cancel),
             usage: usage::UsageTally::default(),
-            vars: serde_json::Map::new(),
+            vars: workflow::StepOutputs::new(),
             policy: RunPolicy::default(),
             always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
             approval_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -174,7 +180,7 @@ impl RunContext {
     }
 
     pub(crate) fn with_vars(mut self, vars: serde_json::Map<String, serde_json::Value>) -> Self {
-        self.vars = vars;
+        self.vars = vars.into();
         self
     }
 

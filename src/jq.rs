@@ -25,7 +25,7 @@ use jaq_core::{
     unwrap_valr,
 };
 use jaq_json::{Val, read};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{async_io, template};
 
@@ -141,8 +141,65 @@ const MAX_VALUE_DEPTH: usize = 1024;
 /// Named step outputs recorded by `id` (see `workflow::StepOutputs`), exposed
 /// to jq filters as the `$steps` global variable (e.g. `$steps.extract.city`).
 /// The same type also holds `--var KEY=VALUE` overrides exposed as `$vars`
-/// (e.g. `$vars.lang`) — both are flat JSON objects keyed by name.
-pub(crate) type Steps = serde_json::Map<String, serde_json::Value>;
+/// (e.g. `$vars.lang`, see `engine::RunContext::vars`) — both are flat JSON
+/// objects keyed by name.
+///
+/// Copy-on-write over an `Arc`, not a plain `serde_json::Map`: a `for_each`
+/// item/`parallel` branch/`loop` iteration each need their own independent
+/// view of the accumulated step outputs so far (see `workflow::exec`'s
+/// `record_step_output`, this type's one write path), and every jq call
+/// (`when:`/`jq:`/`for_each.items`/every `join`) previously paid a full deep
+/// clone of that accumulated map just to hand a worker thread an owned copy
+/// it only ever reads (`run_cancellable_async` below). `Deref` makes reads
+/// (`.get`, iteration, `RenderScope::new`'s `&serde_json::Map` parameter via
+/// coercion, ...) transparent; `DerefMut` goes through `Arc::make_mut`, so a
+/// `.clone()` while the `Arc` is shared (concurrent branches/items) still
+/// isolates them exactly as before, but a clone with no other holder (the
+/// overwhelmingly common case: sequential steps, `execute_sequential_items`,
+/// the post-take rebind in `execute_loop`) is a refcount bump instead of a
+/// deep copy. `#[serde(transparent)]` keeps the on-disk `Checkpoint`
+/// (de)serialization byte-for-byte identical to the plain-`Map` shape used
+/// before this type existed — a checkpoint written by an older build must
+/// still resume-load.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct Steps(Arc<serde_json::Map<String, serde_json::Value>>);
+
+impl Steps {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Borrows the underlying flat JSON object as a concrete
+    /// `&serde_json::Map`, for call sites (`Val::deserialize` below) whose
+    /// generic trait bound needs a concrete `Deserializer` type spelled out
+    /// rather than relying on `Deref`-based coercion — coercion only fires
+    /// against a caller's already-concrete expected type, not against an
+    /// unresolved generic parameter.
+    fn as_map(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Steps {
+    type Target = serde_json::Map<String, serde_json::Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Steps {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl From<serde_json::Map<String, serde_json::Value>> for Steps {
+    fn from(map: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self(Arc::new(map))
+    }
+}
 
 /// Runs a jq filter while allowing a caller that owns the evaluation worker
 /// to request a cooperative stop.  jaq evaluates filters lazily, so checking
@@ -473,7 +530,7 @@ where
 /// tree's depth/heap estimate directly — is now this function's only limit,
 /// same as it already is for the jq input value in `run_filter_with`.
 fn parse_global_var(value: &Steps, label: &str) -> Result<Val> {
-    let parsed = Val::deserialize(value)
+    let parsed = Val::deserialize(value.as_map())
         .map_err(|error| anyhow!("failed to convert {label} data to a jq value: {error}"))?;
     validate_value_structure(&parsed)
         .with_context(|| format!("jq '{label}' structure exceeds the configured memory limit"))?;
