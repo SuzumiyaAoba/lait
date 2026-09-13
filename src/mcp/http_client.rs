@@ -61,6 +61,18 @@ impl From<reqwest::Error> for LimitedHttpClientError {
     }
 }
 
+/// Lifts a `reqwest::Error` into this transport's error type in the two
+/// steps every request/chunk/status result below needs: wrap it as
+/// [`LimitedHttpClientError::Request`] (via the `From` impl above), then as
+/// `StreamableHttpError::Client`. `send`, the SSE/body reader, and both
+/// `post_message`/`get_stream`'s `error_for_status()` check each used to
+/// spell out the same two-`map_err` chain themselves.
+fn client_error<T>(
+    result: Result<T, reqwest::Error>,
+) -> Result<T, StreamableHttpError<LimitedHttpClientError>> {
+    result.map_err(|error| StreamableHttpError::Client(error.into()))
+}
+
 /// A reqwest-backed rmcp client with a finite budget for every HTTP response.
 /// The stock rmcp adapter parses JSON responses with `Response::json()`, which
 /// has no byte limit. Keeping this small adapter here lets us reject a large
@@ -101,9 +113,7 @@ impl LimitedHttpClient {
             _ = cancellation.cancelled() => Err(StreamableHttpError::Client(
                 LimitedHttpClientError::Cancelled,
             )),
-            response = request.send() => response
-                .map_err(LimitedHttpClientError::Request)
-                .map_err(StreamableHttpError::Client),
+            response = request.send() => client_error(response),
         }
     }
 
@@ -242,9 +252,7 @@ impl LimitedHttpClient {
             }
             chunk = stream.next() => chunk,
         } {
-            let chunk = chunk
-                .map_err(LimitedHttpClientError::Request)
-                .map_err(StreamableHttpError::Client)?;
+            let chunk = client_error(chunk)?;
             let Some(next_total) = total.checked_add(chunk.len()) else {
                 return Err(StreamableHttpError::Client(
                     LimitedHttpClientError::BodyTooLarge {
@@ -461,10 +469,7 @@ impl StreamableHttpClient for LimitedHttpClient {
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }
-        let response = response
-            .error_for_status()
-            .map_err(LimitedHttpClientError::Request)
-            .map_err(StreamableHttpError::Client)?;
+        let response = client_error(response.error_for_status())?;
         self.drain_body(response).await
     }
 
@@ -515,10 +520,7 @@ impl StreamableHttpClient for LimitedHttpClient {
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
-        let response = response
-            .error_for_status()
-            .map_err(LimitedHttpClientError::Request)
-            .map_err(StreamableHttpError::Client)?;
+        let response = client_error(response.error_for_status())?;
         match response.headers().get(reqwest::header::CONTENT_TYPE) {
             Some(value)
                 if value

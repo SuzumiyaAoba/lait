@@ -110,27 +110,12 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let path = crate::test_support::unique_temp_path("lait-storage", "");
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn concurrent_writers_publish_complete_snapshots_and_leave_no_temporary_files() {
-        let dir = TempDir::new();
-        let path = dir.0.join("snapshot.json");
+        let dir = TempDir::new("lait-storage");
+        let path = dir.path().join("snapshot.json");
         write_atomic(&path, &[0; 8192]).unwrap();
         std::thread::scope(|scope| {
             let barrier = std::sync::Barrier::new(8);
@@ -149,16 +134,16 @@ mod tests {
                 });
             }
         });
-        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
     fn failed_publication_cleans_up_its_temporary_file() {
-        let dir = TempDir::new();
-        let path = dir.0.join("directory");
+        let dir = TempDir::new("lait-storage");
+        let path = dir.path().join("directory");
         fs::create_dir(&path).unwrap();
         assert!(write_atomic(&path, b"payload").is_err());
         assert!(path.is_dir());
-        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

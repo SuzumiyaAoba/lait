@@ -397,15 +397,16 @@ mod tests {
     use super::expand_test_targets_with_cancellation;
     use std::path::PathBuf;
 
+    /// Unlike [`crate::test_support::TempDir`], returns a bare `PathBuf`
+    /// with no `Drop`-based cleanup: every caller here already removes its
+    /// own directory explicitly (`std::fs::remove_dir_all(&dir).ok()`) at
+    /// the end of the test, and several pass `dir` around by value
+    /// (`dir.clone()`, `std::slice::from_ref(&dir)`) in ways a guard type
+    /// would need unwrapping at each call site for no benefit. Still shares
+    /// `unique_temp_path`'s process/time/counter-unique naming instead of
+    /// rolling its own.
     fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "lait-test-run-test-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path(&format!("lait-test-run-test-{name}"), "");
         std::fs::create_dir_all(&path).unwrap();
         path
     }

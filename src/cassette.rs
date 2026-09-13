@@ -161,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn saves_and_loads_a_cassette_entry() {
-        let dir = tempfile_dir();
+        let dir = crate::test_support::TempDir::new("lait-cassette-test");
         let response = sample_response("hello");
         save(
             dir.path(),
@@ -190,7 +190,7 @@ mod tests {
     /// `async_io::read_to_string_sync_rejects_a_file_beyond_max_read_bytes`.
     #[tokio::test]
     async fn load_rejects_a_cassette_entry_beyond_max_read_bytes() {
-        let dir = tempfile_dir();
+        let dir = crate::test_support::TempDir::new("lait-cassette-test");
         std::fs::write(
             dir.path().join("big-key.json"),
             vec![b'a'; crate::async_io::MAX_READ_BYTES + 1],
@@ -208,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_fails_clearly_when_the_key_has_no_cassette() {
-        let dir = tempfile_dir();
+        let dir = crate::test_support::TempDir::new("lait-cassette-test");
         let error = load(dir.path(), "missing-key", "model-a", None)
             .await
             .unwrap_err();
@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_reports_a_parse_failure_distinctly_from_a_missing_entry() {
-        let dir = tempfile_dir();
+        let dir = crate::test_support::TempDir::new("lait-cassette-test");
         std::fs::write(dir.path().join("bad-key.json"), "not json").unwrap();
         let error = load(dir.path(), "bad-key", "model-a", None)
             .await
@@ -229,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_creates_missing_directories() {
-        let dir = tempfile_dir();
+        let dir = crate::test_support::TempDir::new("lait-cassette-test");
         let nested = dir.path().join("nested").join("cassettes");
         let response = sample_response("hi");
         save(
@@ -246,37 +246,5 @@ mod tests {
         .await
         .expect("save should create missing directories");
         assert!(nested.join("k.json").is_file());
-    }
-
-    /// A minimal `tempfile`-free temporary directory helper for this
-    /// module's unit tests (which, unlike `tests/*.rs` integration tests,
-    /// cannot reach `tests/support`'s fixture helpers) — a process/time
-    /// unique path under `std::env::temp_dir()`, removed when the guard
-    /// drops.
-    struct TempDir(std::path::PathBuf);
-
-    impl TempDir {
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn tempfile_dir() -> TempDir {
-        let path = std::env::temp_dir().join(format!(
-            "lait-cassette-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).expect("failed to create temp dir for test");
-        TempDir(path)
     }
 }

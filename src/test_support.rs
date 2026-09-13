@@ -25,6 +25,32 @@ pub(crate) fn unique_temp_path(prefix: &str, suffix: &str) -> std::path::PathBuf
     ))
 }
 
+/// A `tempfile`-free real directory, removed when it drops, backed by
+/// [`unique_temp_path`] — for a `#[cfg(test)]` module that needs an actual
+/// directory to read/write files under (not just the current directory
+/// swapped out from under it, which is what [`in_temp_dir`] gives instead).
+/// `cassette` and `storage` each used to keep an identical copy of this
+/// struct-plus-`Drop` pair as a private test-module type.
+pub(crate) struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    pub(crate) fn new(label: &str) -> Self {
+        let path = unique_temp_path(label, "");
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 struct DirectoryGuard {
     original: std::path::PathBuf,
     temporary: std::path::PathBuf,
