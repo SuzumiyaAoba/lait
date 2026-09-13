@@ -1005,10 +1005,7 @@ mod tests {
         .expect("stream_response should return promptly once cancelled, not hang");
 
         let error = result.expect_err("a cancelled stream should be reported as an error");
-        assert!(
-            error.downcast_ref::<crate::error::Interrupted>().is_some(),
-            "{error}"
-        );
+        assert!(crate::error::is_interrupted(&error), "{error}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::{
     cli::DoctorArgs,
     config::{self, ApiKeySource, ConfigFile, ConfigSource},
     engine::AppServices,
+    error::is_interrupted,
     llm, mcp,
 };
 
@@ -533,12 +534,6 @@ fn connectivity_step<T>(
     }
 }
 
-fn is_interrupted(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<crate::error::Interrupted>())
-}
-
 async fn await_with_cancellation<T, E>(
     future: impl Future<Output = std::result::Result<T, E>>,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
@@ -712,6 +707,7 @@ mod tests {
     };
     use crate::config::{ApiKeySource, CommandSpec, ConfigFile};
     use crate::engine::AppServices;
+    use crate::error::is_interrupted;
     use std::sync::Arc;
 
     fn parse_config(yaml: &str) -> ConfigFile {
@@ -885,11 +881,7 @@ models:
             .await
             .unwrap_err();
 
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>())
-        );
+        assert!(is_interrupted(&error));
         assert!(
             checks.is_empty(),
             "cancellation must not be absorbed as a check"

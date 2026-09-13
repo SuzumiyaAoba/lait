@@ -301,9 +301,7 @@ mod tests {
             .unwrap_err();
         assert!(result.to_string().contains("cancel"), "error: {result}");
         assert!(
-            result
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            crate::error::is_interrupted(&result),
             "cancellation should remain typed: {result:#}"
         );
 

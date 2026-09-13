@@ -168,7 +168,7 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         cancelled.store(true, std::sync::atomic::Ordering::Release);
         let error = worker.join().unwrap().expect_err("lock wait must cancel");
-        assert!(error.downcast_ref::<crate::error::Interrupted>().is_some());
+        assert!(crate::error::is_interrupted(&error));
         drop(held);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
         let _ = std::fs::remove_file(path);

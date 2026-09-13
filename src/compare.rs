@@ -17,6 +17,7 @@ use crate::{
         AppServices, CapabilityOverrides, EndpointOverrides, PromptTurn, RunContext,
         SamplingOverrides, resolve_request_settings,
     },
+    error::missing_prompt_error,
     response, signal,
 };
 
@@ -48,7 +49,7 @@ pub(crate) async fn run(
     let prompt =
         chat::resolve_input_with_stdin_cancellable(args.prompt.clone(), Some(cancel.clone()))
             .await?
-            .ok_or_else(crate::app::missing_prompt_error)?;
+            .ok_or_else(missing_prompt_error)?;
 
     let sampling = SamplingOverrides {
         reasoning_effort: args.reasoning_effort,

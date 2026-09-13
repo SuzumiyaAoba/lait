@@ -19,6 +19,7 @@ use crate::{
     cli::{TestArgs, TestFormat},
     config::{self, ConfigFile, ConfigSource},
     engine::{AppServices, RunContext},
+    error::is_interrupted,
     signal, storage,
     workflow::{
         self, WorkflowScope,
@@ -257,10 +258,7 @@ fn cancel_is_active(
     error: &anyhow::Error,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> bool {
-    cancellation.is_cancelled()
-        && error
-            .chain()
-            .any(|cause| cause.is::<crate::error::Interrupted>())
+    cancellation.is_cancelled() && is_interrupted(error)
 }
 
 async fn run_test_file_inner(
@@ -268,15 +266,8 @@ async fn run_test_file_inner(
     file_config: &Arc<ConfigFile>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
-    let contents = crate::async_io::read_to_string_cancellable(
-        path,
-        Some(cancel.clone()),
-        crate::async_io::MAX_READ_BYTES,
-    )
-    .await
-    .with_context(|| format!("failed to read test definition '{}'", path.display()))?;
-    let definition: TestDefinition = serde_yaml::from_str(&contents)
-        .with_context(|| format!("failed to parse test definition '{}'", path.display()))?;
+    let definition: TestDefinition =
+        storage::read_and_parse_yaml(path, "test", Some(cancel.clone())).await?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let workflow_path = base_dir.join(&definition.workflow);
     let replay_dir = base_dir.join(&definition.replay);

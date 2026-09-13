@@ -797,9 +797,7 @@ mod tests {
         .expect("the deadline must remain observable after both readers finish")
         .expect_err("the sleeping child should time out");
         assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            crate::error::is_interrupted(&error),
             "timeout should retain its typed interruption: {error:#}"
         );
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");

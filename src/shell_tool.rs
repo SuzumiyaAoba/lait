@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 
-use crate::{config, mcp, process, schema, template};
+use crate::{config, error::is_interrupted, mcp, process, schema, template};
 
 /// How long a tool's command may run before it's killed and the call fails,
 /// when its `tools:` entry sets no `timeout:` of its own.
@@ -203,13 +203,7 @@ pub(crate) async fn call(
         };
     match outcome {
         Ok(output) => Ok(output),
-        Err(error)
-            if error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>()) =>
-        {
-            Err(error)
-        }
+        Err(error) if is_interrupted(&error) => Err(error),
         Err(error) => Ok(format!("tool command failed: {error:#}")),
     }
 }
@@ -324,9 +318,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            is_interrupted(&error),
             "cancellation should remain typed: {error:#}"
         );
         assert!(

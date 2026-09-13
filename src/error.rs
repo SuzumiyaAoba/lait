@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use anyhow::anyhow;
 use async_openai::error::OpenAIError;
 
 /// An intentional cancellation or an elapsed execution deadline.
@@ -53,6 +54,36 @@ pub(crate) fn timed_out(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(Interrupted::timed_out(message))
 }
 
+/// Shared by `workflow_run::run_workflow` and `compare::run`: both resolve
+/// `PROMPT` the same way (`chat::resolve_input_with_stdin_cancellable`) and
+/// fail identically when neither a positional argument nor piped stdin
+/// supplied one. Lives here (rather than on either call site's own module)
+/// so `compare` doesn't need to depend on `app` just for this one error —
+/// that single-function edge used to be `compare`'s only reason to import
+/// from `app`, forming a needless `{app, compare}` dependency cycle.
+pub(crate) fn missing_prompt_error() -> anyhow::Error {
+    anyhow!("a PROMPT is required; provide one or pipe input via stdin")
+}
+
+/// Whether `error` carries an [`Interrupted`] anywhere in it — the read-side
+/// counterpart to [`cancelled`]/[`timed_out`]'s write side. Before this
+/// existed, call sites that needed to tell a genuine cancellation apart from
+/// an ordinary failure each spelled out their own
+/// `error.downcast_ref::<Interrupted>().is_some()` or, less reliably,
+/// `error.chain().any(|cause| cause.is::<Interrupted>())`.
+///
+/// Deliberately `downcast_ref`, not a manual `.chain().any(..)` walk: when
+/// `Interrupted` is attached via `.context(..)` rather than being the error
+/// itself (`process::run_process`'s cleanup-failure arm does this so the
+/// cleanup failure stays in the chain too — see its comment), anyhow's
+/// `downcast_ref` still finds it because anyhow searches context values as
+/// well as `source()` links, but a hand-rolled `.chain()` walk only sees
+/// `source()` links and misses it. This is exactly `classify`'s existing
+/// check, pulled out so every other call site gets it right too.
+pub(crate) fn is_interrupted(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Interrupted>().is_some()
+}
+
 /// Clap owns usage errors (2); the signal handler owns SIGINT (130).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitKind {
@@ -77,7 +108,7 @@ pub(crate) fn classify(error: &anyhow::Error, is_lint: bool) -> ExitKind {
     if is_lint {
         return ExitKind::Validation;
     }
-    if error.downcast_ref::<Interrupted>().is_some() {
+    if is_interrupted(error) {
         return ExitKind::Interrupted;
     }
     if error.chain().any(|cause| cause.is::<OpenAIError>()) {
@@ -113,6 +144,18 @@ mod tests {
                 ExitKind::General
             );
         }
+    }
+
+    #[test]
+    fn is_interrupted_finds_the_marker_anywhere_in_the_chain() {
+        let bare = anyhow::Error::new(Interrupted::cancelled("停止"));
+        assert!(is_interrupted(&bare));
+
+        let wrapped = anyhow::anyhow!("cleanup failed").context(Interrupted::timed_out("期限"));
+        assert!(is_interrupted(&wrapped));
+
+        let unrelated = anyhow::anyhow!("cannot open cancelled.yml");
+        assert!(!is_interrupted(&unrelated));
     }
 
     #[test]

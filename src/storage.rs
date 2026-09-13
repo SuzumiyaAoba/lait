@@ -1,4 +1,6 @@
-//! Atomic publication of complete local snapshots (cache, cassette, checkpoint).
+//! Atomic publication of complete local snapshots (cache, cassette, checkpoint),
+//! plus the shared "read a whole small YAML file, then parse it" step
+//! definition files (`test`/`eval`) use to load themselves.
 
 use std::{
     fs::{self, OpenOptions},
@@ -8,6 +10,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
+use tokio_util::sync::CancellationToken;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -26,6 +30,28 @@ pub(crate) fn read_dir_context(path: &Path) -> String {
 }
 pub(crate) fn create_dir_context(path: &Path) -> String {
     format!("failed to create directory '{}'", path.display())
+}
+
+/// Reads `path` as UTF-8 (cancellable, size-bounded the same as every other
+/// file this crate loads — see `async_io::MAX_READ_BYTES`) and parses it as
+/// YAML into `T`. `kind` names the definition in both error messages
+/// ("failed to {read,parse} {kind} definition '<path>'"), matching the
+/// wording `test_run`/`eval` each used to spell out independently — down to
+/// the same two `with_context` calls — for their own definition file.
+pub(crate) async fn read_and_parse_yaml<T: DeserializeOwned>(
+    path: &Path,
+    kind: &str,
+    cancellation: Option<CancellationToken>,
+) -> Result<T> {
+    let contents = crate::async_io::read_to_string_cancellable(
+        path,
+        cancellation,
+        crate::async_io::MAX_READ_BYTES,
+    )
+    .await
+    .with_context(|| format!("failed to read {kind} definition '{}'", path.display()))?;
+    serde_yaml::from_str(&contents)
+        .with_context(|| format!("failed to parse {kind} definition '{}'", path.display()))
 }
 
 struct PendingFile(PathBuf);

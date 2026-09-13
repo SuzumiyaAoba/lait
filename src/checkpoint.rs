@@ -479,9 +479,7 @@ mod tests {
             .expect("cancellable checkpoint load should finish promptly")
             .expect_err("a checkpoint FIFO without a writer should be cancelled");
         assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>()),
+            crate::error::is_interrupted(&error),
             "checkpoint cancellation should remain typed: {error:#}"
         );
         std::fs::remove_file(path).expect("checkpoint FIFO should be removable");

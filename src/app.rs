@@ -40,13 +40,19 @@ use crate::{
         RequestSettings, RunContext, SamplingOverrides, agent_file_settings, call_agent,
         resolve_request_settings,
     },
-    history, lint, prompt, repl, report, response, schema, skill, subagent, template, test_run,
-    usage,
+    error, history, lint, prompt, repl, report, response, schema, skill, subagent, template,
+    test_run, usage,
     workflow::{self, exec::announce_named_file},
 };
 
 mod workflow_run;
 use workflow_run::run_workflow;
+
+/// Re-exported so `workflow_run::run_workflow` (a descendant module, via
+/// `super::missing_prompt_error`) keeps its existing reference path — the
+/// function itself lives in `error` now so `compare`, a sibling of `app`,
+/// doesn't need to depend on `app` just to call it.
+pub(crate) use error::missing_prompt_error;
 
 /// Every subcommand (and the bare, no-subcommand invocation) that never
 /// awaits anything — no model request, no MCP connection — grouped by
@@ -706,15 +712,6 @@ async fn run_chat(
 /// neither a positional argument nor piped stdin supplied one.
 fn missing_input_error() -> anyhow::Error {
     anyhow!("an INPUT is required; provide one or pipe input via stdin")
-}
-
-/// Shared by `workflow_run::run_workflow` and `compare::run`: both resolve
-/// `PROMPT` the same way (`chat::resolve_input_with_stdin_cancellable`) and
-/// fail identically when neither a positional argument nor piped stdin
-/// supplied one. `pub(crate)` (unlike [`missing_input_error`]) because
-/// `compare` is a sibling module of `app`, not a descendant.
-pub(crate) fn missing_prompt_error() -> anyhow::Error {
-    anyhow!("a PROMPT is required; provide one or pipe input via stdin")
 }
 
 /// Runs `lait prompt run <NAME> [INPUT]` (`lait prompt list` is handled

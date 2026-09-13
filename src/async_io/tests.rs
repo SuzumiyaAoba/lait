@@ -717,6 +717,6 @@ async fn waiting_for_a_fifo_writer_needs_only_read_permission() {
         .await
         .unwrap()
         .unwrap_err();
-    assert!(error.downcast_ref::<crate::error::Interrupted>().is_some());
+    assert!(crate::error::is_interrupted(&error));
     std::fs::remove_file(path).unwrap();
 }

@@ -281,9 +281,6 @@ mod tests {
         .await
         .expect_err("cancelled stream should fail");
 
-        assert!(
-            error.downcast_ref::<crate::error::Interrupted>().is_some(),
-            "{error}"
-        );
+        assert!(crate::error::is_interrupted(&error), "{error}");
     }
 }

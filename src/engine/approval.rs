@@ -336,11 +336,7 @@ mod tests {
             .expect("a cancelled approval owner must return promptly")
             .unwrap()
             .unwrap_err();
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>())
-        );
+        assert!(crate::error::is_interrupted(&error));
         assert!(
             gate.clone().try_lock_owned().is_err(),
             "the cancelled worker must retain the approval gate while blocked"

@@ -281,12 +281,7 @@ mod tests {
             .expect("cancelling a running command must return promptly")
             .unwrap()
             .unwrap_err();
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>()),
-            "{error:#}"
-        );
+        assert!(crate::error::is_interrupted(&error), "{error:#}");
 
         for _ in 0..100 {
             // `kill(pid, 0)` only probes existence and does not signal the
@@ -325,7 +320,7 @@ mod tests {
             .resolve(&source, Some(cancellation.clone()))
             .await
             .unwrap_err();
-        assert!(error.downcast_ref::<crate::error::Interrupted>().is_some());
+        assert!(crate::error::is_interrupted(&error));
         assert!(!marker.exists(), "a pre-cancelled command must not run");
 
         let error = resolver
@@ -335,7 +330,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.downcast_ref::<crate::error::Interrupted>().is_some());
+        assert!(crate::error::is_interrupted(&error));
 
         let command = ApiKeySource::Command(CommandSpec::Shell("printf cached-value".to_owned()));
         assert_eq!(
@@ -346,7 +341,7 @@ mod tests {
             .resolve(&command, Some(cancellation))
             .await
             .unwrap_err();
-        assert!(error.downcast_ref::<crate::error::Interrupted>().is_some());
+        assert!(crate::error::is_interrupted(&error));
         std::fs::remove_file(marker).ok();
     }
 
@@ -397,11 +392,7 @@ mod tests {
             cancelled_at.elapsed() < Duration::from_millis(500),
             "waiter cancellation was not prompt"
         );
-        assert!(
-            waiter_error
-                .downcast_ref::<crate::error::Interrupted>()
-                .is_some()
-        );
+        assert!(crate::error::is_interrupted(&waiter_error));
 
         let value = tokio::time::timeout(Duration::from_secs(3), initializer)
             .await

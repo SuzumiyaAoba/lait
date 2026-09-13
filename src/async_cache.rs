@@ -123,10 +123,6 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<crate::error::Interrupted>())
-        );
+        assert!(crate::error::is_interrupted(&error));
     }
 }

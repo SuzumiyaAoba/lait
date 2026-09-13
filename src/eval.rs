@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use futures_util::StreamExt;
 use serde::Deserialize;
 
@@ -23,7 +23,7 @@ use crate::{
         AppServices, CapabilityOverrides, EndpointOverrides, PromptTurn, RequestSettings,
         RunContext, SamplingOverrides, resolve_request_settings,
     },
-    response, signal, template,
+    response, signal, storage, template,
     workflow::{
         self, WorkflowScope,
         exec::{RunStepsFrame, run_steps},
@@ -299,15 +299,8 @@ pub(crate) async fn run(
     let file_config =
         Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
 
-    let contents = crate::async_io::read_to_string_cancellable(
-        &args.file,
-        Some(cancel.clone()),
-        crate::async_io::MAX_READ_BYTES,
-    )
-    .await
-    .with_context(|| format!("failed to read eval definition '{}'", args.file.display()))?;
-    let definition: EvalDefinition = serde_yaml::from_str(&contents)
-        .with_context(|| format!("failed to parse eval definition '{}'", args.file.display()))?;
+    let definition: EvalDefinition =
+        storage::read_and_parse_yaml(&args.file, "eval", Some(cancel.clone())).await?;
     let base_dir = args.file.parent().unwrap_or_else(|| Path::new("."));
 
     let target = load_target(

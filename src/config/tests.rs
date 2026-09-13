@@ -56,9 +56,7 @@ async fn cancellable_config_load_stops_waiting_for_a_fifo() {
         .expect("cancellable config load should finish promptly")
         .expect_err("a config FIFO without a writer should be cancelled");
     assert!(
-        error
-            .chain()
-            .any(|cause| cause.is::<crate::error::Interrupted>()),
+        crate::error::is_interrupted(&error),
         "config cancellation should remain typed: {error:#}"
     );
     std::fs::remove_file(path).expect("config FIFO should be removable");
