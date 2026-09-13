@@ -3,11 +3,12 @@
 //! public entry points every caller — chat, `lait prompt`, `lait agent run`,
 //! a workflow node — goes through to build a [`RequestSettings`]), plus the
 //! fallback machinery ([`is_fallback_eligible`], [`EndpointAttempt`],
-//! `RequestSettings::advance_to_next_candidate`) that `complete_recorded`/
-//! `stream_endpoint` in the parent module drive their retry loop with.
-//! `RequestSettings` itself, and the rest of its `impl` block (`request`,
-//! `complete`, `complete_stream`), stay in the parent module — they're the
-//! request/response pipeline this module only feeds settings into.
+//! `RequestSettings::advance_to_next_candidate`) that `transport::
+//! complete_recorded`/`transport::stream_endpoint` (a sibling module) drive
+//! their retry loop with. `RequestSettings` itself stays in the parent
+//! module; the rest of its `impl` block (`request`, `complete`,
+//! `complete_stream`) lives in `transport` — they're the request/response
+//! pipeline this module only feeds settings into.
 
 use anyhow::{Result, anyhow};
 use async_openai::error::OpenAIError;
