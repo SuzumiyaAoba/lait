@@ -11,7 +11,7 @@
 //! and per-value) with cooperative cancellation and `try_reserve_exact`. The
 //! overlap is the ~10 lines of bounds-checking arithmetic; sharing it would
 //! cost `mcp.rs` three unused fields and its own `with_context`-attached
-//! error text (see the design plan's C7 note).
+//! error text.
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;

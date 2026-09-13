@@ -85,7 +85,7 @@ pub(crate) fn emit_output(
 
 /// Writes a `run_prompt`/`run_agent`/`run_workflow` response body per
 /// `-o`/`--render`/`--json` (`cli::OutputArgs`, extended to these three entry
-/// points by the design plan's B-2). `--json`'s shape
+/// points from chat's own `-o`/`--render`/`--json`). `--json`'s shape
 /// (`response::render_text_json`) matches chat's own `--json`, so the flag
 /// means the same thing everywhere it appears; `--render` is ignored when
 /// combined with `--json`, matching [`emit_output`]'s chat behavior.

@@ -341,9 +341,9 @@ mod tests {
         }
     }
 
-    /// The table-driven test the design plan's B3 requires before merging:
-    /// clap's derive doesn't enumerate `Command`'s variants for us, so this
-    /// table is the only thing that actually exercises every one of them
+    /// The table-driven test that guards `classify`'s exhaustiveness: clap's
+    /// derive doesn't enumerate `Command`'s variants for us, so this table is
+    /// the only thing that actually exercises every one of them
     /// (`tests/man.rs` only covers 8 of ~23 — see its own comment). Every
     /// top-level subcommand appears at least once, `models`/`prompt`/`agent`
     /// each appear in both of their lanes (the three variants `classify`

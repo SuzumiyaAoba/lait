@@ -6,14 +6,15 @@
 //! (`append_relative`, `open_relative`, `path_exists_relative`,
 //! `directory_exists_relative`, `remove_relative`, `read_dir_relative`).
 //! Collapsing them behind a `trait SafeFs` with two implementations was
-//! considered (see the design plan's A-6) and deliberately not done: this
-//! repo's CI (`ci.yml`) builds ubuntu-latest only, and Windows is compiled
-//! solely by the release workflow — so a semantic mistake introduced in the
-//! `#[cfg(not(unix))]` arm while restructuring it (as opposed to a syntax
-//! error, which `cargo check` still parses and would still catch) would be
-//! invisible until a tag build, with no local or PR-time way to check it
-//! here. The cosmetic win of one trait over six already-correct,
-//! already-documented cfg pairs doesn't justify that risk. `open_relative`
+//! considered and deliberately not done: `ci.yml`'s `native-locks` job does
+//! compile this crate for `windows-latest` (it runs `file_lock::`/
+//! `async_io::` tests there), but it never runs a `jsonl::` test on that
+//! runner — so a semantic mistake introduced in the `#[cfg(not(unix))]` arm
+//! while restructuring it (as opposed to a syntax error, which `cargo check`
+//! still parses and would still catch) would be invisible until a tag build,
+//! with no local or PR-time way to check it here. The cosmetic win of one
+//! trait over six already-correct, already-documented cfg pairs doesn't
+//! justify that risk. `open_relative`
 //! (opens a file without reading it) replaced an earlier `read_relative`
 //! pair once every whole-file reader here started building on it instead —
 //! see `read_or_empty`'s and `load_rev`'s doc comments.

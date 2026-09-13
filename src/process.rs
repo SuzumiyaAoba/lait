@@ -275,8 +275,10 @@ struct ProcessRun<'a> {
 /// as four separate `let mut` bindings) purely to give the loop's "have we
 /// collected everything yet?" check and the post-loop conversion into
 /// [`CapturedOutput`] a named home; the `tokio::select!` loop itself is not
-/// restructured (see the design plan's C5 note on why splitting it further
-/// risks a race).
+/// restructured further — splitting the `select!` arms themselves out of the
+/// loop body risks a race between the branches it currently evaluates
+/// together (`biased;` ordering and each arm's `if` guard depend on being
+/// re-evaluated against the same snapshot of `outcome` every iteration).
 #[derive(Default)]
 struct ProcessOutcome {
     child_status: Option<Result<ExitStatus>>,

@@ -2,9 +2,9 @@
 //! environment-variable expansion. `resolve_endpoint`/`resolve_fallback_endpoint`
 //! and the `expand_*` helpers are entangled (an endpoint's base URL/API key
 //! layers are each expanded only after the layer wins — see
-//! `resolve_endpoint`'s own doc comment) — kept in one file rather than the
-//! design plan's earlier `config/expand.rs` split, which would have cut
-//! `resolve_endpoint` in half.
+//! `resolve_endpoint`'s own doc comment) — kept in one file rather than
+//! split into a separate `config/expand.rs` for just the environment-variable
+//! expansion helpers, which would cut `resolve_endpoint` in half.
 
 use std::collections::HashMap;
 

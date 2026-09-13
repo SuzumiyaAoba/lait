@@ -1,11 +1,10 @@
 //! The `clap`-derived command-line grammar: `Cli`, its `Command` subcommand
 //! enum (one variant per top-level subcommand, `lait chat`/`lait run`/...),
 //! and each subcommand's own `*Args` struct. Deliberately kept as one file
-//! rather than split by command group (see the design plan's rejection of a
-//! `cli/` split) — the bulk of its line count is `#[derive]`/`#[arg]`
-//! attributes and field doc comments (`--help` text), not logic, so grouping
-//! by subcommand would move declarations around without reducing what a
-//! reader has to hold in mind.
+//! rather than split by command group — the bulk of its line count is
+//! `#[derive]`/`#[arg]` attributes and field doc comments (`--help` text),
+//! not logic, so grouping by subcommand would move declarations around
+//! without reducing what a reader has to hold in mind.
 //!
 //! `app::classify`/`app::run_blocking`/`app::run` are the consumers that
 //! turn a parsed `Command` into behavior; this module owns only the shape of
@@ -520,10 +519,10 @@ pub(crate) struct EndpointArgs {
 
 /// `-o`/`--render`/`--json`, shared by every subcommand that produces a
 /// single finished response body: single-shot chat, `lait run`, `lait agent
-/// run`, and `lait prompt run <NAME>`. Previously only `ChatArgs` had these (see
-/// the design plan's B-2) — `--session` is deliberately not part of this
-/// bundle, since a workflow/agent run has no single conversation turn to
-/// append a session entry for.
+/// run`, and `lait prompt run <NAME>`. Previously only `ChatArgs` had these —
+/// `--session` is deliberately not part of this bundle, since a
+/// workflow/agent run has no single conversation turn to append a session
+/// entry for.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct OutputArgs {
     /// Write the response body to PATH instead of stdout (`-o -` writes to

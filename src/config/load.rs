@@ -386,8 +386,8 @@ fn load_config_at(source: &ConfigSource, path: Option<PathBuf>) -> Result<Config
 /// injection point for the read itself was rejected instead.
 /// The read-failure context message shared by [`config_from_read_result`]/
 /// [`optional_config_from_read_result`] — previously duplicated literally at
-/// each site (see the design plan's B1 note); factored out so a future
-/// wording change can't drift between the project and global loaders.
+/// each site; factored out so a future wording change can't drift between
+/// the project and global loaders.
 fn config_read_error_context(path: &Path) -> String {
     format!(
         "failed to read YAML configuration file '{}'",

@@ -9,7 +9,7 @@
 //! `clap::ValueEnum` still derives here (so `--reasoning-effort` keeps
 //! working directly off this type), but the module's own role is "the
 //! domain type CLI happens to borrow", not "a CLI type other layers must
-//! reach into" — see the design plan's B4.
+//! reach into".
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
