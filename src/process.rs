@@ -244,6 +244,47 @@ async fn reader_failed(
     error
 }
 
+/// Shared recovery tail for the cancellation and deadline `select!` arms in
+/// `run_process`: contains the process tree, aborts every other in-flight
+/// task, and builds the error to return. The two arms differ only in their
+/// message and which `Interrupted` constructor applies (`cancelled` vs
+/// `timed_out`); everything else — including the `drop(child_wait)` each arm
+/// still does itself immediately before calling this, for the same
+/// borrow-checker reason `reader_failed` cannot swallow it either — is
+/// identical and now lives here once instead of twice. Takes the constructor
+/// rather than a pre-built `Interrupted` since the failure path needs to
+/// build a second, longer-message instance from the same variant; a single
+/// `build_interrupted` covers both the success arm (`anyhow::Error::new`,
+/// matching what `error::cancelled`/`error::timed_out` do) and the failure
+/// arm (`.context(..)`), keeping this at 7 parameters instead of 8.
+async fn interrupted_by(
+    process_tree: &CommandProcessTree,
+    child: &mut tokio::process::Child,
+    child_reaped: bool,
+    descendants_terminated: bool,
+    tasks: ProcessTasks<'_>,
+    message: String,
+    build_interrupted: fn(String) -> crate::error::Interrupted,
+) -> anyhow::Error {
+    let cleanup =
+        contain_process_tree(process_tree, child, child_reaped, descendants_terminated).await;
+    abort_process_tasks(tasks.write_stdin, tasks.read_stdout, tasks.read_stderr).await;
+    match cleanup {
+        Ok(()) => anyhow::Error::new(build_interrupted(message)),
+        // Unlike the `Ok(())` arm, this attaches `Interrupted` via
+        // `.context()` onto `error` (the cleanup failure) rather than
+        // building a standalone `anyhow::Error` — `error::classify`'s
+        // `downcast_ref::<Interrupted>()` still finds it there (see
+        // `error.rs`'s
+        // `typed_context_preserves_interruption_policy_and_underlying_cause`
+        // test), and this way the cleanup failure itself stays in the chain
+        // too, instead of being replaced by it.
+        Err(error) => error.context(build_interrupted(format!(
+            "{message}; failed to terminate its process tree"
+        ))),
+    }
+}
+
 /// Terminates descendants after the direct child has already been reaped.
 /// Retry once after yielding: on macOS a process group can briefly transition
 /// between the reader closing its pipe and the kernel reaping the last member.
@@ -466,30 +507,22 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                 }
             } => {
                 drop(child_wait);
-                let cleanup = contain_process_tree(
+                let child_reaped = outcome.child_status.as_ref().is_some_and(Result::is_ok);
+                let message = format!("{} '{program}' was cancelled", request.command_kind);
+                return Err(interrupted_by(
                     &process_tree,
                     &mut child,
-                    outcome.child_status.as_ref().is_some_and(Result::is_ok),
+                    child_reaped,
                     outcome.descendants_terminated,
+                    ProcessTasks {
+                        write_stdin: &mut write_stdin,
+                        read_stdout: &mut read_stdout,
+                        read_stderr: &mut read_stderr,
+                    },
+                    message,
+                    crate::error::Interrupted::cancelled,
                 )
-                .await;
-                abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
-                let message = format!("{} '{program}' was cancelled", request.command_kind);
-                return match cleanup {
-                    Ok(()) => Err(crate::error::cancelled(message)),
-                    // Unlike the `Ok(())` arm, this attaches `Interrupted`
-                    // via `.context()` onto `error` (the cleanup failure)
-                    // rather than building a standalone `anyhow::Error` via
-                    // `error::cancelled` — `error::classify`'s
-                    // `downcast_ref::<Interrupted>()` still finds it there
-                    // (see `error.rs`'s `typed_context_preserves_
-                    // interruption_policy_and_underlying_cause` test), and
-                    // this way the cleanup failure itself stays in the chain
-                    // too, instead of being replaced by it.
-                    Err(error) => Err(error.context(crate::error::Interrupted::cancelled(
-                        format!("{message}; failed to terminate its process tree"),
-                    ))),
-                };
+                .await);
             }
             status = &mut child_wait, if outcome.child_status.is_none() => {
                 outcome.child_status = Some(
@@ -556,23 +589,21 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
                     timeout.as_secs_f64(),
                 );
                 drop(child_wait);
-                let cleanup = contain_process_tree(
+                let child_reaped = outcome.child_status.as_ref().is_some_and(Result::is_ok);
+                return Err(interrupted_by(
                     &process_tree,
                     &mut child,
-                    outcome.child_status.as_ref().is_some_and(Result::is_ok),
+                    child_reaped,
                     outcome.descendants_terminated,
+                    ProcessTasks {
+                        write_stdin: &mut write_stdin,
+                        read_stdout: &mut read_stdout,
+                        read_stderr: &mut read_stderr,
+                    },
+                    message,
+                    crate::error::Interrupted::timed_out,
                 )
-                .await;
-                abort_process_tasks(&mut write_stdin, &mut read_stdout, &mut read_stderr).await;
-                if let Err(cleanup_error) = cleanup {
-                    // See the cancellation branch above for why this stays
-                    // `.context(Interrupted::timed_out(..))` rather than
-                    // `error::timed_out(..)`.
-                    return Err(cleanup_error.context(crate::error::Interrupted::timed_out(
-                        format!("{message}; failed to terminate its process tree"),
-                    )));
-                }
-                return Err(crate::error::timed_out(message));
+                .await);
             }
         }
 
