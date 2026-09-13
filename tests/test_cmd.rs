@@ -221,3 +221,63 @@ assert:
         "symlink aliases/cycles must not duplicate test files: {stdout}"
     );
 }
+
+/// Regression test for `lait test <DIR>` descending into a `target/` (or
+/// `node_modules/`) subdirectory the way `lait lint <DIR>` already skips —
+/// without this, `lait test <repo-root>` on a Rust project would recurse
+/// into its own build output.
+#[test]
+fn directory_discovery_skips_target_and_node_modules_directories() {
+    let scratch = scratch_with_recorded_cassette();
+    scratch.write(
+        "cases/pass.yml",
+        r#"
+workflow: ../workflow.yml
+input: "hello"
+replay: ../cassettes
+assert:
+  - type: jq
+    expr: 'contains("結論")'
+"#,
+    );
+    // Neither of these should ever be discovered: if they were, this test
+    // definition's own `workflow`/`replay` relative paths (pointing at
+    // `cases/../workflow.yml`) would resolve correctly here too, so a
+    // silent recursion wouldn't even fail loudly — it would just inflate
+    // the total count, which is exactly what this test's assertion catches.
+    scratch.write(
+        "cases/target/debug/should-not-run.yml",
+        r#"
+workflow: ../../workflow.yml
+input: "hello"
+replay: ../../cassettes
+assert:
+  - type: equals
+    value: "unexpected"
+"#,
+    );
+    scratch.write(
+        "cases/node_modules/some-pkg/should-not-run.yml",
+        r#"
+workflow: ../../workflow.yml
+input: "hello"
+replay: ../../cassettes
+assert:
+  - type: equals
+    value: "unexpected"
+"#,
+    );
+
+    let output = test_command()
+        .arg("test")
+        .arg(scratch.path().join("cases"))
+        .output()
+        .expect("failed to execute lait test");
+
+    assert!(output.status.success(), "lait test failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed, 0 failed, 1 total"),
+        "target/ and node_modules/ must be skipped like `lait lint` does: {stdout}"
+    );
+}

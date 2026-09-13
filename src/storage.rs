@@ -15,6 +15,17 @@ use tokio_util::sync::CancellationToken;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Directory names a recursive workflow-file discovery walk never descends
+/// into, even though they don't start with `.` (dot-directories, e.g.
+/// `.git`, are always skipped too by each caller's own check) — scanning
+/// them would be slow, and their `.yml`/`.yaml`/`.md` files (dependency
+/// manifests, changelogs, CI configs belonging to a vendored package, ...)
+/// are never lait workflow/test/agent files. Shared by `lint::targets`
+/// (`lait lint <DIR>`) and `test_run` (`lait test <DIR>`) — the latter used
+/// to omit this list entirely, so `lait test <repo-root>` would recurse into
+/// `target/`, a real cost for a Rust project's own build directory.
+pub(crate) const SKIPPED_DIR_NAMES: &[&str] = &["target", "node_modules"];
+
 /// Shared `with_context`/`.context` message shapes for plain filesystem
 /// reads, listings, and directory creation — the same three actions
 /// `write_atomic` below and several other modules (`cache`, `checkpoint`,

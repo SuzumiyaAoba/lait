@@ -6,14 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::storage;
-
-/// Directory names `lait lint <DIR>` never descends into, even though they
-/// don't start with `.` (dot-directories, e.g. `.git`, are always skipped
-/// too) — scanning them would be slow, and their `.yml`/`.md` files
-/// (dependency manifests, changelogs, CI configs belonging to a vendored
-/// package, ...) are never lait workflow/agent files.
-const SKIPPED_DIR_NAMES: &[&str] = &["target", "node_modules"];
+use crate::storage::{self, SKIPPED_DIR_NAMES};
 
 /// Expands `paths` (files and/or directories, as `lait lint` accepts) into
 /// the sorted, deduplicated list of files to actually lint: a file entry is
@@ -21,7 +14,7 @@ const SKIPPED_DIR_NAMES: &[&str] = &["target", "node_modules"];
 /// so that error is still reported per file); a directory entry is searched
 /// recursively for `.yml`/`.yaml` files and `.md` files that start with a
 /// `---` frontmatter delimiter (see `has_frontmatter_delimiter`), skipping
-/// `SKIPPED_DIR_NAMES` and dot-directories along the way.
+/// `storage::SKIPPED_DIR_NAMES` and dot-directories along the way.
 pub(super) fn expand_lint_targets(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for path in paths {

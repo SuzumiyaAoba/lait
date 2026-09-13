@@ -181,6 +181,12 @@ impl TestTargetCollector {
                 continue;
             }
             if file_type.is_dir() {
+                // Same skip list `lint::targets` applies to `lait lint
+                // <DIR>` — without it, `lait test <repo-root>` used to
+                // recurse into a Rust project's own `target/` directory.
+                if file_name.is_some_and(|name| storage::SKIPPED_DIR_NAMES.contains(&name)) {
+                    continue;
+                }
                 self.collect_directory(&entry_path, cancellation)?;
                 continue;
             }
