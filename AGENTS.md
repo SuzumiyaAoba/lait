@@ -19,6 +19,8 @@ cargo build --release --locked
 
 `makers run|check|test|fmt-check|clippy|build` provides the corresponding cargo-make tasks; its wrapper configures Apple Clang and the macOS SDK when needed. For the documentation site, use `cd website && pnpm dev`, `pnpm build`, `pnpm preview`, or `pnpm types:check`.
 
+A bare `cargo`/`makers` on `PATH` may not resolve to a toolchain with the `clippy` component (for example, a Nix-profile `cargo` outside the flake's dev shell) — that `cargo clippy` fails with "no such command" is a symptom of that, not of clippy being globally unavailable. This repository's `flake.nix` provides a dev shell built from `rust-toolchain.toml`, whose `components = ["rustfmt", "clippy"]` include it: `nix develop --command makers clippy` (or `nix develop`, then `makers clippy` inside the shell) runs it. Prefer that whenever a bare `cargo clippy`/`makers clippy` reports the command missing, before concluding clippy cannot be checked at all — CI's `lint` job always installs an explicit `clippy` component (`dtolnay/rust-toolchain@stable`) independently of this.
+
 ## Coding Style and Naming
 
 Use standard `rustfmt` formatting (four-space indentation) and keep Clippy warning-free. Rust modules, functions, variables, and test names use `snake_case`; types and enums use `PascalCase`; constants use `UPPER_SNAKE_CASE`. Keep TypeScript/TSX consistent with neighboring files and run the site type check after site changes.

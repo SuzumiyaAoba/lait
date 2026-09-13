@@ -26,17 +26,27 @@ pkg-fmt = "zip"
 # here. What's declared below are specific, narrow lints worth catching on
 # every local build regardless of edit-in-progress noise — verified via
 # `grep` rather than a `cargo clippy` run (clippy is not available as a
-# component in every dev environment this crate is built in).
+# component in every dev environment this crate is built in — a bare `cargo`
+# on `PATH` may lack the component even though this repo's own `flake.nix`
+# dev shell has one; see AGENTS.md's "Build, Test, and Development Commands"
+# for how to reach it, which lets these four lints be checked by running
+# clippy, not only by grep).
 [lints.clippy]
 # `src/` has zero uses of `dbg!`/`todo!`/`unimplemented!` today (verified by
 # grep across the tree, including test modules). All three are markers of
 # code that was never meant to reach a commit, so denying them locally
 # catches a leftover before it reaches review rather than waiting for CI.
 # (`.unwrap()` is deliberately not covered here: `src/` proper already has
-# zero non-test `.unwrap()` calls, but enforcing that via `clippy::unwrap_used`
-# needs a per-test-module `#[allow]` that can only be placed correctly with
-# a working `cargo clippy` to check against — not available in every dev
-# environment this crate is built in.)
+# zero non-test `.unwrap()` calls, sustained by review rather than by this
+# lint. Enabling `clippy::unwrap_used` crate-wide to guard that was
+# reconsidered once a working `cargo clippy` was available to check against
+# (see the dev-shell note above) — and rejected on the numbers it surfaced,
+# not on tooling availability: doing so would require a
+# `#[allow(clippy::unwrap_used)]` on every one of the ~40 `#[cfg(test)]`
+# modules that use `.unwrap()` freely and idiomatically on data the test
+# itself just constructed, replacing this crate's current one-`#[allow]`
+# total with dozens. That trades a real amount of noise for a lint whose
+# only enforcement surface — non-test code — is already clean without it.)
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
