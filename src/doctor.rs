@@ -138,6 +138,16 @@ async fn check_config_load(
 /// presence, MCP servers, agent/skill file references) once a config file
 /// has successfully loaded — the checks [`run`] skips entirely (with a
 /// single "skipped" warning) when [`check_config_load`] returns `None`.
+///
+/// Connectivity (an HTTP round-trip per configured endpoint, up to
+/// `CONNECTIVITY_TIMEOUT` each) and MCP servers (a child-process/HTTP
+/// handshake per server, up to `MCP_CHECK_TIMEOUT` each) are otherwise
+/// independent checks that both used to run one after the other — with a
+/// broken endpoint and a broken MCP server configured together, that paid
+/// both timeouts back to back. `try_join!` (not `join!`) runs them
+/// concurrently while still preserving the original short-circuit-on-error
+/// behavior: a genuine interruption from either side drops the other future
+/// immediately rather than waiting out its own timeout first.
 async fn run_all_checks(
     file_config: &Arc<ConfigFile>,
     cancellation: &tokio_util::sync::CancellationToken,
@@ -147,17 +157,17 @@ async fn run_all_checks(
     check_default_model(file_config, checks);
     let uses = resolve_endpoint_uses(file_config);
     let services = Arc::new(AppServices::new(Arc::clone(file_config)));
-    let server_models = services
-        .clone()
-        .finish(check_connectivity(
+    let (server_models, mcp_checks) = tokio::try_join!(
+        services.clone().finish(check_connectivity(
             &uses,
             &services,
             Some(cancellation.clone()),
             checks,
-        ))
-        .await?;
+        )),
+        async { Ok::<_, anyhow::Error>(check_mcp_servers(file_config).await) },
+    )?;
+    checks.extend(mcp_checks);
     check_models_on_server(&uses, &server_models, checks);
-    check_mcp_servers(file_config, checks).await;
     check_registry_files(file_config, checks);
     Ok(())
 }
@@ -603,13 +613,18 @@ fn check_models_on_server(
 /// one future per name, each still bounded by `MCP_CHECK_TIMEOUT` so a
 /// broken server can't make `doctor` hang, keeps that diagnostic while
 /// still connecting every server in parallel. Every connection this opens
-/// is shut down before returning, whether it succeeded or not.
-async fn check_mcp_servers(file_config: &ConfigFile, checks: &mut Vec<Check>) {
+/// is shut down before returning, whether it succeeded or not. Returns its
+/// own `Vec<Check>` (rather than appending to a shared one, as it used to)
+/// so [`run_all_checks`] can run it concurrently with [`check_connectivity`]
+/// — both need `&mut Vec<Check>` otherwise, which can't be held by two
+/// futures polled at once — mirroring the local-`Vec`-then-`extend` pattern
+/// [`check_connectivity`] already uses internally for the same reason.
+async fn check_mcp_servers(file_config: &ConfigFile) -> Vec<Check> {
     if file_config.mcp_servers.is_empty() {
-        return;
+        return Vec::new();
     }
-    let servers = Arc::new(file_config.mcp_servers.clone());
-    let registry = mcp::McpRegistry::new(Arc::clone(&servers));
+    let servers = file_config.mcp_servers.clone();
+    let registry = mcp::McpRegistry::new(servers.clone());
 
     let mut names: Vec<&String> = servers.keys().collect();
     names.sort_unstable();
@@ -648,9 +663,9 @@ async fn check_mcp_servers(file_config: &ConfigFile, checks: &mut Vec<Check>) {
         }
     }))
     .await;
-    checks.extend(server_checks);
 
     registry.shutdown().await;
+    server_checks
 }
 
 /// Checks 7. every `agents:`/`skills:` entry's path actually exists — issue

@@ -77,7 +77,7 @@ impl LoadedAgent {
 /// calls within one round — see `engine::RequestSettings::complete`) racing
 /// on the same path share one load instead of two.
 pub(crate) struct AgentRegistry {
-    agents_map: Arc<config::AgentMap>,
+    agents_map: config::AgentMap,
     loaded: AsyncCache<PathBuf, LoadedAgent>,
 }
 
@@ -110,7 +110,7 @@ impl ToolSet {
 }
 
 impl AgentRegistry {
-    pub(crate) fn new(agents_map: Arc<config::AgentMap>) -> Self {
+    pub(crate) fn new(agents_map: config::AgentMap) -> Self {
         Self {
             agents_map,
             loaded: AsyncCache::new(),
@@ -247,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn errors_on_an_unknown_subagent_name() {
-        let agents_map: config::AgentMap = StdHashMap::new();
+        let agents_map: StdHashMap<String, std::path::PathBuf> = StdHashMap::new();
         let registry = AgentRegistry::new(Arc::new(agents_map));
         let error = registry
             .load_cancellable("missing", None)
@@ -273,7 +273,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let agents_map: config::AgentMap = StdHashMap::new();
+        let agents_map: StdHashMap<String, std::path::PathBuf> = StdHashMap::new();
         let registry = AgentRegistry::new(Arc::new(agents_map));
 
         // A token of its own that's never cancelled: this caller becomes the

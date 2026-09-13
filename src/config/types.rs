@@ -9,7 +9,7 @@
 //! inputs/outputs) — the same hazard `lint/report.rs`'s doc notes for the
 //! unrelated top-level `crate::report`.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
@@ -273,8 +273,17 @@ impl DefaultSettings {
 }
 
 /// A map of `mcp_servers:` name to its connection settings, as used by
-/// `lait.config.yml`'s top-level `mcp_servers:`.
-pub(crate) type McpServerMap = HashMap<String, McpServerConfig>;
+/// `lait.config.yml`'s top-level `mcp_servers:`. `Arc`-wrapped (not a bare
+/// `HashMap`) so `AppServices::new`/`doctor::check_mcp_servers` — both
+/// called once per invocation, but each `.clone()`d off `ConfigFile` at
+/// least once — only ever bump a refcount instead of deep-copying every
+/// configured server's connection settings. `serde` deserializes into
+/// `Arc<T>` transparently, so `#[serde(default)]` and direct YAML parsing
+/// are unaffected; the only sites that needed to change are the two places
+/// that mutate or merge these maps in place (`config::load`'s
+/// `resolve_registry_paths_in_place`/`merge_config`), via `Arc::make_mut`
+/// and a small `Arc`-aware counterpart to `merge_maps`.
+pub(crate) type McpServerMap = Arc<HashMap<String, McpServerConfig>>;
 
 /// One `mcp_servers:` entry. Exactly one of `command` (stdio, a child
 /// process) or `url` (streamable HTTP) must be set; see
@@ -364,14 +373,14 @@ impl McpServerConfig {
 /// A map of `skills:` name to the path of its skill file (or a directory
 /// containing a `SKILL.md`), as used by `lait.config.yml`'s top-level
 /// `skills:`. See `crate::skill::load_skill`.
-pub(crate) type SkillMap = HashMap<String, PathBuf>;
+pub(crate) type SkillMap = Arc<HashMap<String, PathBuf>>;
 
 /// A map of `agents:` name to the path of its agent Markdown file, as used by
 /// `lait.config.yml`'s top-level `agents:`. Each named entry can be made
 /// available, via a `subagents:` list, as a tool the model itself may decide
 /// to call mid-completion — unlike `agent:`/`workflow:` workflow nodes, which
 /// wire in a fixed agent call at parse time. See `crate::subagent`.
-pub(crate) type AgentMap = HashMap<String, PathBuf>;
+pub(crate) type AgentMap = Arc<HashMap<String, PathBuf>>;
 
 /// A map of model alias to its candidate definitions, as used by both
 /// `lait.config.yml`'s top-level `models:` and a workflow file's `models:`.

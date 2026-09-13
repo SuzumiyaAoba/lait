@@ -146,7 +146,7 @@ fn format_skill(skill: &SkillFile) -> String {
 /// cached value is an `Arc<String>` rather than a bare `String`, so a cache
 /// hit is a refcount bump instead of a clone of the skill's Markdown body.
 pub(crate) struct SkillCache {
-    skills_map: Arc<config::SkillMap>,
+    skills_map: config::SkillMap,
     sections: AsyncCache<String, String>,
     /// `render`'s own combined-text result, cached by its exact `names` list
     /// (order matters — it's the order sections are joined in). Sections
@@ -160,7 +160,7 @@ pub(crate) struct SkillCache {
 }
 
 impl SkillCache {
-    pub(crate) fn new(skills_map: Arc<config::SkillMap>) -> Self {
+    pub(crate) fn new(skills_map: config::SkillMap) -> Self {
         Self {
             skills_map,
             sections: AsyncCache::new(),

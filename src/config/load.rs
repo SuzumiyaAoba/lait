@@ -10,6 +10,7 @@ use std::{
     collections::HashMap,
     hash::Hash,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -67,10 +68,16 @@ fn resolve_registry_paths_in_place(config: &mut ConfigFile, config_dir: &Path) {
     for path in config.workflows.values_mut() {
         *path = config_dir.join(&path);
     }
-    for path in config.agents.values_mut() {
+    // `agents`/`skills` are `Arc<HashMap<..>>` (see `config::types::AgentMap`/
+    // `SkillMap`'s doc comment) so that later, once `ConfigFile` is shared
+    // broadly, cloning them out is a refcount bump rather than a deep copy.
+    // `Arc::make_mut` still gets a plain `&mut HashMap` here for free: this
+    // runs immediately after parsing, before the `Arc` has a second owner,
+    // so it takes the "sole owner" fast path and never actually clones.
+    for path in Arc::make_mut(&mut config.agents).values_mut() {
         *path = config_dir.join(&path);
     }
-    for path in config.skills.values_mut() {
+    for path in Arc::make_mut(&mut config.skills).values_mut() {
         *path = config_dir.join(&path);
     }
 }
@@ -103,6 +110,36 @@ where
 {
     global.extend(project);
     global
+}
+
+/// [`merge_maps`]'s counterpart for the `Arc<HashMap<..>>`-typed maps
+/// (`mcp_servers`/`skills`/`agents` — see `config::types::McpServerMap`'s
+/// doc comment for why they're `Arc`-wrapped). Takes `Arc<..>` by value so
+/// the common case — one side empty, true for the overwhelming majority of
+/// invocations that have no global `lait.config.yml` at all — returns the
+/// other side's `Arc` moved (a refcount bump at most) instead of allocating
+/// a new merged map nobody needed.
+fn merge_arc_maps<K, V>(
+    global: Arc<HashMap<K, V>>,
+    project: Arc<HashMap<K, V>>,
+) -> Arc<HashMap<K, V>>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    if project.is_empty() {
+        return global;
+    }
+    if global.is_empty() {
+        return project;
+    }
+    let mut merged = (*global).clone();
+    merged.extend(
+        project
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    Arc::new(merged)
 }
 
 /// Merges `global` (loaded from [`global_config_path`]) with `project`
@@ -140,9 +177,9 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         api_key_cmd,
         default: DefaultSettings::merge(global.default, project.default),
         models: merge_maps(global.models, project.models),
-        mcp_servers: merge_maps(global.mcp_servers, project.mcp_servers),
-        skills: merge_maps(global.skills, project.skills),
-        agents: merge_maps(global.agents, project.agents),
+        mcp_servers: merge_arc_maps(global.mcp_servers, project.mcp_servers),
+        skills: merge_arc_maps(global.skills, project.skills),
+        agents: merge_arc_maps(global.agents, project.agents),
         prompts: merge_maps(global.prompts, project.prompts),
         workflows: merge_maps(global.workflows, project.workflows),
         tool_policy: ToolPolicy::merge(global.tool_policy, project.tool_policy),
@@ -172,18 +209,40 @@ pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
 /// both path discovery and file reads run through [`async_io::run_blocking`]
 /// rather than blocking the Tokio runtime. The synchronous loader remains the
 /// API for runtime-free commands such as `lint`, `init`, and registry listing.
+///
+/// For [`ConfigSource::Search`], the project lookup+read and the global
+/// config read are independent of each other (`merge_config` only needs both
+/// results, not one before the other) and each goes through its own
+/// `async_io` blocking worker, so they run concurrently via `try_join!`
+/// rather than one fully finishing before the other starts — one fewer
+/// worker round-trip off the invocation's startup latency. `Explicit`/
+/// `Disabled` never touch the global file at all, so they skip straight to
+/// the project-only path with no `try_join!` overhead.
 pub(crate) async fn load_config_cancellable(
     source: &ConfigSource,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ConfigFile> {
-    let project_path = resolve_config_path_cancellable(source, cancellation.clone()).await?;
-    let project = load_config_at_cancellable(source, project_path, cancellation.clone()).await?;
+    async fn load_project(
+        source: &ConfigSource,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<ConfigFile> {
+        let project_path = resolve_config_path_cancellable(source, cancellation.clone()).await?;
+        load_config_at_cancellable(source, project_path, cancellation).await
+    }
     match source {
-        ConfigSource::Search => match load_global_config_cancellable(cancellation).await? {
-            Some(global) => Ok(merge_config(global, project)),
-            None => Ok(project),
-        },
-        ConfigSource::Explicit(_) | ConfigSource::Disabled => Ok(project),
+        ConfigSource::Search => {
+            let (project, global) = tokio::try_join!(
+                load_project(source, cancellation.clone()),
+                load_global_config_cancellable(cancellation),
+            )?;
+            Ok(match global {
+                Some(global) => merge_config(global, project),
+                None => project,
+            })
+        }
+        ConfigSource::Explicit(_) | ConfigSource::Disabled => {
+            load_project(source, cancellation).await
+        }
     }
 }
 

@@ -32,9 +32,9 @@ pub(crate) struct AppServices {
 impl AppServices {
     pub(crate) fn new(file_config: Arc<ConfigFile>) -> Self {
         Self {
-            registry: mcp::McpRegistry::new(Arc::new(file_config.mcp_servers.clone())),
-            skill_cache: skill::SkillCache::new(Arc::new(file_config.skills.clone())),
-            agent_registry: subagent::AgentRegistry::new(Arc::new(file_config.agents.clone())),
+            registry: mcp::McpRegistry::new(file_config.mcp_servers.clone()),
+            skill_cache: skill::SkillCache::new(file_config.skills.clone()),
+            agent_registry: subagent::AgentRegistry::new(file_config.agents.clone()),
             workflow_registry: workflow::WorkflowRegistry::new(),
             secret_resolver: secret::SecretResolver::new(),
             file_config,

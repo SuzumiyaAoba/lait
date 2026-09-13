@@ -60,7 +60,7 @@ type ToolListCell = Arc<tokio::sync::OnceCell<Arc<Vec<Tool>>>>;
 /// `for_each` branches), which is why connections are cached behind a
 /// `tokio::sync::Mutex`.
 pub(crate) struct McpRegistry {
-    servers: Arc<config::McpServerMap>,
+    servers: config::McpServerMap,
     connections: tokio::sync::Mutex<HashMap<String, ConnectionCellRef>>,
     /// Each server's `tools/list` result, cached for the registry's lifetime:
     /// a server's tool list doesn't change over the course of one `lait run`/
@@ -94,7 +94,7 @@ impl ToolSet {
 }
 
 impl McpRegistry {
-    pub(crate) fn new(servers: Arc<config::McpServerMap>) -> Self {
+    pub(crate) fn new(servers: config::McpServerMap) -> Self {
         Self {
             servers,
             connections: tokio::sync::Mutex::new(HashMap::new()),

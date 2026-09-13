@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn parse_workflow_fixture(yaml: &str) -> workflow::WorkflowFile {
     workflow::parse_workflow(yaml).expect("fixture workflow should validate")
@@ -139,7 +140,7 @@ fn flags_an_unknown_mcp_server_name() {
 #[test]
 fn accepts_a_known_mcp_server_name() {
     let mut config = empty_config();
-    config.mcp_servers.insert(
+    Arc::make_mut(&mut config.mcp_servers).insert(
         "known".to_owned(),
         config::McpServerConfig {
             command: Some("true".to_owned()),
@@ -164,7 +165,7 @@ fn accepts_a_known_mcp_server_name() {
 #[test]
 fn flags_a_referenced_mcp_server_whose_allowed_tools_is_empty() {
     let mut config = empty_config();
-    config.mcp_servers.insert(
+    Arc::make_mut(&mut config.mcp_servers).insert(
         "locked-down".to_owned(),
         config::McpServerConfig {
             command: Some("true".to_owned()),
@@ -221,9 +222,7 @@ fn flags_an_unknown_subagent_name() {
 #[test]
 fn accepts_a_known_subagent_name() {
     let mut config = empty_config();
-    config
-        .agents
-        .insert("known".to_owned(), PathBuf::from("agents/known.md"));
+    Arc::make_mut(&mut config.agents).insert("known".to_owned(), PathBuf::from("agents/known.md"));
     let wf = parse_workflow_fixture(
         "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
     );
