@@ -59,6 +59,29 @@ pub(crate) struct CompletionRequest<'a> {
     /// result. Owned (not built from `system_prompt`/`prompt` here) so the
     /// caller can reuse/extend the same history across rounds without lait
     /// re-deriving it each time.
+    ///
+    /// The fallback loop in `engine::transport`'s `complete_recorded`/
+    /// `stream_endpoint` builds one of these per candidate endpoint attempt
+    /// (`self.request(...)`) from a `messages: &[ChatCompletionRequestMessage]`
+    /// it only borrows, via `messages.to_vec()` — considered and rejected as
+    /// a place to save a clone, for the same reason as `tools` above but one
+    /// link further down the chain: `engine::transport::RequestSettings::
+    /// complete`/`complete_stream` retain the message history across
+    /// tool-loop rounds (the next round appends to the *same* `Vec`), so
+    /// they can only ever hand this field a borrow, never move their own
+    /// copy in — an owned `Vec` here forces every call to clone one out of
+    /// that borrow. And `chat_request.messages(request.messages)` (see
+    /// `complete`'s call site below) moves this field unconditionally while
+    /// *building* the HTTP request, before the send can fail — so even a
+    /// candidate attempt that goes on to fail still needs its own
+    /// independent owned copy; the clone is not "wasted work from
+    /// retrying", it is the request body. One owned `Vec` per attempt is
+    /// therefore the floor for this boundary's current shape. A real
+    /// reduction would need to thread ownership of the message history
+    /// through the round loop itself (`complete`/`complete_stream` handing
+    /// it to the fallback loop by value and getting it back out on success
+    /// to append the next round's `tool_calls`/`tool` messages) — a
+    /// materially larger, separate change not undertaken here.
     pub(crate) messages: Vec<ChatCompletionRequestMessage>,
     /// The MCP-derived tools available to the model this round. Empty means
     /// "don't send a `tools:` field at all", not "send an empty list" —

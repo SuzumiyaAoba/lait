@@ -9,6 +9,44 @@
 //! `RequestSettings` itself (and its trivial `with_usage_label` setter) stay
 //! in the parent module, per `impl RequestSettings`'s existing split there
 //! and in `settings.rs` (`advance_to_next_candidate`).
+//!
+//! `complete_recorded` and `stream_endpoint` share an identical skeleton —
+//! resolve the current candidate's API key, build a request, send it, and on
+//! a fallback-eligible error advance to the next candidate via
+//! `advance_to_next_candidate` before retrying — differing only in which
+//! `llm::` function they call and, for `complete_recorded`, its success-arm
+//! cache/cassette saves. P8-6a planned collapsing this into one
+//! `with_fallback`-style helper and it was never done; P9 re-planned it and
+//! **attempted and reverted it**, so the reason belongs here rather than
+//! being re-discovered a third time.
+//!
+//! The two loops cannot be unified with a plain `Fn(CompletionRequest<'_>)
+//! -> F where F: Future<Output = Result<T>>` closure parameter: the request
+//! each call builds borrows from that call's own `endpoint`/`api_key`
+//! locals, a fresh lifetime every loop iteration, so the future `send`
+//! returns must vary per call in a way one associated type `F` cannot
+//! express — a "lifetime may not live long enough" error. `AsyncFn`
+//! (stable since Rust 1.85, which resolves exactly this case via an
+//! internal GAT) compiles the helper itself, but introducing that bound
+//! into this file breaks unrelated code elsewhere in the crate:
+//! `workflow/exec.rs`'s and `workflow/exec/retry.rs`'s recursive
+//! `Box::pin(async move { .. })` futures (`run_steps`'s own recursion, and
+//! `execute_step_with_retry`'s) fail `Send` inference with "implementation
+//! of `Send` is not general enough" for `&str`/`&WorkflowScope`/
+//! `&FlowStep`/`&RouterContext<'_>` — a known class of rustc trait-solver
+//! limitation where a higher-ranked closure bound in one part of a crate
+//! can poison auto-trait inference for an unrelated recursive boxed future
+//! elsewhere in the same crate. Verified by bisect: `cargo check
+//! --locked --all-targets` is clean on the parent commit and fails with
+//! these errors only once the `AsyncFn`-based `with_fallback` is added,
+//! with no other change. A `Pin<Box<dyn Future<Output = Result<T>> + '_>>`
+//! return type was also tried, on the theory that erasing the future's
+//! concrete type would sidestep the associated-type problem without
+//! `AsyncFn` — it still introduces the same higher-ranked bound the
+//! `Send`-inference failure traces back to, and reproduces the identical
+//! errors. The ~25 lines of duplication between the two loops are
+//! therefore left as they are; each is already documented as the other's
+//! counterpart (see `stream_endpoint`'s own doc comment).
 
 use std::{
     borrow::Cow,
