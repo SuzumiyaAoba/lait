@@ -77,6 +77,24 @@ pub(crate) struct McpRegistry {
 /// (possibly cached) per-server tool lists, since which servers are in play
 /// can differ request to request even though each server's own tool list
 /// doesn't.
+///
+/// Freshness isn't the only cost of rebuilding this: `tools()` also
+/// re-qualifies every tool name and, per tool, deep-clones its JSON Schema
+/// (`Value::Object((*tool.input_schema).clone())` below) on every call, even
+/// when the same set of server names repeats across an N-step workflow. A
+/// per-server cache of the already-qualified `ChatCompletionTools` was tried
+/// and abandoned: `tools` must end up as one contiguous owned
+/// `Vec<ChatCompletionTools>` so that `llm::CompletionRequest::tools:
+/// &[ChatCompletionTools]` can borrow it, and assembling that `Vec` from a
+/// cache still means `tools.extend(cached.iter().cloned())` — which clones
+/// each `ChatCompletionTools`, schema tree included, exactly as before.
+/// Such a cache would only remove the qualified-name string derivation
+/// (`qualify_tool_name`, two `to_string()`/`to_owned()` calls per tool), not
+/// the dominant cost. A real fix needs `tools` to stop being a plain owned
+/// `Vec` — e.g. `Arc`-shared per-server slices, or an enum with a zero-copy
+/// single-server case — and that would ripple into how the tool set is
+/// combined with `subagent::ToolSet` and consumed by
+/// `engine::transport::assemble_tool_sets`'s `mem::take`-and-extend.
 pub(crate) struct ToolSet {
     pub(crate) tools: Vec<ChatCompletionTools>,
     /// Qualified tool name (`<server>__<tool>`, see `qualify_tool_name`) to
