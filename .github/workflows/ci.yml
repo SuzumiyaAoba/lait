@@ -120,7 +120,7 @@ jobs:
       - name: Run file lock tests
         shell: bash
         run: |
-          count=$(cargo test --locked --bin lait file_lock:: -- --list 2>/dev/null | grep -c ': test$')
+          count=$(cargo test --locked --bin lait file_lock:: -- --list 2>/dev/null | grep -c ': test$' || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no tests matched filter 'file_lock::' — was the module renamed or moved?"
             exit 1
@@ -131,7 +131,7 @@ jobs:
       - name: Run cancellable filesystem tests
         shell: bash
         run: |
-          count=$(cargo test --locked --bin lait async_io:: -- --list 2>/dev/null | grep -c ': test$')
+          count=$(cargo test --locked --bin lait async_io:: -- --list 2>/dev/null | grep -c ': test$' || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no tests matched filter 'async_io::' — was the module renamed or moved?"
             exit 1
@@ -147,7 +147,7 @@ jobs:
       - name: Run jsonl tests
         shell: bash
         run: |
-          count=$(cargo test --locked --bin lait jsonl:: -- --list 2>/dev/null | grep -c ': test$')
+          count=$(cargo test --locked --bin lait jsonl:: -- --list 2>/dev/null | grep -c ': test$' || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no tests matched filter 'jsonl::' — was the module renamed or moved?"
             exit 1
