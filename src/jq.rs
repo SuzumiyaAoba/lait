@@ -78,7 +78,12 @@ static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CachedFilter>>>> =
 /// itself), or returns the cached result of an earlier call with the same
 /// source text. Callers must call [`validate_filter_source`] first — this
 /// function does not re-check the byte/nesting limits, so a cache hit must
-/// not be reachable for a filter that failed validation.
+/// not be reachable for a filter that failed validation. This is also what
+/// lets [`validate_filter_source`] itself short-circuit on a cache hit here
+/// instead of re-scanning `filter_source`: a filter only ever reaches
+/// [`FILTER_CACHE`] below by first passing that scan, and a failed
+/// parse/compile below is never cached, so presence in the cache is sound
+/// evidence validation already passed.
 ///
 /// The prelude and `with_global_vars(["$steps", "$vars"])` are fixed across
 /// every caller (`run_filter_with` and `check_syntax` alike), so neither
@@ -614,7 +619,30 @@ fn parse_global_var(value: &Steps, label: &str) -> Result<Val> {
     Ok(parsed)
 }
 
+/// The byte-length and nesting-depth checks below are a full char-by-char
+/// scan of `filter_source`, run on every call — including a `for_each`/`loop`
+/// body that calls the same `when:`/`jq:` filter hundreds of times over. Both
+/// callers (`check_syntax`, `run_filter_with`) already look this same
+/// `filter_source` up in [`FILTER_CACHE`] shortly afterwards via
+/// [`compiled_filter`], and a filter only ever enters that cache *after*
+/// this exact scan has already passed (`compiled_filter` never caches a
+/// filter that failed to parse/compile, and this function is always called
+/// before it — see `compiled_filter`'s own doc comment for that invariant).
+/// So a cache hit here is sound evidence the scan below already ran once
+/// successfully for this exact source text; short-circuit on it instead of
+/// repeating the scan. This turns per-item validation into an O(1) lock +
+/// hash lookup after the first call for a given filter, while a filter that
+/// has never been seen (or that previously failed to compile, since a
+/// failure is never cached) still pays the full scan — exactly as before.
 fn validate_filter_source(filter_source: &str) -> Result<()> {
+    if FILTER_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(filter_source)
+    {
+        return Ok(());
+    }
+
     if filter_source.len() > MAX_FILTER_SOURCE_BYTES {
         bail!(
             "jq filter exceeds the configured limit of {} bytes",

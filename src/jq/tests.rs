@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicBool;
 
-use super::{Steps, apply_bool, apply_cancellable, apply_one_cancellable};
+use super::{Steps, apply_bool, apply_cancellable, apply_one_cancellable, check_syntax};
 
 fn no_steps() -> Steps {
     Steps::new()
@@ -496,5 +496,27 @@ fn unused_global_slot_does_not_break_evaluation() {
         )
         .unwrap(),
         "ja"
+    );
+}
+
+/// `validate_filter_source`'s nesting-depth scan short-circuits on a cache
+/// hit in `FILTER_CACHE` (P9-3 §B) — but a filter that *fails* that scan is
+/// never cached (only a filter that goes on to compile successfully is), so
+/// calling the same over-nested filter source twice must reject it both
+/// times, not let the second call slip through as a false cache hit. Uses a
+/// filter source distinct from every other test in this module (a unique
+/// text is a fresh `FILTER_CACHE` key) so this test cannot pass merely
+/// because some other test already cached an entry under the same key.
+#[test]
+fn an_over_nested_filter_source_is_rejected_on_every_call_not_only_the_first() {
+    let over_nested_filter = "[".repeat(super::MAX_VALUE_DEPTH + 1);
+    assert!(
+        check_syntax(&over_nested_filter).is_err(),
+        "first call must reject the over-nested filter"
+    );
+    assert!(
+        check_syntax(&over_nested_filter).is_err(),
+        "second call (a `FILTER_CACHE` lookup for the same source text) must \
+         still reject it — a rejected filter must never be cached as valid"
     );
 }

@@ -98,7 +98,8 @@ impl RenderScope {
     /// text) and reused across every call — including from a different
     /// `RenderScope` — instead of being re-parsed on every render.
     pub(crate) fn render(&self, template: &str) -> Result<String> {
-        if self.input_is_object_or_array && references_bare_input(template) {
+        let cached = compiled_template(template)?;
+        if self.input_is_object_or_array && cached.references_bare_input {
             bail!(
                 "template references bare '{{{{ input }}}}' but the input is a JSON object/array; \
                  use '{{{{ json input }}}}' to render it as JSON text, or access a field with \
@@ -106,14 +107,14 @@ impl RenderScope {
             );
         }
 
-        let compiled = compiled_template(template)?;
         // Equivalent to `Handlebars::render_resolved_template_to_output`'s
         // non-dev-mode path for an unregistered (ad-hoc) template: `None`
         // as the root template name (an ad-hoc `Template::compile` result
         // has no name) and the registry's default (unset)
         // `recursive_lookup`, which `HANDLEBARS` never turns on.
         let mut render_context = RenderContext::new(None);
-        compiled
+        cached
+            .template
             .renders(&HANDLEBARS, &self.context, &mut render_context)
             .with_context(|| format!("failed to render template: {template:?}"))
     }
@@ -130,6 +131,14 @@ static HANDLEBARS: LazyLock<Handlebars<'static>> = LazyLock::new(|| {
     handlebars
 });
 
+/// A compiled template plus whether its own source text contains a bare
+/// `{{ input }}` expression — see [`compiled_template`] for why the two are
+/// computed together, and [`RenderScope::render`] for how the flag is used.
+struct CachedTemplate {
+    template: Arc<Template>,
+    references_bare_input: bool,
+}
+
 /// Templates compiled by [`compiled_template`], shared across every render
 /// in the process. `Handlebars::render_template`/`render_template_with_context`
 /// compile their argument from scratch on every call (there is no built-in
@@ -143,26 +152,37 @@ static HANDLEBARS: LazyLock<Handlebars<'static>> = LazyLock::new(|| {
 /// grows across every workflow file in a directory tree rather than one
 /// workflow — still bounded by the distinct template strings on disk, and
 /// the process exits once linting finishes.
-static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<Template>>>> =
+static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<CachedTemplate>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn compiled_template(template: &str) -> Result<Arc<Template>> {
-    if let Some(compiled) = TEMPLATE_CACHE
+/// Compiles `template`, or returns the cached result of an earlier call with
+/// the same source text — [`references_bare_input`]'s scan is folded in here
+/// (computed once, alongside the compile, rather than by
+/// `RenderScope::render` on every call against this same source text) for
+/// the same reason `jq::compiled_filter` folds in its own `uses_steps`/
+/// `uses_vars` substring search: a `for_each`/`loop` body re-renders the same
+/// template text on every item/iteration, and the scan's result cannot
+/// change for a source text that never changes.
+fn compiled_template(template: &str) -> Result<Arc<CachedTemplate>> {
+    if let Some(cached) = TEMPLATE_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(template)
     {
-        return Ok(Arc::clone(compiled));
+        return Ok(Arc::clone(cached));
     }
 
     let compiled = Template::compile(template)
         .with_context(|| format!("failed to parse template: {template:?}"))?;
-    let compiled = Arc::new(compiled);
+    let cached = Arc::new(CachedTemplate {
+        template: Arc::new(compiled),
+        references_bare_input: references_bare_input(template),
+    });
     TEMPLATE_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(template.to_owned(), Arc::clone(&compiled));
-    Ok(compiled)
+        .insert(template.to_owned(), Arc::clone(&cached));
+    Ok(cached)
 }
 
 /// Checks `template`'s handlebars syntax without rendering it (used by the
@@ -311,6 +331,28 @@ mod tests {
     fn rejects_a_bare_input_placeholder_against_an_array_input() {
         let input = json!(["Tokyo", "Osaka"]);
         assert!(render("{{ input }}", &input, &no_steps(), &no_vars()).is_err());
+    }
+
+    /// `compiled_template` folds `references_bare_input`'s scan into
+    /// `TEMPLATE_CACHE` (P9-3 §C), computed once at compile time rather than
+    /// on every `render` call against the same source text — a *for_each*
+    /// body renders the same `prompt:`/`system_prompt:` template once per
+    /// item, each against a different `input`. Uses a template string unique
+    /// to this test (so a `TEMPLATE_CACHE` hit from another test cannot mask
+    /// a bug here) and calls `render` three times against an object input,
+    /// asserting every call rejects — not just the first (a fresh compile)
+    /// or the second (a cache hit computed at insert time), pinning that the
+    /// cached flag is consulted correctly on repeat hits too.
+    #[test]
+    fn a_bare_input_placeholder_is_rejected_on_every_call_against_the_same_template_text() {
+        let template = "distinctly-unique-template: {{ input }}";
+        let input = json!({"city": "Tokyo"});
+        for attempt in 1..=3 {
+            assert!(
+                render(template, &input, &no_steps(), &no_vars()).is_err(),
+                "attempt {attempt} must still reject the bare '{{{{ input }}}}' placeholder"
+            );
+        }
     }
 
     #[test]
