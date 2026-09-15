@@ -31,7 +31,7 @@ use super::blocking::run_blocking_with_path_lock;
 pub(crate) async fn write_output_file(
     path: &Path,
     output: &str,
-    step_cancel: Option<CancellationToken>,
+    step_cancel: CancellationToken,
 ) -> Result<()> {
     let path = path.to_owned();
     let output = output.to_owned();

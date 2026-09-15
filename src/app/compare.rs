@@ -2,7 +2,6 @@
 //! concurrently and reports each one's response, timing, and usage side by
 //! side. See docs/usage/ja/compare.md.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
@@ -12,13 +11,13 @@ use serde::Serialize;
 use crate::{
     chat,
     cli::CompareArgs,
-    config::{self, ConfigSource, ModelMap},
+    config::{ConfigSource, ModelMap},
     engine::{
-        AppServices, CapabilityOverrides, EndpointOverrides, PromptTurn, RunContext,
-        SamplingOverrides, resolve_request_settings,
+        CapabilityOverrides, EndpointOverrides, PromptTurn, SamplingOverrides,
+        resolve_request_settings,
     },
     error::missing_prompt_error,
-    response, signal,
+    response,
 };
 
 /// One model's outcome, serialized as-is for `--json` (an array of these).
@@ -32,7 +31,7 @@ struct ModelResult {
     error: Option<String>,
 }
 
-pub(crate) async fn run(
+pub(super) async fn run(
     args: CompareArgs,
     config_source: ConfigSource,
     cache_override: Option<bool>,
@@ -42,14 +41,11 @@ pub(crate) async fn run(
         bail!("`lait compare` requires at least two `--model` values");
     }
 
-    signal::spawn_handler(cancel.clone());
-    let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+    let file_config = super::load_config(&config_source, &cancel).await?;
 
-    let prompt =
-        chat::resolve_input_with_stdin_cancellable(args.prompt.clone(), Some(cancel.clone()))
-            .await?
-            .ok_or_else(missing_prompt_error)?;
+    let prompt = chat::resolve_input_with_stdin_cancellable(args.prompt.clone(), cancel.clone())
+        .await?
+        .ok_or_else(missing_prompt_error)?;
 
     let sampling = SamplingOverrides {
         reasoning_effort: args.reasoning_effort,
@@ -72,9 +68,7 @@ pub(crate) async fn run(
         settings_list.push((model_name.clone(), settings));
     }
 
-    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
-    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
-    let env = RunContext::new(Arc::clone(&services), cancel).with_cache(cache_enabled, cache_ttl);
+    let (services, env) = super::build_run_context(&file_config, cache_override, false, cancel);
 
     let futures = settings_list.iter().map(|(model_name, settings)| {
         let prompt = &prompt;
@@ -83,7 +77,7 @@ pub(crate) async fn run(
             let turn = PromptTurn::simple(None, prompt);
             let started = Instant::now();
             let outcome = settings
-                .complete(env, &[], turn, None, Some(env.operation_token()))
+                .complete(env, &[], turn, None, env.operation_token())
                 .await;
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             match outcome {

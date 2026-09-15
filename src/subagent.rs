@@ -124,7 +124,7 @@ impl AgentRegistry {
     pub(crate) async fn load_cancellable(
         &self,
         name: &str,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Arc<LoadedAgent>> {
         let path = self.agents_map.get(name).ok_or_else(|| {
             anyhow!(
@@ -150,7 +150,7 @@ impl AgentRegistry {
     pub(crate) async fn load_path_cancellable(
         &self,
         path: &Path,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Arc<LoadedAgent>> {
         let init_cancellation = cancellation.clone();
         self.loaded
@@ -205,7 +205,7 @@ impl AgentRegistry {
     pub(crate) async fn tools_cancellable(
         &self,
         names: &[String],
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ToolSet> {
         let loaded_agents = futures_util::future::try_join_all(
             names
@@ -250,7 +250,7 @@ mod tests {
         let agents_map: StdHashMap<String, std::path::PathBuf> = StdHashMap::new();
         let registry = AgentRegistry::new(Arc::new(agents_map));
         let error = registry
-            .load_cancellable("missing", None)
+            .load_cancellable("missing", crate::cancellation::none())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing"));
@@ -281,14 +281,14 @@ mod tests {
         // (passing `None` here would skip the wait-for-a-writer path
         // entirely and return immediately instead).
         let first_token = tokio_util::sync::CancellationToken::new();
-        let mut first = Box::pin(registry.load_path_cancellable(&path, Some(first_token)));
+        let mut first = Box::pin(registry.load_path_cancellable(&path, first_token));
         tokio::select! {
             result = &mut first => panic!("first load unexpectedly returned: {result:?}"),
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
 
         let token = tokio_util::sync::CancellationToken::new();
-        let mut second = Box::pin(registry.load_path_cancellable(&path, Some(token.clone())));
+        let mut second = Box::pin(registry.load_path_cancellable(&path, token.clone()));
         tokio::select! {
             result = &mut second => panic!("second load unexpectedly returned: {result:?}"),
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {

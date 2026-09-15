@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{RunsAction, RunsCommand},
-    jsonl, session, workflow,
+    jsonl, report, session, workflow,
 };
 
 /// The directory every checkpoint file lives under, relative to the current
@@ -149,7 +149,7 @@ pub(crate) fn generate_run_id() -> String {
 /// itself crosses onto the worker.
 pub(crate) async fn save_cancellable(
     checkpoint: &CheckpointRef<'_>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let path = run_path(checkpoint.run_id)?;
     let body =
@@ -192,7 +192,7 @@ pub(crate) fn load(run_id: &str) -> Result<Checkpoint> {
 /// not prevent the enclosing command from observing cancellation.
 pub(crate) async fn load_cancellable(
     run_id: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Checkpoint> {
     let path = run_path(run_id)?;
     load_path_cancellable(path, run_id.to_owned(), cancellation).await
@@ -201,7 +201,7 @@ pub(crate) async fn load_cancellable(
 async fn load_path_cancellable(
     path: PathBuf,
     run_id: String,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Checkpoint> {
     crate::async_io::run_blocking(
         move |cancelled| {
@@ -273,11 +273,11 @@ pub(crate) fn check_resumable(current_labels: &[String], checkpoint: &Checkpoint
         );
     }
     if current_labels[boundary..] != recorded[boundary..] {
-        eprintln!(
-            "warning: the workflow's steps after step {boundary} differ from when run '{}' was \
+        report::warn(format_args!(
+            "the workflow's steps after step {boundary} differ from when run '{}' was \
              checkpointed; resuming anyway",
             checkpoint.run_id
-        );
+        ));
     }
     Ok(())
 }
@@ -474,7 +474,7 @@ mod tests {
         let mut load = Box::pin(load_path_cancellable(
             path.clone(),
             "fifo-test".to_owned(),
-            Some(token.clone()),
+            token.clone(),
         ));
         tokio::select! {
             result = &mut load => panic!("FIFO checkpoint unexpectedly loaded: {result:?}"),

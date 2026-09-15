@@ -40,7 +40,7 @@ pub(super) struct StepContext<'a> {
     pub(super) label: &'a str,
     pub(super) progress_prefix: &'a str,
     pub(super) steps_outputs: &'a workflow::StepOutputs,
-    pub(super) step_cancel: Option<tokio_util::sync::CancellationToken>,
+    pub(super) step_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<'a> StepContext<'a> {
@@ -49,10 +49,7 @@ impl<'a> StepContext<'a> {
     /// `execute_step` an attempt-scoped child token (when the node has an
     /// effective `timeout`) or the unmodified workflow token (when it
     /// doesn't), without repeating every other field at each call site.
-    pub(super) fn with_cancel(
-        &self,
-        step_cancel: Option<tokio_util::sync::CancellationToken>,
-    ) -> Self {
+    pub(super) fn with_cancel(&self, step_cancel: tokio_util::sync::CancellationToken) -> Self {
         Self {
             step_cancel,
             ..self.clone()
@@ -169,7 +166,7 @@ pub(super) async fn resolve_attachments<'a>(
     images: Option<&[String]>,
     base_prompt: &'a str,
     label: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(Cow<'a, str>, Vec<String>)> {
     let (file_context, image_urls) = tokio::try_join!(
         attachment::read_file_attachments_cancellable(files.unwrap_or(&[]), cancellation.clone(),),

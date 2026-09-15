@@ -34,13 +34,19 @@ use crate::{
         WorkflowAction, WorkflowCommand,
     },
     config::{self, ConfigSource},
-    docgen, doctor,
+    docgen,
     engine::{AppServices, RunContext},
-    error, history, lint, repl, skill, subagent, test_run, workflow,
+    error, history, lint, skill, subagent, workflow,
 };
 
 mod chat_run;
+mod compare;
+mod doctor;
+mod eval;
+mod models;
 mod prompt_run;
+mod repl;
+mod test_run;
 mod workflow_run;
 
 use chat_run::run_chat_or_repl;
@@ -48,9 +54,7 @@ use prompt_run::{run_agent, run_prompt};
 use workflow_run::run_workflow;
 
 /// Re-exported so `workflow_run::run_workflow` (a descendant module, via
-/// `super::missing_prompt_error`) keeps its existing reference path — the
-/// function itself lives in `error` now so `compare`, a sibling of `app`,
-/// doesn't need to depend on `app` just to call it.
+/// `super::missing_prompt_error`) keeps its existing reference path.
 pub(crate) use error::missing_prompt_error;
 
 /// Every subcommand (and the bare, no-subcommand invocation) that never
@@ -196,7 +200,7 @@ pub(crate) async fn run(
             run_agent(args, config_source, cache_override, approve_tools, cancel).await
         }
         AsyncCommand::ModelsRemote(models_args) => {
-            crate::models::run(models_args, config_source, Some(cancel)).await
+            models::run(models_args, config_source, cancel).await
         }
         AsyncCommand::Chat(chat_repl_args) => {
             repl::run(
@@ -218,14 +222,12 @@ pub(crate) async fn run(
             )
             .await
         }
-        AsyncCommand::Doctor(doctor_args) => {
-            doctor::run(doctor_args, config_source, Some(cancel)).await
-        }
+        AsyncCommand::Doctor(doctor_args) => doctor::run(doctor_args, config_source, cancel).await,
         AsyncCommand::Compare(compare_args) => {
-            crate::compare::run(compare_args, config_source, cache_override, cancel).await
+            compare::run(compare_args, config_source, cache_override, cancel).await
         }
         AsyncCommand::Test(test_args) => test_run::run(test_args, config_source, cancel).await,
-        AsyncCommand::Eval(eval_args) => crate::eval::run(eval_args, config_source, cancel).await,
+        AsyncCommand::Eval(eval_args) => eval::run(eval_args, config_source, cancel).await,
         AsyncCommand::Bare => {
             run_chat_or_repl(
                 bare_chat,
@@ -262,9 +264,7 @@ pub(crate) fn cache_override(cache: bool, no_cache: bool) -> Option<bool> {
 pub(crate) fn run_blocking(command: SyncCommand, config_source: ConfigSource) -> Result<()> {
     match command {
         SyncCommand::Lint(lint_args) => lint::run(lint_args, config_source),
-        SyncCommand::ModelsLocal(models_args) => {
-            crate::models::run_local(models_args, config_source)
-        }
+        SyncCommand::ModelsLocal(models_args) => models::run_local(models_args, config_source),
         SyncCommand::Completions(completions_args) => {
             docgen::generate_completions(completions_args);
             Ok(())
@@ -296,6 +296,33 @@ fn run_graph(graph_args: GraphArgs) -> Result<()> {
     };
     print!("{}", workflow::graph::render(&wf, format)?);
     Ok(())
+}
+
+/// Upper bound on concurrently in-flight per-case runs for `lait test` and
+/// `lait eval` — the same value both commands spelled out as their own
+/// `TEST_CONCURRENCY`/`EVAL_CONCURRENCY` constant. Matches
+/// `engine::tool_loop::MAX_CONCURRENT_TOOL_CALLS`'s rationale: independent
+/// runs, bounded so a large suite doesn't open unbounded concurrent
+/// connections to a replay directory or configured endpoint.
+pub(super) const SUITE_CONCURRENCY: usize = 8;
+
+/// Arms the process-wide Ctrl-C handler for `cancel`, then loads
+/// `lait.config.yml` — the two-step prefix every single-shot async command
+/// used to spell out by hand. The handler goes first so a Ctrl-C landing
+/// during the config read itself is a typed cancellation, not the default
+/// terminate. Callers whose ordering must differ keep the pieces separate:
+/// `test_run` expands its target list first so a bad `--paths` errors
+/// before a bad config, `doctor` reads the config non-fatally through its
+/// own `check_config_load`, and `run_agent` folds the load into a
+/// `try_join!` with its other initial reads.
+pub(super) async fn load_config(
+    config_source: &ConfigSource,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Arc<config::ConfigFile>> {
+    crate::signal::spawn_handler(cancel.clone());
+    Ok(Arc::new(
+        config::load_config_cancellable(config_source, cancel.clone()).await?,
+    ))
 }
 
 /// Builds the `AppServices`/`RunContext` pair `run_chat`/`run_prompt`/

@@ -50,7 +50,7 @@ impl WorkflowScope {
     pub(crate) async fn top_level(
         wf: &mut WorkflowFile,
         file_path: &Path,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
         let canonical = async_io::canonicalize(file_path, cancellation)
             .await
@@ -81,7 +81,7 @@ impl WorkflowScope {
         &self,
         relative_path: &Path,
         label: &str,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<PathBuf> {
         let resolved_path = self.base_dir.join(relative_path);
         let canonical = async_io::canonicalize(&resolved_path, cancellation)

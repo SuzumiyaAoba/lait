@@ -141,11 +141,8 @@ fn parse_call_arguments(arguments_json: &str) -> Result<serde_json::Value> {
     }
 }
 
-fn ensure_not_cancelled(cancellation: Option<&tokio_util::sync::CancellationToken>) -> Result<()> {
-    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        bail!(crate::error::cancelled("shell tool call was cancelled"));
-    }
-    Ok(())
+fn ensure_not_cancelled(cancellation: &tokio_util::sync::CancellationToken) -> Result<()> {
+    crate::cancellation::check(cancellation, "shell tool call was cancelled")
 }
 
 /// Runs `definition`'s command for one tool call — see `render_argv` for how
@@ -165,9 +162,9 @@ fn ensure_not_cancelled(cancellation: Option<&tokio_util::sync::CancellationToke
 pub(crate) async fn call(
     definition: &config::ShellToolDefinition,
     arguments_json: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
-    ensure_not_cancelled(cancellation.as_ref())?;
+    ensure_not_cancelled(&cancellation)?;
     let input = parse_call_arguments(arguments_json)?;
     if let Err(error) = schema::validate_input_against_schema(&definition.parameters, &input) {
         return Ok(format!("tool arguments failed validation: {error:#}"));
@@ -180,14 +177,11 @@ pub(crate) async fn call(
     // check but before the child is spawned. Keep the process boundary itself
     // cancellation-safe as well; this check also makes the intent explicit at
     // the shell-tool call site.
-    ensure_not_cancelled(cancellation.as_ref())?;
+    ensure_not_cancelled(&cancellation)?;
 
     let timeout_secs = definition.timeout.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS);
-    let child_cancel = cancellation
-        .as_ref()
-        .map(tokio_util::sync::CancellationToken::child_token)
-        .unwrap_or_default();
-    let mut execution = Box::pin(process::run_command(&argv, "", Some(child_cancel.clone())));
+    let child_cancel = cancellation.child_token();
+    let mut execution = Box::pin(process::run_command(&argv, "", child_cancel.clone()));
     let outcome =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), &mut execution)
             .await
@@ -243,16 +237,22 @@ mod tests {
     #[tokio::test]
     async fn renders_command_arguments_from_the_call_arguments() {
         let definition = definition(&["echo", "{{ input.text }}"]);
-        let output = call(&definition, r#"{"text":"hi there"}"#, None)
-            .await
-            .unwrap();
+        let output = call(
+            &definition,
+            r#"{"text":"hi there"}"#,
+            crate::cancellation::none(),
+        )
+        .await
+        .unwrap();
         assert_eq!(output.trim(), "hi there");
     }
 
     #[tokio::test]
     async fn a_nonzero_exit_is_reported_as_a_result_string_not_an_error() {
         let definition = definition(&["sh", "-c", "exit 3"]);
-        let output = call(&definition, "{}", None).await.unwrap();
+        let output = call(&definition, "{}", crate::cancellation::none())
+            .await
+            .unwrap();
         assert!(output.contains("tool command failed"), "output: {output}");
     }
 
@@ -260,7 +260,9 @@ mod tests {
     async fn a_timeout_is_reported_as_a_result_string_not_an_error() {
         let mut definition = definition(&["sh", "-c", "sleep 5"]);
         definition.timeout = Some(0);
-        let output = call(&definition, "{}", None).await.unwrap();
+        let output = call(&definition, "{}", crate::cancellation::none())
+            .await
+            .unwrap();
         assert!(output.contains("timed out"), "output: {output}");
     }
 
@@ -270,7 +272,9 @@ mod tests {
         // mode fails to resolve it — this must not abort the whole round
         // just because the model omitted an optional-looking field.
         let definition = definition(&["echo", "{{ input.text }}"]);
-        let output = call(&definition, "{}", None).await.unwrap();
+        let output = call(&definition, "{}", crate::cancellation::none())
+            .await
+            .unwrap();
         assert!(output.contains("tool command failed"), "output: {output}");
     }
 
@@ -313,9 +317,7 @@ mod tests {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
 
-        let error = call(&definition, "{}", Some(cancellation))
-            .await
-            .unwrap_err();
+        let error = call(&definition, "{}", cancellation).await.unwrap_err();
 
         assert!(
             is_interrupted(&error),
@@ -338,7 +340,9 @@ mod tests {
             "properties": {"text": {"type": "string"}},
         });
 
-        let result = call(&definition, "{}", None).await.unwrap();
+        let result = call(&definition, "{}", crate::cancellation::none())
+            .await
+            .unwrap();
 
         assert!(
             result.contains("tool arguments failed validation"),
@@ -367,7 +371,9 @@ mod tests {
             serde_json::json!({"mode": 1}),
             serde_json::json!({"mode": "unsafe"}),
         ] {
-            let result = call(&definition, &input.to_string(), None).await.unwrap();
+            let result = call(&definition, &input.to_string(), crate::cancellation::none())
+                .await
+                .unwrap();
             assert!(
                 result.contains("tool arguments failed validation"),
                 "{result}"

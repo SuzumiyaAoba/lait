@@ -147,7 +147,7 @@ pub(crate) async fn load(
     key: &str,
     ttl_secs: Option<u64>,
     now: chrono::DateTime<chrono::Utc>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Option<response::ChatCompletionResponse>> {
     let path = entry_path(key);
     let body =
@@ -190,7 +190,7 @@ pub(crate) async fn save(
     key: &str,
     response: &response::ChatCompletionResponse,
     now: chrono::DateTime<chrono::Utc>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let path = entry_path(key);
     let entry = CacheEntryRef {
@@ -249,9 +249,14 @@ mod tests {
             let path = std::path::Path::new(super::CACHE_DIR).join("big-key.json");
             std::fs::write(&path, vec![b'a'; crate::async_io::MAX_READ_BYTES + 1]).unwrap();
 
-            let error = load("big-key", None, chrono::Utc::now(), None)
-                .await
-                .unwrap_err();
+            let error = load(
+                "big-key",
+                None,
+                chrono::Utc::now(),
+                crate::cancellation::none(),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 format!("{error:#}").contains("read limit"),
                 "error: {error:#}"
@@ -284,27 +289,37 @@ mod tests {
         crate::test_support::in_temp_dir_async("lait-cache-ttl", async {
             let saved_at = chrono::Utc::now();
             let response = sample_response();
-            save("ttl-key", &response, saved_at, None)
+            save("ttl-key", &response, saved_at, crate::cancellation::none())
                 .await
                 .expect("save should succeed");
 
             // Just inside the TTL: still a hit.
             let just_before_expiry = saved_at + chrono::Duration::seconds(59);
             assert!(
-                load("ttl-key", Some(60), just_before_expiry, None)
-                    .await
-                    .expect("load should succeed")
-                    .is_some(),
+                load(
+                    "ttl-key",
+                    Some(60),
+                    just_before_expiry,
+                    crate::cancellation::none()
+                )
+                .await
+                .expect("load should succeed")
+                .is_some(),
                 "an entry younger than its TTL should still be a hit"
             );
 
             // Past the TTL: a miss, not an error.
             let after_expiry = saved_at + chrono::Duration::seconds(61);
             assert!(
-                load("ttl-key", Some(60), after_expiry, None)
-                    .await
-                    .expect("load should succeed")
-                    .is_none(),
+                load(
+                    "ttl-key",
+                    Some(60),
+                    after_expiry,
+                    crate::cancellation::none()
+                )
+                .await
+                .expect("load should succeed")
+                .is_none(),
                 "an entry older than its TTL should be treated as a miss"
             );
         })

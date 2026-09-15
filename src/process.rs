@@ -263,7 +263,7 @@ struct ProcessRun<'a> {
     stdin: StdinMode<'a>,
     timeout: Option<Duration>,
     max_output_bytes: usize,
-    cancellation: Option<CancellationToken>,
+    cancellation: CancellationToken,
     command_kind: &'static str,
     kill_descendants_after_exit: bool,
 }
@@ -443,11 +443,7 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
         );
     };
     let command_kind = request.command_kind;
-    if request
-        .cancellation
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
+    if request.cancellation.is_cancelled() {
         bail!(crate::error::cancelled(format!(
             "{} '{program}' was cancelled",
             request.command_kind
@@ -482,12 +478,7 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
 
         tokio::select! {
             biased;
-            () = async {
-                match request.cancellation.as_ref() {
-                    Some(cancellation) => cancellation.cancelled().await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
+            () = request.cancellation.cancelled() => {
                 drop(child_wait);
                 let child_reaped = outcome.child_status.as_ref().is_some_and(Result::is_ok);
                 let message = format!("{} '{program}' was cancelled", request.command_kind);
@@ -631,7 +622,7 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
 pub(crate) async fn run_command(
     argv: &[String],
     stdin_input: &str,
-    step_cancel: Option<tokio_util::sync::CancellationToken>,
+    step_cancel: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     let output = run_process(ProcessRun {
         argv,
@@ -674,7 +665,7 @@ pub(crate) async fn run_bounded_command(
     argv: &[String],
     timeout: Duration,
     max_output_bytes: usize,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<BoundedCommandOutput> {
     let output = run_process(ProcessRun {
         argv,
@@ -714,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_an_empty_argv_without_panicking() {
-        let error = run_command(&[], "", None)
+        let error = run_command(&[], "", crate::cancellation::none())
             .await
             .expect_err("an empty command must be rejected");
 
@@ -725,10 +716,13 @@ mod tests {
     #[tokio::test]
     async fn kills_the_process_tree_when_stdout_exceeds_the_capture_limit() {
         let argv = ["sh".to_owned(), "-c".to_owned(), "yes".to_owned()];
-        let error = tokio::time::timeout(Duration::from_secs(3), run_command(&argv, "", None))
-            .await
-            .expect("an oversized stdout stream must be stopped promptly")
-            .expect_err("an oversized stdout stream must fail");
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_command(&argv, "", crate::cancellation::none()),
+        )
+        .await
+        .expect("an oversized stdout stream must be stopped promptly")
+        .expect_err("an oversized stdout stream must fail");
 
         let details = format!("{error:#}");
         assert!(
@@ -741,10 +735,13 @@ mod tests {
     #[tokio::test]
     async fn kills_the_process_tree_when_stderr_exceeds_the_capture_limit() {
         let argv = ["sh".to_owned(), "-c".to_owned(), "yes >&2".to_owned()];
-        let error = tokio::time::timeout(Duration::from_secs(3), run_command(&argv, "", None))
-            .await
-            .expect("an oversized stderr stream must be stopped promptly")
-            .expect_err("an oversized stderr stream must fail");
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_command(&argv, "", crate::cancellation::none()),
+        )
+        .await
+        .expect("an oversized stderr stream must be stopped promptly")
+        .expect_err("an oversized stderr stream must fail");
 
         let details = format!("{error:#}");
         assert!(
@@ -761,7 +758,12 @@ mod tests {
         let argv = ["sh".to_owned(), "-c".to_owned(), script];
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            run_bounded_command(&argv, Duration::from_secs(3), 4096, None),
+            run_bounded_command(
+                &argv,
+                Duration::from_secs(3),
+                4096,
+                crate::cancellation::none(),
+            ),
         )
         .await
         .expect("an oversized stream must be stopped promptly")
@@ -786,7 +788,12 @@ mod tests {
         ];
         let output = tokio::time::timeout(
             Duration::from_secs(2),
-            run_bounded_command(&argv, Duration::from_secs(2), 4096, None),
+            run_bounded_command(
+                &argv,
+                Duration::from_secs(2),
+                4096,
+                crate::cancellation::none(),
+            ),
         )
         .await
         .expect("a descendant-held pipe must not defeat bounded cleanup")
@@ -804,7 +811,12 @@ mod tests {
         ];
         let error = tokio::time::timeout(
             Duration::from_secs(2),
-            run_bounded_command(&argv, Duration::from_millis(50), 4096, None),
+            run_bounded_command(
+                &argv,
+                Duration::from_millis(50),
+                4096,
+                crate::cancellation::none(),
+            ),
         )
         .await
         .expect("the deadline must remain observable after both readers finish")
@@ -822,7 +834,7 @@ mod tests {
         let marker = crate::test_support::unique_temp_path("lait-process-drop", ".marker");
         let script = format!("(sleep 1; touch '{}') & sleep 5", marker.display());
         let argv = ["sh".to_owned(), "-c".to_owned(), script];
-        let mut execution = Box::pin(run_command(&argv, "", None));
+        let mut execution = Box::pin(run_command(&argv, "", crate::cancellation::none()));
         tokio::select! {
             result = &mut execution => panic!("runner unexpectedly completed: {result:?}"),
             () = tokio::time::sleep(Duration::from_millis(50)) => {}

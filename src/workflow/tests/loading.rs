@@ -23,8 +23,14 @@ async fn workflow_registry_caches_a_loaded_file_by_path() {
     .unwrap();
 
     let registry = WorkflowRegistry::new();
-    let first = registry.load_path_cancellable(&path, None).await.unwrap();
-    let second = registry.load_path_cancellable(&path, None).await.unwrap();
+    let first = registry
+        .load_path_cancellable(&path, crate::cancellation::none())
+        .await
+        .unwrap();
+    let second = registry
+        .load_path_cancellable(&path, crate::cancellation::none())
+        .await
+        .unwrap();
 
     assert!(
         std::sync::Arc::ptr_eq(&first, &second),

@@ -46,7 +46,7 @@ async fn cancellable_config_load_stops_waiting_for_a_fifo() {
 
     let token = tokio_util::sync::CancellationToken::new();
     let source = ConfigSource::Explicit(path.clone());
-    let mut load = Box::pin(load_config_cancellable(&source, Some(token.clone())));
+    let mut load = Box::pin(load_config_cancellable(&source, token.clone()));
     tokio::select! {
         result = &mut load => panic!("FIFO config unexpectedly loaded: {result:?}"),
         () = tokio::time::sleep(std::time::Duration::from_millis(50)) => token.cancel(),

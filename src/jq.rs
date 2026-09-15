@@ -11,12 +11,8 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
     mem::size_of,
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, LazyLock, atomic::AtomicBool},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -28,7 +24,7 @@ use jaq_core::{
 use jaq_json::{Val, read};
 use serde::{Deserialize, Serialize};
 
-use crate::{async_io, template};
+use crate::{async_io, sync_cache::SyncCache, template};
 
 mod limits;
 
@@ -71,8 +67,7 @@ struct CachedFilter {
     uses_vars: bool,
 }
 
-static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CachedFilter>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static FILTER_CACHE: LazyLock<SyncCache<CachedFilter>> = LazyLock::new(SyncCache::new);
 
 /// Parses and compiles `filter_source` (defs/funs prelude plus the filter
 /// itself), or returns the cached result of an earlier call with the same
@@ -101,50 +96,41 @@ static FILTER_CACHE: LazyLock<Mutex<HashMap<String, Arc<CachedFilter>>>> =
 /// possible false positive, and it only costs the global a construction
 /// that then goes unused, never a missing one.
 fn compiled_filter(filter_source: &str) -> Result<Arc<CachedFilter>> {
-    if let Some(filter) = FILTER_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(filter_source)
-    {
-        return Ok(Arc::clone(filter));
-    }
+    FILTER_CACHE.get_or_init(filter_source, |filter_source| {
+        let program = File {
+            code: filter_source,
+            path: (),
+        };
+        let defs = jaq_core::defs()
+            .chain(jaq_std::defs())
+            .chain(jaq_json::defs());
+        // Turbofished for the same reason `check_syntax` used to spell it out:
+        // nothing downstream of `compiled_filter` builds a `Ctx` to pin `D`
+        // retroactively, since the whole point is to hand back a filter whose
+        // `D` is already fixed to `data::JustLut<Val>` (see `CompiledFilter`).
+        let funs = jaq_core::funs::<data::JustLut<Val>>()
+            .chain(jaq_std::funs())
+            .chain(jaq_json::funs());
 
-    let program = File {
-        code: filter_source,
-        path: (),
-    };
-    let defs = jaq_core::defs()
-        .chain(jaq_std::defs())
-        .chain(jaq_json::defs());
-    // Turbofished for the same reason `check_syntax` used to spell it out:
-    // nothing downstream of `compiled_filter` builds a `Ctx` to pin `D`
-    // retroactively, since the whole point is to hand back a filter whose
-    // `D` is already fixed to `data::JustLut<Val>` (see `CompiledFilter`).
-    let funs = jaq_core::funs::<data::JustLut<Val>>()
-        .chain(jaq_std::funs())
-        .chain(jaq_json::funs());
+        let loader = Loader::new(defs);
+        let arena = Arena::default();
+        let modules = loader
+            .load(&arena, program)
+            .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
+        let filter: CompiledFilter = Compiler::default()
+            .with_funs(funs)
+            .with_global_vars(["$steps", "$vars"])
+            .compile(modules)
+            .map_err(|errors| {
+                anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}")
+            })?;
 
-    let loader = Loader::new(defs);
-    let arena = Arena::default();
-    let modules = loader
-        .load(&arena, program)
-        .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
-    let filter: CompiledFilter = Compiler::default()
-        .with_funs(funs)
-        .with_global_vars(["$steps", "$vars"])
-        .compile(modules)
-        .map_err(|errors| anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}"))?;
-
-    let cached = Arc::new(CachedFilter {
-        filter: Arc::new(filter),
-        uses_steps: filter_source.contains("$steps"),
-        uses_vars: filter_source.contains("$vars"),
-    });
-    FILTER_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(filter_source.to_owned(), Arc::clone(&cached));
-    Ok(cached)
+        Ok(CachedFilter {
+            filter: Arc::new(filter),
+            uses_steps: filter_source.contains("$steps"),
+            uses_vars: filter_source.contains("$vars"),
+        })
+    })
 }
 
 /// jq is intentionally run in a bounded worker rather than on Tokio's
@@ -273,15 +259,10 @@ fn apply_cancellable(
     cancelled: &AtomicBool,
 ) -> Result<String> {
     check_cancelled(cancelled)?;
-    let mut output = OutputWriter::new(Some(cancelled));
-    run_filter_with(
-        filter_source,
-        input_json,
-        steps,
-        vars,
-        Some(cancelled),
-        |value| output.render(filter_source, &value),
-    )?;
+    let mut output = OutputWriter::new(cancelled);
+    run_filter_with(filter_source, input_json, steps, vars, cancelled, |value| {
+        output.render(filter_source, &value)
+    })?;
     output.finish(filter_source)
 }
 
@@ -296,7 +277,7 @@ async fn run_cancellable_async<T, F>(
     input: &str,
     steps: &Steps,
     vars: &Steps,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
     op: F,
 ) -> Result<T>
 where
@@ -326,7 +307,7 @@ pub(crate) async fn apply_cancellable_async(
     input: &str,
     steps: &Steps,
     vars: &Steps,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     run_cancellable_async(
         filter_source,
@@ -345,7 +326,7 @@ pub(crate) async fn apply_bool_cancellable_async(
     input: &str,
     steps: &Steps,
     vars: &Steps,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<bool> {
     run_cancellable_async(
         filter_source,
@@ -366,7 +347,7 @@ pub(crate) async fn apply_one_cancellable_async(
     input: &str,
     steps: &Steps,
     vars: &Steps,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     run_cancellable_async(
         filter_source,
@@ -394,7 +375,13 @@ pub(crate) fn apply_bool(
     steps: &Steps,
     vars: &Steps,
 ) -> Result<bool> {
-    apply_bool_inner(filter_source, input_json, steps, vars, None)
+    apply_bool_inner(
+        filter_source,
+        input_json,
+        steps,
+        vars,
+        &crate::cancellation::NEVER_SET,
+    )
 }
 
 /// Parses and compiles `filter_source` without running it against any input,
@@ -418,7 +405,7 @@ fn apply_bool_cancellable(
     vars: &Steps,
     cancelled: &AtomicBool,
 ) -> Result<bool> {
-    apply_bool_inner(filter_source, input_json, steps, vars, Some(cancelled))
+    apply_bool_inner(filter_source, input_json, steps, vars, cancelled)
 }
 
 fn apply_one_cancellable(
@@ -428,7 +415,7 @@ fn apply_one_cancellable(
     vars: &Steps,
     cancelled: &AtomicBool,
 ) -> Result<String> {
-    apply_one_inner(filter_source, input_json, steps, vars, Some(cancelled))
+    apply_one_inner(filter_source, input_json, steps, vars, cancelled)
 }
 
 fn apply_bool_inner(
@@ -436,7 +423,7 @@ fn apply_bool_inner(
     input_json: &str,
     steps: &Steps,
     vars: &Steps,
-    cancelled: Option<&AtomicBool>,
+    cancelled: &AtomicBool,
 ) -> Result<bool> {
     // Conditions do not return their value to the caller, but they still
     // must not be able to materialize an arbitrarily large result, so the
@@ -458,7 +445,7 @@ fn apply_one_inner(
     input_json: &str,
     steps: &Steps,
     vars: &Steps,
-    cancelled: Option<&AtomicBool>,
+    cancelled: &AtomicBool,
 ) -> Result<String> {
     run_single_value(
         filter_source,
@@ -483,7 +470,7 @@ fn run_single_value<T>(
     input_json: &str,
     steps: &Steps,
     vars: &Steps,
-    cancelled: Option<&AtomicBool>,
+    cancelled: &AtomicBool,
     label: &str,
     mut extract: impl FnMut(Val, Vec<u8>) -> Result<T>,
 ) -> Result<T> {
@@ -520,7 +507,7 @@ fn run_filter_with<F>(
     input_json: &str,
     steps: &Steps,
     vars: &Steps,
-    cancelled: Option<&AtomicBool>,
+    cancelled: &AtomicBool,
     mut on_value: F,
 ) -> Result<()>
 where
@@ -533,15 +520,15 @@ where
             MAX_INPUT_BYTES
         );
     }
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
     let input = read::parse_single(input_json.as_bytes())
         .map_err(|error| anyhow!("failed to parse jq input as JSON: {error}"))?;
     validate_value_structure(&input)
         .context("jq input structure exceeds the configured memory limit")?;
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
 
     let cached = compiled_filter(filter_source)?;
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
 
     // Skip converting a `Steps` value into a jaq `Val` tree (`parse_global_var`
     // walks the whole thing — see its doc comment) when `filter_source`
@@ -557,13 +544,13 @@ where
     } else {
         Val::Null
     };
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
     let vars_val = if cached.uses_vars {
         parse_global_var(vars, "$vars")?
     } else {
         Val::Null
     };
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
 
     let ctx = Ctx::<data::JustLut<Val>>::new(&cached.filter.lut, Vars::new([steps_val, vars_val]));
     for (output_count, result) in cached
@@ -573,7 +560,7 @@ where
         .map(unwrap_valr)
         .enumerate()
     {
-        check_cancelled_opt(cancelled)?;
+        check_cancelled(cancelled)?;
         if output_count >= MAX_OUTPUT_VALUES {
             bail!(
                 "jq filter {filter_source:?} produced more than the configured limit of {} outputs",
@@ -587,7 +574,7 @@ where
         // instead of collecting the rest of an otherwise unbounded stream.
         on_value(value)?;
     }
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
     Ok(())
 }
 
@@ -635,11 +622,7 @@ fn parse_global_var(value: &Steps, label: &str) -> Result<Val> {
 /// has never been seen (or that previously failed to compile, since a
 /// failure is never cached) still pays the full scan — exactly as before.
 fn validate_filter_source(filter_source: &str) -> Result<()> {
-    if FILTER_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains_key(filter_source)
-    {
+    if FILTER_CACHE.contains(filter_source) {
         return Ok(());
     }
 
@@ -727,14 +710,7 @@ fn normalize_input(input: &str) -> Result<Cow<'_, str>> {
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
-    check_cancelled_opt(Some(cancelled))
-}
-
-fn check_cancelled_opt(cancelled: Option<&AtomicBool>) -> Result<()> {
-    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-        bail!(crate::error::cancelled("jq evaluation was cancelled"));
-    }
-    Ok(())
+    crate::cancellation::check_flag(cancelled, "jq evaluation was cancelled")
 }
 
 /// Checks an already-materialized jaq value before handing it to the JSON

@@ -4,7 +4,7 @@
 //! `chat::load_session_history`/`chat::finish_chat_turn`) lives in the `chat`
 //! module, shared with `app::run_chat`'s single-shot path.
 
-use std::{io::Write, sync::Arc};
+use std::io::Write;
 
 use anyhow::Result;
 use async_openai::types::chat::ChatCompletionRequestMessage;
@@ -12,9 +12,9 @@ use async_openai::types::chat::ChatCompletionRequestMessage;
 use crate::{
     async_io, chat,
     cli::{ChatReplArgs, SharedChatArgs},
-    config::{self, ConfigFile, ConfigSource},
-    engine::{AppServices, PromptTurn, RequestSettings, RunContext, StreamOptions},
-    llm, response, signal, usage,
+    config::{ConfigFile, ConfigSource},
+    engine::{PromptTurn, RequestSettings, RunContext, StreamOptions},
+    llm, response, usage,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -61,25 +61,20 @@ pub(crate) fn parse_meta_command(line: &str) -> Option<MetaCommand<'_>> {
 /// processes. See `parse_meta_command` for the `/exit`/`/clear`/
 /// `/model`/`/system` syntax handled below. Also reached from a prompt-less,
 /// stdin-is-a-terminal bare `lait` invocation — see `app::run_chat_or_repl`.
-pub(crate) async fn run(
+pub(super) async fn run(
     args: ChatReplArgs,
     config_source: ConfigSource,
     cache_override: Option<bool>,
     approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    signal::spawn_handler(cancel.clone());
     let mut shared = args.shared;
-    let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+    let file_config = super::load_config(&config_source, &cancel).await?;
     let mut history = chat::load_session_history(shared.session.as_deref())?;
     let mut system_prompt =
-        chat::resolve_system_prompt(&shared, &file_config, Some(cancel.clone())).await?;
-    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
-    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
-    let env = RunContext::new(Arc::clone(&services), cancel.clone())
-        .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools);
+        chat::resolve_system_prompt(&shared, &file_config, cancel.clone()).await?;
+    let (services, env) =
+        super::build_run_context(&file_config, cache_override, approve_tools, cancel.clone());
 
     eprintln!("lait chat — /exit to quit, /clear to reset history, /model <name>, /system <text>");
 
@@ -101,7 +96,7 @@ pub(crate) async fn run(
                     let bytes_read = std::io::stdin().read_line(&mut line)?;
                     Ok((bytes_read, line))
                 },
-                Some(cancel.clone()),
+                cancel.clone(),
             )
             .await?;
             if bytes_read == 0 {
@@ -260,7 +255,7 @@ async fn run_turn(
                 show_reasoning,
                 output_path: None,
             },
-            Some(env.operation_token()),
+            env.operation_token(),
         )
         .await?;
     if show_usage && let Some(usage) = outcome.usage {

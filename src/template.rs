@@ -7,14 +7,13 @@
 //! wrapper around it. Both go through [`compiled_template`]'s process-wide
 //! cache rather than recompiling a template string on every render.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
-};
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
 use handlebars::{Handlebars, Helper, HelperResult, Output, RenderContext, RenderErrorReason};
 use handlebars::{Renderable, Template};
+
+use crate::sync_cache::SyncCache;
 
 /// Parses a raw string as JSON when possible; falls back to a JSON string
 /// holding the raw value unchanged (so a plain-text `{{ input }}` render is
@@ -152,8 +151,7 @@ struct CachedTemplate {
 /// grows across every workflow file in a directory tree rather than one
 /// workflow — still bounded by the distinct template strings on disk, and
 /// the process exits once linting finishes.
-static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<CachedTemplate>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TEMPLATE_CACHE: LazyLock<SyncCache<CachedTemplate>> = LazyLock::new(SyncCache::new);
 
 /// Compiles `template`, or returns the cached result of an earlier call with
 /// the same source text — [`references_bare_input`]'s scan is folded in here
@@ -164,25 +162,14 @@ static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<CachedTemplate>>>> =
 /// template text on every item/iteration, and the scan's result cannot
 /// change for a source text that never changes.
 fn compiled_template(template: &str) -> Result<Arc<CachedTemplate>> {
-    if let Some(cached) = TEMPLATE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(template)
-    {
-        return Ok(Arc::clone(cached));
-    }
-
-    let compiled = Template::compile(template)
-        .with_context(|| format!("failed to parse template: {template:?}"))?;
-    let cached = Arc::new(CachedTemplate {
-        template: Arc::new(compiled),
-        references_bare_input: references_bare_input(template),
-    });
-    TEMPLATE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(template.to_owned(), Arc::clone(&cached));
-    Ok(cached)
+    TEMPLATE_CACHE.get_or_init(template, |template| {
+        let compiled = Template::compile(template)
+            .with_context(|| format!("failed to parse template: {template:?}"))?;
+        Ok(CachedTemplate {
+            template: Arc::new(compiled),
+            references_bare_input: references_bare_input(template),
+        })
+    })
 }
 
 /// Checks `template`'s handlebars syntax without rendering it (used by the

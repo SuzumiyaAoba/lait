@@ -52,7 +52,7 @@ pub(crate) fn create_dir_context(path: &Path) -> String {
 pub(crate) async fn read_and_parse_yaml<T: DeserializeOwned>(
     path: &Path,
     kind: &str,
-    cancellation: Option<CancellationToken>,
+    cancellation: CancellationToken,
 ) -> Result<T> {
     let contents = crate::async_io::read_to_string_cancellable(
         path,

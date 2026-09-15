@@ -44,7 +44,7 @@ pub(super) async fn tool_decision(
     qualified_name: &str,
     arguments: &str,
     command_preview: impl FnOnce() -> Option<String>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<ToolDecision> {
     if !env.services.file_config.tool_policy.allows(qualified_name) {
         return Ok(ToolDecision::Deny(format!(
@@ -60,8 +60,7 @@ pub(super) async fn tool_decision(
     // share one process stdin. Keep the gate until the blocking reader worker
     // has finished, even when the async owner is cancelled; the lease is
     // moved into that worker by `prompt_tool_approval` below.
-    let Some(approval_lease) =
-        acquire_approval_slot(env, qualified_name, cancellation.as_ref()).await?
+    let Some(approval_lease) = acquire_approval_slot(env, qualified_name, &cancellation).await?
     else {
         return Ok(ToolDecision::Allow);
     };
@@ -106,20 +105,15 @@ type ApprovalGateLease = tokio::sync::OwnedMutexGuard<()>;
 
 async fn acquire_approval_gate(
     env: &RunContext,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<ApprovalGateLease> {
     let gate = Arc::clone(&env.approval_gate);
-    match cancellation {
-        Some(cancellation) => {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    Err(crate::error::cancelled("tool approval was cancelled"))
-                }
-                lease = gate.lock_owned() => Ok(lease),
-            }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            Err(crate::error::cancelled("tool approval was cancelled"))
         }
-        None => Ok(gate.lock_owned().await),
+        lease = gate.lock_owned() => Ok(lease),
     }
 }
 
@@ -129,7 +123,7 @@ async fn acquire_approval_gate(
 async fn acquire_approval_slot(
     env: &RunContext,
     qualified_name: &str,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<ApprovalGateLease>> {
     let approval_lease = acquire_approval_gate(env, cancellation).await?;
     if always_approved(env, qualified_name) {
@@ -159,7 +153,7 @@ async fn prompt_tool_approval(
     arguments: &str,
     command_preview: Option<&str>,
     approval_lease: ApprovalGateLease,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(ToolApprovalAnswer, ApprovalGateLease)> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
@@ -192,7 +186,7 @@ async fn prompt_tool_approval(
 /// reader of stdin until its blocking read completes.
 async fn read_tool_approval_with_lease<R>(
     approval_lease: ApprovalGateLease,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
     reader: R,
 ) -> Result<(ToolApprovalAnswer, ApprovalGateLease)>
 where
@@ -254,13 +248,17 @@ mod tests {
             let (sender, receiver) = std::sync::mpsc::channel();
             let lease = gate.clone().lock_owned().await;
             let started = Arc::clone(&first_started);
-            let first = tokio::spawn(read_tool_approval_with_lease(lease, None, move || {
-                started.store(true, Ordering::Release);
-                receiver
-                    .recv()
-                    .map_err(|_| anyhow::anyhow!("first approval reader was closed"))?;
-                Ok(ToolApprovalAnswer::Once)
-            }));
+            let first = tokio::spawn(read_tool_approval_with_lease(
+                lease,
+                crate::cancellation::none(),
+                move || {
+                    started.store(true, Ordering::Release);
+                    receiver
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("first approval reader was closed"))?;
+                    Ok(ToolApprovalAnswer::Once)
+                },
+            ));
             (first, sender)
         };
         for _ in 0..100 {
@@ -277,7 +275,7 @@ mod tests {
             let started = Arc::clone(&second_started);
             async move {
                 let lease = gate.lock_owned().await;
-                read_tool_approval_with_lease(lease, None, move || {
+                read_tool_approval_with_lease(lease, crate::cancellation::none(), move || {
                     started.store(true, Ordering::Release);
                     Ok(ToolApprovalAnswer::Once)
                 })
@@ -314,7 +312,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         let reader = tokio::spawn({
             let started = Arc::clone(&started);
-            read_tool_approval_with_lease(lease, Some(cancellation.clone()), move || {
+            read_tool_approval_with_lease(lease, cancellation.clone(), move || {
                 started.store(true, Ordering::Release);
                 answer_receiver
                     .recv()
@@ -355,10 +353,12 @@ mod tests {
             crate::config::ConfigFile::default(),
         )));
         let env = Arc::new(RunContext::new(services, CancellationToken::new()));
-        let held = acquire_approval_gate(&env, None).await.unwrap();
+        let held = acquire_approval_gate(&env, &crate::cancellation::none())
+            .await
+            .unwrap();
         let waiter = tokio::spawn({
             let env = Arc::clone(&env);
-            async move { acquire_approval_slot(&env, "tool__echo", None).await }
+            async move { acquire_approval_slot(&env, "tool__echo", &crate::cancellation::none()).await }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!waiter.is_finished());

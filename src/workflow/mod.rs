@@ -18,7 +18,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{async_cache::AsyncCache, async_io, config::ConfigFile, jq, registry};
+use crate::{async_cache::AsyncCache, async_io, config::ConfigFile, jq, registry, report};
 
 #[cfg(test)]
 use crate::template;
@@ -53,9 +53,9 @@ pub(crate) fn resolve_run_target(argument: &Path, file_config: &ConfigFile) -> P
         if let Some(name) = argument.to_str()
             && file_config.workflows.contains_key(name)
         {
-            eprintln!(
-                "note: '{name}' exists as a file and is also a 'workflows:' entry; running the file"
-            );
+            report::note(format_args!(
+                "'{name}' exists as a file and is also a 'workflows:' entry; running the file"
+            ));
         }
         return argument.to_path_buf();
     }
@@ -64,11 +64,11 @@ pub(crate) fn resolve_run_target(argument: &Path, file_config: &ConfigFile) -> P
     };
     match file_config.workflows.get(name) {
         Some(resolved) => {
-            eprintln!(
-                "note: resolved '{name}' to '{}' via 'workflows:' in {}",
+            report::note(format_args!(
+                "resolved '{name}' to '{}' via 'workflows:' in {}",
                 resolved.display(),
                 crate::config::CONFIG_FILE_NAME
-            );
+            ));
             resolved.clone()
         }
         None => argument.to_path_buf(),
@@ -101,7 +101,7 @@ pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
 /// while waiting for a FIFO writer or reading the source.
 pub(crate) async fn load_workflow_cancellable(
     path: &Path,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<WorkflowFile> {
     let path = path.to_owned();
     async_io::run_blocking(
@@ -146,7 +146,7 @@ impl WorkflowRegistry {
     pub(crate) async fn load_path_cancellable(
         &self,
         path: &Path,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Arc<WorkflowFile>> {
         let load_cancellation = cancellation.clone();
         self.loaded
@@ -221,7 +221,7 @@ pub(crate) async fn eval_when_async(
     current_input: &str,
     steps: &StepOutputs,
     vars: &StepOutputs,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<bool> {
     jq::apply_bool_cancellable_async(filter, current_input, steps, vars, cancellation)
         .await

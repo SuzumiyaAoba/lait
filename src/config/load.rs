@@ -220,11 +220,11 @@ pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
 /// the project-only path with no `try_join!` overhead.
 pub(crate) async fn load_config_cancellable(
     source: &ConfigSource,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<ConfigFile> {
     async fn load_project(
         source: &ConfigSource,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ConfigFile> {
         let project_path = resolve_config_path_cancellable(source, cancellation.clone()).await?;
         load_config_at_cancellable(source, project_path, cancellation).await
@@ -257,14 +257,9 @@ const CONFIG_LOOKUP_CANCELLED: &str = "configuration lookup was cancelled";
 /// sources have no filesystem work and return immediately.
 pub(crate) async fn resolve_config_path_cancellable(
     source: &ConfigSource,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Option<PathBuf>> {
-    if cancellation
-        .as_ref()
-        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-    {
-        bail!(crate::error::cancelled(CONFIG_LOOKUP_CANCELLED));
-    }
+    crate::cancellation::check(&cancellation, CONFIG_LOOKUP_CANCELLED)?;
     match source {
         ConfigSource::Disabled => Ok(None),
         ConfigSource::Explicit(path) => Ok(Some(path.clone())),
@@ -303,7 +298,7 @@ fn find_config_upward_cancellable(
 async fn load_config_at_cancellable(
     source: &ConfigSource,
     path: Option<PathBuf>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<ConfigFile> {
     let Some(path) = path else {
         return Ok(ConfigFile::default());
@@ -314,7 +309,7 @@ async fn load_config_at_cancellable(
 }
 
 async fn load_global_config_cancellable(
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Option<ConfigFile>> {
     let path = global_config_path()?;
     let read_result =
@@ -326,14 +321,14 @@ async fn load_global_config_cancellable(
 /// synchronous metadata call. `doctor` uses this to distinguish an absent
 /// global file from a parsed empty config.
 pub(crate) async fn global_config_exists_cancellable(
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<bool> {
     is_file_cancellable(&global_config_path()?, cancellation).await
 }
 
 async fn is_file_cancellable(
     path: &Path,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<bool> {
     let path = path.to_owned();
     async_io::run_blocking(

@@ -32,7 +32,7 @@ pub(super) async fn stream_response_to<C, R>(
     show_reasoning: bool,
     content_sink: &mut C,
     mut reasoning_sink: Option<&mut R>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<StreamOutcome>
 where
     C: AsyncWrite + Unpin,
@@ -135,7 +135,7 @@ pub(super) async fn stream_response(
     show_reasoning: bool,
     output_path: Option<&Path>,
     append: bool,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<StreamOutcome> {
     let mut stdout_writer;
     let mut file_writer;
@@ -230,7 +230,7 @@ mod tests {
             true,
             &mut content,
             None::<&mut CaptureWriter>,
-            None,
+            crate::cancellation::none(),
         )
         .await
         .expect("stream should render");
@@ -253,7 +253,7 @@ mod tests {
             true,
             &mut content,
             Some(&mut reasoning),
-            None,
+            crate::cancellation::none(),
         )
         .await
         .expect("stream should render");
@@ -276,7 +276,7 @@ mod tests {
             false,
             &mut content,
             None::<&mut CaptureWriter>,
-            Some(cancellation),
+            cancellation,
         )
         .await
         .expect_err("cancelled stream should fail");

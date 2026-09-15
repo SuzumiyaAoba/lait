@@ -105,6 +105,22 @@ pub(crate) fn emit_run_output(
     }
 }
 
+/// Prints a `note:`-prefixed informational line to stderr — the shared
+/// spelling for non-fatal asides (`note: resolved 'foo' to ...`), so the
+/// prefix's wording lives in one place. Call sites pass
+/// `format_args!(...)`; nothing is allocated beyond the line itself.
+pub(crate) fn note(args: std::fmt::Arguments<'_>) {
+    eprintln!("note: {args}");
+}
+
+/// Prints a `warning:`-prefixed line to stderr — the shared spelling for
+/// recoverable problems the run continued past (a checkpoint that failed
+/// to save, a model alias that failed to resolve). See [`note`] for why
+/// this takes `format_args!(...)`.
+pub(crate) fn warn(args: std::fmt::Arguments<'_>) {
+    eprintln!("warning: {args}");
+}
+
 /// Records a completed chat/agent/workflow/prompt run in `lait history`,
 /// unless `no_history` (the caller's own `--no-history`) or
 /// `default.history: false` opts out — the one gate every `run_*` entry

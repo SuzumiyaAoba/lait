@@ -34,7 +34,7 @@ use super::model::AskNode;
 pub(crate) async fn run_ask(
     prompt: &str,
     node: &AskNode,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     if !std::io::stdin().is_terminal() {
         let default = node.default.clone().ok_or_else(|| {

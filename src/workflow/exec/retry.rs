@@ -152,7 +152,7 @@ pub(super) async fn execute_step_with_retry(
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        check_workflow_cancellation(workflow_cancel.as_ref())?;
+        check_workflow_cancellation(&workflow_cancel)?;
         tracing::debug!(step = %label, attempt, max_attempts, "step started");
         let outcome = match effective_timeout {
             // Keep the timeout around the whole node action (including its
@@ -168,14 +168,11 @@ pub(super) async fn execute_step_with_retry(
                 // `CancellationToken` property, not something forwarded by
                 // hand) — `execute_step` only ever needs to watch this one
                 // token either way.
-                let node_cancel = match &workflow_cancel {
-                    Some(parent) => parent.child_token(),
-                    None => tokio_util::sync::CancellationToken::new(),
-                };
+                let node_cancel = workflow_cancel.child_token();
                 let execution = execute_step(
                     node,
                     current_input,
-                    context.with_cancel(Some(node_cancel.clone())),
+                    context.with_cancel(node_cancel.clone()),
                 );
                 tokio::pin!(execution);
                 match tokio::time::timeout(Duration::from_secs(seconds), &mut execution).await {
@@ -205,7 +202,7 @@ pub(super) async fn execute_step_with_retry(
                 return Ok(output);
             }
             Err(error) if attempt < max_attempts => {
-                check_workflow_cancellation(workflow_cancel.as_ref())?;
+                check_workflow_cancellation(&workflow_cancel)?;
                 tracing::debug!(
                     step = %label,
                     attempt,
@@ -218,7 +215,7 @@ pub(super) async fn execute_step_with_retry(
                     "{progress_prefix}    -> attempt {attempt}/{max_attempts} failed: {error}; retrying in {:.1}s",
                     delay.as_secs_f64()
                 );
-                wait_retry_delay(delay, workflow_cancel.as_ref()).await?;
+                wait_retry_delay(delay, &workflow_cancel).await?;
                 // `try_from_secs_f64` + the `MAX_RETRY_DELAY` clamp keep an
                 // exponentially growing (or pathological) delay from
                 // overflowing `Duration` — `Duration::from_secs_f64` would
@@ -237,14 +234,8 @@ pub(super) async fn execute_step_with_retry(
 /// workflow to wait for an arbitrarily large backoff before returning.
 async fn wait_retry_delay(
     delay: Duration,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let Some(cancellation) = cancellation else {
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        return Ok(());
-    };
     if delay.is_zero() {
         if cancellation.is_cancelled() {
             bail!(crate::error::cancelled(WORKFLOW_EXECUTION_CANCELLED));

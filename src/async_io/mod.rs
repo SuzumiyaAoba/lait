@@ -34,7 +34,7 @@ use read::read_file;
 #[cfg(all(test, unix))]
 use read::read_file_wait_for_fifo_writer;
 pub(crate) use read::{
-    MAX_READ_BYTES, ReadBudget, canonicalize, is_not_found, read_file_with_budget, read_to_string,
+    MAX_READ_BYTES, ReadBudget, canonicalize, is_not_found, read_file_with_budget,
     read_to_string_cancellable, read_to_string_sync, read_to_string_wait_for_fifo_writer,
 };
 pub(crate) use write::write_output_file;

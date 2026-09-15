@@ -12,29 +12,20 @@ use crate::{
     cli::ModelsArgs,
     config::{self, ConfigFile, ConfigSource, ResolvedModel},
     engine::AppServices,
-    llm,
+    llm, report,
 };
 
-pub(crate) async fn run(
+pub(super) async fn run(
     args: ModelsArgs,
     config_source: ConfigSource,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let cancellation = cancellation.unwrap_or_default();
-    crate::signal::spawn_handler(cancellation.clone());
-    let file_config = Arc::new(
-        config::load_config_cancellable(&config_source, Some(cancellation.clone())).await?,
-    );
+    let file_config = super::load_config(&config_source, &cancellation).await?;
     if args.remote {
         let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
         services
             .clone()
-            .finish(list_remote(
-                &args,
-                &file_config,
-                &services,
-                Some(cancellation),
-            ))
+            .finish(list_remote(&args, &file_config, &services, cancellation))
             .await
     } else {
         list_local(&args, &file_config)
@@ -43,7 +34,7 @@ pub(crate) async fn run(
 
 /// The `--remote`-less path, callable without an async runtime — see
 /// `app::run_blocking`.
-pub(crate) fn run_local(args: ModelsArgs, config_source: ConfigSource) -> Result<()> {
+pub(super) fn run_local(args: ModelsArgs, config_source: ConfigSource) -> Result<()> {
     let file_config = config::load_config(&config_source)?;
     list_local(&args, &file_config)
 }
@@ -76,7 +67,7 @@ fn alias_rows(file_config: &ConfigFile) -> Vec<AliasRow<'_>> {
             let resolved = match config::resolve_model_alias(name, &file_config.models) {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    eprintln!("warning: skipping model alias '{name}': {error:#}");
+                    report::warn(format_args!("skipping model alias '{name}': {error:#}"));
                     return None;
                 }
             }?;
@@ -235,7 +226,7 @@ async fn list_remote(
     args: &ModelsArgs,
     file_config: &ConfigFile,
     services: &AppServices,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     // The same endpoint resolution as a completion request (CLI/env >
     // config), except model aliases play no part: `--remote` asks one
@@ -259,11 +250,11 @@ async fn list_remote(
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
-    let response = await_with_cancellation(request.send(), cancellation.as_ref())
+    let response = await_with_cancellation(request.send(), &cancellation)
         .await
         .with_context(|| format!("failed to request {url}"))?;
     let status = response.status();
-    let body = await_with_cancellation(response.text(), cancellation.as_ref())
+    let body = await_with_cancellation(response.text(), &cancellation)
         .await
         .with_context(|| format!("failed to read the response from {url}"))?;
     if !status.is_success() {
@@ -290,21 +281,16 @@ async fn list_remote(
 
 async fn await_with_cancellation<T, E>(
     future: impl Future<Output = std::result::Result<T, E>>,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<T>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    match cancellation {
-        Some(cancellation) => {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => Err(crate::error::cancelled(
-                    "models remote request was cancelled",
-                )),
-                result = future => result.map_err(anyhow::Error::new),
-            }
-        }
-        None => future.await.map_err(anyhow::Error::new),
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(crate::error::cancelled(
+            "models remote request was cancelled",
+        )),
+        result = future => result.map_err(anyhow::Error::new),
     }
 }

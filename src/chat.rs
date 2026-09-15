@@ -36,7 +36,7 @@ fn read_stdin_text() -> Result<String> {
 /// FIFO or a pipe with no EOF cannot hold the Tokio runtime past Ctrl-C.
 pub(crate) async fn resolve_input_with_stdin_cancellable(
     positional: Option<String>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Option<String>> {
     use std::io::IsTerminal;
 
@@ -110,7 +110,7 @@ pub(crate) fn resolve_cache_settings(
 pub(crate) async fn resolve_system_prompt(
     shared: &SharedChatArgs,
     file_config: &ConfigFile,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Option<String>> {
     if let Some(text) = &shared.system {
         return Ok(Some(text.clone()));
@@ -204,7 +204,7 @@ pub(crate) fn load_session_history(
 /// image URLs) instead of blocking ahead of them on the calling task.
 pub(crate) async fn load_session_history_cancellable(
     session_name: Option<&str>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<ChatCompletionRequestMessage>> {
     let Some(name) = session_name else {
         return Ok(Vec::new());

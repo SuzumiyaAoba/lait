@@ -59,7 +59,7 @@ use async_openai::types::chat::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{cache, cassette, llm, mcp, response, shell_tool, skill, subagent};
+use crate::{cache, cassette, llm, mcp, report, response, shell_tool, skill, subagent};
 
 use super::{
     PromptTurn, RequestSettings, RunContext,
@@ -153,7 +153,7 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &'a [ChatCompletionTools],
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> llm::CompletionRequest<'a> {
         llm::CompletionRequest {
             base_url: &endpoint.base_url,
@@ -207,7 +207,7 @@ impl RequestSettings {
         active_agent_paths: &[PathBuf],
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<response::ChatCompletionResponse> {
         let messages = self
             .initial_turn_messages(env, turn, cancellation.clone())
@@ -281,7 +281,7 @@ impl RequestSettings {
     async fn assemble_tool_sets(
         &self,
         env: &RunContext,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<(
         mcp::ToolSet,
         subagent::ToolSet,
@@ -314,7 +314,7 @@ impl RequestSettings {
         &self,
         env: &RunContext,
         messages: Vec<ChatCompletionRequestMessage>,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<ToolLoop> {
         let (mcp_tool_set, subagent_tool_set, shell_tool_set, tools) =
             self.assemble_tool_sets(env, cancellation.clone()).await?;
@@ -351,7 +351,7 @@ impl RequestSettings {
         &self,
         env: &RunContext,
         content_key: &Option<String>,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<Option<response::ChatCompletionResponse>> {
         let Some(replay_dir) = env.policy.cassette.replay_dir() else {
             return Ok(None);
@@ -375,7 +375,7 @@ impl RequestSettings {
         &self,
         env: &RunContext,
         content_key: &Option<String>,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<Option<response::ChatCompletionResponse>> {
         if !(env.policy.cache.enabled() && env.policy.cassette.record_dir().is_none()) {
             return Ok(None);
@@ -390,7 +390,7 @@ impl RequestSettings {
         .await
         {
             Ok(Some(response)) => {
-                eprintln!("note: cache hit for {}", self.usage_label);
+                report::note(format_args!("cache hit for {}", self.usage_label));
                 tracing::debug!(cache_key = %cache_key, "response cache hit");
                 Ok(Some(response))
             }
@@ -415,7 +415,7 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         messages: &[ChatCompletionRequestMessage],
         tools: &[ChatCompletionTools],
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<response::ChatCompletionResponse> {
         // The same content hash serves three purposes below (response cache,
         // `--record` cassette filename, `--replay` cassette lookup) —
@@ -537,7 +537,7 @@ impl RequestSettings {
         messages: &[ChatCompletionRequestMessage],
         tools: &[ChatCompletionTools],
         include_usage: bool,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<llm::CompletionStream> {
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
@@ -600,7 +600,7 @@ impl RequestSettings {
         turn: PromptTurn<'_>,
         response_format: Option<ResponseFormat>,
         stream: StreamOptions<'_>,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<StreamOutcome> {
         let StreamOptions {
             include_usage,
@@ -722,7 +722,7 @@ impl RequestSettings {
         &self,
         skill_cache: &skill::SkillCache,
         system_prompt: Option<&'a str>,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<Option<Cow<'a, str>>> {
         let skills_text = skill_cache.render(&self.skills, cancellation).await?;
         Ok(with_skills(
@@ -743,7 +743,7 @@ impl RequestSettings {
         &self,
         env: &RunContext,
         turn: PromptTurn<'_>,
-        cancellation: Option<CancellationToken>,
+        cancellation: CancellationToken,
     ) -> Result<Vec<ChatCompletionRequestMessage>> {
         let system_prompt = self
             .system_prompt_with_skills(&env.services.skill_cache, turn.system_prompt, cancellation)

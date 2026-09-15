@@ -46,7 +46,7 @@ async fn cancellation_cleanup_does_not_wait_for_an_uncooperative_worker() {
             std::thread::sleep(Duration::from_millis(500));
             Ok(())
         },
-        Some(token.clone()),
+        token.clone(),
         test_worker_pool(),
     ));
 
@@ -83,7 +83,7 @@ async fn saturated_worker_acquisition_recovers_after_workers_release() {
                 }
                 Ok(())
             },
-            None,
+            crate::cancellation::none(),
             Arc::clone(&worker_pool),
         )));
     }
@@ -93,7 +93,7 @@ async fn saturated_worker_acquisition_recovers_after_workers_release() {
         tokio::task::yield_now().await;
     }
     let token = CancellationToken::new();
-    let result = run_blocking_with_pool(move |_| Ok(()), Some(token), Arc::clone(&worker_pool));
+    let result = run_blocking_with_pool(move |_| Ok(()), token, Arc::clone(&worker_pool));
     let result = tokio::time::timeout(
         super::BLOCKING_WORKER_ACQUIRE_TIMEOUT + Duration::from_millis(100),
         result,
@@ -121,7 +121,7 @@ async fn saturated_worker_acquisition_recovers_after_workers_release() {
                 worker_ran.store(true, Ordering::Release);
                 Ok(42_u8)
             },
-            None,
+            crate::cancellation::none(),
             Arc::clone(&worker_pool),
         ),
     )
@@ -144,7 +144,7 @@ async fn an_already_cancelled_operation_does_not_spawn_a_worker() {
             worker_ran.store(true, Ordering::Release);
             Ok(())
         },
-        Some(token),
+        token,
         test_worker_pool(),
     )
     .await;
@@ -180,7 +180,7 @@ async fn a_path_lease_stays_with_an_uncooperative_worker_after_cancellation() {
                 worker_finished.store(true, Ordering::Release);
                 Ok(())
             },
-            Some(task_token),
+            task_token,
         )
         .await
     });
@@ -199,7 +199,7 @@ async fn a_path_lease_stays_with_an_uncooperative_worker_after_cancellation() {
     let retry_token = CancellationToken::new();
     let retry = tokio::time::timeout(
         super::BLOCKING_WORKER_ACQUIRE_TIMEOUT + Duration::from_millis(100),
-        acquire_path_lock(&path, Some(&retry_token)),
+        acquire_path_lock(&path, &retry_token),
     )
     .await
     .expect("a retry must not wait indefinitely for a stuck writer")
@@ -214,7 +214,7 @@ async fn a_path_lease_stays_with_an_uncooperative_worker_after_cancellation() {
     }
     assert!(finished.load(Ordering::Acquire));
     let retry_token = CancellationToken::new();
-    let _permit = acquire_path_lock(&path, Some(&retry_token)).await.unwrap();
+    let _permit = acquire_path_lock(&path, &retry_token).await.unwrap();
 }
 
 #[tokio::test]
@@ -235,7 +235,7 @@ async fn blocking_workers_are_limited() {
                 active.fetch_sub(1, Ordering::AcqRel);
                 Ok(())
             },
-            None,
+            crate::cancellation::none(),
             Arc::clone(&worker_pool),
         )));
     }
@@ -331,7 +331,7 @@ async fn waiting_for_a_fifo_writer_can_be_cancelled_before_a_writer_connects() {
         move |cancelled| {
             read_file_wait_for_fifo_writer(&worker_path, cancelled, super::MAX_READ_BYTES)
         },
-        Some(token.clone()),
+        token.clone(),
         test_worker_pool(),
     ));
 
@@ -356,7 +356,7 @@ async fn waiting_for_a_fifo_writer_returns_empty_eof_after_an_empty_writer_close
         move |cancelled| {
             read_file_wait_for_fifo_writer(&worker_path, cancelled, super::MAX_READ_BYTES)
         },
-        None,
+        crate::cancellation::none(),
         test_worker_pool(),
     ));
 
@@ -398,7 +398,7 @@ async fn a_cancelled_regular_write_does_not_truncate_an_existing_file() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let result = write_output_file(&path, "replacement", Some(token)).await;
+    let result = write_output_file(&path, "replacement", token).await;
     let contents = std::fs::read_to_string(&path).expect("output fixture should remain");
     std::fs::remove_file(&path).expect("failed to remove output fixture");
 
@@ -419,8 +419,8 @@ async fn hardlink_writers_publish_one_complete_payload() {
     let first_output = "A".repeat(2 * 1024 * 1024);
     let second_output = "B".repeat(2 * 1024 * 1024);
     let (first, second) = tokio::join!(
-        write_output_file(&first_path, &first_output, None),
-        write_output_file(&second_path, &second_output, None),
+        write_output_file(&first_path, &first_output, crate::cancellation::none()),
+        write_output_file(&second_path, &second_output, crate::cancellation::none()),
     );
     first.unwrap();
     second.unwrap();
@@ -456,7 +456,7 @@ async fn cancelling_a_hardlink_writer_before_its_lease_keeps_original_contents()
     let writer_path = second_path.clone();
     let writer_cancellation = cancellation.clone();
     let writer = tokio::spawn(async move {
-        write_output_file(&writer_path, "replacement", Some(writer_cancellation)).await
+        write_output_file(&writer_path, "replacement", writer_cancellation).await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     cancellation.cancel();
@@ -556,7 +556,7 @@ async fn a_cancelled_fifo_write_is_joined_before_a_retry_can_write() {
     let first_output_for_task = first_output.clone();
     let first_token = cancel_token.clone();
     let mut first = tokio::spawn(async move {
-        write_output_file(&first_path, &first_output_for_task, Some(first_token)).await
+        write_output_file(&first_path, &first_output_for_task, first_token).await
     });
 
     let first_started = tokio::time::timeout(Duration::from_secs(1), first_byte_receiver)
@@ -593,8 +593,9 @@ async fn a_cancelled_fifo_write_is_joined_before_a_retry_can_write() {
     reader_may_drain.store(true, Ordering::Release);
     let second_path = path.clone();
     let second_output = retry_output.clone();
-    let mut second =
-        tokio::spawn(async move { write_output_file(&second_path, &second_output, None).await });
+    let mut second = tokio::spawn(async move {
+        write_output_file(&second_path, &second_output, crate::cancellation::none()).await
+    });
 
     let second_result = tokio::time::timeout(Duration::from_secs(2), &mut second)
         .await
@@ -656,23 +657,34 @@ async fn output_path_aliases_share_the_same_lease_before_and_after_creation() {
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("output.txt");
     let alias = dir.join(".").join("output.txt");
-    let lease = acquire_path_lock(&path, None).await.unwrap();
+    let lease = acquire_path_lock(&path, &crate::cancellation::none())
+        .await
+        .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&alias, None))
-            .await
-            .is_err()
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            acquire_path_lock(&alias, &crate::cancellation::none())
+        )
+        .await
+        .is_err()
     );
     std::fs::write(&path, "created while holding the lease").unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&alias, None))
-            .await
-            .is_err()
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            acquire_path_lock(&alias, &crate::cancellation::none())
+        )
+        .await
+        .is_err()
     );
     drop(lease);
-    let _next = tokio::time::timeout(Duration::from_secs(1), acquire_path_lock(&alias, None))
-        .await
-        .unwrap()
-        .unwrap();
+    let _next = tokio::time::timeout(
+        Duration::from_secs(1),
+        acquire_path_lock(&alias, &crate::cancellation::none()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -684,17 +696,25 @@ async fn a_dangling_output_symlink_and_its_target_share_a_lease() {
     let path = dir.join("output.txt");
     let link = dir.join("link.txt");
     std::os::unix::fs::symlink("output.txt", &link).unwrap();
-    let lease = acquire_path_lock(&link, None).await.unwrap();
+    let lease = acquire_path_lock(&link, &crate::cancellation::none())
+        .await
+        .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), acquire_path_lock(&path, None))
-            .await
-            .is_err()
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            acquire_path_lock(&path, &crate::cancellation::none())
+        )
+        .await
+        .is_err()
     );
     drop(lease);
-    let _next = tokio::time::timeout(Duration::from_secs(1), acquire_path_lock(&path, None))
-        .await
-        .unwrap()
-        .unwrap();
+    let _next = tokio::time::timeout(
+        Duration::from_secs(1),
+        acquire_path_lock(&path, &crate::cancellation::none()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[cfg(unix)]
@@ -706,7 +726,7 @@ async fn waiting_for_a_fifo_writer_needs_only_read_permission() {
     let cancellation = tokio_util::sync::CancellationToken::new();
     let mut read = Box::pin(super::read_to_string_cancellable(
         &path,
-        Some(cancellation.clone()),
+        cancellation.clone(),
         1024,
     ));
     tokio::select! {

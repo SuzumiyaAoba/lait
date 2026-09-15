@@ -90,14 +90,11 @@ pub(super) async fn run_prompt(
     approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    crate::signal::spawn_handler(cancel.clone());
-    let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+    let file_config = super::load_config(&config_source, &cancel).await?;
 
-    let raw_input =
-        chat::resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone()))
-            .await?
-            .ok_or_else(missing_input_error)?;
+    let raw_input = chat::resolve_input_with_stdin_cancellable(args.input.clone(), cancel.clone())
+        .await?
+        .ok_or_else(missing_input_error)?;
     let (prompt_text, prompt_model) =
         prompt::render_named(&args.name, &raw_input, &args.var.var, &file_config)?;
 
@@ -136,7 +133,7 @@ pub(super) async fn run_prompt(
             &[],
             PromptTurn::simple(None, &prompt_text),
             None,
-            Some(env.operation_token()),
+            env.operation_token(),
         ))
         .await?;
     let output = response::render_plain(&response)?;
@@ -176,10 +173,10 @@ pub(super) async fn run_agent(
     // text, so there is no risk of a confusing partial message, only a
     // different tie-break among independent failures.
     let (raw_input, agent_file, canonical_agent_path, config) = tokio::try_join!(
-        chat::resolve_input_with_stdin_cancellable(args.input.clone(), Some(cancel.clone())),
-        agent::load_agent_cancellable(&args.file, Some(cancel.clone())),
+        chat::resolve_input_with_stdin_cancellable(args.input.clone(), cancel.clone()),
+        agent::load_agent_cancellable(&args.file, cancel.clone()),
         async {
-            crate::async_io::canonicalize(&args.file, Some(cancel.clone()))
+            crate::async_io::canonicalize(&args.file, cancel.clone())
                 .await
                 .with_context(|| {
                     format!(
@@ -188,7 +185,7 @@ pub(super) async fn run_agent(
                     )
                 })
         },
-        config::load_config_cancellable(&config_source, Some(cancel.clone())),
+        config::load_config_cancellable(&config_source, cancel.clone()),
     )?;
     let raw_input = raw_input.ok_or_else(missing_input_error)?;
     let file_config = Arc::new(config);
@@ -220,7 +217,7 @@ pub(super) async fn run_agent(
             AgentTurn::simple(&input, &raw_input),
             &workflow::StepOutputs::new(),
             std::slice::from_ref(&canonical_agent_path),
-            Some(env.operation_token()),
+            env.operation_token(),
         ))
         .await
         .with_context(|| format!("agent '{}'", args.file.display()))?;

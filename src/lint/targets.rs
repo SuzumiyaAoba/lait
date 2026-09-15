@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::storage::{self, SKIPPED_DIR_NAMES};
+use crate::{file_walk::DirWalker, storage};
 
 /// Expands `paths` (files and/or directories, as `lait lint` accepts) into
 /// the sorted, deduplicated list of files to actually lint: a file entry is
@@ -14,12 +14,28 @@ use crate::storage::{self, SKIPPED_DIR_NAMES};
 /// so that error is still reported per file); a directory entry is searched
 /// recursively for `.yml`/`.yaml` files and `.md` files that start with a
 /// `---` frontmatter delimiter (see `has_frontmatter_delimiter`), skipping
-/// `storage::SKIPPED_DIR_NAMES` and dot-directories along the way.
+/// `storage::SKIPPED_DIR_NAMES` and dot-entries along the way. The walk
+/// itself is shared with `lait test` — see `file_walk::DirWalker`.
 pub(super) fn expand_lint_targets(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
+    // `lint` runs on the sync path with no async runtime behind it, so
+    // there is no cancellation source to wire in — see `DirWalker`'s doc.
+    let mut walker = DirWalker::new(
+        &crate::cancellation::NEVER_SET,
+        "lint target discovery was cancelled",
+    );
     for path in paths {
         if path.is_dir() {
-            collect_lintable_files(path, &mut files)?;
+            walker.walk(path, &mut |path| {
+                match path.extension().and_then(|extension| extension.to_str()) {
+                    Some("yml") | Some("yaml") => files.push(path.to_path_buf()),
+                    Some("md") if has_frontmatter_delimiter(path)? => {
+                        files.push(path.to_path_buf());
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
         } else {
             files.push(path.clone());
         }
@@ -27,39 +43,6 @@ pub(super) fn expand_lint_targets(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     files.sort();
     files.dedup();
     Ok(files)
-}
-
-fn collect_lintable_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let mut entries = std::fs::read_dir(dir)
-        .with_context(|| storage::read_dir_context(dir))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| storage::read_dir_context(dir))?;
-    // Deterministic traversal order, so directory expansion is stable across
-    // runs/platforms (relied on by tests, and generally friendlier for CI
-    // diffs than filesystem-dependent order).
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to inspect '{}'", path.display()))?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name.as_ref()) {
-                continue;
-            }
-            collect_lintable_files(&path, out)?;
-        } else if file_type.is_file() {
-            match path.extension().and_then(|extension| extension.to_str()) {
-                Some("yml") | Some("yaml") => out.push(path),
-                Some("md") if has_frontmatter_delimiter(&path)? => out.push(path),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Cheaply sniffs whether `path` starts with the `---` frontmatter

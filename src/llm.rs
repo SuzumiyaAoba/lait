@@ -114,7 +114,7 @@ pub(crate) struct CompletionRequest<'a> {
     /// the token on the request so cancellation is observed by the HTTP
     /// future itself rather than only by a caller that may drop that future
     /// before a nested MCP/subagent operation has cleaned up.
-    pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
 /// Builds the initial message history shared by every completion request
@@ -434,7 +434,7 @@ fn trace_request(chat_request: &CreateChatCompletionRequest) {
 /// mapping its `CancellationResult` onto this module's plain `Result`.
 async fn await_cancellation<F, T>(
     future: F,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<T>
 where
     F: Future<Output = Result<T, OpenAIError>>,
@@ -458,7 +458,7 @@ mod tests {
         cancellation.cancel();
         let error = await_cancellation(
             std::future::pending::<std::result::Result<(), OpenAIError>>(),
-            Some(cancellation),
+            cancellation,
         )
         .await
         .expect_err("cancelled completion should fail");

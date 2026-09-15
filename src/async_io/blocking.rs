@@ -83,12 +83,12 @@ fn path_lock(path: &Path) -> Arc<tokio::sync::Semaphore> {
 /// write ignores the cooperative flag for a while.
 pub(crate) async fn acquire_path_lock(
     path: &Path,
-    cancellation: Option<&CancellationToken>,
+    cancellation: &CancellationToken,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     let path = path.to_owned();
     let key = run_blocking(
         move |cancelled| output_path_identity(&path, cancelled),
-        cancellation.cloned(),
+        cancellation.clone(),
     )
     .await?;
     acquire_permit(
@@ -167,13 +167,13 @@ fn output_path_identity(path: &Path, cancelled: &AtomicBool) -> Result<PathBuf> 
 pub(crate) async fn run_blocking_with_path_lock<T, F>(
     path: &Path,
     operation: F,
-    cancellation: Option<CancellationToken>,
+    cancellation: CancellationToken,
 ) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&AtomicBool) -> Result<T> + Send + 'static,
 {
-    let lease = acquire_path_lock(path, cancellation.as_ref()).await?;
+    let lease = acquire_path_lock(path, &cancellation).await?;
     run_blocking(
         move |cancelled| {
             let _lease = lease;
@@ -186,7 +186,7 @@ where
 
 async fn acquire_worker(
     semaphore: Arc<tokio::sync::Semaphore>,
-    cancellation: Option<&CancellationToken>,
+    cancellation: &CancellationToken,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     acquire_permit(
         semaphore,
@@ -198,16 +198,9 @@ async fn acquire_worker(
 
 async fn acquire_permit(
     semaphore: Arc<tokio::sync::Semaphore>,
-    cancellation: Option<&CancellationToken>,
+    cancellation: &CancellationToken,
     saturated_message: &'static str,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
-    let Some(cancellation) = cancellation else {
-        return tokio::time::timeout(BLOCKING_WORKER_ACQUIRE_TIMEOUT, semaphore.acquire_owned())
-            .await
-            .map_err(|_| anyhow::anyhow!(saturated_message))?
-            .context("blocking I/O permit owner was closed");
-    };
-
     tokio::select! {
         biased;
         permit = semaphore.clone().acquire_owned() => {
@@ -227,10 +220,7 @@ async fn acquire_permit(
 /// must check between bounded I/O operations. If this future is dropped, the
 /// guard also sets the flag, so a worker that outlives the future still gets a
 /// chance to stop.
-pub(crate) async fn run_blocking<T, F>(
-    operation: F,
-    cancellation: Option<CancellationToken>,
-) -> Result<T>
+pub(crate) async fn run_blocking<T, F>(operation: F, cancellation: CancellationToken) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&AtomicBool) -> Result<T> + Send + 'static,
@@ -247,7 +237,7 @@ where
 /// unrelated tests which happen to run in parallel in the same process.
 pub(super) async fn run_blocking_with_pool<T, F>(
     operation: F,
-    cancellation: Option<CancellationToken>,
+    cancellation: CancellationToken,
     worker_pool: Arc<tokio::sync::Semaphore>,
 ) -> Result<T>
 where
@@ -256,12 +246,9 @@ where
 {
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
-    let permit = acquire_worker(worker_pool, cancellation.as_ref()).await?;
+    let permit = acquire_worker(worker_pool, &cancellation).await?;
 
-    if cancellation
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
+    if cancellation.is_cancelled() {
         drop(permit);
         bail!(crate::error::cancelled(BLOCKING_IO_CANCELLED));
     }
@@ -282,14 +269,6 @@ where
     let guard = CancellationGuard {
         cancelled: Arc::clone(&cancelled),
         armed: true,
-    };
-
-    let Some(cancellation) = cancellation else {
-        let result = receiver
-            .await
-            .context("blocking I/O worker was cancelled")??;
-        drop(guard);
-        return Ok(result);
     };
 
     // `biased` polls the cancellation branch first every turn, so it always
@@ -357,15 +336,11 @@ pub(crate) enum CancellationResult<T> {
 /// torn down elsewhere completed normally.
 pub(crate) async fn await_cancellation<F, T>(
     future: F,
-    cancellation: Option<CancellationToken>,
+    cancellation: CancellationToken,
 ) -> CancellationResult<T>
 where
     F: Future<Output = T>,
 {
-    let Some(cancellation) = cancellation else {
-        return CancellationResult::Completed(future.await);
-    };
-
     tokio::select! {
         biased;
         () = cancellation.cancelled() => CancellationResult::Cancelled,

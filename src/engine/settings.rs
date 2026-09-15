@@ -16,7 +16,7 @@ use async_openai::error::OpenAIError;
 use crate::{
     agent::AgentFile,
     config::{self, ConfigFile, ModelMap},
-    llm,
+    llm, report,
 };
 
 use super::{
@@ -106,11 +106,11 @@ impl RequestSettings {
         let Some(candidate) = candidates.next() else {
             return Ok(false);
         };
-        eprintln!(
-            "warning: request to {} failed ({error:#}); falling back to model definition's \
+        report::warn(format_args!(
+            "request to {} failed ({error:#}); falling back to model definition's \
              next entry ('{}')",
             endpoint.base_url, candidate.model_id
-        );
+        ));
         tracing::warn!(
             failed_base_url = %endpoint.base_url,
             next_model_id = %candidate.model_id,

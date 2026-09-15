@@ -71,6 +71,14 @@ pub(crate) struct AssertionFailure {
     pub(crate) message: String,
 }
 
+/// The `assertion {position}: {message}` report line `lait test`/`lait eval`
+/// spell per failed assertion — one impl so the two reports can't drift.
+impl std::fmt::Display for AssertionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "assertion {}: {}", self.position, self.message)
+    }
+}
+
 /// The model-calling context an `llm_judge` assertion needs to actually call
 /// a judge model — passed by `lait eval` (which always has a live model
 /// connection). `lait test` passes `None` to [`evaluate`] instead (it is
@@ -132,7 +140,7 @@ async fn run_llm_judge(
     criteria: &str,
     output: &str,
     model_override: Option<&str>,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<f64> {
     let model_name = model_override
         .or(judge.default_model)
@@ -213,7 +221,7 @@ async fn check_jq(
     input_json: &str,
     empty_steps: &jq::Steps,
     output: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Option<String> {
     match jq::apply_bool_cancellable_async(expr, input_json, empty_steps, empty_steps, cancellation)
         .await
@@ -235,7 +243,7 @@ async fn check_llm_judge(
     model: Option<&str>,
     threshold: Option<f64>,
     output: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Option<String> {
     let Some(judge_context) = judge else {
         return Some(
@@ -274,7 +282,7 @@ pub(crate) async fn evaluate(
     assertions: &[Assertion],
     judge: Option<&LlmJudgeContext<'_>>,
     output: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Vec<AssertionFailure> {
     let input_json = normalize_jq_input(output);
     let empty_steps = jq::Steps::new();
@@ -343,7 +351,11 @@ mod tests {
         let assertions = vec![Assertion::Equals {
             value: "hello".to_owned(),
         }];
-        assert!(evaluate(&assertions, None, "hello", None).await.is_empty());
+        assert!(
+            evaluate(&assertions, None, "hello", crate::cancellation::none())
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -351,7 +363,7 @@ mod tests {
         let assertions = vec![Assertion::Equals {
             value: "hello".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "goodbye", None).await;
+        let failures = evaluate(&assertions, None, "goodbye", crate::cancellation::none()).await;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].position, 1);
     }
@@ -362,9 +374,14 @@ mod tests {
             value: "結論".to_owned(),
         }];
         assert!(
-            evaluate(&assertions, None, "これは結論です", None)
-                .await
-                .is_empty()
+            evaluate(
+                &assertions,
+                None,
+                "これは結論です",
+                crate::cancellation::none()
+            )
+            .await
+            .is_empty()
         );
     }
 
@@ -373,7 +390,13 @@ mod tests {
         let assertions = vec![Assertion::Contains {
             value: "結論".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "まだ途中です", None).await;
+        let failures = evaluate(
+            &assertions,
+            None,
+            "まだ途中です",
+            crate::cancellation::none(),
+        )
+        .await;
         assert_eq!(failures.len(), 1);
     }
 
@@ -383,9 +406,14 @@ mod tests {
             expr: "contains(\"結論\")".to_owned(),
         }];
         assert!(
-            evaluate(&assertions, None, "これは結論です", None)
-                .await
-                .is_empty()
+            evaluate(
+                &assertions,
+                None,
+                "これは結論です",
+                crate::cancellation::none()
+            )
+            .await
+            .is_empty()
         );
     }
 
@@ -394,7 +422,13 @@ mod tests {
         let assertions = vec![Assertion::Jq {
             expr: "contains(\"結論\")".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "まだ途中です", None).await;
+        let failures = evaluate(
+            &assertions,
+            None,
+            "まだ途中です",
+            crate::cancellation::none(),
+        )
+        .await;
         assert_eq!(failures.len(), 1);
     }
 
@@ -404,9 +438,14 @@ mod tests {
             expr: ".title | length > 0".to_owned(),
         }];
         assert!(
-            evaluate(&assertions, None, r#"{"title": "hello"}"#, None)
-                .await
-                .is_empty()
+            evaluate(
+                &assertions,
+                None,
+                r#"{"title": "hello"}"#,
+                crate::cancellation::none()
+            )
+            .await
+            .is_empty()
         );
     }
 
@@ -415,7 +454,7 @@ mod tests {
         let assertions = vec![Assertion::Jq {
             expr: "not valid jq (((".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "anything", None).await;
+        let failures = evaluate(&assertions, None, "anything", crate::cancellation::none()).await;
         assert_eq!(failures.len(), 1);
     }
 
@@ -429,7 +468,7 @@ mod tests {
                 expr: "contains(\"never\")".to_owned(),
             },
         ];
-        let failures = evaluate(&assertions, None, "actual", None).await;
+        let failures = evaluate(&assertions, None, "actual", crate::cancellation::none()).await;
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].position, 1);
         assert_eq!(failures[1].position, 2);
@@ -462,7 +501,7 @@ mod tests {
                 expr: "contains(\"missing\")".to_owned(),
             },
         ];
-        let failures = evaluate(&assertions, None, "actual", None).await;
+        let failures = evaluate(&assertions, None, "actual", crate::cancellation::none()).await;
         // Positions 1 (equals mismatch), 2 (contains mismatch), 3 (jq
         // false), 5 (contains mismatch), and 6 (jq false) fail; only 4
         // (equals an exact match) passes.
@@ -482,7 +521,7 @@ mod tests {
             model: None,
             threshold: None,
         }];
-        let failures = evaluate(&assertions, None, "anything", None).await;
+        let failures = evaluate(&assertions, None, "anything", crate::cancellation::none()).await;
         assert_eq!(failures.len(), 1);
         assert!(failures[0].message.contains("not supported"));
     }

@@ -35,12 +35,11 @@ use report::{Check, DoctorFormat, Status, emit};
 /// should not hang on a broken one.
 const MCP_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub(crate) async fn run(
+pub(super) async fn run(
     args: DoctorArgs,
     config_source: ConfigSource,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let cancellation = cancellation.unwrap_or_default();
     crate::signal::spawn_handler(cancellation.clone());
     let mut checks = Vec::new();
 
@@ -90,12 +89,12 @@ async fn check_config_load(
     checks: &mut Vec<Check>,
 ) -> Result<Option<Arc<ConfigFile>>> {
     let config_path =
-        config::resolve_config_path_cancellable(config_source, Some(cancellation.clone())).await?;
+        config::resolve_config_path_cancellable(config_source, cancellation.clone()).await?;
     let global_config_present = matches!(config_source, ConfigSource::Search)
-        && config::global_config_exists_cancellable(Some(cancellation.clone())).await?;
+        && config::global_config_exists_cancellable(cancellation.clone()).await?;
     let config_present = config_path.is_some() || global_config_present;
 
-    match config::load_config_cancellable(config_source, Some(cancellation.clone())).await {
+    match config::load_config_cancellable(config_source, cancellation.clone()).await {
         Ok(file_config) => {
             if config_present {
                 checks.push(Check::ok(
@@ -161,7 +160,7 @@ async fn run_all_checks(
         services.clone().finish(check_connectivity(
             &uses,
             &services,
-            Some(cancellation.clone()),
+            cancellation.clone(),
             checks,
         )),
         async { Ok::<_, anyhow::Error>(check_mcp_servers(file_config).await) },
@@ -202,7 +201,7 @@ async fn check_mcp_servers(file_config: &ConfigFile) -> Vec<Check> {
         async move {
             let outcome = tokio::time::timeout(
                 MCP_CHECK_TIMEOUT,
-                registry.tools(std::slice::from_ref(name), None),
+                registry.tools(std::slice::from_ref(name), crate::cancellation::none()),
             )
             .await;
             match outcome {
@@ -460,7 +459,7 @@ models:
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
         let mut checks = Vec::new();
-        let error = check_connectivity(&uses, &services, Some(cancellation), &mut checks)
+        let error = check_connectivity(&uses, &services, cancellation, &mut checks)
             .await
             .unwrap_err();
 

@@ -51,7 +51,7 @@ pub(crate) async fn call_agent(
     turn: AgentTurn<'_>,
     steps_outputs: &workflow::StepOutputs,
     active_agent_paths: &[PathBuf],
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     let system_prompt = template::render(
         &agent_file.system_prompt_template,
@@ -175,7 +175,7 @@ pub(crate) fn call_subagent_tool<'a>(
     arguments_json: &'a str,
     env: &'a RunContext,
     active_paths: &'a [PathBuf],
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         // `Copy` (it only captures `name: &str`), so it can back every

@@ -214,7 +214,7 @@ struct RouterContext<'a> {
     env: &'a RunContext,
     placement: ExecutionPlacement,
     progress_prefix: &'a str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl<'a> RouterContext<'a> {
@@ -240,13 +240,8 @@ impl<'a> RouterContext<'a> {
 /// [`wait_retry_delay`]'s own zero-delay check and `select!` branch.
 const WORKFLOW_EXECUTION_CANCELLED: &str = "workflow execution was cancelled";
 
-fn check_workflow_cancellation(
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
-) -> Result<()> {
-    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        bail!(crate::error::cancelled(WORKFLOW_EXECUTION_CANCELLED));
-    }
-    Ok(())
+fn check_workflow_cancellation(cancellation: &tokio_util::sync::CancellationToken) -> Result<()> {
+    crate::cancellation::check(cancellation, WORKFLOW_EXECUTION_CANCELLED)
 }
 
 /// Execution scope, cancellation, and progress for a sequence of steps.
@@ -259,7 +254,7 @@ pub(crate) struct RunStepsFrame<'a> {
     pub(crate) placement: ExecutionPlacement,
     pub(crate) start_counter: usize,
     pub(crate) progress_prefix: &'a str,
-    pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl<'a> RunStepsFrame<'a> {
@@ -318,7 +313,7 @@ pub(crate) fn run_steps<'a>(
             cancellation: cancellation.clone(),
         };
         for step in steps {
-            check_workflow_cancellation(cancellation.as_ref())?;
+            check_workflow_cancellation(&cancellation)?;
             state.counter += 1;
             let counter = state.counter;
             let label = step.label_or(counter);
@@ -403,7 +398,7 @@ async fn execute_step(
     context: StepContext<'_>,
 ) -> Result<String> {
     // Cloned before `context` is moved into `nodes::execute` below — cheap
-    // (borrowed fields are `Copy`, `step_cancel` is an `Option<CancellationToken>`
+    // (borrowed fields are `Copy`, `step_cancel` is an `CancellationToken`
     // clone) and lets this wrapper keep what it needs for the jq/write_file
     // tail without `nodes::execute` having to hand any of it back.
     let StepContext {
@@ -418,15 +413,9 @@ async fn execute_step(
 
     let settings = node.settings();
     if let Some(filter) = settings.jq {
-        step_output = apply_jq(
-            filter,
-            &step_output,
-            steps_outputs,
-            &env.vars,
-            step_cancel.as_ref(),
-        )
-        .await
-        .step(label)?;
+        step_output = apply_jq(filter, &step_output, steps_outputs, &env.vars, &step_cancel)
+            .await
+            .step(label)?;
     }
 
     if let Some(path) = settings.write_file {
@@ -449,9 +438,9 @@ async fn apply_jq(
     input: &str,
     steps_outputs: &workflow::StepOutputs,
     vars: &workflow::StepOutputs,
-    step_cancel: Option<&tokio_util::sync::CancellationToken>,
+    step_cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<String> {
-    let cancellation = step_cancel.cloned();
+    let cancellation = step_cancel.clone();
     // Input normalization is deliberately performed inside the bounded jq
     // worker. A large plain-text model/command result must not be parsed and
     // re-serialized on a Tokio executor thread before cancellation can win.
@@ -474,7 +463,7 @@ mod tests {
         // The filter is intentionally expensive if it is allowed to run. A
         // pre-set step cancellation must be observed immediately, before a
         // caller can mistake a value from the worker for a successful step.
-        let result = apply_jq("range(0; 1000000000)", "null", &steps, &vars, Some(&token)).await;
+        let result = apply_jq("range(0; 1000000000)", "null", &steps, &vars, &token).await;
 
         assert!(result.is_err());
         assert!(
@@ -502,7 +491,7 @@ steps:
         )
         .expect("router workflow fixture should be writable");
         let mut workflow = crate::workflow::load_workflow(&path).unwrap();
-        let scope = WorkflowScope::top_level(&mut workflow, &path, None)
+        let scope = WorkflowScope::top_level(&mut workflow, &path, crate::cancellation::none())
             .await
             .unwrap();
         let config = std::sync::Arc::new(crate::config::ConfigFile::default());
@@ -521,7 +510,7 @@ steps:
                 env: &env,
                 start_counter: 0,
                 progress_prefix: "",
-                cancellation: Some(token.clone()),
+                cancellation: token.clone(),
                 placement: Default::default(),
             },
         );

@@ -58,7 +58,7 @@ where
     pub(crate) async fn get_or_try_init<F, Fut>(
         &self,
         key: K,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
         init: F,
         cancellation_message: &'static str,
     ) -> Result<Arc<V>>
@@ -116,7 +116,7 @@ mod tests {
         let error = cache
             .get_or_try_init(
                 "key".to_owned(),
-                Some(cancellation),
+                cancellation,
                 || async { Ok(Arc::new("value".to_owned())) },
                 "cache initialization was cancelled",
             )

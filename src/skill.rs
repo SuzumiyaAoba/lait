@@ -72,29 +72,25 @@ pub(crate) fn list(file_config: &config::ConfigFile) -> Result<()> {
 async fn load_skill(
     name: &str,
     configured_path: &Path,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<SkillFile> {
     let configured_path = configured_path.to_owned();
     let name = name.to_owned();
     let read_error_name = name.clone();
-    let wait_for_fifo_writer = cancellation.is_some();
     // Resolve a directory entry and read its SKILL.md on the same bounded,
     // cancellation-aware worker. `Path::is_dir` itself performs metadata I/O
     // and can block on a network/FUSE mount, so doing only the final
     // `read_to_string` off-thread would still leave a timed step stuck before
-    // admission to async_io.
+    // admission to async_io. Waiting for a FIFO writer is always safe here:
+    // `run_blocking`'s guard trips `cancelled` on drop either way.
     let (path, contents) = async_io::run_blocking(
         move |cancelled| {
             let path = resolve_skill_file_path(&configured_path);
-            let contents = if wait_for_fifo_writer {
-                async_io::read_to_string_wait_for_fifo_writer(
-                    &path,
-                    cancelled,
-                    async_io::MAX_READ_BYTES,
-                )
-            } else {
-                async_io::read_to_string(&path, cancelled, async_io::MAX_READ_BYTES)
-            }
+            let contents = async_io::read_to_string_wait_for_fifo_writer(
+                &path,
+                cancelled,
+                async_io::MAX_READ_BYTES,
+            )
             .map_err(|error| {
                 anyhow!(
                     "failed to read skill file '{}' (skill '{read_error_name}'): {error}",
@@ -191,17 +187,12 @@ impl SkillCache {
     pub(crate) async fn render(
         &self,
         names: &[String],
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Option<Arc<String>>> {
         if names.is_empty() {
             return Ok(None);
         }
-        if cancellation
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-        {
-            anyhow::bail!(crate::error::cancelled(SKILL_RENDERING_CANCELLED));
-        }
+        crate::cancellation::check(&cancellation, SKILL_RENDERING_CANCELLED)?;
         let joined = self
             .joined
             .get_or_try_init(
@@ -230,7 +221,7 @@ impl SkillCache {
     async fn section(
         &self,
         name: &str,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Arc<String>> {
         let init_cancellation = cancellation.clone();
         let section = self
@@ -247,12 +238,7 @@ impl SkillCache {
                     })?;
                     let read_cancellation = init_cancellation.clone();
                     let skill = load_skill(name, configured_path, init_cancellation).await?;
-                    if read_cancellation
-                        .as_ref()
-                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                    {
-                        anyhow::bail!(crate::error::cancelled(SKILL_RENDERING_CANCELLED));
-                    }
+                    crate::cancellation::check(&read_cancellation, SKILL_RENDERING_CANCELLED)?;
                     Ok(Arc::new(format_skill(&skill)))
                 },
                 SKILL_RENDERING_CANCELLED,
@@ -301,7 +287,13 @@ mod tests {
     async fn render_returns_none_for_an_empty_name_list() {
         let skills_map = HashMap::new();
         let cache = SkillCache::new(Arc::new(skills_map));
-        assert!(cache.render(&[], None).await.unwrap().is_none());
+        assert!(
+            cache
+                .render(&[], crate::cancellation::none())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A second `render` call for the same `names` list must reuse the
@@ -318,8 +310,16 @@ mod tests {
         let cache = SkillCache::new(Arc::new(skills_map));
         let names = vec!["s".to_owned()];
 
-        let first = cache.render(&names, None).await.unwrap().unwrap();
-        let second = cache.render(&names, None).await.unwrap().unwrap();
+        let first = cache
+            .render(&names, crate::cancellation::none())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = cache
+            .render(&names, crate::cancellation::none())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(
             Arc::ptr_eq(&first, &second),
@@ -333,7 +333,7 @@ mod tests {
         let skills_map = HashMap::new();
         let cache = SkillCache::new(Arc::new(skills_map));
         let error = cache
-            .render(&["missing".to_owned()], None)
+            .render(&["missing".to_owned()], crate::cancellation::none())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing"));
@@ -349,7 +349,10 @@ mod tests {
         skills_map.insert("large".to_owned(), path.clone());
         let cache = SkillCache::new(Arc::new(skills_map));
 
-        let error = cache.render(&["large".to_owned()], None).await.unwrap_err();
+        let error = cache
+            .render(&["large".to_owned()], crate::cancellation::none())
+            .await
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("read limit"),
             "error: {error:#}"
@@ -371,7 +374,7 @@ mod tests {
         let cache = SkillCache::new(Arc::new(skills_map));
         let names = ["blocked".to_owned()];
         let token = tokio_util::sync::CancellationToken::new();
-        let mut render = Box::pin(cache.render(&names, Some(token.clone())));
+        let mut render = Box::pin(cache.render(&names, token.clone()));
 
         tokio::select! {
             result = &mut render => panic!("FIFO skill unexpectedly returned: {result:?}"),
@@ -417,14 +420,14 @@ mod tests {
         // (passing `None` here would skip `load_skill`'s wait-for-a-writer
         // path entirely and return immediately instead).
         let first_token = tokio_util::sync::CancellationToken::new();
-        let mut first = Box::pin(cache.render(&names, Some(first_token)));
+        let mut first = Box::pin(cache.render(&names, first_token));
         tokio::select! {
             result = &mut first => panic!("first render unexpectedly returned: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
 
         let token = tokio_util::sync::CancellationToken::new();
-        let mut second = Box::pin(cache.render(&names, Some(token.clone())));
+        let mut second = Box::pin(cache.render(&names, token.clone()));
         tokio::select! {
             result = &mut second => panic!("second render unexpectedly returned: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {

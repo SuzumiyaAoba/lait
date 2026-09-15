@@ -156,7 +156,7 @@ impl McpRegistry {
     pub(crate) async fn tools(
         &self,
         names: &[String],
-        cancellation: Option<CancellationReceiver>,
+        cancellation: CancellationReceiver,
     ) -> Result<ToolSet> {
         let per_server = futures_util::future::try_join_all(names.iter().map(|name| {
             let cancellation = cancellation.clone();
@@ -210,7 +210,7 @@ impl McpRegistry {
     async fn server_tools(
         &self,
         name: &str,
-        cancellation: Option<CancellationReceiver>,
+        cancellation: CancellationReceiver,
     ) -> Result<Arc<Vec<Tool>>> {
         let cell = self
             .tool_lists
@@ -259,11 +259,7 @@ impl McpRegistry {
         // there is no connection cleanup path to evict this initializer's
         // exact tool-list cell. Remove it so a later attempt can start with
         // a fresh cell instead of retaining the cancelled one.
-        if result.is_err()
-            && cancellation
-                .as_ref()
-                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-        {
+        if result.is_err() && cancellation.is_cancelled() {
             self.remove_tool_list_cell(name, &tool_list_cell).await;
         }
 
@@ -278,7 +274,7 @@ impl McpRegistry {
         tool_set: &ToolSet,
         qualified_name: &str,
         arguments_json: &str,
-        cancellation: Option<CancellationReceiver>,
+        cancellation: CancellationReceiver,
     ) -> Result<String> {
         let (server_name, tool_name) = tool_set
             .index
@@ -366,12 +362,9 @@ impl McpRegistry {
     async fn connection(
         &self,
         name: &str,
-        cancellation: Option<CancellationReceiver>,
+        cancellation: CancellationReceiver,
     ) -> Result<Arc<McpConnection>> {
-        if cancellation
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-        {
+        if cancellation.is_cancelled() {
             return Err(crate::error::cancelled(super::MCP_OPERATION_CANCELLED));
         }
 
@@ -389,13 +382,14 @@ impl McpRegistry {
             // turns a caller's cancellation into cancellation of that shared
             // attempt; the initializer then remains alive long enough for
             // `connect` to close/reap its transport before this future ends.
-            let monitor = cancellation.clone().map(|cancellation| {
+            let monitor = {
+                let caller_cancellation = cancellation.clone();
                 let initializer_cancellation = initializer_cancellation.clone();
                 tokio::spawn(async move {
-                    cancellation.cancelled().await;
+                    caller_cancellation.cancelled().await;
                     initializer_cancellation.cancel();
                 })
-            });
+            };
             let result = cell
                 .value
                 .get_or_try_init(|| async {
@@ -411,17 +405,13 @@ impl McpRegistry {
                     ))
                 })
                 .await;
-            if let Some(monitor) = monitor {
-                monitor.abort();
-            }
+            monitor.abort();
 
             match result {
                 Ok(connection) => {
                     let connection = Arc::clone(connection);
-                    let cancelled = initializer_cancellation.is_cancelled()
-                        || cancellation
-                            .as_ref()
-                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    let cancelled =
+                        initializer_cancellation.is_cancelled() || cancellation.is_cancelled();
                     if cancelled {
                         connection.shutdown().await;
                         self.remove_connection_cell(name, &cell).await;
@@ -542,7 +532,7 @@ fn parse_tool_arguments(
 /// until the server reports none left.
 async fn list_all_tools(
     connection: &McpConnection,
-    cancellation: Option<CancellationReceiver>,
+    cancellation: CancellationReceiver,
 ) -> Result<Vec<Tool>> {
     let mut tools = Vec::new();
     let mut metadata_bytes = 0usize;

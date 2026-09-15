@@ -279,7 +279,7 @@ pub(crate) fn read_to_string(
 /// a writer: a synchronous caller has no cancellation channel to interrupt
 /// that wait, so a FIFO with no writer yet fails fast instead of hanging.
 pub(crate) fn read_to_string_sync(path: &Path) -> Result<String> {
-    read_to_string(path, &AtomicBool::new(false), MAX_READ_BYTES)
+    read_to_string(path, &crate::cancellation::NEVER_SET, MAX_READ_BYTES)
 }
 
 /// FIFO-waiting counterpart to [`read_to_string`].
@@ -293,25 +293,18 @@ pub(crate) fn read_to_string_wait_for_fifo_writer(
 }
 
 /// Reads UTF-8 text through the cancellation-aware blocking worker, waiting
-/// for a FIFO writer only when a cancellation channel is present (a caller
-/// with no channel has no way to be told to give up on one, so there is
-/// nothing to wait for). Shared by every loader (agent files, skills, JSON
-/// schemas) that reads exactly one file and returns its contents as a string.
+/// for a FIFO writer to appear if needed — `run_blocking`'s guard always
+/// trips the flag on drop, so the wait can always be interrupted. Shared by
+/// every loader (agent files, skills, JSON schemas) that reads exactly one
+/// file and returns its contents as a string.
 pub(crate) async fn read_to_string_cancellable(
     path: &Path,
-    cancellation: Option<CancellationToken>,
+    cancellation: CancellationToken,
     max_bytes: usize,
 ) -> Result<String> {
     let path = path.to_owned();
-    let wait_for_fifo_writer = cancellation.is_some();
     run_blocking(
-        move |cancelled| {
-            if wait_for_fifo_writer {
-                read_to_string_wait_for_fifo_writer(&path, cancelled, max_bytes)
-            } else {
-                read_to_string(&path, cancelled, max_bytes)
-            }
-        },
+        move |cancelled| read_to_string_wait_for_fifo_writer(&path, cancelled, max_bytes),
         cancellation,
     )
     .await
@@ -336,10 +329,7 @@ pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
 /// Resolves a path on a worker so cancellation cannot be delayed by a slow
 /// network/FUSE filesystem. `canonicalize` is metadata I/O rather than a file
 /// read, but it belongs to the same timeout-sensitive loader paths.
-pub(crate) async fn canonicalize(
-    path: &Path,
-    cancellation: Option<CancellationToken>,
-) -> Result<PathBuf> {
+pub(crate) async fn canonicalize(path: &Path, cancellation: CancellationToken) -> Result<PathBuf> {
     let path = path.to_owned();
     run_blocking(move |_| Ok(std::fs::canonicalize(path)?), cancellation).await
 }

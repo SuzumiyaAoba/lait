@@ -18,23 +18,20 @@ use serde::Deserialize;
 use crate::{
     assert::{self, Assertion, LlmJudgeContext},
     cli::{EvalArgs, EvalFormat},
-    config::{self, ConfigFile, ConfigSource, ModelMap},
+    config::{ConfigFile, ConfigSource, ModelMap},
     engine::{
         AppServices, CapabilityOverrides, EndpointOverrides, PromptTurn, RequestSettings,
         RunContext, SamplingOverrides, resolve_request_settings,
     },
-    response, signal, storage, template,
+    response, storage, template,
     workflow::{
         self, WorkflowScope,
         exec::{RunStepsFrame, run_steps},
     },
 };
 
-/// Upper bound on concurrently in-flight (case, repeat) runs — matches
-/// `engine::tool_loop::MAX_CONCURRENT_TOOL_CALLS`'s rationale: independent
-/// model round-trips, bounded so a large suite doesn't open unbounded
-/// concurrent connections to the endpoint.
-const EVAL_CONCURRENCY: usize = 8;
+// Concurrently in-flight (case, repeat) runs are bounded by
+// `app::SUITE_CONCURRENCY` (shared with `lait test`) — see its doc comment.
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,7 +94,7 @@ impl Target {
     async fn run(&self, env: &RunContext, input: &str) -> Result<String> {
         match self {
             Target::Workflow { wf, scope } => {
-                let operation = Some(env.operation_token());
+                let operation = env.operation_token();
                 let outcome = run_steps(
                     &wf.steps,
                     input.to_owned(),
@@ -127,7 +124,7 @@ impl Target {
                         &[],
                         PromptTurn::simple(None, &rendered),
                         None,
-                        Some(env.operation_token()),
+                        env.operation_token(),
                     )
                     .await?;
                 Ok(response::content_text(&response).to_owned())
@@ -140,7 +137,7 @@ async fn load_target(
     target: &EvalTarget,
     base_dir: &Path,
     file_config: &ConfigFile,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Target> {
     match target {
         EvalTarget::Workflow { workflow } => {
@@ -219,17 +216,12 @@ async fn run_case(
                 default_model,
                 input: Some(case.input.as_str()),
             };
-            let failures = assert::evaluate(
-                &case.assert,
-                Some(&judge),
-                &output,
-                Some(env.operation_token()),
-            )
-            .await;
+            let failures =
+                assert::evaluate(&case.assert, Some(&judge), &output, env.operation_token()).await;
             RunResult {
                 failures: failures
                     .into_iter()
-                    .map(|failure| format!("assertion {}: {}", failure.position, failure.message))
+                    .map(|failure| failure.to_string())
                     .collect(),
             }
         }
@@ -290,26 +282,18 @@ fn print_json_report(cases: &[CaseOutcome]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run(
+pub(super) async fn run(
     args: EvalArgs,
     config_source: ConfigSource,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    signal::spawn_handler(cancel.clone());
-    let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+    let file_config = super::load_config(&config_source, &cancel).await?;
 
     let definition: EvalDefinition =
-        storage::read_and_parse_yaml(&args.file, "eval", Some(cancel.clone())).await?;
+        storage::read_and_parse_yaml(&args.file, "eval", cancel.clone()).await?;
     let base_dir = args.file.parent().unwrap_or_else(|| Path::new("."));
 
-    let target = load_target(
-        &definition.target,
-        base_dir,
-        &file_config,
-        Some(cancel.clone()),
-    )
-    .await?;
+    let target = load_target(&definition.target, base_dir, &file_config, cancel.clone()).await?;
     let default_model = target.default_model(&file_config);
 
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
@@ -338,7 +322,7 @@ pub(crate) async fn run(
     let mut all_runs = services
         .finish(async {
             futures_util::stream::iter(run_futures)
-                .buffered(EVAL_CONCURRENCY)
+                .buffered(super::SUITE_CONCURRENCY)
                 .collect::<Vec<RunResult>>()
                 .await
         })

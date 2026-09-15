@@ -92,7 +92,7 @@ impl ToolLoop {
         content: Option<&str>,
         env: &RunContext,
         active_agent_paths: &[PathBuf],
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         self.messages
             .push(llm::assistant_tool_call_message(tool_calls, content)?);
@@ -146,7 +146,7 @@ impl ToolLoop {
         decision: ToolDecision,
         env: &RunContext,
         active_agent_paths: &[PathBuf],
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ChatCompletionRequestMessage> {
         let name = &tool_call.function.name;
         if let ToolDecision::Deny(reason) = decision {

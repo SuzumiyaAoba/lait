@@ -19,7 +19,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Result, anyhow, bail};
 use jaq_json::Val;
 
-use super::{MAX_OUTPUT_VALUES, MAX_RENDERED_BYTES, check_cancelled_opt, validate_value_structure};
+use super::{MAX_OUTPUT_VALUES, MAX_RENDERED_BYTES, check_cancelled, validate_value_structure};
 
 /// A writer that bounds both the complete rendered result and the value that
 /// is currently being written. It borrows the result buffer so a filter's
@@ -30,7 +30,7 @@ struct LimitedWriter<'a> {
     value_start: usize,
     total_limit: usize,
     value_limit: usize,
-    cancelled: Option<&'a AtomicBool>,
+    cancelled: &'a AtomicBool,
     exceeded: bool,
 }
 
@@ -51,7 +51,7 @@ impl LimitedWriter<'_> {
         value_start: usize,
         total_limit: usize,
         value_limit: usize,
-        cancelled: Option<&'a AtomicBool>,
+        cancelled: &'a AtomicBool,
     ) -> LimitedWriter<'a> {
         LimitedWriter {
             bytes,
@@ -66,7 +66,7 @@ impl LimitedWriter<'_> {
 
 impl io::Write for LimitedWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        check_cancelled_opt(self.cancelled)
+        check_cancelled(self.cancelled)
             .map_err(|error| io::Error::new(io::ErrorKind::Interrupted, error.to_string()))?;
         let Some(next_len) = self.bytes.len().checked_add(bytes.len()) else {
             self.exceeded = true;
@@ -109,11 +109,11 @@ impl io::Write for LimitedWriter<'_> {
 pub(super) struct OutputWriter<'a> {
     bytes: Vec<u8>,
     values: usize,
-    cancelled: Option<&'a AtomicBool>,
+    cancelled: &'a AtomicBool,
 }
 
 impl OutputWriter<'_> {
-    pub(super) fn new(cancelled: Option<&AtomicBool>) -> OutputWriter<'_> {
+    pub(super) fn new(cancelled: &AtomicBool) -> OutputWriter<'_> {
         OutputWriter {
             bytes: Vec::new(),
             values: 0,
@@ -122,7 +122,7 @@ impl OutputWriter<'_> {
     }
 
     pub(super) fn render(&mut self, filter_source: &str, value: &Val) -> Result<()> {
-        check_cancelled_opt(self.cancelled)?;
+        check_cancelled(self.cancelled)?;
         if self.values >= MAX_OUTPUT_VALUES {
             bail!(
                 "jq filter {filter_source:?} produced more than the configured limit of {} outputs",
@@ -161,7 +161,7 @@ impl OutputWriter<'_> {
     }
 
     pub(super) fn finish(self, filter_source: &str) -> Result<String> {
-        check_cancelled_opt(self.cancelled)?;
+        check_cancelled(self.cancelled)?;
         String::from_utf8(self.bytes).map_err(|error| {
             anyhow!("jq filter {filter_source:?} rendered output was not valid UTF-8: {error}")
         })
@@ -178,9 +178,9 @@ pub(super) fn render_value_into(
     value_start: usize,
     total_limit: usize,
     value_limit: usize,
-    cancelled: Option<&AtomicBool>,
+    cancelled: &AtomicBool,
 ) -> Result<()> {
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
     validate_value_structure(value)?;
 
     if raw_strings && let Val::TStr(string_bytes) = value {
@@ -204,7 +204,7 @@ pub(super) fn render_value_into(
                 anyhow!("failed to render jq output: {error}")
             }
         })?;
-        check_cancelled_opt(cancelled)?;
+        check_cancelled(cancelled)?;
         return Ok(());
     }
 
@@ -222,7 +222,7 @@ pub(super) fn render_value_into(
             anyhow!("failed to render jq output: {error}")
         }
     })?;
-    check_cancelled_opt(cancelled)?;
+    check_cancelled(cancelled)?;
     Ok(())
 }
 

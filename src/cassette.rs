@@ -70,7 +70,7 @@ pub(crate) async fn save(
     key: &str,
     request: CassetteRequestRef<'_>,
     response: &response::ChatCompletionResponse,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let entry = CassetteEntryRef {
         recorded_at: chrono::Utc::now(),
@@ -103,7 +103,7 @@ pub(crate) async fn load(
     dir: &Path,
     key: &str,
     model_id: &str,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<response::ChatCompletionResponse> {
     let path = entry_path(dir, key);
     let body =
@@ -165,12 +165,12 @@ mod tests {
                 response_format: None,
             },
             &response,
-            None,
+            crate::cancellation::none(),
         )
         .await
         .expect("save should succeed");
 
-        let loaded = load(dir.path(), "key-1", "model-a", None)
+        let loaded = load(dir.path(), "key-1", "model-a", crate::cancellation::none())
             .await
             .expect("load should succeed");
         assert_eq!(crate::response::content_text(&loaded), "hello");
@@ -190,9 +190,14 @@ mod tests {
         )
         .unwrap();
 
-        let error = load(dir.path(), "big-key", "model-a", None)
-            .await
-            .unwrap_err();
+        let error = load(
+            dir.path(),
+            "big-key",
+            "model-a",
+            crate::cancellation::none(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("read limit"),
             "error: {error:#}"
@@ -202,9 +207,14 @@ mod tests {
     #[tokio::test]
     async fn load_fails_clearly_when_the_key_has_no_cassette() {
         let dir = crate::test_support::TempDir::new("lait-cassette-test");
-        let error = load(dir.path(), "missing-key", "model-a", None)
-            .await
-            .unwrap_err();
+        let error = load(
+            dir.path(),
+            "missing-key",
+            "model-a",
+            crate::cancellation::none(),
+        )
+        .await
+        .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("model-a"), "{message}");
         assert!(message.contains("--record"), "{message}");
@@ -214,9 +224,14 @@ mod tests {
     async fn load_reports_a_parse_failure_distinctly_from_a_missing_entry() {
         let dir = crate::test_support::TempDir::new("lait-cassette-test");
         std::fs::write(dir.path().join("bad-key.json"), "not json").unwrap();
-        let error = load(dir.path(), "bad-key", "model-a", None)
-            .await
-            .unwrap_err();
+        let error = load(
+            dir.path(),
+            "bad-key",
+            "model-a",
+            crate::cancellation::none(),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("bad-key.json"), "{error}");
     }
 
@@ -236,7 +251,7 @@ mod tests {
                 response_format: None,
             },
             &response,
-            None,
+            crate::cancellation::none(),
         )
         .await
         .expect("save should create missing directories");

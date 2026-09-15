@@ -15,10 +15,10 @@ use crate::{
     cli::{ChatArgs, ChatReplArgs},
     config::{self, ConfigSource},
     engine::{AppServices, PromptTurn, RequestSettings, RunContext, StreamOptions},
-    prompt, repl, report, response, schema, usage,
+    prompt, report, response, schema, usage,
 };
 
-use super::build_run_context;
+use super::{build_run_context, repl};
 
 /// The bare-invocation entry point (`lait [OPTIONS] [PROMPT]`, no
 /// subcommand): sends a single-shot chat request when a prompt is available
@@ -46,9 +46,7 @@ pub(super) async fn run_chat_or_repl(
     if !enters_repl {
         crate::signal::spawn_handler(cancel.clone());
     }
-    match chat::resolve_input_with_stdin_cancellable(chat.prompt.clone(), Some(cancel.clone()))
-        .await?
-    {
+    match chat::resolve_input_with_stdin_cancellable(chat.prompt.clone(), cancel.clone()).await? {
         Some(prompt) => {
             run_chat(
                 chat,
@@ -167,7 +165,7 @@ async fn prepare_chat_request<'a>(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<ChatRequest<'a>> {
     let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+        Arc::new(config::load_config_cancellable(&config_source, cancel.clone()).await?);
 
     // `-p`/`--prompt-name` renders a named `prompts:` template against
     // `prompt` (which, for this path, is really the template's `{{ input }}`
@@ -202,23 +200,18 @@ async fn prepare_chat_request<'a>(
     let (response_format, file_context, system_prompt, image_urls, session_history) = tokio::try_join!(
         async {
             match chat.json_schema.as_deref() {
-                Some(path) => schema::load_json_schema_cancellable(
-                    path,
-                    &chat.schema_name,
-                    Some(cancel.clone()),
-                )
-                .await
-                .map(Some),
+                Some(path) => {
+                    schema::load_json_schema_cancellable(path, &chat.schema_name, cancel.clone())
+                        .await
+                        .map(Some)
+                }
                 None => Ok(None),
             }
         },
         attachment::read_file_attachments(&chat.files),
-        chat::resolve_system_prompt(&chat.shared, &file_config, Some(cancel.clone())),
+        chat::resolve_system_prompt(&chat.shared, &file_config, cancel.clone()),
         attachment::resolve_image_urls(&chat.images),
-        chat::load_session_history_cancellable(
-            chat.shared.session.as_deref(),
-            Some(cancel.clone())
-        ),
+        chat::load_session_history_cancellable(chat.shared.session.as_deref(), cancel.clone()),
     )?;
     let prompt = match file_context {
         Some(file_context) => format!("{prompt}\n\n{file_context}"),
@@ -289,7 +282,7 @@ async fn run_chat(
                     show_reasoning: display.show_reasoning,
                     output_path: display.output_path,
                 },
-                Some(env.operation_token()),
+                env.operation_token(),
             ))
             .await?;
         // Streamed usage arrives on the final chunk rather than through
@@ -310,13 +303,7 @@ async fn run_chat(
     }
 
     let response = services
-        .finish(settings.complete(
-            &env,
-            &[],
-            turn,
-            response_format,
-            Some(env.operation_token()),
-        ))
+        .finish(settings.complete(&env, &[], turn, response_format, env.operation_token()))
         .await?;
 
     match display.output_path {

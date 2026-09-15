@@ -27,11 +27,8 @@ use crate::{
     },
 };
 
-/// Upper bound on concurrently in-flight test files — matches
-/// `engine::tool_loop::MAX_CONCURRENT_TOOL_CALLS`'s rationale: independent
-/// workflow runs, bounded so a large test suite doesn't open unbounded
-/// concurrent connections to a replay directory or configured endpoint.
-const TEST_CONCURRENCY: usize = 8;
+// Concurrently in-flight test files are bounded by `app::SUITE_CONCURRENCY`
+// (shared with `lait eval`) — see its doc comment for the rationale.
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,11 +84,11 @@ struct TestOutcome {
 /// keep the entire collector on the bounded filesystem worker.
 async fn expand_test_targets_cancellable(
     paths: &[PathBuf],
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<PathBuf>> {
     let paths = paths.to_owned();
     crate::async_io::run_blocking(
-        move |cancelled| expand_test_targets_with_cancellation(&paths, Some(cancelled)),
+        move |cancelled| expand_test_targets_with_cancellation(&paths, cancelled),
         cancellation,
     )
     .await
@@ -99,9 +96,16 @@ async fn expand_test_targets_cancellable(
 
 fn expand_test_targets_with_cancellation(
     paths: &[PathBuf],
-    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    cancellation: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<PathBuf>> {
-    let mut collector = TestTargetCollector::default();
+    let mut collector = TestTargetCollector {
+        files: Vec::new(),
+        seen_files: HashSet::new(),
+        walker: crate::file_walk::DirWalker::new(
+            cancellation,
+            "test target discovery was cancelled",
+        ),
+    };
     for path in paths {
         collector.collect_explicit(path, cancellation)?;
     }
@@ -109,18 +113,17 @@ fn expand_test_targets_with_cancellation(
     Ok(collector.files)
 }
 
-#[derive(Default)]
-struct TestTargetCollector {
+struct TestTargetCollector<'a> {
     files: Vec<PathBuf>,
     seen_files: HashSet<PathBuf>,
-    visited_directories: HashSet<PathBuf>,
+    walker: crate::file_walk::DirWalker<'a>,
 }
 
-impl TestTargetCollector {
+impl TestTargetCollector<'_> {
     fn collect_explicit(
         &mut self,
         path: &Path,
-        cancellation: Option<&std::sync::atomic::AtomicBool>,
+        cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         check_discovery_cancellation(cancellation)?;
         let file_type = std::fs::symlink_metadata(path)
@@ -136,66 +139,27 @@ impl TestTargetCollector {
             self.add_file(path, cancellation)?;
             return Ok(());
         }
-        if file_type.is_dir() {
-            self.collect_directory(path, cancellation)
-        } else {
+        if !file_type.is_dir() {
             bail!(
                 "test target '{}' is not a regular file or directory",
                 path.display()
             );
         }
-    }
-
-    fn collect_directory(
-        &mut self,
-        path: &Path,
-        cancellation: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<()> {
-        check_discovery_cancellation(cancellation)?;
-        let identity = std::fs::canonicalize(path)
-            .with_context(|| format!("failed to resolve test directory '{}'", path.display()))?;
-        if !self.visited_directories.insert(identity) {
-            return Ok(());
-        }
-
-        let mut entries: Vec<_> = std::fs::read_dir(path)
-            .with_context(|| storage::read_dir_context(path))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| storage::read_dir_context(path))?;
-        entries.sort_by_key(std::fs::DirEntry::path);
-        for entry in entries {
-            check_discovery_cancellation(cancellation)?;
-            let entry_path = entry.path();
-            let file_name = entry_path.file_name().and_then(|name| name.to_str());
-            if file_name.is_some_and(|name| name.starts_with('.')) {
-                continue;
-            }
-
-            // `DirEntry::file_type` and `symlink_metadata` inspect the entry
-            // itself, so this branch cannot accidentally turn a symlink to a
-            // directory into a recursive walk.
-            let file_type = entry.file_type().with_context(|| {
-                format!("failed to inspect test path '{}'", entry_path.display())
-            })?;
-            if file_type.is_symlink() || (!file_type.is_file() && !file_type.is_dir()) {
-                continue;
-            }
-            if file_type.is_dir() {
-                // Same skip list `lint::targets` applies to `lait lint
-                // <DIR>` — without it, `lait test <repo-root>` used to
-                // recurse into a Rust project's own `target/` directory.
-                if file_name.is_some_and(|name| storage::SKIPPED_DIR_NAMES.contains(&name)) {
-                    continue;
-                }
-                self.collect_directory(&entry_path, cancellation)?;
-                continue;
-            }
+        // The walk (shared with `lait lint` — see `file_walk::DirWalker`)
+        // yields every regular file under the directory; the `.yml`/`.yaml`
+        // filter and canonical dedup stay test-specific here.
+        let mut discovered = Vec::new();
+        self.walker.walk(path, &mut |path| {
             if matches!(
-                entry_path.extension().and_then(|ext| ext.to_str()),
+                path.extension().and_then(|ext| ext.to_str()),
                 Some("yml") | Some("yaml")
             ) {
-                self.add_file(&entry_path, cancellation)?;
+                discovered.push(path.to_path_buf());
             }
+            Ok(())
+        })?;
+        for path in discovered {
+            self.add_file(&path, cancellation)?;
         }
         Ok(())
     }
@@ -203,7 +167,7 @@ impl TestTargetCollector {
     fn add_file(
         &mut self,
         path: &Path,
-        cancellation: Option<&std::sync::atomic::AtomicBool>,
+        cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         check_discovery_cancellation(cancellation)?;
         let identity = std::fs::canonicalize(path)
@@ -216,17 +180,8 @@ impl TestTargetCollector {
     }
 }
 
-fn check_discovery_cancellation(
-    cancellation: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<()> {
-    use std::sync::atomic::Ordering;
-
-    if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-        bail!(crate::error::cancelled(
-            "test target discovery was cancelled"
-        ));
-    }
-    Ok(())
+fn check_discovery_cancellation(cancellation: &std::sync::atomic::AtomicBool) -> Result<()> {
+    crate::cancellation::check_flag(cancellation, "test target discovery was cancelled")
 }
 
 /// Runs one test definition file, never propagating an error: a load/parse
@@ -273,13 +228,13 @@ async fn run_test_file_inner(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
     let definition: TestDefinition =
-        storage::read_and_parse_yaml(path, "test", Some(cancel.clone())).await?;
+        storage::read_and_parse_yaml(path, "test", cancel.clone()).await?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let workflow_path = base_dir.join(&definition.workflow);
     let replay_dir = base_dir.join(&definition.replay);
 
-    let mut wf = workflow::load_workflow_cancellable(&workflow_path, Some(cancel.clone())).await?;
-    let scope = WorkflowScope::top_level(&mut wf, &workflow_path, Some(cancel.clone())).await?;
+    let mut wf = workflow::load_workflow_cancellable(&workflow_path, cancel.clone()).await?;
+    let scope = WorkflowScope::top_level(&mut wf, &workflow_path, cancel.clone()).await?;
 
     let services = Arc::new(AppServices::new(Arc::clone(file_config)));
     let env = RunContext::new(Arc::clone(&services), cancel)
@@ -296,7 +251,7 @@ async fn run_test_file_inner(
                 env: &env,
                 start_counter: 0,
                 progress_prefix: "",
-                cancellation: Some(env.root_token()),
+                cancellation: env.root_token(),
                 placement: Default::default(),
             },
         ))
@@ -307,12 +262,12 @@ async fn run_test_file_inner(
         &definition.assert,
         None,
         &outcome.output,
-        Some(env.operation_token()),
+        env.operation_token(),
     )
     .await;
     Ok(failures
         .into_iter()
-        .map(|failure| format!("assertion {}: {}", failure.position, failure.message))
+        .map(|failure| failure.to_string())
         .collect())
 }
 
@@ -356,15 +311,15 @@ fn print_json_report(outcomes: &[TestOutcome]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run(
+pub(super) async fn run(
     args: TestArgs,
     config_source: ConfigSource,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     signal::spawn_handler(cancel.clone());
-    let targets = expand_test_targets_cancellable(&args.paths, Some(cancel.clone())).await?;
+    let targets = expand_test_targets_cancellable(&args.paths, cancel.clone()).await?;
     let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+        Arc::new(config::load_config_cancellable(&config_source, cancel.clone()).await?);
 
     // Each test file runs a whole workflow (potentially several model
     // calls) independently of every other, so running them one at a time
@@ -379,7 +334,7 @@ pub(crate) async fn run(
         .iter()
         .map(|target| run_test_file(target, &file_config, cancel.clone()));
     let outcomes: Vec<TestOutcome> = futures_util::stream::iter(run_futures)
-        .buffered(TEST_CONCURRENCY)
+        .buffered(super::SUITE_CONCURRENCY)
         .try_collect()
         .await?;
 
@@ -425,8 +380,11 @@ mod tests {
         std::fs::write(dir.join("nested").join("a.yaml"), "").unwrap();
         std::fs::write(dir.join("ignored.txt"), "").unwrap();
 
-        let files =
-            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
+        let files = expand_test_targets_with_cancellation(
+            std::slice::from_ref(&dir),
+            &crate::cancellation::NEVER_SET,
+        )
+        .unwrap();
         assert_eq!(files, vec![dir.join("b.yml"), dir.join("nested/a.yaml")]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -439,8 +397,11 @@ mod tests {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git").join("config.yml"), "").unwrap();
 
-        let files =
-            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
+        let files = expand_test_targets_with_cancellation(
+            std::slice::from_ref(&dir),
+            &crate::cancellation::NEVER_SET,
+        )
+        .unwrap();
         assert_eq!(files, vec![dir.join("visible.yml")]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -451,8 +412,11 @@ mod tests {
         let file = dir.join("case.yml");
         std::fs::write(&file, "").unwrap();
 
-        let files =
-            expand_test_targets_with_cancellation(&[file.clone(), dir.clone()], None).unwrap();
+        let files = expand_test_targets_with_cancellation(
+            &[file.clone(), dir.clone()],
+            &crate::cancellation::NEVER_SET,
+        )
+        .unwrap();
         assert_eq!(files, vec![file]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -471,8 +435,11 @@ mod tests {
         symlink(&dir, nested.join("cycle")).unwrap();
         symlink(&file, dir.join("alias.yml")).unwrap();
 
-        let files =
-            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
+        let files = expand_test_targets_with_cancellation(
+            std::slice::from_ref(&dir),
+            &crate::cancellation::NEVER_SET,
+        )
+        .unwrap();
         assert_eq!(files, vec![file]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -488,8 +455,11 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         symlink(&file, &link).unwrap();
 
-        let error =
-            expand_test_targets_with_cancellation(std::slice::from_ref(&link), None).unwrap_err();
+        let error = expand_test_targets_with_cancellation(
+            std::slice::from_ref(&link),
+            &crate::cancellation::NEVER_SET,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("symbolic link"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -519,8 +489,11 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let files =
-            expand_test_targets_with_cancellation(std::slice::from_ref(&dir), None).unwrap();
+        let files = expand_test_targets_with_cancellation(
+            std::slice::from_ref(&dir),
+            &crate::cancellation::NEVER_SET,
+        )
+        .unwrap();
         assert!(files.is_empty());
         std::fs::remove_file(&fifo_path).ok();
         std::fs::remove_dir_all(&dir).ok();

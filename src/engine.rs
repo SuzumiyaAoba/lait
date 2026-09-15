@@ -156,7 +156,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            stream_response(stream, false, None, false, Some(cancellation)),
+            stream_response(stream, false, None, false, cancellation),
         )
         .await
         .expect("stream_response should return promptly once cancelled, not hang");

@@ -32,7 +32,7 @@ const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// avoids a metadata-then-open TOCTOU window for paths that are replaced while
 /// attachments are being resolved.
 pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>> {
-    read_file_attachments_cancellable(files, None).await
+    read_file_attachments_cancellable(files, crate::cancellation::none()).await
 }
 
 /// The cancellation-aware form used by workflow nodes. Every content read
@@ -40,7 +40,7 @@ pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<St
 /// filesystem even before the first model request is made.
 pub(crate) async fn read_file_attachments_cancellable(
     files: &[PathBuf],
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Option<String>> {
     if files.is_empty() {
         return Ok(None);
@@ -72,7 +72,7 @@ pub(crate) async fn read_file_attachments_cancellable(
 /// leaving it running in the runtime's blocking pool.
 async fn read_all(
     files: &[PathBuf],
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
     let budget = async_io::ReadBudget::new(MAX_TOTAL_ATTACHMENT_BYTES as usize);
     let reads = files
@@ -84,7 +84,7 @@ async fn read_all(
 
 async fn read_text_file_cancellable(
     path: PathBuf,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
     budget: async_io::ReadBudget,
 ) -> Result<String> {
     let error_path = path.clone();
@@ -127,7 +127,7 @@ async fn read_text_file_cancellable(
 /// single image is resolved inline; two or more run concurrently, the same
 /// way `read_all` above handles multiple `--file` attachments.
 pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<String>> {
-    resolve_image_urls_cancellable(images, None).await
+    resolve_image_urls_cancellable(images, crate::cancellation::none()).await
 }
 
 /// The cancellation-aware form used by workflow nodes. Local image files use
@@ -135,7 +135,7 @@ pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<String>>
 /// pass through without touching the filesystem.
 pub(crate) async fn resolve_image_urls_cancellable(
     images: &[String],
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
     match images {
         [] => Ok(Vec::new()),
@@ -152,7 +152,7 @@ pub(crate) async fn resolve_image_urls_cancellable(
 
 async fn resolve_one_cancellable(
     image: String,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
     budget: async_io::ReadBudget,
 ) -> Result<String> {
     // Checked here, before ever touching `run_blocking`'s dedicated OS
@@ -477,8 +477,7 @@ mod tests {
         let read_task = tokio::spawn({
             let token = token.clone();
             async move {
-                read_file_attachments_cancellable(std::slice::from_ref(&read_path), Some(token))
-                    .await
+                read_file_attachments_cancellable(std::slice::from_ref(&read_path), token).await
             }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;

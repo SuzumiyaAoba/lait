@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 use crate::{
     async_io, chat, checkpoint,
     cli::RunArgs,
-    config::{self, ConfigSource},
-    engine::{AppServices, RunContext},
+    config::ConfigSource,
+    engine::RunContext,
     report,
     workflow::{
         self, WorkflowScope,
@@ -44,7 +44,7 @@ impl CheckpointContext<'_> {
         &self,
         progress: &Progress,
         status: checkpoint::RunStatus,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         checkpoint::save_cancellable(
             &checkpoint::CheckpointRef {
@@ -170,12 +170,10 @@ async fn resolve_run_start(
             ))
         }
         None => {
-            let prompt = chat::resolve_input_with_stdin_cancellable(
-                run_args.prompt.clone(),
-                Some(cancel.clone()),
-            )
-            .await?
-            .ok_or_else(super::missing_prompt_error)?;
+            let prompt =
+                chat::resolve_input_with_stdin_cancellable(run_args.prompt.clone(), cancel.clone())
+                    .await?
+                    .ok_or_else(super::missing_prompt_error)?;
             let vars = workflow::build_vars(&run_args.var.var)?;
             Ok((
                 prompt.clone(),
@@ -198,27 +196,25 @@ pub(super) async fn run_workflow(
     approve_tools: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    crate::signal::spawn_handler(cancel.clone());
-    let file_config =
-        Arc::new(config::load_config_cancellable(&config_source, Some(cancel.clone())).await?);
+    let file_config = super::load_config(&config_source, &cancel).await?;
     let argument = run_args.file.clone();
     let registry_config = Arc::clone(&file_config);
     let resolved_file = async_io::run_blocking(
         move |_| Ok(workflow::resolve_run_target(&argument, &registry_config)),
-        Some(cancel.clone()),
+        cancel.clone(),
     )
     .await?;
     let workflow_path = resolved_file.display().to_string();
 
     let resumed = match run_args.resume.as_deref() {
-        Some(run_id) => Some(checkpoint::load_cancellable(run_id, Some(cancel.clone())).await?),
+        Some(run_id) => Some(checkpoint::load_cancellable(run_id, cancel.clone()).await?),
         None => None,
     };
     check_resume_compatible(resumed.as_ref(), &workflow_path)?;
 
-    let mut wf = workflow::load_workflow_cancellable(&resolved_file, Some(cancel.clone())).await?;
+    let mut wf = workflow::load_workflow_cancellable(&resolved_file, cancel.clone()).await?;
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
-    let scope = WorkflowScope::top_level(&mut wf, &resolved_file, Some(cancel.clone())).await?;
+    let scope = WorkflowScope::top_level(&mut wf, &resolved_file, cancel.clone()).await?;
     let top_level_labels = top_level_step_labels(&wf.steps);
 
     let (initial_prompt, vars, progress) =
@@ -240,12 +236,10 @@ pub(super) async fn run_workflow(
     let run_cancel = cancel.child_token();
     let deadline = RunDeadline::start(scope.defaults.workflow_timeout, run_cancel.clone());
 
-    let (cache_enabled, cache_ttl) = chat::resolve_cache_settings(cache_override, &file_config);
-    let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
-    let env = RunContext::new(Arc::clone(&services), run_cancel)
+    let (services, env) =
+        super::build_run_context(&file_config, cache_override, approve_tools, run_cancel);
+    let env = env
         .with_vars(vars.clone())
-        .with_cache(cache_enabled, cache_ttl)
-        .with_approve_tools(approve_tools)
         .with_record_replay(run_args.record.clone(), run_args.replay.clone())?;
     let checkpoint = CheckpointContext {
         run_id: &run_id,
@@ -270,7 +264,7 @@ pub(super) async fn run_workflow(
             .save(
                 &progress,
                 checkpoint::RunStatus::Completed,
-                Some(env.root_token()),
+                env.root_token(),
             )
             .await?;
     }
@@ -319,7 +313,7 @@ async fn run_top_level(
                 env,
                 start_counter: progress.counter,
                 progress_prefix: "",
-                cancellation: Some(env.root_token()),
+                cancellation: env.root_token(),
                 placement: Default::default(),
             },
         )
@@ -338,7 +332,7 @@ async fn run_top_level(
                     // Persistence failure must not replace the execution error,
                     // especially its typed cancellation/API classification.
                     //
-                    // Deliberately `None`, not `Some(env.root_token())`: this
+                    // Deliberately `None`, not `env.root_token()`: this
                     // branch runs precisely when the step above failed,
                     // which after a SIGINT means the root token is already
                     // cancelled. `async_io::run_blocking` bails immediately
@@ -350,19 +344,23 @@ async fn run_top_level(
                     // write on this path — nothing downstream is waiting on
                     // it — so letting it complete uncancelled is correct.
                     match checkpoint
-                        .save(&progress, checkpoint::RunStatus::Failed, None)
+                        .save(
+                            &progress,
+                            checkpoint::RunStatus::Failed,
+                            crate::cancellation::none(),
+                        )
                         .await
                     {
-                        Ok(()) => eprintln!(
-                            "note: run checkpointed as '{}'; resume with `lait run {} --resume {}`",
+                        Ok(()) => report::note(format_args!(
+                            "run checkpointed as '{}'; resume with `lait run {} --resume {}`",
                             checkpoint.run_id,
                             requested_file.display(),
                             checkpoint.run_id,
-                        ),
-                        Err(save_error) => eprintln!(
-                            "warning: failed to save checkpoint for run '{}': {save_error:#}",
+                        )),
+                        Err(save_error) => report::warn(format_args!(
+                            "failed to save checkpoint for run '{}': {save_error:#}",
                             checkpoint.run_id,
-                        ),
+                        )),
                     }
                 }
                 return Err(error);
@@ -376,11 +374,7 @@ async fn run_top_level(
         };
         if let Some(checkpoint) = checkpoint {
             checkpoint
-                .save(
-                    &progress,
-                    checkpoint::RunStatus::Failed,
-                    Some(env.root_token()),
-                )
+                .save(&progress, checkpoint::RunStatus::Failed, env.root_token())
                 .await?;
         }
         if flow != Flow::Continue {

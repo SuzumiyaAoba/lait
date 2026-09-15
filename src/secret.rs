@@ -69,9 +69,9 @@ impl SecretResolver {
     pub(crate) async fn resolve(
         &self,
         source: &ApiKeySource,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Option<String>> {
-        ensure_not_cancelled(cancellation.as_ref())?;
+        ensure_not_cancelled(&cancellation)?;
         match source {
             ApiKeySource::Absent => Ok(None),
             ApiKeySource::Literal(value) => Ok(Some(value.clone())),
@@ -82,9 +82,9 @@ impl SecretResolver {
     async fn resolve_command(
         &self,
         spec: &CommandSpec,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<String> {
-        ensure_not_cancelled(cancellation.as_ref())?;
+        ensure_not_cancelled(&cancellation)?;
         let cell = {
             let mut cache = self.cache.lock().await;
             cache
@@ -93,23 +93,19 @@ impl SecretResolver {
                 .clone()
         };
 
-        let mut value = if let Some(cancellation) = &cancellation {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    return Err(cancellation_error());
-                }
-                value = cell.lock() => value,
+        let mut value = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(cancellation_error());
             }
-        } else {
-            cell.lock().await
+            value = cell.lock() => value,
         };
         if let Some(secret) = value.as_ref() {
             return Ok(secret.clone());
         }
 
         let secret = self.run(spec, cancellation.clone()).await?;
-        ensure_not_cancelled(cancellation.as_ref())?;
+        ensure_not_cancelled(&cancellation)?;
         *value = Some(secret.clone());
         Ok(secret)
     }
@@ -117,7 +113,7 @@ impl SecretResolver {
     async fn run(
         &self,
         spec: &CommandSpec,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<String> {
         let argv = command_argv(spec)?;
         let output =
@@ -142,11 +138,8 @@ fn cancellation_error() -> anyhow::Error {
     crate::error::cancelled("api_key_cmd resolution was cancelled")
 }
 
-fn ensure_not_cancelled(cancellation: Option<&tokio_util::sync::CancellationToken>) -> Result<()> {
-    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        return Err(cancellation_error());
-    }
-    Ok(())
+fn ensure_not_cancelled(cancellation: &tokio_util::sync::CancellationToken) -> Result<()> {
+    crate::cancellation::check(cancellation, "api_key_cmd resolution was cancelled")
 }
 
 fn command_argv(spec: &CommandSpec) -> Result<Vec<String>> {
@@ -177,12 +170,18 @@ mod tests {
     async fn resolves_literal_and_command_sources() {
         let resolver = SecretResolver::default();
         assert_eq!(
-            resolver.resolve(&ApiKeySource::Absent, None).await.unwrap(),
+            resolver
+                .resolve(&ApiKeySource::Absent, crate::cancellation::none())
+                .await
+                .unwrap(),
             None
         );
         assert_eq!(
             resolver
-                .resolve(&ApiKeySource::Literal("literal".to_owned()), None)
+                .resolve(
+                    &ApiKeySource::Literal("literal".to_owned()),
+                    crate::cancellation::none()
+                )
                 .await
                 .unwrap()
                 .as_deref(),
@@ -190,7 +189,11 @@ mod tests {
         );
         let source = ApiKeySource::Command(CommandSpec::Shell("printf command-secret".to_owned()));
         assert_eq!(
-            resolver.resolve(&source, None).await.unwrap().as_deref(),
+            resolver
+                .resolve(&source, crate::cancellation::none())
+                .await
+                .unwrap()
+                .as_deref(),
             Some("command-secret")
         );
     }
@@ -212,13 +215,26 @@ mod tests {
         );
         let source = ApiKeySource::Command(CommandSpec::Shell(script));
         let resolver = SecretResolver::default();
-        assert!(resolver.resolve(&source, None).await.is_err());
+        assert!(
+            resolver
+                .resolve(&source, crate::cancellation::none())
+                .await
+                .is_err()
+        );
         assert_eq!(
-            resolver.resolve(&source, None).await.unwrap().as_deref(),
+            resolver
+                .resolve(&source, crate::cancellation::none())
+                .await
+                .unwrap()
+                .as_deref(),
             Some("recovered")
         );
         assert_eq!(
-            resolver.resolve(&source, None).await.unwrap().as_deref(),
+            resolver
+                .resolve(&source, crate::cancellation::none())
+                .await
+                .unwrap()
+                .as_deref(),
             Some("recovered")
         );
         std::fs::remove_file(marker).ok();
@@ -229,14 +245,20 @@ mod tests {
         let resolver = SecretResolver::with_limits(Duration::from_secs(5), 8);
         let too_large =
             ApiKeySource::Command(CommandSpec::Shell("printf 123456789; sleep 30".to_owned()));
-        let error = resolver.resolve(&too_large, None).await.unwrap_err();
+        let error = resolver
+            .resolve(&too_large, crate::cancellation::none())
+            .await
+            .unwrap_err();
         let error_text = format!("{error:#}");
         assert!(error_text.contains("limit of 8 bytes"), "{error_text}");
 
         let failed = ApiKeySource::Command(CommandSpec::Shell(
             "printf hidden-secret >&2; exit 7".to_owned(),
         ));
-        let error = resolver.resolve(&failed, None).await.unwrap_err();
+        let error = resolver
+            .resolve(&failed, crate::cancellation::none())
+            .await
+            .unwrap_err();
         assert!(!error.to_string().contains("hidden-secret"));
     }
 
@@ -261,7 +283,7 @@ mod tests {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn({
             let cancellation = cancellation.clone();
-            async move { resolver.resolve(&source, Some(cancellation)).await }
+            async move { resolver.resolve(&source, cancellation).await }
         });
         for _ in 0..100 {
             if marker.exists() && child_pid_file.exists() {
@@ -317,7 +339,7 @@ mod tests {
         let resolver = SecretResolver::default();
 
         let error = resolver
-            .resolve(&source, Some(cancellation.clone()))
+            .resolve(&source, cancellation.clone())
             .await
             .unwrap_err();
         assert!(crate::error::is_interrupted(&error));
@@ -326,7 +348,7 @@ mod tests {
         let error = resolver
             .resolve(
                 &ApiKeySource::Literal("cached-value".to_owned()),
-                Some(cancellation.clone()),
+                cancellation.clone(),
             )
             .await
             .unwrap_err();
@@ -334,13 +356,14 @@ mod tests {
 
         let command = ApiKeySource::Command(CommandSpec::Shell("printf cached-value".to_owned()));
         assert_eq!(
-            resolver.resolve(&command, None).await.unwrap().as_deref(),
+            resolver
+                .resolve(&command, crate::cancellation::none())
+                .await
+                .unwrap()
+                .as_deref(),
             Some("cached-value")
         );
-        let error = resolver
-            .resolve(&command, Some(cancellation))
-            .await
-            .unwrap_err();
+        let error = resolver.resolve(&command, cancellation).await.unwrap_err();
         assert!(crate::error::is_interrupted(&error));
         std::fs::remove_file(marker).ok();
     }
@@ -363,7 +386,7 @@ mod tests {
         let initializer = tokio::spawn({
             let resolver = Arc::clone(&resolver);
             let source = source.clone();
-            async move { resolver.resolve(&source, None).await }
+            async move { resolver.resolve(&source, crate::cancellation::none()).await }
         });
         for _ in 0..100 {
             if marker.exists() {
@@ -378,7 +401,7 @@ mod tests {
             let resolver = Arc::clone(&resolver);
             let source = source.clone();
             let cancellation = cancellation.clone();
-            async move { resolver.resolve(&source, Some(cancellation)).await }
+            async move { resolver.resolve(&source, cancellation).await }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         let cancelled_at = std::time::Instant::now();

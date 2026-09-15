@@ -101,7 +101,7 @@ struct RemoteModel {
 pub(super) async fn check_connectivity(
     uses: &[EndpointUse],
     services: &AppServices,
-    cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancellation: tokio_util::sync::CancellationToken,
     checks: &mut Vec<Check>,
 ) -> Result<HashMap<String, Option<HashSet<String>>>> {
     let mut ordered_base_urls: Vec<(String, ApiKeySource)> = Vec::new();
@@ -134,7 +134,7 @@ pub(super) async fn check_connectivity(
                     services,
                     &base_url,
                     &api_key_source,
-                    cancellation.as_ref(),
+                    &cancellation,
                     &mut local_checks,
                 )
                 .await;
@@ -171,13 +171,13 @@ async fn check_one_endpoint(
     services: &AppServices,
     base_url: &str,
     api_key_source: &ApiKeySource,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    cancellation: &tokio_util::sync::CancellationToken,
     checks: &mut Vec<Check>,
 ) -> Result<Option<HashSet<String>>> {
     let Some(api_key) = connectivity_step(
         services
             .secret_resolver
-            .resolve(api_key_source, cancellation.cloned())
+            .resolve(api_key_source, cancellation.clone())
             .await,
         base_url,
         |error| format!("API キーの解決に失敗しました: {error:#}"),
@@ -193,7 +193,7 @@ async fn check_one_endpoint(
 async fn fetch_models(
     base_url: &str,
     api_key: Option<&str>,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    cancellation: &tokio_util::sync::CancellationToken,
     checks: &mut Vec<Check>,
 ) -> Result<Option<HashSet<String>>> {
     let url = format!("{base_url}/models");
@@ -288,22 +288,17 @@ fn connectivity_step<T>(
 
 async fn await_with_cancellation<T, E>(
     future: impl Future<Output = std::result::Result<T, E>>,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<T>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    match cancellation {
-        Some(cancellation) => {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => Err(crate::error::cancelled(
-                    "doctor connectivity check was cancelled",
-                )),
-                result = future => result.map_err(anyhow::Error::new),
-            }
-        }
-        None => future.await.map_err(anyhow::Error::new),
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(crate::error::cancelled(
+            "doctor connectivity check was cancelled",
+        )),
+        result = future => result.map_err(anyhow::Error::new),
     }
 }
 
