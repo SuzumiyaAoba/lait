@@ -114,9 +114,36 @@ mod tests {
         });
     }
 
+    /// Regression coverage for the normalization `file_walk::DirWalker`
+    /// carries: a directory walk now skips dot-prefixed *files*, not just
+    /// dot-prefixed directories — see that module's doc comment and
+    /// `docs/usage/ja/lint.md`'s directory-walk paragraph. Explicitly named
+    /// file arguments are unaffected (see the test just below).
+    #[test]
+    fn expand_lint_targets_skips_dot_prefixed_files_found_by_directory_expansion() {
+        crate::test_support::in_temp_dir("lait-test-lint-expand-skip-dotfile", || {
+            std::fs::write("top.yml", "steps: []\n").unwrap();
+            std::fs::write(".hidden.yml", "steps: []\n").unwrap();
+            std::fs::write(".hidden.md", "---\n---\nbody\n").unwrap();
+
+            let files = expand_lint_targets(&[PathBuf::from(".")]).unwrap();
+
+            assert_eq!(files, vec![PathBuf::from("./top.yml")]);
+        });
+    }
+
     #[test]
     fn expand_lint_targets_passes_through_explicit_files_unchanged() {
         let files = expand_lint_targets(&[PathBuf::from("a.yml"), PathBuf::from("b.md")]).unwrap();
         assert_eq!(files, vec![PathBuf::from("a.yml"), PathBuf::from("b.md")]);
+    }
+
+    /// A dot-prefixed file passed explicitly (not discovered by a directory
+    /// walk) is still linted — the dot-prefix skip only ever applies to
+    /// directory expansion, matching `expand_lint_targets`'s own doc.
+    #[test]
+    fn expand_lint_targets_passes_through_an_explicit_dot_prefixed_file() {
+        let files = expand_lint_targets(&[PathBuf::from(".hidden.yml")]).unwrap();
+        assert_eq!(files, vec![PathBuf::from(".hidden.yml")]);
     }
 }
