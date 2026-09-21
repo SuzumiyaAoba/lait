@@ -398,7 +398,7 @@ async fn execute_step(
     context: StepContext<'_>,
 ) -> Result<String> {
     // Cloned before `context` is moved into `nodes::execute` below — cheap
-    // (borrowed fields are `Copy`, `step_cancel` is an `CancellationToken`
+    // (borrowed fields are `Copy`, `step_cancel` is a `CancellationToken`
     // clone) and lets this wrapper keep what it needs for the jq/write_file
     // tail without `nodes::execute` having to hand any of it back.
     let StepContext {

@@ -69,19 +69,15 @@ struct TestOutcome {
     failures: Vec<String>,
 }
 
-/// Collects test definitions from explicit files and directories.
-///
-/// The discovery policy is deliberately stricter than the later file read:
-/// explicit targets must be regular files or directories, while a directory
-/// walk only includes regular `.yml`/`.yaml` files. Symbolic links and special
-/// files are never followed. A symlink or special file encountered below an
-/// explicit directory is skipped, whereas passing one explicitly is an error
-/// so a typo cannot silently result in zero tests. Canonical file/directory
-/// identities prevent overlapping targets from producing duplicate work, and
-/// the returned paths are sorted for stable reports.
+/// The message every target-discovery cancellation check in this module
+/// reports — shared by `DirWalker::new`'s `cancel_message` and
+/// `check_discovery_cancellation` so the two spellings can't drift apart.
+const TEST_TARGET_DISCOVERY_CANCELLED: &str = "test target discovery was cancelled";
+
 /// Cancellation-aware target discovery for the async `lait test` entry point.
 /// Directory traversal and canonicalization perform blocking metadata I/O, so
-/// keep the entire collector on the bounded filesystem worker.
+/// keep the entire collector on the bounded filesystem worker. See
+/// [`expand_test_targets_with_cancellation`] for the discovery policy itself.
 async fn expand_test_targets_cancellable(
     paths: &[PathBuf],
     cancellation: tokio_util::sync::CancellationToken,
@@ -94,6 +90,16 @@ async fn expand_test_targets_cancellable(
     .await
 }
 
+/// Collects test definitions from explicit files and directories.
+///
+/// The discovery policy is deliberately stricter than the later file read:
+/// explicit targets must be regular files or directories, while a directory
+/// walk only includes regular `.yml`/`.yaml` files. Symbolic links and special
+/// files are never followed. A symlink or special file encountered below an
+/// explicit directory is skipped, whereas passing one explicitly is an error
+/// so a typo cannot silently result in zero tests. Canonical file/directory
+/// identities prevent overlapping targets from producing duplicate work, and
+/// the returned paths are sorted for stable reports.
 fn expand_test_targets_with_cancellation(
     paths: &[PathBuf],
     cancellation: &std::sync::atomic::AtomicBool,
@@ -101,10 +107,7 @@ fn expand_test_targets_with_cancellation(
     let mut collector = TestTargetCollector {
         files: Vec::new(),
         seen_files: HashSet::new(),
-        walker: crate::file_walk::DirWalker::new(
-            cancellation,
-            "test target discovery was cancelled",
-        ),
+        walker: crate::file_walk::DirWalker::new(cancellation, TEST_TARGET_DISCOVERY_CANCELLED),
     };
     for path in paths {
         collector.collect_explicit(path, cancellation)?;
@@ -181,7 +184,7 @@ impl TestTargetCollector<'_> {
 }
 
 fn check_discovery_cancellation(cancellation: &std::sync::atomic::AtomicBool) -> Result<()> {
-    crate::cancellation::check_flag(cancellation, "test target discovery was cancelled")
+    crate::cancellation::check_flag(cancellation, TEST_TARGET_DISCOVERY_CANCELLED)
 }
 
 /// Runs one test definition file, never propagating an error: a load/parse

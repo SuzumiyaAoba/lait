@@ -332,17 +332,18 @@ async fn run_top_level(
                     // Persistence failure must not replace the execution error,
                     // especially its typed cancellation/API classification.
                     //
-                    // Deliberately `None`, not `env.root_token()`: this
-                    // branch runs precisely when the step above failed,
-                    // which after a SIGINT means the root token is already
-                    // cancelled. `async_io::run_blocking` bails immediately
-                    // on an already-cancelled token before the write ever
-                    // happens, so passing it here silently turned every
-                    // SIGINT into a checkpoint that was never written (see
-                    // the "warning: failed to save checkpoint" path this
-                    // used to hit unconditionally). This is the run's last
-                    // write on this path — nothing downstream is waiting on
-                    // it — so letting it complete uncancelled is correct.
+                    // Deliberately `cancellation::none()`, not
+                    // `env.root_token()`: this branch runs precisely when
+                    // the step above failed, which after a SIGINT means the
+                    // root token is already cancelled. `async_io::
+                    // run_blocking` bails immediately on an already-cancelled
+                    // token before the write ever happens, so passing it
+                    // here silently turned every SIGINT into a checkpoint
+                    // that was never written (see the "warning: failed to
+                    // save checkpoint" path this used to hit
+                    // unconditionally). This is the run's last write on this
+                    // path — nothing downstream is waiting on it — so
+                    // letting it complete uncancelled is correct.
                     match checkpoint
                         .save(
                             &progress,
