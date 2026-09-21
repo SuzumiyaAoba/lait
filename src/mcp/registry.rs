@@ -382,13 +382,30 @@ impl McpRegistry {
             // turns a caller's cancellation into cancellation of that shared
             // attempt; the initializer then remains alive long enough for
             // `connect` to close/reap its transport before this future ends.
+            //
+            // Wrapped in `AbortOnDropHandle` (rather than a bare
+            // `JoinHandle`) because the `get_or_try_init` await below is
+            // itself droppable mid-flight — `doctor::run`'s
+            // `tokio::time::timeout` around `registry.tools(...)` is the one
+            // caller that does this today, passing `cancellation::none()`
+            // as `cancellation` (never cancelled). If that timeout fires,
+            // this whole `connection` future is dropped before reaching the
+            // explicit `monitor.abort()` a few lines down, and a bare
+            // `JoinHandle` would leak a task parked forever on
+            // `caller_cancellation.cancelled()`. `AbortOnDropHandle` aborts
+            // on drop unconditionally, so that path is covered too; the
+            // explicit `.abort()` below stays as the immediate cleanup for
+            // the common (not-dropped) path, since leaving cleanup solely to
+            // `monitor`'s own drop would let it stay alive through the
+            // `match result` block just after, which reads
+            // `initializer_cancellation.is_cancelled()`.
             let monitor = {
                 let caller_cancellation = cancellation.clone();
                 let initializer_cancellation = initializer_cancellation.clone();
-                tokio::spawn(async move {
+                tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                     caller_cancellation.cancelled().await;
                     initializer_cancellation.cancel();
-                })
+                }))
             };
             let result = cell
                 .value
@@ -780,5 +797,77 @@ mod tests {
             !message.contains("10-byte"),
             "error must not report the remaining budget as if it were the limit: {message}"
         );
+    }
+
+    /// Regression test for the leak `b4746af` introduced: `connection`'s
+    /// cancellation monitor used to be spawned only when a caller actually
+    /// wired cancellation in (`Option<CancellationToken>::Some`); the
+    /// `cancellation::none()` sentinel refactor made spawning unconditional.
+    /// A caller that wraps `tools`/`connection` in its own
+    /// `tokio::time::timeout` while passing `cancellation::none()` — exactly
+    /// what `app::doctor::run` does — drops the whole `connection` future on
+    /// expiry, so the explicit `monitor.abort()` a few lines past the
+    /// `get_or_try_init` await is never reached. Before wrapping `monitor`
+    /// in `AbortOnDropHandle`, that left a task parked forever on
+    /// `caller_cancellation.cancelled()` (a token nothing will ever cancel).
+    /// This drives that exact shape — a hung handshake, timed out from the
+    /// outside, with no cancellation wired — and asserts the runtime's task
+    /// count returns to its pre-call baseline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_timeout_around_a_hung_handshake_does_not_leak_the_cancellation_monitor_task()
+    {
+        let script = crate::test_support::unique_temp_path("lait-test-mcp-hang", ".sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "mock".to_owned(),
+            McpServerConfig {
+                command: Some("sh".to_owned()),
+                args: vec![script.to_string_lossy().into_owned()],
+                env: HashMap::new(),
+                cwd: None,
+                url: None,
+                headers: HashMap::new(),
+                allowed_tools: None,
+            },
+        );
+        let registry = McpRegistry::new(Arc::new(servers));
+
+        let baseline = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            registry.tools(&["mock".to_owned()], crate::cancellation::none()),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a handshake that never responds must still be timed out by the caller"
+        );
+
+        // Both the child process' kill-on-drop and the monitor task's abort
+        // complete asynchronously off this task, so poll briefly instead of
+        // asserting on the very next instruction.
+        let mut alive = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        for _ in 0..50 {
+            if alive <= baseline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            alive = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks();
+        }
+        assert!(
+            alive <= baseline,
+            "monitor task leaked: {alive} alive tasks vs a baseline of {baseline}"
+        );
+
+        let _ = std::fs::remove_file(&script);
     }
 }
