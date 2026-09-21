@@ -71,6 +71,15 @@ macOS arm64 で `ld: library not found for -liconv` が発生する場合は、`
   `fsync` による電源断時の永続性保証は行いません。
 - `process::run_process` はコマンドとシークレット取得で共通のプロセス実行基盤です。
   出力上限、キャンセル、期限、子プロセスの回収と読み書きタスクの後始末を一か所で管理します。
+- `cancellation` は `CancellationToken`/`AtomicBool` それぞれの「キャンセル済みか」チェックと、
+  キャンセルが配線されていない呼び出し元向けの never-cancelled sentinel (`none()`/`NEVER_SET`)
+  を提供します。`file_walk::DirWalker` は `lait lint`/`lait test` のディレクトリ再帰探索
+  (決定的な順序・symlink 非追従・ドット始まりエントリの除外・重複排除) を共有し、
+  `sync_cache::SyncCache` は `template`/`jq` のコンパイル結果キャッシュ (ロック・poison 復帰
+  込み) を共有します。`report::note`/`warn` は `note:`/`warning:` 接頭辞付きの標準エラー出力を
+  一箇所に集約します。`app::load_config`/`build_run_context` は `lait chat`/`prompt run`/
+  `agent run` が共有するエントリポイントの定型セットアップ (Ctrl-C ハンドラの登録、設定読込、
+  キャッシュポリシー解決、`RunContext` 構築) です。
 - workflow の出力は正規化したパスと、実際に開いた通常ファイルの二段階でロックします。
   `file_lock::ExclusiveLease` を切り詰め前に取得し、書き込み完了まで保持することで、
   別名のハードリンクも直列化します。Unix のファイルロックは advisory であり、

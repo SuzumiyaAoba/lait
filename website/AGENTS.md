@@ -15,7 +15,8 @@ Run these from `website/`:
 
 ```sh
 pnpm sync-docs         # regenerate src/content/docs/docs/ from ../docs/usage/ja/
-pnpm sync-docs:check   # verify it's already in sync, without writing (used in CI)
+pnpm sync-docs:check   # verify it's already in sync, without writing (not currently wired into CI —
+                       # see scripts/sync-docs.mjs's own comment; `pnpm build` regenerates instead of checking)
 pnpm dev
 pnpm build
 pnpm preview

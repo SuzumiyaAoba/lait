@@ -17,8 +17,14 @@
 //     `#anchor`), rewritten to this site's absolute `/lait/docs/slug/` path.
 //
 // Run via `pnpm sync-docs` (or automatically as part of `pnpm dev`/`build`/
-// `types:check`, see package.json). `--check` verifies the generated tree
-// matches what's committed without writing, for CI to catch a stale copy.
+// `types:check`, see package.json). `--check` verifies the on-disk generated
+// tree (`destDir`, gitignored — see `.gitignore` and `website/AGENTS.md`)
+// matches what this script would produce from the current `docs/usage/ja/`,
+// without writing. Nothing under `destDir` is ever committed, so this
+// compares against a local build artifact, not a committed copy; no CI job
+// currently calls `--check` (`pnpm build` already runs the writing form of
+// this script before `astro build`, which makes any staleness moot at build
+// time — see `.github/workflows/ci.yml`'s `website` job).
 
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
