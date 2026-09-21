@@ -30,6 +30,12 @@ pub(super) struct ToolLoop {
     shell_tool_set: shell_tool::ToolSet,
     tools: Vec<ChatCompletionTools>,
     round: usize,
+    /// The same label `usage::UsageTally`/`trace::TraceCollector` record
+    /// this completion's own events under (`RequestSettings::usage_label`)
+    /// — carried onto every `execute_tool` trace event this loop's calls
+    /// record, as `lait.step.label`, so a reader can tell which workflow
+    /// step/agent/chat call a given tool call happened during.
+    usage_label: String,
 }
 
 impl ToolLoop {
@@ -39,6 +45,7 @@ impl ToolLoop {
         subagent_tool_set: subagent::ToolSet,
         shell_tool_set: shell_tool::ToolSet,
         tools: Vec<ChatCompletionTools>,
+        usage_label: String,
     ) -> Self {
         Self {
             messages,
@@ -47,6 +54,7 @@ impl ToolLoop {
             shell_tool_set,
             tools,
             round: 0,
+            usage_label,
         }
     }
 
@@ -165,6 +173,11 @@ impl ToolLoop {
                 chrono::Utc::now(),
                 trace::attrs([
                     ("gen_ai.tool.name", Value::from(name.clone())),
+                    (
+                        "gen_ai.tool.arguments",
+                        Value::from(tool_call.function.arguments.clone()),
+                    ),
+                    ("lait.step.label", Value::from(self.usage_label.clone())),
                     ("lait.tool.round", Value::from(self.round as u64)),
                     ("lait.tool.decision", Value::from("denied")),
                     ("lait.tool.denial_reason", Value::from(reason.clone())),
@@ -210,6 +223,11 @@ impl ToolLoop {
             chrono::Utc::now(),
             trace::attrs([
                 ("gen_ai.tool.name", Value::from(name.clone())),
+                (
+                    "gen_ai.tool.arguments",
+                    Value::from(tool_call.function.arguments.clone()),
+                ),
+                ("lait.step.label", Value::from(self.usage_label.clone())),
                 ("lait.tool.round", Value::from(self.round as u64)),
                 ("lait.tool.decision", Value::from("allowed")),
             ]),

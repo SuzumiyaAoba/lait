@@ -1,11 +1,20 @@
 //! Shared `assert:` evaluation for `lait test`'s and `lait eval`'s test
 //! definition YAML (see docs/usage/ja/testing.md and docs/usage/ja/eval.md):
 //! an `equals` (exact string match), `contains` (substring match), `jq`
-//! (boolean jq expression), or `llm_judge` (LLM-as-judge scoring) check
-//! against a workflow/model's final output text. `lait test` never passes an
-//! [`LlmJudgeContext`] (it is replay-only and makes no model calls), so an
-//! `llm_judge` assertion there always fails with a clear "not supported"
-//! message rather than silently skipping it; `lait eval` always passes one.
+//! (boolean jq expression), `llm_judge` (LLM-as-judge scoring), or a
+//! trajectory check (`tool_called`/`usage`/`step_output`) against a
+//! workflow/model's final output text and its recorded execution trace.
+//! `lait test` never passes an [`LlmJudgeContext`] (it is replay-only and
+//! makes no model calls), so an `llm_judge` assertion there always fails
+//! with a clear "not supported" message rather than silently skipping it.
+//! Conversely, `lait eval` never passes a [`TrajectoryContext`] today (its
+//! `run_case` shares one `RunContext`/`TraceCollector` across several
+//! concurrently running cases/repeats — see `eval::run` — so per-case trace
+//! attribution isn't possible yet), so a trajectory assertion there fails
+//! the same way in the opposite direction. Both "not supported here" cases
+//! report clearly rather than silently passing or mixing in unrelated data.
+
+use std::{future::Future, pin::Pin};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -17,7 +26,7 @@ use crate::{
         CapabilityOverrides, EndpointOverrides, PromptTurn, RunContext, SamplingOverrides,
         resolve_request_settings,
     },
-    jq, response, schema,
+    jq, response, schema, trace, workflow,
 };
 
 /// The `llm_judge` pass/fail threshold when an assertion doesn't set its own
@@ -62,10 +71,47 @@ pub(crate) enum Assertion {
         #[serde(default)]
         threshold: Option<f64>,
     },
+    /// A tool matching the qualified name `name` (e.g. `tool__ripgrep`,
+    /// `mcp__server__tool`, `agent__researcher`) was called at least `min`
+    /// (default 1) and at most `max` (default unbounded) times during the
+    /// run, and — when `args_jq` is set — at least one matching call's
+    /// arguments satisfied it (evaluated the same way [`Assertion::Jq`]
+    /// evaluates against output: the raw JSON arguments text as `.`).
+    /// Requires a [`TrajectoryContext`] — see this module's doc comment.
+    ToolCalled {
+        name: String,
+        #[serde(default)]
+        min: Option<u64>,
+        #[serde(default)]
+        max: Option<u64>,
+        #[serde(default)]
+        args_jq: Option<String>,
+    },
+    /// The run's total token usage (summed across every model call the run
+    /// made, the same total `--show-usage` prints) stayed within every
+    /// bound given (any omitted bound is unchecked). Requires a
+    /// [`TrajectoryContext`].
+    Usage {
+        #[serde(default)]
+        max_prompt_tokens: Option<u64>,
+        #[serde(default)]
+        max_completion_tokens: Option<u64>,
+        #[serde(default)]
+        max_total_tokens: Option<u64>,
+    },
+    /// Every assertion in `assert` holds against the named workflow step's
+    /// own output (rather than the run's final output). A trajectory
+    /// assertion (`tool_called`/`usage`/`step_output`) nested here still
+    /// evaluates against the *whole run*, not scoped to just this step —
+    /// recorded tool-call events are not currently attributed to a single
+    /// step narrowly enough to support that. Requires a
+    /// [`TrajectoryContext`].
+    StepOutput { id: String, assert: Vec<Assertion> },
 }
 
 /// One failed [`Assertion`], identified by its position in the original
 /// `assert:` list (1-based, for display) alongside a human-readable reason.
+#[derive(Debug)]
 pub(crate) struct AssertionFailure {
     pub(crate) position: usize,
     pub(crate) message: String,
@@ -93,6 +139,206 @@ pub(crate) struct LlmJudgeContext<'a> {
     /// The input that produced `output`, shown to the judge model alongside
     /// it — `lait eval`'s own case input.
     pub(crate) input: Option<&'a str>,
+}
+
+/// The per-run execution data a trajectory assertion
+/// (`tool_called`/`usage`/`step_output`) needs — passed by `lait test`,
+/// which always runs its target workflow through a fresh `RunContext` owned
+/// by that one test file (see `test_run::run_test_file_inner`), so `events`/
+/// `usage_total` are unambiguously "this run's, and only this run's" data.
+/// `lait eval` passes `None` instead — see this module's doc comment for why.
+pub(crate) struct TrajectoryContext<'a> {
+    /// Every model-call/tool-call event `crate::trace::TraceCollector`
+    /// recorded during the run, in recording order (see
+    /// `trace::TraceCollector::events`).
+    pub(crate) events: &'a [trace::TraceEvent],
+    /// The run's `$steps`/`{{ steps.<id> }}` map — the same value a workflow
+    /// template/jq filter would see, letting `step_output` look up a named
+    /// step's own output by id.
+    pub(crate) steps_outputs: &'a workflow::StepOutputs,
+    /// The run's total token usage, when the server reported any (see
+    /// `usage::UsageTally::total`).
+    pub(crate) usage_total: Option<response::Usage>,
+}
+
+/// The message every trajectory assertion (`tool_called`/`usage`/
+/// `step_output`) fails with when no [`TrajectoryContext`] is available —
+/// see this module's doc comment for why `lait eval` doesn't have one yet.
+fn trajectory_unsupported_message() -> String {
+    "trajectory assertions (tool_called/usage/step_output) are not \
+     supported here (no per-run trace context is available in this \
+     context yet; use `lait test`)"
+        .to_owned()
+}
+
+/// Recovers the text a workflow step's own output would have rendered as,
+/// from the JSON value `workflow::exec::run_steps` stored for it (see
+/// `steps_outputs.insert`'s doc comment: it stores `template::parse_input`'s
+/// result, the same JSON-if-parseable-else-wrapped-string duality
+/// [`normalize_jq_input`] applies in the other direction). A plain-text
+/// output round-trips exactly (`Value::String` unwraps to the original
+/// text); a JSON-producing step's output round-trips to equivalent
+/// (not necessarily byte-identical, e.g. key order/whitespace) JSON text.
+fn step_output_text(value: &serde_json::Value) -> String {
+    match value.as_str() {
+        Some(text) => text.to_owned(),
+        None => serde_json::to_string(value).expect("a parsed JSON value always re-serializes"),
+    }
+}
+
+/// Checks [`Assertion::ToolCalled`]: `events` must contain between `min`
+/// (default 1) and `max` (default unbounded) `"execute_tool"` events whose
+/// `gen_ai.tool.name` attribute equals `name`, and — when `args_jq` is set —
+/// at least one of those calls' recorded `gen_ai.tool.arguments` must
+/// satisfy it.
+async fn check_tool_called(
+    events: &[trace::TraceEvent],
+    name: &str,
+    min: Option<u64>,
+    max: Option<u64>,
+    args_jq: Option<&str>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Option<String> {
+    let matching: Vec<&trace::TraceEvent> = events
+        .iter()
+        .filter(|event| {
+            event.operation == "execute_tool"
+                && event
+                    .attributes
+                    .get("gen_ai.tool.name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(name)
+        })
+        .collect();
+    let count = matching.len() as u64;
+    let min = min.unwrap_or(1);
+    if count < min {
+        return Some(format!(
+            "expected tool '{name}' to be called at least {min} time(s), was called {count} time(s)"
+        ));
+    }
+    if let Some(max) = max
+        && count > max
+    {
+        return Some(format!(
+            "expected tool '{name}' to be called at most {max} time(s), was called {count} time(s)"
+        ));
+    }
+    let expr = args_jq?;
+    let empty_steps = jq::Steps::new();
+    for event in &matching {
+        let Some(arguments) = event
+            .attributes
+            .get("gen_ai.tool.arguments")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if let Ok(true) = jq::apply_bool_cancellable_async(
+            expr,
+            arguments,
+            &empty_steps,
+            &empty_steps,
+            cancellation.clone(),
+        )
+        .await
+        {
+            return None;
+        }
+    }
+    Some(format!(
+        "no call to tool '{name}' had arguments satisfying `{expr}`"
+    ))
+}
+
+/// Checks [`Assertion::Usage`] against the run's total usage (zero in every
+/// field when the server reported none at all — the same default
+/// [`response::Usage`] uses elsewhere).
+fn check_usage(
+    usage_total: Option<response::Usage>,
+    max_prompt_tokens: Option<u64>,
+    max_completion_tokens: Option<u64>,
+    max_total_tokens: Option<u64>,
+) -> Option<String> {
+    let usage = usage_total.unwrap_or_default();
+    if let Some(max) = max_prompt_tokens
+        && usage.prompt_tokens > max
+    {
+        return Some(format!(
+            "prompt_tokens {} exceeded max_prompt_tokens {max}",
+            usage.prompt_tokens
+        ));
+    }
+    if let Some(max) = max_completion_tokens
+        && usage.completion_tokens > max
+    {
+        return Some(format!(
+            "completion_tokens {} exceeded max_completion_tokens {max}",
+            usage.completion_tokens
+        ));
+    }
+    if let Some(max) = max_total_tokens
+        && usage.total_tokens > max
+    {
+        return Some(format!(
+            "total_tokens {} exceeded max_total_tokens {max}",
+            usage.total_tokens
+        ));
+    }
+    None
+}
+
+/// Checks [`Assertion::StepOutput`]: looks up `id` in
+/// `trajectory.steps_outputs`, then recursively [`evaluate`]s `nested`
+/// against that step's own output text (see [`step_output_text`]). Every
+/// nested failure is folded into one message (`step_output` is itself one
+/// entry in the caller's `assert:` list, so it can only ever produce one
+/// [`AssertionFailure`] of its own).
+async fn check_step_output(
+    id: &str,
+    nested: &[Assertion],
+    judge: Option<&LlmJudgeContext<'_>>,
+    trajectory: Option<&TrajectoryContext<'_>>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Option<String> {
+    let Some(trajectory) = trajectory else {
+        return Some(trajectory_unsupported_message());
+    };
+    let Some(value) = trajectory.steps_outputs.get(id) else {
+        return Some(format!(
+            "step '{id}' produced no output (it may not have run, or the id doesn't exist)"
+        ));
+    };
+    let text = step_output_text(value);
+    // Boxed and coerced to `dyn Future` (rather than a plain
+    // `evaluate(..).await`) so this recursive call doesn't give `evaluate`'s
+    // own future type an infinite size — see `evaluate`'s doc comment. Not
+    // `+ Send`: nothing in this call chain (`evaluate`'s own
+    // `futures_util::stream::buffered`, `lait test`'s per-file
+    // `stream::buffered` over `run_test_file`) ever crosses a `tokio::spawn`
+    // boundary — every one of them is plain cooperative polling within a
+    // single task — so requiring `Send` here would only recreate the
+    // Send-inference cycle this boxing is meant to avoid, for a bound
+    // nothing downstream actually needs.
+    let recurse: Pin<Box<dyn Future<Output = Vec<AssertionFailure>> + '_>> = Box::pin(evaluate(
+        nested,
+        judge,
+        Some(trajectory),
+        &text,
+        cancellation,
+    ));
+    let failures = recurse.await;
+    if failures.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "step '{id}': {}",
+        failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
 }
 
 /// Converts a workflow/model's final output text into the JSON text a jq
@@ -278,9 +524,24 @@ async fn check_llm_judge(
 /// of them used to pay for that serially. `buffered` (not
 /// `buffer_unordered`) preserves `assertions`' order, so the `position` on
 /// each result still lines up with its original 1-based index.
+///
+/// [`check_step_output`] calls this function recursively for a nested
+/// `assert:` list; it boxes that one recursive call (`Box::pin(evaluate(..))`
+/// coerced to a `dyn Future`) rather than this function returning a boxed
+/// future itself — the latter was tried first and rejected: it made the
+/// `assertions.iter().map(move |assertion| async move { .. })` closure
+/// below fail to type-check with "implementation of `FnOnce` is not general
+/// enough", an unrelated higher-ranked-lifetime inference failure the
+/// compiler's trait solver produces once this function's own return type
+/// carries an explicit lifetime parameter tied to a `dyn Future` (see
+/// `engine/transport.rs`'s similar `AsyncFn`/HRTB doc comment for another
+/// instance of this same class of trait-solver limitation). Boxing only at
+/// the recursive call site avoids ever giving `evaluate` itself a
+/// non-elided return lifetime.
 pub(crate) async fn evaluate(
     assertions: &[Assertion],
     judge: Option<&LlmJudgeContext<'_>>,
+    trajectory: Option<&TrajectoryContext<'_>>,
     output: &str,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Vec<AssertionFailure> {
@@ -313,6 +574,41 @@ pub(crate) async fn evaluate(
                     )
                     .await
                 }
+                Assertion::ToolCalled {
+                    name,
+                    min,
+                    max,
+                    args_jq,
+                } => match trajectory {
+                    Some(trajectory) => {
+                        check_tool_called(
+                            trajectory.events,
+                            name,
+                            *min,
+                            *max,
+                            args_jq.as_deref(),
+                            cancellation,
+                        )
+                        .await
+                    }
+                    None => Some(trajectory_unsupported_message()),
+                },
+                Assertion::Usage {
+                    max_prompt_tokens,
+                    max_completion_tokens,
+                    max_total_tokens,
+                } => match trajectory {
+                    Some(trajectory) => check_usage(
+                        trajectory.usage_total,
+                        *max_prompt_tokens,
+                        *max_completion_tokens,
+                        *max_total_tokens,
+                    ),
+                    None => Some(trajectory_unsupported_message()),
+                },
+                Assertion::StepOutput { id, assert } => {
+                    check_step_output(id, assert, judge, trajectory, cancellation).await
+                }
             }
         }
     });
@@ -334,7 +630,7 @@ pub(crate) async fn evaluate(
 
 #[cfg(test)]
 mod tests {
-    use super::{Assertion, evaluate, normalize_jq_input};
+    use super::{Assertion, TrajectoryContext, evaluate, normalize_jq_input, trace, workflow};
 
     #[test]
     fn normalizes_plain_text_as_a_json_string() {
@@ -352,9 +648,15 @@ mod tests {
             value: "hello".to_owned(),
         }];
         assert!(
-            evaluate(&assertions, None, "hello", crate::cancellation::none())
-                .await
-                .is_empty()
+            evaluate(
+                &assertions,
+                None,
+                None,
+                "hello",
+                crate::cancellation::none()
+            )
+            .await
+            .is_empty()
         );
     }
 
@@ -363,7 +665,14 @@ mod tests {
         let assertions = vec![Assertion::Equals {
             value: "hello".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "goodbye", crate::cancellation::none()).await;
+        let failures = evaluate(
+            &assertions,
+            None,
+            None,
+            "goodbye",
+            crate::cancellation::none(),
+        )
+        .await;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].position, 1);
     }
@@ -376,6 +685,7 @@ mod tests {
         assert!(
             evaluate(
                 &assertions,
+                None,
                 None,
                 "これは結論です",
                 crate::cancellation::none()
@@ -393,6 +703,7 @@ mod tests {
         let failures = evaluate(
             &assertions,
             None,
+            None,
             "まだ途中です",
             crate::cancellation::none(),
         )
@@ -408,6 +719,7 @@ mod tests {
         assert!(
             evaluate(
                 &assertions,
+                None,
                 None,
                 "これは結論です",
                 crate::cancellation::none()
@@ -425,6 +737,7 @@ mod tests {
         let failures = evaluate(
             &assertions,
             None,
+            None,
             "まだ途中です",
             crate::cancellation::none(),
         )
@@ -441,6 +754,7 @@ mod tests {
             evaluate(
                 &assertions,
                 None,
+                None,
                 r#"{"title": "hello"}"#,
                 crate::cancellation::none()
             )
@@ -454,7 +768,14 @@ mod tests {
         let assertions = vec![Assertion::Jq {
             expr: "not valid jq (((".to_owned(),
         }];
-        let failures = evaluate(&assertions, None, "anything", crate::cancellation::none()).await;
+        let failures = evaluate(
+            &assertions,
+            None,
+            None,
+            "anything",
+            crate::cancellation::none(),
+        )
+        .await;
         assert_eq!(failures.len(), 1);
     }
 
@@ -468,7 +789,14 @@ mod tests {
                 expr: "contains(\"never\")".to_owned(),
             },
         ];
-        let failures = evaluate(&assertions, None, "actual", crate::cancellation::none()).await;
+        let failures = evaluate(
+            &assertions,
+            None,
+            None,
+            "actual",
+            crate::cancellation::none(),
+        )
+        .await;
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].position, 1);
         assert_eq!(failures[1].position, 2);
@@ -501,7 +829,14 @@ mod tests {
                 expr: "contains(\"missing\")".to_owned(),
             },
         ];
-        let failures = evaluate(&assertions, None, "actual", crate::cancellation::none()).await;
+        let failures = evaluate(
+            &assertions,
+            None,
+            None,
+            "actual",
+            crate::cancellation::none(),
+        )
+        .await;
         // Positions 1 (equals mismatch), 2 (contains mismatch), 3 (jq
         // false), 5 (contains mismatch), and 6 (jq false) fail; only 4
         // (equals an exact match) passes.
@@ -521,7 +856,298 @@ mod tests {
             model: None,
             threshold: None,
         }];
-        let failures = evaluate(&assertions, None, "anything", crate::cancellation::none()).await;
+        let failures = evaluate(
+            &assertions,
+            None,
+            None,
+            "anything",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("not supported"));
+    }
+
+    /// Builds an `"execute_tool"` event the way `engine::tool_loop` records
+    /// one, with just the attributes `check_tool_called` reads.
+    fn tool_event(name: &str, arguments: &str) -> trace::TraceEvent {
+        let now = chrono::Utc::now();
+        trace::TraceEvent {
+            seq: 0,
+            operation: "execute_tool".to_owned(),
+            label: format!("tool '{name}'"),
+            start: now,
+            end: now,
+            duration_ms: 0,
+            attributes: trace::attrs([
+                ("gen_ai.tool.name", serde_json::Value::from(name)),
+                ("gen_ai.tool.arguments", serde_json::Value::from(arguments)),
+            ]),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_called_passes_when_the_tool_was_called_at_least_once() {
+        let events = vec![tool_event("tool__echo", "{}")];
+        let steps_outputs = workflow::StepOutputs::new();
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: None,
+        };
+        let assertions = vec![Assertion::ToolCalled {
+            name: "tool__echo".to_owned(),
+            min: None,
+            max: None,
+            args_jq: None,
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert!(failures.is_empty(), "failures: {failures:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_called_fails_when_the_tool_was_never_called() {
+        let events: Vec<trace::TraceEvent> = Vec::new();
+        let steps_outputs = workflow::StepOutputs::new();
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: None,
+        };
+        let assertions = vec![Assertion::ToolCalled {
+            name: "tool__echo".to_owned(),
+            min: None,
+            max: None,
+            args_jq: None,
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("at least"));
+    }
+
+    #[tokio::test]
+    async fn tool_called_respects_max() {
+        let events = vec![
+            tool_event("tool__echo", "{}"),
+            tool_event("tool__echo", "{}"),
+        ];
+        let steps_outputs = workflow::StepOutputs::new();
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: None,
+        };
+        let assertions = vec![Assertion::ToolCalled {
+            name: "tool__echo".to_owned(),
+            min: None,
+            max: Some(1),
+            args_jq: None,
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("at most"));
+    }
+
+    #[tokio::test]
+    async fn tool_called_checks_args_jq_against_at_least_one_matching_call() {
+        let events = vec![
+            tool_event("tool__echo", r#"{"text":"bye"}"#),
+            tool_event("tool__echo", r#"{"text":"hi"}"#),
+        ];
+        let steps_outputs = workflow::StepOutputs::new();
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: None,
+        };
+        let assertions = vec![Assertion::ToolCalled {
+            name: "tool__echo".to_owned(),
+            min: None,
+            max: None,
+            args_jq: Some(".text == \"hi\"".to_owned()),
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert!(failures.is_empty(), "failures: {failures:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_called_fails_without_a_trajectory_context() {
+        let assertions = vec![Assertion::ToolCalled {
+            name: "tool__echo".to_owned(),
+            min: None,
+            max: None,
+            args_jq: None,
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            None,
+            "output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn usage_fails_when_total_tokens_exceed_the_maximum() {
+        let events: Vec<trace::TraceEvent> = Vec::new();
+        let steps_outputs = workflow::StepOutputs::new();
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: Some(crate::response::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            }),
+        };
+        let assertions = vec![Assertion::Usage {
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            max_total_tokens: Some(10),
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("total_tokens"));
+    }
+
+    #[tokio::test]
+    async fn usage_passes_within_bounds() {
+        let events: Vec<trace::TraceEvent> = Vec::new();
+        let steps_outputs = workflow::StepOutputs::new();
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: Some(crate::response::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            }),
+        };
+        let assertions = vec![Assertion::Usage {
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            max_total_tokens: Some(100),
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert!(failures.is_empty(), "failures: {failures:?}");
+    }
+
+    #[tokio::test]
+    async fn step_output_checks_nested_assertions_against_the_named_steps_output() {
+        let events: Vec<trace::TraceEvent> = Vec::new();
+        let mut steps_outputs = workflow::StepOutputs::new();
+        steps_outputs.insert(
+            "greet".to_owned(),
+            serde_json::Value::String("hello world".to_owned()),
+        );
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: None,
+        };
+        let assertions = vec![Assertion::StepOutput {
+            id: "greet".to_owned(),
+            assert: vec![Assertion::Contains {
+                value: "hello".to_owned(),
+            }],
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "final output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert!(failures.is_empty(), "failures: {failures:?}");
+    }
+
+    #[tokio::test]
+    async fn step_output_fails_clearly_when_the_step_id_is_unknown() {
+        let events: Vec<trace::TraceEvent> = Vec::new();
+        let steps_outputs = workflow::StepOutputs::new();
+        let trajectory = TrajectoryContext {
+            events: &events,
+            steps_outputs: &steps_outputs,
+            usage_total: None,
+        };
+        let assertions = vec![Assertion::StepOutput {
+            id: "missing".to_owned(),
+            assert: vec![Assertion::Contains {
+                value: "hello".to_owned(),
+            }],
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            Some(&trajectory),
+            "final output",
+            crate::cancellation::none(),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("produced no output"));
+    }
+
+    #[tokio::test]
+    async fn step_output_fails_without_a_trajectory_context() {
+        let assertions = vec![Assertion::StepOutput {
+            id: "greet".to_owned(),
+            assert: vec![],
+        }];
+        let failures = evaluate(
+            &assertions,
+            None,
+            None,
+            "final output",
+            crate::cancellation::none(),
+        )
+        .await;
         assert_eq!(failures.len(), 1);
         assert!(failures[0].message.contains("not supported"));
     }

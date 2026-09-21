@@ -43,6 +43,7 @@ cases:
   - `contains`: 出力に`value`が部分文字列として含まれること。
   - `jq`: `expr`を出力に対して評価し、真(jqの真偽値ルール — `false`/`null`以外はすべて真)であること。出力がJSONとしてパース可能ならそのJSON値、そうでなければ生文字列をJSON文字列値として評価対象にする。
   - `llm_judge`: `criteria`をもとにLLMに0.0〜1.0でスコアを付けさせ、`threshold`(省略時0.7)以上ならpass。`model`を省略した場合はevalの`target`が使っているモデル(`target.model`、またはワークフローの`default.model`)にフォールバックする。判定はStructured Outputsで`{"score": number, "reasoning": string}`を1回のモデル呼び出しで取得して行う。
+  - `tool_called`/`usage`/`step_output`([実行トレース](./trace.md)を参照する trajectory アサーション、[決定的テスト](./testing.md#実行軌跡trajectoryのアサーション)を参照)は**まだサポートされていません**。`lait eval`は`--repeat`・複数ケースを同じ実行コンテキスト上で並行実行するため、どのイベントがどのケース/リピートのものかを区別できないからです。使うと「not supported」というアサーション失敗になります — 実行軌跡を検査したい場合は`lait test`(1テストファイルにつき専用の実行コンテキストを持つ)を使ってください。
 
 ## `--repeat N`
 

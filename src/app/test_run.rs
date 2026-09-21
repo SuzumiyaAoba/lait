@@ -261,9 +261,16 @@ async fn run_test_file_inner(
         .await
         .with_context(|| format!("workflow '{}'", workflow_path.display()))?;
 
+    let events = env.trace.events();
+    let trajectory = assert::TrajectoryContext {
+        events: &events,
+        steps_outputs: &outcome.steps_outputs,
+        usage_total: env.usage.total(),
+    };
     let failures = assert::evaluate(
         &definition.assert,
         None,
+        Some(&trajectory),
         &outcome.output,
         env.operation_token(),
     )

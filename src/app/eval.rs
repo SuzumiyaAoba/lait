@@ -216,8 +216,18 @@ async fn run_case(
                 default_model,
                 input: Some(case.input.as_str()),
             };
-            let failures =
-                assert::evaluate(&case.assert, Some(&judge), &output, env.operation_token()).await;
+            // `None`: `run_case` shares one `env` (and thus one
+            // `TraceCollector`/`UsageTally`) across every concurrently
+            // running case/repeat — see `assert`'s own doc comment on why a
+            // trajectory assertion isn't supported here yet.
+            let failures = assert::evaluate(
+                &case.assert,
+                Some(&judge),
+                None,
+                &output,
+                env.operation_token(),
+            )
+            .await;
             RunResult {
                 failures: failures
                     .into_iter()

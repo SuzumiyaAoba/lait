@@ -57,6 +57,42 @@ assert:
 - `assert:` の各項目は上から順にすべて評価されます。`type: jq` の `expr` は、出力テキストがそのまま有効な JSON であればその値に対して、そうでなければ JSON 文字列としてラップした値に対して評価されるので、`contains("...")` のような文字列アサーションと `.title | length > 0` のような構造化アサーションのどちらも書けます。
 - 実行はワークフロー全体を `--replay` 相当で走らせるので、記録されていない LLM リクエストに当たった場合はそのテストファイル自体が失敗として報告されます(他のテストファイルの実行は継続します)。MCP や command などの外部 I/O を使うワークフローは、決定的にするために fixture/mock を参照する構成にしてください。
 
+### 実行軌跡(trajectory)のアサーション
+
+最終出力だけでなく、ワークフロー実行中に何が起きたか([実行トレース](./trace.md)が記録する内容)も
+`assert:` で検査できます。`lait test` は1テストファイルにつき専用の `RunContext` を持つため、
+これらのアサーションは常に**そのテストファイル自身の実行だけ**を見ます(`lait eval` では現時点で
+未対応 — 後述)。
+
+```yaml
+assert:
+  - type: tool_called          # ツールが呼ばれたこと
+    name: tool__ripgrep         # 修飾済みツール名(mcp__<server>__<tool> / agent__<name> / tool__<name>)
+    min: 1                      # 省略時 1
+    max: 3                      # 省略時無制限
+    args_jq: '.pattern == "TODO"'  # 省略可。呼び出し引数の生 JSON に対する jq 式(いずれか1回の呼び出しが満たせばよい)
+  - type: usage                # トークン使用量の上限
+    max_prompt_tokens: 2000
+    max_completion_tokens: 500
+    max_total_tokens: 2500      # いずれも省略可(省略したフィールドは検査しない)
+  - type: step_output          # 名前付きステップ自身の出力を検査
+    id: summarize                # そのステップの label(id: またはノード名)
+    assert:                      # ネストした assert: (equals/contains/jq/llm_judge/更なる step_output など)
+      - type: contains
+        value: "結論"
+```
+
+- `tool_called`/`usage`/`step_output` はどれも [実行トレース](./trace.md) が記録する情報を参照します。
+  `--trace-file` を指定していなくても `lait test`/`lait eval` 自体は常に内部でトレースを収集している
+  ので、これらのアサーションを使うのに `--trace-file` は不要です。
+- `step_output` の `assert:` にさらに `tool_called`/`usage` をネストした場合、それはその**ステップに
+  限定されず実行全体**を対象に評価されます(ツール呼び出しのトレースは現状どのステップから呼ばれた
+  かまでは `assert:` から絞り込めません)。
+- `lait eval` では `tool_called`/`usage`/`step_output` はまだサポートされていません(複数のケース/
+  `--repeat` が同じ実行コンテキストを共有して並行実行されるため、どのイベントがどのケースのものかを
+  区別できません)。`lait eval` でこれらを使うと「not supported」というアサーション失敗として報告
+  されます — `lait test` を使ってください。
+
 ### 実行例
 
 ```sh

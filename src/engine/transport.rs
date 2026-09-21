@@ -325,6 +325,7 @@ impl RequestSettings {
             subagent_tool_set,
             shell_tool_set,
             tools,
+            self.usage_label.clone(),
         ))
     }
 
