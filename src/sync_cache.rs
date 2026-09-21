@@ -73,3 +73,98 @@ impl<V> SyncCache<V> {
         Ok(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SyncCache;
+    use std::sync::Arc;
+
+    #[test]
+    fn contains_is_false_until_the_key_has_actually_been_inserted() {
+        let cache: SyncCache<u32> = SyncCache::new();
+        assert!(!cache.contains("a"));
+        cache.get_or_init("a", |_| Ok(1)).unwrap();
+        assert!(cache.contains("a"));
+    }
+
+    #[test]
+    fn a_cache_hit_returns_the_same_arc_without_recompiling() {
+        let cache: SyncCache<u32> = SyncCache::new();
+        let compiles = std::sync::atomic::AtomicU32::new(0);
+        let compile = |_: &str| {
+            compiles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(42)
+        };
+
+        let first = cache.get_or_init("a", compile).unwrap();
+        let second = cache.get_or_init("a", compile).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a cache hit must return the same Arc, not an equal-but-distinct clone"
+        );
+        assert_eq!(compiles.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// `compile` must run *outside* the lock — proven here by reentrancy,
+    /// not timing: from inside key `"a"`'s own `compile` closure, look up a
+    /// *different* key (`"b"`) on the same cache. If `get_or_init` held its
+    /// lock across the `compile` call, this reentrant `contains`/`get_or_init`
+    /// would deadlock on the same `Mutex`; since it doesn't, the lock was
+    /// already released before `compile` ran.
+    #[test]
+    fn compile_runs_outside_the_lock() {
+        let cache: SyncCache<u32> = SyncCache::new();
+        let value = cache
+            .get_or_init("a", |_| {
+                assert!(!cache.contains("b"));
+                let inner = cache.get_or_init("b", |_| Ok(2)).unwrap();
+                Ok(*inner + 1)
+            })
+            .unwrap();
+        assert_eq!(*value, 3);
+        assert!(cache.contains("b"));
+    }
+
+    #[test]
+    fn get_or_init_propagates_a_compile_error_without_caching_it() {
+        let cache: SyncCache<u32> = SyncCache::new();
+        let error = cache
+            .get_or_init("a", |_| anyhow::bail!("compile failed"))
+            .unwrap_err();
+        assert!(error.to_string().contains("compile failed"));
+        assert!(
+            !cache.contains("a"),
+            "a failed compile must not leave a cache entry behind"
+        );
+    }
+
+    /// The map is append-only and every value is immutable once stored, so a
+    /// panic while another thread holds the lock can at most leave a
+    /// fully-formed map behind — recovering via `PoisonError::into_inner`
+    /// (rather than propagating the poison) must still see that prior entry.
+    ///
+    /// This needs direct access to the private `entries` field to force a
+    /// poison deterministically (locking it and panicking while held), which
+    /// only this inline `#[cfg(test)] mod tests` can do — moving this test
+    /// to `tests/` later would lose that access entirely.
+    #[test]
+    fn a_poisoned_lock_recovers_and_keeps_the_entry_inserted_before_the_panic() {
+        let cache: Arc<SyncCache<u32>> = Arc::new(SyncCache::new());
+        cache.get_or_init("a", |_| Ok(1)).unwrap();
+
+        let poisoning = Arc::clone(&cache);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoning.entries.lock().unwrap();
+            panic!("deliberately poisoning the lock for the test above");
+        })
+        .join();
+        assert!(joined.is_err(), "the spawned thread must have panicked");
+
+        // The pre-existing entry survives poison recovery, and the cache
+        // keeps working for new keys afterward.
+        assert!(cache.contains("a"));
+        let value = cache.get_or_init("b", |_| Ok(2)).unwrap();
+        assert_eq!(*value, 2);
+    }
+}

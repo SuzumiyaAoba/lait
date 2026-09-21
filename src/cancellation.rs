@@ -59,3 +59,57 @@ pub(crate) fn check_flag(flag: &AtomicBool, message: &'static str) -> Result<()>
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{NEVER_SET, check, check_flag, none};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn check_passes_through_an_uncancelled_token() {
+        assert!(check(&none(), "not cancelled").is_ok());
+    }
+
+    #[test]
+    fn check_reports_a_cancelled_token_as_a_typed_interruption() {
+        let token = none();
+        token.cancel();
+        let error = check(&token, "was cancelled").unwrap_err();
+        assert!(crate::error::is_interrupted(&error));
+        assert_eq!(error.to_string(), "was cancelled");
+    }
+
+    #[test]
+    fn check_flag_passes_through_a_clear_flag() {
+        assert!(check_flag(&NEVER_SET, "not cancelled").is_ok());
+    }
+
+    #[test]
+    fn check_flag_reports_a_set_flag_as_a_typed_interruption() {
+        let flag = AtomicBool::new(true);
+        let error = check_flag(&flag, "was cancelled").unwrap_err();
+        assert!(crate::error::is_interrupted(&error));
+        assert_eq!(error.to_string(), "was cancelled");
+    }
+
+    #[test]
+    fn never_set_never_reads_as_cancelled() {
+        // `NEVER_SET` is a single process-wide `static` shared by every
+        // caller that has no cancellation source wired — this only holds as
+        // long as nothing ever stores into it (see the `static`'s own doc).
+        assert!(!NEVER_SET.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn none_returns_a_fresh_uncancelled_token_each_call() {
+        let a = none();
+        let b = none();
+        assert!(!a.is_cancelled());
+        assert!(!b.is_cancelled());
+        // Cancelling one must not affect the other — `none()` hands out an
+        // independent, parentless token per call, not a shared one.
+        a.cancel();
+        assert!(a.is_cancelled());
+        assert!(!b.is_cancelled());
+    }
+}
