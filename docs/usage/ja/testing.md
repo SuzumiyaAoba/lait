@@ -71,10 +71,12 @@ assert:
     min: 1                      # 省略時 1
     max: 3                      # 省略時無制限
     args_jq: '.pattern == "TODO"'  # 省略可。呼び出し引数の生 JSON に対する jq 式(いずれか1回の呼び出しが満たせばよい)
-  - type: usage                # トークン使用量の上限
+  - type: usage                # トークン使用量・コストの上限
     max_prompt_tokens: 2000
     max_completion_tokens: 500
     max_total_tokens: 2500      # いずれも省略可(省略したフィールドは検査しない)
+    max_cost_usd: 0.01          # 省略可。該当モデルに pricing:([設定ファイル](./config.md#コスト概算pricing))が
+                                 # 設定されていない場合は検査されない(コスト0ではなく不明として扱う)
   - type: step_output          # 名前付きステップ自身の出力を検査
     id: summarize                # そのステップの label(id: またはノード名)
     assert:                      # ネストした assert: (equals/contains/jq/llm_judge/更なる step_output など)

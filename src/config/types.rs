@@ -15,6 +15,7 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 
 use crate::reasoning::ReasoningEffort;
+use crate::response;
 
 use super::resolve::{FallbackCandidate, expand_env_placeholders, expand_list, expand_map};
 
@@ -413,6 +414,32 @@ pub(crate) struct PromptDefinition {
     pub(crate) vars: HashMap<String, String>,
 }
 
+/// A `models:` definition's `pricing:` block: USD per 1,000,000 prompt/
+/// completion tokens, for `--show-usage`/`lait compare` to turn a reported
+/// [`response::Usage`] into an estimated cost. Entirely optional — every
+/// caller treats "no `pricing:`" as "cost unknown" (`None`), never as zero,
+/// the same None-vs-zero convention `response::Usage` itself uses for a
+/// server that doesn't report usage at all.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Pricing {
+    pub(crate) input_per_1m: f64,
+    pub(crate) output_per_1m: f64,
+}
+
+impl Pricing {
+    /// Estimated USD cost of `usage` at these rates. Token counts are
+    /// server-reported (untrusted, per `response::Usage::add`'s own
+    /// comment), but a plain `as f64` conversion (rather than a
+    /// saturating/checked one) is fine here: the result is a display
+    /// estimate, not used for billing enforcement, and `u64::MAX` tokens
+    /// converting to `f64` cannot panic or wrap the way integer overflow can.
+    pub(crate) fn cost(&self, usage: response::Usage) -> f64 {
+        (usage.prompt_tokens as f64 / 1_000_000.0) * self.input_per_1m
+            + (usage.completion_tokens as f64 / 1_000_000.0) * self.output_per_1m
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelDefinition {
@@ -422,6 +449,16 @@ pub(crate) struct ModelDefinition {
     default_temperature: Option<f64>,
     default_top_p: Option<f64>,
     default_max_tokens: Option<u32>,
+    /// Per-1M-token USD pricing, for `--show-usage`/`lait compare` to turn
+    /// this model's reported token usage into an estimated cost — see
+    /// `Pricing`'s own doc comment. Like `default_reasoning_effort`/etc.
+    /// (see `FallbackCandidate`'s doc comment), this only ever applies from
+    /// the *primary* `models:` definition: a fallback candidate's own
+    /// `pricing:` (if it even set one) is never consulted, since cost is
+    /// attributed to the logical request the same way the cache key and
+    /// `gen_ai.request.model` trace attribute already are — see
+    /// `engine::transport`'s `complete_recorded` doc comment.
+    pricing: Option<Pricing>,
 }
 
 impl ModelDefinition {
@@ -442,6 +479,7 @@ impl ModelDefinition {
             temperature: self.default_temperature,
             top_p: self.default_top_p,
             max_tokens: self.default_max_tokens,
+            pricing: self.pricing,
         }
     }
 
@@ -511,6 +549,7 @@ pub(crate) struct ResolvedModel {
     pub(crate) temperature: Option<f64>,
     pub(crate) top_p: Option<f64>,
     pub(crate) max_tokens: Option<u32>,
+    pub(crate) pricing: Option<Pricing>,
 }
 
 /// Rejects `api_key`/`api_key_cmd` set together at the same config layer —

@@ -22,6 +22,7 @@ usage: prompt=12 completion=15 total=27
 - `--model` は2回以上指定する必要があります（`lait.config.yml` の `models:` エイリアス名、またはサーバーが受け付けるモデル ID をそのまま指定できます）。
 - PROMPT は省略して標準入力から渡すこともできます（`git diff | lait compare --model a --model b "このdiffをレビューして"` のように、他のPROMPT系サブコマンドと同じ規約です）。
 - リクエストは並行に送信されます。1つのモデルが失敗しても他のモデルの結果は表示され、いずれか1つでも失敗すると終了コードは非ゼロになります。
+- `--model` に指定したエイリアスに[`pricing:`](./config.md#コスト概算pricing)が設定されていれば、`usage:` の行に概算USDコストが併記されます(例: `usage: prompt=12 completion=8 total=20 ($0.0001)`)。設定されていないモデルはコストを表示しません。
 
 ## サンプリングパラメータの一律適用
 
@@ -33,7 +34,7 @@ $ lait compare --model gemma-4-12b --model qwen-3-14b --temperature 0 "厳密に
 
 ## `--json`
 
-機械可読な出力が必要な場合は `--json` を付けます。各モデルの結果を1要素とする配列が返り、成功時は `error` が `null`、失敗時は `content`/`usage` が `null` になります。
+機械可読な出力が必要な場合は `--json` を付けます。各モデルの結果を1要素とする配列が返り、成功時は `error` が `null`、失敗時は `content`/`usage`/`cost_usd` が `null` になります。`cost_usd` は該当モデルに `pricing:` が設定されていない場合も `null` です(コスト0ではなく「不明」を表します)。
 
 ```sh
 $ lait compare --model gemma-4-12b --model qwen-3-14b --json "..." | jq '.[].model'
@@ -46,6 +47,7 @@ $ lait compare --model gemma-4-12b --model qwen-3-14b --json "..." | jq '.[].mod
     "model_id": "gemma-4-12b-it",
     "duration_ms": 812,
     "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+    "cost_usd": null,
     "content": "日本の首都は東京です。",
     "error": null
   },

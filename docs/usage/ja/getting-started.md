@@ -92,7 +92,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--json` | CLI の応答を JSON（`content`、`reasoning`、`usage`）で出力します。Structured Outputs の指定とは別の機能です。 |
 | `--json-schema <FILE>` | API の Structured Outputs に使う JSON Schema ファイルです。スキーマ名は `--schema-name <NAME>`（既定値 `structured_output`）で変更できます。詳しくは [出力例](./output.md) を参照してください。 |
 | `--show-reasoning` | 対応サーバーが返す `reasoning`（旧形式の `reasoning_content` を含む）を回答前に表示します。 |
-| `--show-usage` | トークン使用量を標準エラー出力に表示します。`lait run` や `lait agent run` でも使えます。 |
+| `--show-usage` | トークン使用量を標準エラー出力に表示します。`lait run` や `lait agent run` でも使えます。モデルに`pricing:`（[設定ファイル](./config.md#コスト概算pricing)）が設定されていれば概算USDコストも併記されます。 |
 | `-o, --output <PATH>` | 応答を PATH に書き込みます。`-o -` は標準出力です。非ストリーミング時は成功後に書き込み、ストリーミング時は生成中に書き込みます。 |
 | `--render` | 端末で応答を Markdown として表示します。詳しくは [出力例](./output.md) を参照してください。 |
 | `--quiet` | reasoning や usage など本文以外の注記を抑制します。 |

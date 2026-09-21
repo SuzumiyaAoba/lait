@@ -266,6 +266,7 @@ async fn run_test_file_inner(
         events: &events,
         steps_outputs: &outcome.steps_outputs,
         usage_total: env.usage.total(),
+        cost_total: env.usage.total_cost(),
     };
     let failures = assert::evaluate(
         &definition.assert,

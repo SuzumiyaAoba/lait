@@ -173,3 +173,46 @@ fn requires_at_least_two_models() {
         "expected a clear error about needing at least two models: {stderr}"
     );
 }
+
+#[test]
+fn priced_model_reports_cost_and_unpriced_model_does_not() {
+    let server_a = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":"response from a"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000000,"completion_tokens":1000000,"total_tokens":2000000}}"#,
+    );
+    let server_b = MockServer::start(
+        "200 OK",
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"model-b","choices":[{"index":0,"message":{"role":"assistant","content":"response from b"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":5,"total_tokens":9}}"#,
+    );
+    let config = ConfigDirectory::new(&format!(
+        "models:\n  a:\n    - provider:\n        base_url: \"{}\"\n      model_id: model-a\n      pricing:\n        input_per_1m: 1.0\n        output_per_1m: 2.0\n  b:\n    - provider:\n        base_url: \"{}\"\n      model_id: model-b\n",
+        server_a.base_url, server_b.base_url
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["compare", "--model", "a", "--model", "b", "--json", "hello"])
+        .output()
+        .expect("failed to execute lait compare");
+
+    server_a.receive_request();
+    server_b.receive_request();
+    server_a.finish();
+    server_b.finish();
+
+    assert!(output.status.success(), "lait compare failed: {output:?}");
+    let results: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--json output should be valid JSON");
+    let results = results.as_array().expect("results should be a JSON array");
+    let a = results
+        .iter()
+        .find(|result| result["model"] == "a")
+        .expect("result for model 'a'");
+    let b = results
+        .iter()
+        .find(|result| result["model"] == "b")
+        .expect("result for model 'b'");
+    // 1M prompt + 1M completion tokens at $1/$2 per 1M => $3.00.
+    assert_eq!(a["cost_usd"], 3.0);
+    assert_eq!(b["cost_usd"], serde_json::Value::Null);
+}

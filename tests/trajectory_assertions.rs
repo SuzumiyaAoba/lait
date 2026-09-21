@@ -160,7 +160,10 @@ assert:
         .output()
         .expect("failed to execute lait test");
 
-    assert!(!output.status.success(), "lait test should report a failure");
+    assert!(
+        !output.status.success(),
+        "lait test should report a failure"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("FAIL"), "{stdout}");
     assert!(

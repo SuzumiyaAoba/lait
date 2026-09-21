@@ -87,10 +87,13 @@ pub(crate) enum Assertion {
         #[serde(default)]
         args_jq: Option<String>,
     },
-    /// The run's total token usage (summed across every model call the run
-    /// made, the same total `--show-usage` prints) stayed within every
-    /// bound given (any omitted bound is unchecked). Requires a
-    /// [`TrajectoryContext`].
+    /// The run's total token usage/cost (summed across every model call the
+    /// run made, the same totals `--show-usage` prints) stayed within every
+    /// bound given (any omitted bound is unchecked). `max_cost_usd` only
+    /// ever checks a run where at least one resolved model has `pricing:`
+    /// configured — see `TrajectoryContext::cost_total`'s doc comment; when
+    /// nothing was priced, `max_cost_usd` is simply not checked (cost is
+    /// unknown, not zero). Requires a [`TrajectoryContext`].
     Usage {
         #[serde(default)]
         max_prompt_tokens: Option<u64>,
@@ -98,6 +101,8 @@ pub(crate) enum Assertion {
         max_completion_tokens: Option<u64>,
         #[serde(default)]
         max_total_tokens: Option<u64>,
+        #[serde(default)]
+        max_cost_usd: Option<f64>,
     },
     /// Every assertion in `assert` holds against the named workflow step's
     /// own output (rather than the run's final output). A trajectory
@@ -159,6 +164,9 @@ pub(crate) struct TrajectoryContext<'a> {
     /// The run's total token usage, when the server reported any (see
     /// `usage::UsageTally::total`).
     pub(crate) usage_total: Option<response::Usage>,
+    /// The run's total estimated USD cost, when at least one recorded model
+    /// has `pricing:` configured (see `usage::UsageTally::total_cost`).
+    pub(crate) cost_total: Option<f64>,
 }
 
 /// The message every trajectory assertion (`tool_called`/`usage`/
@@ -256,9 +264,11 @@ async fn check_tool_called(
 /// [`response::Usage`] uses elsewhere).
 fn check_usage(
     usage_total: Option<response::Usage>,
+    cost_total: Option<f64>,
     max_prompt_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
     max_total_tokens: Option<u64>,
+    max_cost_usd: Option<f64>,
 ) -> Option<String> {
     let usage = usage_total.unwrap_or_default();
     if let Some(max) = max_prompt_tokens
@@ -283,6 +293,20 @@ fn check_usage(
         return Some(format!(
             "total_tokens {} exceeded max_total_tokens {max}",
             usage.total_tokens
+        ));
+    }
+    // Only checked when at least one recorded model was actually priced —
+    // see `TrajectoryContext::cost_total`'s doc comment: `None` means "cost
+    // unknown", not "cost zero", so this never fails a run just because
+    // nothing it called had `pricing:` configured.
+    if let Some(max) = max_cost_usd
+        && let Some(cost) = cost_total
+        && cost > max
+    {
+        return Some(format!(
+            "cost {} exceeded max_cost_usd {}",
+            crate::usage::format_cost(cost),
+            crate::usage::format_cost(max)
         ));
     }
     None
@@ -597,12 +621,15 @@ pub(crate) async fn evaluate(
                     max_prompt_tokens,
                     max_completion_tokens,
                     max_total_tokens,
+                    max_cost_usd,
                 } => match trajectory {
                     Some(trajectory) => check_usage(
                         trajectory.usage_total,
+                        trajectory.cost_total,
                         *max_prompt_tokens,
                         *max_completion_tokens,
                         *max_total_tokens,
+                        *max_cost_usd,
                     ),
                     None => Some(trajectory_unsupported_message()),
                 },
@@ -894,6 +921,7 @@ mod tests {
             events: &events,
             steps_outputs: &steps_outputs,
             usage_total: None,
+            cost_total: None,
         };
         let assertions = vec![Assertion::ToolCalled {
             name: "tool__echo".to_owned(),
@@ -920,6 +948,7 @@ mod tests {
             events: &events,
             steps_outputs: &steps_outputs,
             usage_total: None,
+            cost_total: None,
         };
         let assertions = vec![Assertion::ToolCalled {
             name: "tool__echo".to_owned(),
@@ -950,6 +979,7 @@ mod tests {
             events: &events,
             steps_outputs: &steps_outputs,
             usage_total: None,
+            cost_total: None,
         };
         let assertions = vec![Assertion::ToolCalled {
             name: "tool__echo".to_owned(),
@@ -980,6 +1010,7 @@ mod tests {
             events: &events,
             steps_outputs: &steps_outputs,
             usage_total: None,
+            cost_total: None,
         };
         let assertions = vec![Assertion::ToolCalled {
             name: "tool__echo".to_owned(),
@@ -1030,11 +1061,13 @@ mod tests {
                 completion_tokens: 5,
                 total_tokens: 15,
             }),
+            cost_total: None,
         };
         let assertions = vec![Assertion::Usage {
             max_prompt_tokens: None,
             max_completion_tokens: None,
             max_total_tokens: Some(10),
+            max_cost_usd: None,
         }];
         let failures = evaluate(
             &assertions,
@@ -1060,11 +1093,13 @@ mod tests {
                 completion_tokens: 5,
                 total_tokens: 15,
             }),
+            cost_total: None,
         };
         let assertions = vec![Assertion::Usage {
             max_prompt_tokens: None,
             max_completion_tokens: None,
             max_total_tokens: Some(100),
+            max_cost_usd: None,
         }];
         let failures = evaluate(
             &assertions,
@@ -1089,6 +1124,7 @@ mod tests {
             events: &events,
             steps_outputs: &steps_outputs,
             usage_total: None,
+            cost_total: None,
         };
         let assertions = vec![Assertion::StepOutput {
             id: "greet".to_owned(),
@@ -1115,6 +1151,7 @@ mod tests {
             events: &events,
             steps_outputs: &steps_outputs,
             usage_total: None,
+            cost_total: None,
         };
         let assertions = vec![Assertion::StepOutput {
             id: "missing".to_owned(),

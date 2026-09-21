@@ -195,3 +195,50 @@ fn streaming_without_show_usage_does_not_request_the_usage_chunk() {
         "the request should not send stream_options: {body}"
     );
 }
+
+#[test]
+fn show_usage_prints_an_estimated_cost_when_the_model_has_pricing() {
+    let server = MockServer::start("200 OK", RESPONSE_WITH_USAGE);
+    let config = support::ConfigDirectory::new(&format!(
+        "models:\n  priced:\n    - provider:\n        base_url: \"{}\"\n      model_id: test-model\n      pricing:\n        input_per_1m: 1.0\n        output_per_1m: 2.0\n",
+        server.base_url
+    ));
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["--model", "priced"])
+        .arg("--show-usage")
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // RESPONSE_WITH_USAGE reports prompt_tokens=11, completion_tokens=22 —
+    // (11/1_000_000)*1.0 + (22/1_000_000)*2.0 = 0.000011 + 0.000044 = 0.000055.
+    assert!(
+        stderr.contains("usage: prompt=11 completion=22 total=33 ($0.0001)"),
+        "stderr should carry the estimated cost: {stderr}"
+    );
+}
+
+#[test]
+fn show_usage_omits_cost_when_the_model_has_no_pricing() {
+    let server = MockServer::start("200 OK", RESPONSE_WITH_USAGE);
+    let output = test_command()
+        .args(["--model", "test-model", "--base-url", &server.base_url])
+        .arg("--show-usage")
+        .arg("hello")
+        .output()
+        .expect("failed to execute lait");
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("usage: prompt=11 completion=22 total=33") && !stderr.contains('$'),
+        "stderr should not mention cost without pricing: {stderr}"
+    );
+}

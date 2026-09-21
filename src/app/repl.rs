@@ -259,7 +259,11 @@ async fn run_turn(
         )
         .await?;
     if show_usage && let Some(usage) = outcome.usage {
-        env.usage.record(&settings.usage_label, usage);
+        env.usage.record(
+            &settings.usage_label,
+            usage,
+            settings.resolved_model.pricing,
+        );
     }
     if show_usage {
         usage::print_usage_summary(&env.usage);

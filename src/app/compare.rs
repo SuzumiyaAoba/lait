@@ -27,6 +27,11 @@ struct ModelResult {
     model_id: String,
     duration_ms: u64,
     usage: Option<response::Usage>,
+    /// Estimated USD cost of `usage` at this model's `pricing:` rates —
+    /// `None` when either `usage` itself is `None` or the resolved model has
+    /// no `pricing:` configured (never `Some(0.0)` for "unpriced"; see
+    /// `config::Pricing`'s doc comment).
+    cost_usd: Option<f64>,
     content: Option<String>,
     error: Option<String>,
 }
@@ -86,6 +91,10 @@ pub(super) async fn run(
                     model_id: settings.resolved_model.model_id.clone(),
                     duration_ms,
                     usage: response.usage,
+                    cost_usd: response
+                        .usage
+                        .zip(settings.resolved_model.pricing)
+                        .map(|(usage, pricing)| pricing.cost(usage)),
                     content: Some(response::content_text(&response).to_owned()),
                     error: None,
                 },
@@ -94,6 +103,7 @@ pub(super) async fn run(
                     model_id: settings.resolved_model.model_id.clone(),
                     duration_ms,
                     usage: None,
+                    cost_usd: None,
                     content: None,
                     error: Some(format!("{error:#}")),
                 },
@@ -134,7 +144,12 @@ fn print_report(results: &[ModelResult]) {
             Some(error) => println!("error: {error}"),
             None => {
                 if let Some(usage) = result.usage {
-                    println!("usage: {usage}");
+                    match result.cost_usd {
+                        Some(cost) => {
+                            println!("usage: {usage} ({})", crate::usage::format_cost(cost))
+                        }
+                        None => println!("usage: {usage}"),
+                    }
                 }
                 if let Some(content) = &result.content {
                     println!("{content}");

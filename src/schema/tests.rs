@@ -242,6 +242,9 @@ models:
         api_key: sk-test
       model_id: my-model
       default_reasoning_effort: high
+      pricing:
+        input_per_1m: 1.0
+        output_per_1m: 2.0
 json_schemas:
   inline_example:
     schema:
@@ -384,6 +387,9 @@ models:
       model_id: my-model
       default_reasoning_effort: high
       default_temperature: 0.7
+      pricing:
+        input_per_1m: 1.0
+        output_per_1m: 2.0
 mcp_servers:
   fs:
     command: npx

@@ -122,6 +122,30 @@ default:
 リクエストに適用されます。生のモデル ID を指定した場合は、従来どおりトップレベル設定の
 `base_url` などが使用されます。
 
+### コスト概算（`pricing`）
+
+先頭要素（フォールバック先には効きません — `default_reasoning_effort` などと同じ扱いです。
+[複数プロバイダーによるフォールバック](#複数プロバイダーによるフォールバック)を参照）に
+`pricing:` を指定すると、`--show-usage`・`lait compare`・`lait test`/`lait eval` の
+`usage:` アサーションが、サーバーの報告したトークン数から概算 USD コストを計算して
+表示・検査できるようになります。
+
+```yaml
+models:
+  cloud:
+    - provider:
+        base_url: https://api.example.com/v1
+        api_key: "${CLOUD_API_KEY}"
+      model_id: cloud-model
+      pricing:
+        input_per_1m: 1.0   # 入力(prompt)トークン100万あたりのUSD
+        output_per_1m: 2.0  # 出力(completion)トークン100万あたりのUSD
+```
+
+- `pricing:` を省略したモデルは「コスト不明」として扱われ、`--show-usage` の出力にコストは
+  表示されません（`$0.00` のような誤解を招く値にはなりません）。
+- 概算値であり、実際の請求額と一致する保証はありません。
+
 ## 複数プロバイダーによるフォールバック
 
 `models:` の alias に配列の 2 番目以降の要素を追加すると、先頭要素への接続が失敗した際に

@@ -406,7 +406,8 @@ impl RequestSettings {
         let start = chrono::Utc::now();
         let response =
             cassette::load(replay_dir, key, &self.resolved_model.model_id, cancellation).await?;
-        env.usage.record_response(&self.usage_label, &response);
+        env.usage
+            .record_response(&self.usage_label, &response, self.resolved_model.pricing);
         self.record_chat_trace(env, "replay", start, response.usage);
         Ok(Some(response))
     }
@@ -514,7 +515,11 @@ impl RequestSettings {
             );
             match llm::complete(request).await {
                 Ok(response) => {
-                    env.usage.record_response(&self.usage_label, &response);
+                    env.usage.record_response(
+                        &self.usage_label,
+                        &response,
+                        self.resolved_model.pricing,
+                    );
                     self.record_chat_trace(env, "live", attempt_start, response.usage);
                     if env.policy.cache.enabled()
                         && let Some(cache_key) = &content_key
@@ -712,7 +717,8 @@ impl RequestSettings {
                 // recorded here or it's lost entirely; see the fallthrough
                 // branch below for why every non-final round needs this.
                 if let Some(usage) = outcome.usage {
-                    env.usage.record(&self.usage_label, usage);
+                    env.usage
+                        .record(&self.usage_label, usage, self.resolved_model.pricing);
                 }
                 let messages = tool_loop.into_messages();
                 let stream = self
@@ -740,7 +746,8 @@ impl RequestSettings {
             // silently undercount `--show-usage` by every tool-calling round
             // but the last.
             if let Some(usage) = outcome.usage {
-                env.usage.record(&self.usage_label, usage);
+                env.usage
+                    .record(&self.usage_label, usage, self.resolved_model.pricing);
             }
 
             let content = if outcome.content.is_empty() {

@@ -171,6 +171,7 @@ pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<R
         temperature: None,
         top_p: None,
         max_tokens: None,
+        pricing: None,
     })
 }
 

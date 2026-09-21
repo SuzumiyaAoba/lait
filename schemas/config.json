@@ -61,6 +61,16 @@
         "api_key_cmd": { "$ref": "#/$defs/commandSpec" }
       }
     },
+    "pricing": {
+      "description": "USD per 1,000,000 prompt/completion tokens, for --show-usage/lait compare to estimate cost. Only the primary (first) models: entry's pricing is ever consulted, the same as default_reasoning_effort/etc.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_per_1m", "output_per_1m"],
+      "properties": {
+        "input_per_1m": { "type": "number", "minimum": 0 },
+        "output_per_1m": { "type": "number", "minimum": 0 }
+      }
+    },
     "modelDefinition": {
       "type": "object",
       "additionalProperties": false,
@@ -71,7 +81,8 @@
         "default_reasoning_effort": { "$ref": "#/$defs/reasoningEffort" },
         "default_temperature": { "type": "number", "minimum": 0, "maximum": 2 },
         "default_top_p": { "type": "number", "minimum": 0, "maximum": 1 },
-        "default_max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+        "default_max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "pricing": { "$ref": "#/$defs/pricing" }
       }
     },
     "modelMap": {

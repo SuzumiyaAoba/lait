@@ -289,7 +289,11 @@ async fn run_chat(
         // `complete`; feed it into the same tally so both chat paths share
         // one summary format and so `env.usage.total()` below reflects it.
         if let Some(usage) = outcome.usage {
-            env.usage.record(&settings.usage_label, usage);
+            env.usage.record(
+                &settings.usage_label,
+                usage,
+                settings.resolved_model.pricing,
+            );
         }
         return finish_chat_run(
             &chat,

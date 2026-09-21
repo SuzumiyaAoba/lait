@@ -35,8 +35,8 @@ pub(crate) use resolve::{
 };
 pub(crate) use types::{
     AgentMap, ApiKeySource, CommandSpec, ConfigFile, DefaultSettings, Endpoint, McpServerMap,
-    McpTransport, ModelMap, PromptDefinition, ResolvedModel, ShellToolDefinition, SkillMap,
-    ToolMap,
+    McpTransport, ModelMap, Pricing, PromptDefinition, ResolvedModel, ShellToolDefinition,
+    SkillMap, ToolMap,
 };
 // Only ever constructed directly by test code elsewhere in the crate
 // (`mcp/registry.rs`'s and `lint/tests.rs`'s own fixtures) — everywhere else
