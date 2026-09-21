@@ -81,8 +81,15 @@ async fn load_skill(
     // cancellation-aware worker. `Path::is_dir` itself performs metadata I/O
     // and can block on a network/FUSE mount, so doing only the final
     // `read_to_string` off-thread would still leave a timed step stuck before
-    // admission to async_io. Waiting for a FIFO writer is always safe here:
-    // `run_blocking`'s guard trips `cancelled` on drop either way.
+    // admission to async_io. Waiting for a FIFO writer here is safe as long
+    // as `cancellation` (this function's parameter, threaded through from
+    // `SkillCache::render`) is an actually-cancellable token — which every
+    // production caller passes (the run's own `env.operation_token()`, see
+    // `engine::transport::system_prompt_with_skills`) — since
+    // `run_blocking`'s guard then trips `cancelled` on drop. A caller that
+    // instead passed `cancellation::none()` (see that function's doc) and
+    // awaited this call directly would have no such exit: a SKILL.md path
+    // that names a FIFO with no writer would block forever.
     let (path, contents) = async_io::run_blocking(
         move |cancelled| {
             let path = resolve_skill_file_path(&configured_path);

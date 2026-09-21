@@ -293,10 +293,15 @@ pub(crate) fn read_to_string_wait_for_fifo_writer(
 }
 
 /// Reads UTF-8 text through the cancellation-aware blocking worker, waiting
-/// for a FIFO writer to appear if needed — `run_blocking`'s guard always
-/// trips the flag on drop, so the wait can always be interrupted. Shared by
-/// every loader (agent files, skills, JSON schemas) that reads exactly one
-/// file and returns its contents as a string.
+/// for a FIFO writer to appear if needed — `run_blocking`'s guard trips the
+/// flag on drop, so the wait can be interrupted once `cancellation` is
+/// actually cancelled (or the caller drops this call's own future, e.g. by
+/// racing it in a `tokio::time::timeout`). Passing `cancellation::none()` (a
+/// token nothing ever cancels — see that function's doc) and then simply
+/// `.await`ing this call to completion removes both of those exits: a FIFO
+/// with no writer then blocks forever. Shared by every loader (agent files,
+/// skills, JSON schemas) that reads exactly one file and returns its
+/// contents as a string.
 pub(crate) async fn read_to_string_cancellable(
     path: &Path,
     cancellation: CancellationToken,
