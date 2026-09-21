@@ -57,9 +57,10 @@ use anyhow::{Result, bail};
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat,
 };
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::{cache, cassette, llm, mcp, report, response, shell_tool, skill, subagent};
+use crate::{cache, cassette, llm, mcp, report, response, shell_tool, skill, subagent, trace};
 
 use super::{
     PromptTurn, RequestSettings, RunContext,
@@ -327,6 +328,50 @@ impl RequestSettings {
         ))
     }
 
+    /// Records a `"chat"`-operation [`trace::TraceEvent`] under
+    /// `env.trace` — see `crate::trace`'s doc comment for why this is a
+    /// flat, label-keyed event log rather than a span tree. `source`
+    /// distinguishes a `--replay`/`--cache` hit from an actual network round
+    /// trip (`"replay"`/`"cache"`/`"live"`); all three share the same
+    /// `"chat"` operation name (OTel's `gen_ai.operation.name` vocabulary).
+    /// Called from every one of `complete_recorded`'s three return paths
+    /// (`try_replay`/`try_cache`/the network loop's success arm) so a
+    /// `--trace-file` reader can tell which of those actually answered a
+    /// given request, the same way `report::note`'s "cache hit" line
+    /// already does for a human reading stderr.
+    fn record_chat_trace(
+        &self,
+        env: &RunContext,
+        source: &'static str,
+        start: chrono::DateTime<chrono::Utc>,
+        usage: Option<response::Usage>,
+    ) {
+        let mut attributes = trace::attrs([
+            (
+                "gen_ai.request.model",
+                Value::from(self.resolved_model.model_id.clone()),
+            ),
+            ("lait.source", Value::from(source)),
+        ]);
+        if let Some(usage) = usage {
+            attributes.insert(
+                "gen_ai.usage.input_tokens".to_owned(),
+                Value::from(usage.prompt_tokens),
+            );
+            attributes.insert(
+                "gen_ai.usage.output_tokens".to_owned(),
+                Value::from(usage.completion_tokens),
+            );
+        }
+        env.trace.record(
+            "chat",
+            self.usage_label.clone(),
+            start,
+            chrono::Utc::now(),
+            attributes,
+        );
+    }
+
     /// The one way `complete` sends a request: checks the response disk
     /// cache first when `env.policy.cache.enabled()` (see `crate::cache` and
     /// `docs/usage/ja/config.md`'s キャッシュ section — a hit skips the
@@ -357,9 +402,11 @@ impl RequestSettings {
             return Ok(None);
         };
         let key = require_content_key(content_key);
+        let start = chrono::Utc::now();
         let response =
             cassette::load(replay_dir, key, &self.resolved_model.model_id, cancellation).await?;
         env.usage.record_response(&self.usage_label, &response);
+        self.record_chat_trace(env, "replay", start, response.usage);
         Ok(Some(response))
     }
 
@@ -381,17 +428,12 @@ impl RequestSettings {
             return Ok(None);
         }
         let cache_key = require_content_key(content_key);
-        match cache::load(
-            cache_key,
-            env.policy.cache.ttl(),
-            chrono::Utc::now(),
-            cancellation,
-        )
-        .await
-        {
+        let start = chrono::Utc::now();
+        match cache::load(cache_key, env.policy.cache.ttl(), start, cancellation).await {
             Ok(Some(response)) => {
                 report::note(format_args!("cache hit for {}", self.usage_label));
                 tracing::debug!(cache_key = %cache_key, "response cache hit");
+                self.record_chat_trace(env, "cache", start, response.usage);
                 Ok(Some(response))
             }
             Ok(None) => {
@@ -454,6 +496,7 @@ impl RequestSettings {
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
         loop {
+            let attempt_start = chrono::Utc::now();
             let api_key = env
                 .services
                 .secret_resolver
@@ -471,6 +514,7 @@ impl RequestSettings {
             match llm::complete(request).await {
                 Ok(response) => {
                     env.usage.record_response(&self.usage_label, &response);
+                    self.record_chat_trace(env, "live", attempt_start, response.usage);
                     if env.policy.cache.enabled()
                         && let Some(cache_key) = &content_key
                         && let Err(error) = cache::save(

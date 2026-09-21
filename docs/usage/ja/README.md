@@ -30,6 +30,7 @@
 
 ## 運用・診断
 
+- [実行トレース（lait run --trace-file / lait trace show）](./trace.md) — モデル呼び出し・ツール呼び出しを JSONL として記録し、実行軌跡を検査する方法。
 - [出力例](./output.md) — 通常出力、ストリーミング、JSON、Structured Outputs、Markdown 表示。
 - [モデル比較（lait compare）](./compare.md) — 同一プロンプトを複数モデルへ並行送信し、応答・所要時間・usage を比較する方法。
 - [会話セッションと対話モード（lait chat）](./chat.md) — REPL と `--session` による会話の保存・再開。

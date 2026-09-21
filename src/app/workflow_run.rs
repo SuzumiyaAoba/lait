@@ -9,7 +9,7 @@ use crate::{
     cli::RunArgs,
     config::ConfigSource,
     engine::RunContext,
-    report,
+    report, trace,
     workflow::{
         self, WorkflowScope,
         exec::{Flow, RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
@@ -269,6 +269,17 @@ pub(super) async fn run_workflow(
             .await?;
     }
     let current_input = progress.input;
+
+    if let Some(trace_path) = &run_args.trace_file {
+        let events = env.trace.events();
+        trace::write_jsonl(trace_path, &events)?;
+        report::note(format_args!(
+            "trace written to '{}' ({} event{})",
+            trace_path.display(),
+            events.len(),
+            if events.len() == 1 { "" } else { "s" },
+        ));
+    }
 
     report::emit_run_output(
         &current_input,

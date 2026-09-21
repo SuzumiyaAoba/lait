@@ -218,6 +218,9 @@ pub(crate) enum Command {
     /// live model connection, reporting a per-case success rate. See
     /// docs/usage/ja/eval.md.
     Eval(EvalArgs),
+    /// Inspect a `--trace-file`-written JSONL trace log (`lait trace show`).
+    /// See docs/usage/ja/trace.md.
+    Trace(TraceCommand),
 }
 
 #[derive(Debug, Args)]
@@ -365,6 +368,31 @@ pub(crate) struct SkillCommand {
 pub(crate) enum SkillAction {
     /// List every `skills:` entry configured in lait.config.yml.
     List,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TraceCommand {
+    #[command(subcommand)]
+    pub(crate) action: TraceAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum TraceAction {
+    /// Print a `--trace-file`-written JSONL trace log's events, in
+    /// recording order.
+    Show(TraceShowArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TraceShowArgs {
+    /// Path to a JSONL trace file written by `lait run --trace-file`.
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// Print the parsed events as a JSON array instead of a human-readable
+    /// list.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -696,6 +724,15 @@ pub(crate) struct RunArgs {
     /// cassette is an error (see `crate::cassette::load`).
     #[arg(long, value_name = "DIR", conflicts_with = "record")]
     pub(crate) replay: Option<PathBuf>,
+
+    /// Write every model-completion request and tool call this run makes to
+    /// PATH as a JSONL trace log (one event per line, timestamped and
+    /// labeled by workflow step id — see docs/usage/ja/trace.md), creating
+    /// any missing parent directories. Written once, after the run finishes
+    /// (see `--checkpoint`'s own per-step writes for a run that instead
+    /// needs to survive a crash mid-way). Inspect it with `lait trace show`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) trace_file: Option<PathBuf>,
 
     #[command(flatten)]
     pub(crate) var: VarArgs,

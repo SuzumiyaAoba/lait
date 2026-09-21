@@ -46,6 +46,7 @@ mod sync_cache;
 mod template;
 #[cfg(test)]
 mod test_support;
+mod trace;
 mod usage;
 mod workflow;
 mod xdg;

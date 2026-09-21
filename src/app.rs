@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::{
     chat, checkpoint,
@@ -31,12 +31,12 @@ use crate::{
         CompareArgs, CompletionsArgs, DoctorArgs, EvalArgs, GraphArgs, GraphFormat, HistoryArgs,
         InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction, PromptCommand, PromptRunArgs,
         RunArgs, RunsCommand, SchemaArgs, SessionsCommand, SkillAction, SkillCommand, TestArgs,
-        WorkflowAction, WorkflowCommand,
+        TraceAction, TraceCommand, TraceShowArgs, WorkflowAction, WorkflowCommand,
     },
     config::{self, ConfigSource},
     docgen,
     engine::{AppServices, RunContext},
-    error, history, lint, skill, subagent, workflow,
+    error, history, lint, skill, subagent, trace, workflow,
 };
 
 mod chat_run;
@@ -79,6 +79,7 @@ pub(crate) enum SyncCommand {
     Runs(RunsCommand),
     Cache(CacheCommand),
     Schema(SchemaArgs),
+    TraceShow(TraceShowArgs),
 }
 
 /// Every subcommand (and the bare invocation) that awaits a model request or
@@ -169,6 +170,9 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         Some(Command::Compare(args)) => Dispatch::Async(Box::new(AsyncCommand::Compare(args))),
         Some(Command::Test(args)) => Dispatch::Async(Box::new(AsyncCommand::Test(args))),
         Some(Command::Eval(args)) => Dispatch::Async(Box::new(AsyncCommand::Eval(args))),
+        Some(Command::Trace(TraceCommand {
+            action: TraceAction::Show(args),
+        })) => Dispatch::Sync(SyncCommand::TraceShow(args)),
         None => Dispatch::Async(Box::new(AsyncCommand::Bare)),
     }
 }
@@ -281,7 +285,67 @@ pub(crate) fn run_blocking(command: SyncCommand, config_source: ConfigSource) ->
         SyncCommand::Runs(runs_command) => checkpoint::run(runs_command),
         SyncCommand::Cache(cache_command) => crate::cache::run(cache_command),
         SyncCommand::Schema(schema_args) => crate::schema::run(schema_args),
+        SyncCommand::TraceShow(trace_show_args) => run_trace_show(trace_show_args),
     }
+}
+
+/// Runs `lait trace show`: reads a `--trace-file`-written JSONL log back and
+/// prints it (a human-readable, one-line-per-event list; `--json` for a
+/// parsed array instead), sorted the same way `TraceCollector::events`
+/// already orders them. Pure local work, like `run_graph` below — no
+/// `lait.config.yml`, no model resolution.
+fn run_trace_show(args: TraceShowArgs) -> Result<()> {
+    let contents = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("failed to read trace file '{}'", args.file.display()))?;
+    let mut events = Vec::new();
+    for (line_number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: trace::TraceEvent = serde_json::from_str(line).with_context(|| {
+            format!(
+                "failed to parse trace event on line {} of '{}'",
+                line_number + 1,
+                args.file.display(),
+            )
+        })?;
+        events.push(event);
+    }
+    events.sort_by_key(|event| event.seq);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&events)
+                .context("failed to render trace events as JSON")?
+        );
+        return Ok(());
+    }
+    if events.is_empty() {
+        println!("(no events)");
+        return Ok(());
+    }
+    for event in &events {
+        let attributes = event
+            .attributes
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "[{:>6}ms] {:<12} {} — {}{}",
+            event.duration_ms,
+            event.operation,
+            event.label,
+            event.start.format("%H:%M:%S%.3f"),
+            if attributes.is_empty() {
+                String::new()
+            } else {
+                format!("  ({attributes})")
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Runs `lait graph`: parses/validates the workflow file the same way `lait
@@ -409,6 +473,7 @@ mod tests {
             ),
             (&["lait", "test", "case.yml"], Lane::Async),
             (&["lait", "eval", "eval.yml"], Lane::Async),
+            (&["lait", "trace", "show", "trace.jsonl"], Lane::Sync),
             (&["lait", "hi"], Lane::Async),
             (&["lait"], Lane::Async),
             (&["lait", "--cache", "hi"], Lane::Async),

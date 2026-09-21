@@ -9,9 +9,10 @@
 use anyhow::{Result, bail};
 use async_openai::types::chat::{ChatCompletionRequestMessage, ChatCompletionTools};
 use futures_util::{StreamExt, TryStreamExt};
+use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::{llm, mcp, response, shell_tool, subagent};
+use crate::{llm, mcp, response, shell_tool, subagent, trace};
 
 use super::approval::{ToolDecision, tool_decision};
 use super::{RunContext, call_subagent_tool};
@@ -149,12 +150,25 @@ impl ToolLoop {
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ChatCompletionRequestMessage> {
         let name = &tool_call.function.name;
+        let start = chrono::Utc::now();
         if let ToolDecision::Deny(reason) = decision {
             tracing::debug!(
                 tool = %name,
                 round = self.round,
                 reason = %reason,
                 "tool call denied",
+            );
+            env.trace.record(
+                "execute_tool",
+                format!("tool '{name}'"),
+                start,
+                chrono::Utc::now(),
+                trace::attrs([
+                    ("gen_ai.tool.name", Value::from(name.clone())),
+                    ("lait.tool.round", Value::from(self.round as u64)),
+                    ("lait.tool.decision", Value::from("denied")),
+                    ("lait.tool.denial_reason", Value::from(reason.clone())),
+                ]),
             );
             return llm::tool_result_message(&tool_call.id, reason);
         }
@@ -189,6 +203,17 @@ impl ToolLoop {
         } else {
             bail!("model called unknown tool '{name}'");
         };
+        env.trace.record(
+            "execute_tool",
+            format!("tool '{name}'"),
+            start,
+            chrono::Utc::now(),
+            trace::attrs([
+                ("gen_ai.tool.name", Value::from(name.clone())),
+                ("lait.tool.round", Value::from(self.round as u64)),
+                ("lait.tool.decision", Value::from("allowed")),
+            ]),
+        );
         llm::tool_result_message(&tool_call.id, result)
     }
 }

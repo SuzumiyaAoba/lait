@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, bail};
 
-use crate::{config::ConfigFile, mcp, secret, skill, subagent, usage, workflow};
+use crate::{config::ConfigFile, mcp, secret, skill, subagent, trace, usage, workflow};
 
 /// Shared services for one application configuration.
 ///
@@ -147,6 +147,12 @@ pub(crate) struct RunContext {
     pub(crate) services: Arc<AppServices>,
     cancellation: CancellationSource,
     pub(crate) usage: usage::UsageTally,
+    /// Every model-call/tool-call event this run has made so far, when
+    /// `--trace-file` asked for one — see `crate::trace`'s doc comment.
+    /// Always present and always recording (mirrors `usage`, above); whether
+    /// anything is done with it (written to a file) is decided later, by
+    /// whichever command function owns this `RunContext`.
+    pub(crate) trace: trace::TraceCollector,
     // `workflow::StepOutputs` (not a plain `serde_json::Map`) even though
     // this is `$vars`/`{{ vars.* }}`, not step output: both share the same
     // copy-on-write-over-`Arc` type (see its doc comment), and `vars` is set
@@ -172,6 +178,7 @@ impl RunContext {
             services,
             cancellation: CancellationSource::new(root_cancel),
             usage: usage::UsageTally::default(),
+            trace: trace::TraceCollector::default(),
             vars: workflow::StepOutputs::new(),
             policy: RunPolicy::default(),
             always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
