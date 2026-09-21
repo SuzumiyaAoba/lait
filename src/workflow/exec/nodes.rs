@@ -317,9 +317,22 @@ async fn execute_command(
         .map(|arg| render_scope.render(arg))
         .collect::<Result<_>>()
         .step(label)?;
-    crate::process::run_command(&rendered_argv, current_input, context.step_cancel.clone())
-        .await
-        .step(label)
+    // `env`/`cwd` containment (see `config::ShellToolDefinition::env`/`::cwd`)
+    // is scoped to `tools:` shell tool definitions only, for now — a
+    // workflow `command:` node's other fields never get `${VAR_NAME}`
+    // expansion (see AGENTS.md's "Security and Configuration" section), and
+    // extending that boundary to a new field needs its own deliberate
+    // design pass rather than inheriting shell tools' expansion story
+    // by accident.
+    crate::process::run_command(
+        &rendered_argv,
+        current_input,
+        None,
+        None,
+        context.step_cancel.clone(),
+    )
+    .await
+    .step(label)
 }
 
 async fn execute_ask(

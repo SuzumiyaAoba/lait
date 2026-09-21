@@ -236,3 +236,55 @@ fn tool_policy_deny_blocks_a_shell_tool_call_but_the_loop_still_reaches_a_final_
         "second request body should carry the denial reason: {second_body}"
     );
 }
+
+#[test]
+fn a_tool_with_an_env_allowlist_and_cwd_only_sees_what_it_was_given() {
+    let llm_server = MockServer::start_sequence(&[
+        ("200 OK", &tool_call_response("tool__probe", "{}")),
+        ("200 OK", FINAL_ANSWER_BODY),
+    ]);
+    let path = std::env::var("PATH").unwrap_or_default();
+    let config = ConfigDirectory::new(&format!(
+        "tools:\n  probe:\n    command: [\"sh\", \"-c\", \"printf 'FOO=[%s] cwd=[%s]' \\\"$FOO\\\" \\\"$(pwd)\\\"\"]\n    env:\n      PATH: \"{path}\"\n      FOO: \"bar\"\n    cwd: \"{cwd}\"\n",
+        cwd = config_scratch_cwd().display(),
+    ));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "--model",
+            "test-model",
+            "--base-url",
+            &llm_server.base_url,
+            "--tool",
+            "probe",
+            "run the probe",
+        ])
+        .output()
+        .expect("failed to execute lait");
+
+    llm_server.receive_request();
+    let second_request = llm_server.receive_request();
+    llm_server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+
+    let second_body = without_json_whitespace(&second_request.body);
+    assert!(second_body.contains("FOO=[bar]"), "{second_body}");
+    let expected_cwd = std::fs::canonicalize(config_scratch_cwd())
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(
+        second_body.contains(&format!("cwd=[{expected_cwd}]")),
+        "second request body should show the pinned cwd: {second_body}"
+    );
+}
+
+/// A stable scratch directory (the system temp directory itself) to pin
+/// `cwd:` to — this test only needs *some* directory that isn't the
+/// invocation's own cwd, not a freshly created one.
+fn config_scratch_cwd() -> std::path::PathBuf {
+    std::env::temp_dir()
+}

@@ -424,6 +424,9 @@ tools:
       properties:
         text: { type: string }
     timeout: 5
+    env:
+      PATH: "/usr/bin"
+    cwd: "/tmp"
 "#;
 
 #[test]

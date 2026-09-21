@@ -179,9 +179,20 @@ pub(crate) async fn call(
     // the shell-tool call site.
     ensure_not_cancelled(&cancellation)?;
 
+    let (env, cwd) = match definition.resolve_env_cwd() {
+        Ok(resolved) => resolved,
+        Err(error) => return Ok(format!("tool command failed: {error:#}")),
+    };
     let timeout_secs = definition.timeout.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS);
     let child_cancel = cancellation.child_token();
-    let mut execution = Box::pin(process::run_command(&argv, "", child_cancel.clone()));
+    let env_arg = (!env.is_empty()).then_some(&env);
+    let mut execution = Box::pin(process::run_command(
+        &argv,
+        "",
+        env_arg,
+        cwd.as_deref(),
+        child_cancel.clone(),
+    ));
     let outcome =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), &mut execution)
             .await
@@ -383,5 +394,77 @@ mod tests {
             !std::path::Path::new(&marker).exists(),
             "schema value errors must not run the configured command"
         );
+    }
+
+    #[tokio::test]
+    async fn a_non_empty_env_map_replaces_the_inherited_environment() {
+        // SAFETY: `set_var`/`remove_var` are racy against any other thread
+        // reading the environment at the same instant, but this variable
+        // name is unique to this test and nothing else in the suite reads
+        // it, so no concurrently running test can observe an unexpected
+        // value.
+        unsafe {
+            std::env::set_var("LAIT_SHELL_TOOL_TEST_ONLY", "leaked");
+        }
+        let mut definition = definition(&[
+            "sh",
+            "-c",
+            "printf 'marker=[%s] foo=[%s]' \"$LAIT_SHELL_TOOL_TEST_ONLY\" \"$FOO\"",
+        ]);
+        // `PATH` must be in the allowlist too, or `sh` itself (resolved by
+        // name, not an absolute path) can't be found once the environment is
+        // cleared — see `config::ShellToolDefinition::env`'s doc comment.
+        definition.env = [
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("FOO".to_owned(), "bar".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+
+        let output = call(&definition, "{}", crate::cancellation::none())
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("LAIT_SHELL_TOOL_TEST_ONLY");
+        }
+
+        assert!(
+            output.contains("marker=[]"),
+            "a variable outside the allowlist must not reach the child: {output}"
+        );
+        assert!(output.contains("foo=[bar]"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_env_map_preserves_the_full_inherited_environment() {
+        // `definition()`'s fixture leaves `env` at its default (empty), so
+        // this exercises the "nothing changed" path — a variable the test
+        // process itself has (every process has `PATH`) must still reach
+        // the child.
+        let definition = definition(&["sh", "-c", "printf 'path=[%s]' \"$PATH\""]);
+        let output = call(&definition, "{}", crate::cancellation::none())
+            .await
+            .unwrap();
+        assert!(
+            !output.contains("path=[]"),
+            "PATH should still be inherited: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_pins_the_working_directory() {
+        let dir = crate::test_support::TempDir::new("lait-shell-tool-cwd");
+        let mut definition = definition(&["pwd"]);
+        definition.cwd = Some(dir.path().display().to_string());
+
+        let output = call(&definition, "{}", crate::cancellation::none())
+            .await
+            .unwrap();
+
+        // Canonicalize both sides: on macOS, `/tmp` is a symlink to
+        // `/private/tmp`, and `pwd` prints the resolved path.
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        let actual = std::fs::canonicalize(output.trim()).unwrap();
+        assert_eq!(actual, expected);
     }
 }

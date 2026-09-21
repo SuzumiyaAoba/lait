@@ -165,7 +165,9 @@
         "description": { "type": "string" },
         "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
         "parameters": { "type": "object" },
-        "timeout": { "type": "integer", "minimum": 0 }
+        "timeout": { "type": "integer", "minimum": 0 },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "cwd": { "type": "string" }
       }
     }
   }

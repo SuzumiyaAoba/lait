@@ -165,6 +165,8 @@ fn check_shell_tool_definition_rejects_an_empty_command() {
         command: vec![],
         parameters: serde_json::json!({ "type": "object" }),
         timeout: None,
+        env: Default::default(),
+        cwd: None,
     };
     let error = check_shell_tool_definition("echo", &definition).unwrap_err();
     assert!(error.to_string().contains("empty"));
@@ -177,6 +179,8 @@ fn check_shell_tool_definition_rejects_non_object_parameters() {
         command: vec!["echo".to_owned()],
         parameters: serde_json::json!("not an object"),
         timeout: None,
+        env: Default::default(),
+        cwd: None,
     };
     let error = check_shell_tool_definition("echo", &definition).unwrap_err();
     assert!(error.to_string().contains("JSON object"));
@@ -189,8 +193,41 @@ fn check_shell_tool_definition_accepts_a_valid_definition() {
         command: vec!["echo".to_owned(), "{{ input.text }}".to_owned()],
         parameters: serde_json::json!({ "type": "object" }),
         timeout: Some(5),
+        env: Default::default(),
+        cwd: None,
     };
     assert!(check_shell_tool_definition("echo", &definition).is_ok());
+}
+
+/// The `${VAR}`-expanded field boundary AGENTS.md's Security and
+/// Configuration section documents (which lists `mcp_servers[]`'s
+/// `command`/`args`/`env`/`cwd`/`url`/`headers`) also covers a `tools:`
+/// entry's `env`/`cwd` — see `ShellToolDefinition::resolve_env_cwd`.
+#[test]
+fn shell_tool_definition_expands_placeholders_in_env_and_cwd() {
+    // SAFETY: `set_var`/`remove_var` are racy against any other thread
+    // reading the environment at the same instant, but this variable name is
+    // unique to this test and nothing else in the suite reads it, so no
+    // concurrently running test can observe an unexpected value.
+    unsafe {
+        std::env::set_var("LAIT_TEST_TOOL_TOKEN", "secret");
+        std::env::set_var("LAIT_TEST_TOOL_CWD", "/tmp");
+    }
+    let definition = ShellToolDefinition {
+        description: None,
+        command: vec!["echo".to_owned()],
+        parameters: serde_json::json!({ "type": "object" }),
+        timeout: None,
+        env: HashMap::from([("TOKEN".to_owned(), "${LAIT_TEST_TOOL_TOKEN}".to_owned())]),
+        cwd: Some("${LAIT_TEST_TOOL_CWD}".to_owned()),
+    };
+    let (env, cwd) = definition.resolve_env_cwd().unwrap();
+    unsafe {
+        std::env::remove_var("LAIT_TEST_TOOL_TOKEN");
+        std::env::remove_var("LAIT_TEST_TOOL_CWD");
+    }
+    assert_eq!(env.get("TOKEN").map(String::as_str), Some("secret"));
+    assert_eq!(cwd.as_deref(), Some("/tmp"));
 }
 
 #[test]

@@ -266,6 +266,17 @@ struct ProcessRun<'a> {
     cancellation: CancellationToken,
     command_kind: &'static str,
     kill_descendants_after_exit: bool,
+    /// `Some` replaces the child's environment with exactly these variables
+    /// (an allowlist — see `spawn_contained`'s `env_clear`), instead of the
+    /// default `tokio::process::Command` behavior of inheriting the whole
+    /// parent environment. `None` (every existing caller before this field
+    /// existed) keeps that default. See `config::ShellToolDefinition::env`/
+    /// `workflow::CommandNode::env`, the two configuration surfaces that ever
+    /// set this to `Some`.
+    env: Option<&'a std::collections::HashMap<String, String>>,
+    /// `Some` pins the child's working directory; `None` (the default)
+    /// inherits the calling process's own cwd, as before this field existed.
+    cwd: Option<&'a str>,
 }
 
 /// The four pieces of terminal state `run_process`'s `tokio::select!` loop
@@ -357,6 +368,19 @@ async fn spawn_contained(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // An allowlist (`Some`) replaces the inherited environment outright,
+    // rather than adding to it — a `tools:`/`command:` author who sets `env:`
+    // is choosing exactly what this child sees, not layering extra variables
+    // onto whatever lait's own process happened to inherit (which may carry
+    // API keys or other secrets from the invoking shell that this command has
+    // no business seeing). See `ProcessRun::env`'s own doc comment.
+    if let Some(env) = request.env {
+        command.env_clear();
+        command.envs(env);
+    }
+    if let Some(cwd) = request.cwd {
+        command.current_dir(cwd);
+    }
     CommandProcessTree::configure(&mut command);
     let mut child = command
         .spawn()
@@ -619,9 +643,16 @@ async fn run_process(request: ProcessRun<'_>) -> Result<CapturedOutput> {
 }
 
 /// Runs a workflow/shell-tool command through the shared process runner.
+/// `env`/`cwd` are the same allowlist/working-directory containment
+/// `ProcessRun::env`/`::cwd` document — `None` for either preserves this
+/// function's original behavior (inherit the parent's environment/cwd
+/// unchanged), so an existing caller that doesn't set `env:`/`cwd:` on its
+/// `tools:`/`command:` node sees no change at all.
 pub(crate) async fn run_command(
     argv: &[String],
     stdin_input: &str,
+    env: Option<&std::collections::HashMap<String, String>>,
+    cwd: Option<&str>,
     step_cancel: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     let output = run_process(ProcessRun {
@@ -632,6 +663,8 @@ pub(crate) async fn run_command(
         cancellation: step_cancel,
         command_kind: "command",
         kill_descendants_after_exit: false,
+        env,
+        cwd,
     })
     .await?;
     let program = argv.first().map(String::as_str).unwrap_or("<empty>");
@@ -675,6 +708,8 @@ pub(crate) async fn run_bounded_command(
         cancellation,
         command_kind: "secret command",
         kill_descendants_after_exit: true,
+        env: None,
+        cwd: None,
     })
     .await?;
     Ok(BoundedCommandOutput {
@@ -705,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_an_empty_argv_without_panicking() {
-        let error = run_command(&[], "", crate::cancellation::none())
+        let error = run_command(&[], "", None, None, crate::cancellation::none())
             .await
             .expect_err("an empty command must be rejected");
 
@@ -718,7 +753,7 @@ mod tests {
         let argv = ["sh".to_owned(), "-c".to_owned(), "yes".to_owned()];
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            run_command(&argv, "", crate::cancellation::none()),
+            run_command(&argv, "", None, None, crate::cancellation::none()),
         )
         .await
         .expect("an oversized stdout stream must be stopped promptly")
@@ -737,7 +772,7 @@ mod tests {
         let argv = ["sh".to_owned(), "-c".to_owned(), "yes >&2".to_owned()];
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            run_command(&argv, "", crate::cancellation::none()),
+            run_command(&argv, "", None, None, crate::cancellation::none()),
         )
         .await
         .expect("an oversized stderr stream must be stopped promptly")
@@ -834,7 +869,13 @@ mod tests {
         let marker = crate::test_support::unique_temp_path("lait-process-drop", ".marker");
         let script = format!("(sleep 1; touch '{}') & sleep 5", marker.display());
         let argv = ["sh".to_owned(), "-c".to_owned(), script];
-        let mut execution = Box::pin(run_command(&argv, "", crate::cancellation::none()));
+        let mut execution = Box::pin(run_command(
+            &argv,
+            "",
+            None,
+            None,
+            crate::cancellation::none(),
+        ));
         tokio::select! {
             result = &mut execution => panic!("runner unexpectedly completed: {result:?}"),
             () = tokio::time::sleep(Duration::from_millis(50)) => {}

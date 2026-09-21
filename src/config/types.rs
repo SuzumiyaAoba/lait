@@ -114,10 +114,41 @@ pub(crate) struct ShellToolDefinition {
     /// the call fails — see `shell_tool::DEFAULT_TOOL_TIMEOUT_SECS` for the
     /// default when this is unset.
     pub(crate) timeout: Option<u64>,
+    /// An environment allowlist for the command's child process: when
+    /// non-empty, the child sees *only* these variables (each value
+    /// `${VAR_NAME}`-expandable, like `mcp_servers[].env` — see
+    /// `expand_env_placeholders`), never the rest of `lait`'s own inherited
+    /// environment (which may carry API keys or other secrets this command
+    /// has no business seeing). Empty (the default) preserves the original
+    /// behavior: the child inherits the whole parent environment unchanged.
+    #[serde(default)]
+    pub(crate) env: HashMap<String, String>,
+    /// Pins the command's working directory (`${VAR_NAME}`-expandable, like
+    /// `mcp_servers[].cwd`). `None` (the default) preserves the original
+    /// behavior: the child inherits lait's own current directory.
+    pub(crate) cwd: Option<String>,
 }
 
 fn default_tool_parameters() -> serde_json::Value {
     serde_json::json!({ "type": "object", "properties": {} })
+}
+
+impl ShellToolDefinition {
+    /// Expands `${VAR_NAME}` placeholders in `env`/`cwd` — the same
+    /// expansion `McpServerConfig::resolve_transport` applies to
+    /// `mcp_servers[].env`/`.cwd` — called lazily right before a call
+    /// actually runs the command (see `shell_tool::call`), not at
+    /// config-load time, matching every other `${VAR}`-expandable field in
+    /// this crate.
+    pub(crate) fn resolve_env_cwd(&self) -> Result<(HashMap<String, String>, Option<String>)> {
+        let env = expand_map(&self.env)?;
+        let cwd = self
+            .cwd
+            .as_deref()
+            .map(expand_env_placeholders)
+            .transpose()?;
+        Ok((env, cwd))
+    }
 }
 
 /// `tool_policy:` (see [`ConfigFile::tool_policy`]): `deny` is checked
