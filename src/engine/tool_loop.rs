@@ -72,6 +72,25 @@ impl ToolLoop {
         Ok(self.round)
     }
 
+    /// The current round number (as last returned by `next_round`) — read by
+    /// `transport::compact_tool_loop`'s caller to decide whether this round
+    /// is a `default.compaction.trigger_rounds` multiple.
+    pub(super) fn round(&self) -> usize {
+        self.round
+    }
+
+    /// Replaces this loop's message history with a compacted form — see
+    /// [`compact_messages`], which does the actual splicing. Called by
+    /// `transport::compact_tool_loop`; see its own doc comment for why this
+    /// exists and how `summary` is produced.
+    pub(super) fn splice_compacted(
+        &mut self,
+        summary: ChatCompletionRequestMessage,
+        keep_last_n: usize,
+    ) {
+        compact_messages(&mut self.messages, summary, keep_last_n);
+    }
+
     /// Borrows the current message history for an `llm::CompletionRequest`.
     /// The loop must retain its history for the following tool round, so
     /// callers that need to keep sending requests across rounds borrow here
@@ -236,6 +255,41 @@ impl ToolLoop {
     }
 }
 
+/// Replaces `messages` with a compacted form: a leading system message (if
+/// `messages` has one) survives unconditionally, followed by `summary` (an
+/// assistant-role message carrying a model-generated recap of everything
+/// compacted away), followed by the `keep_last_n` most recent non-system
+/// messages, verbatim. A history with `keep_last_n` or fewer non-system
+/// messages is left untouched (nothing meaningful would be compacted away,
+/// and splicing in a summary would only add noise) — a pure free function
+/// (rather than a `ToolLoop` method containing this logic directly) so it
+/// can be unit-tested without constructing the real `mcp`/`subagent`/
+/// `shell_tool` tool sets `ToolLoop::new` otherwise requires.
+fn compact_messages(
+    messages: &mut Vec<ChatCompletionRequestMessage>,
+    summary: ChatCompletionRequestMessage,
+    keep_last_n: usize,
+) {
+    let system = match messages.first() {
+        Some(ChatCompletionRequestMessage::System(_)) => Some(messages.remove(0)),
+        _ => None,
+    };
+    if messages.len() <= keep_last_n {
+        if let Some(system) = system {
+            messages.insert(0, system);
+        }
+        return;
+    }
+    let tail_start = messages.len() - keep_last_n;
+    let tail = messages.split_off(tail_start);
+
+    let mut compacted = Vec::with_capacity(1 + usize::from(system.is_some()) + tail.len());
+    compacted.extend(system);
+    compacted.push(summary);
+    compacted.extend(tail);
+    *messages = compacted;
+}
+
 /// Runs independent tool operations with a fixed concurrency cap while
 /// retaining their input order in the returned tool messages.
 async fn execute_bounded<I, F, T>(futures: I) -> Result<Vec<T>>
@@ -251,11 +305,78 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CONCURRENT_TOOL_CALLS, execute_bounded};
+    use super::{MAX_CONCURRENT_TOOL_CALLS, compact_messages, execute_bounded};
+    use async_openai::types::chat::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn user(text: &str) -> ChatCompletionRequestMessage {
+        crate::llm::user_message(text, &[]).unwrap()
+    }
+
+    fn system(text: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestMessage::from(
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(text)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn assistant(text: &str) -> ChatCompletionRequestMessage {
+        crate::llm::assistant_message(text).unwrap()
+    }
+
+    fn content_text(message: &ChatCompletionRequestMessage) -> String {
+        // Only used to identify a fixture message back by its own text in
+        // these tests — not a general-purpose accessor.
+        format!("{message:?}")
+    }
+
+    #[test]
+    fn keeps_the_leading_system_message_and_the_last_n_others() {
+        let mut messages = vec![
+            system("sys"),
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+            user("u3"),
+        ];
+        compact_messages(&mut messages, assistant("summary"), 2);
+
+        assert_eq!(messages.len(), 4);
+        assert!(content_text(&messages[0]).contains("sys"));
+        assert!(content_text(&messages[1]).contains("summary"));
+        assert!(content_text(&messages[2]).contains("a2"));
+        assert!(content_text(&messages[3]).contains("u3"));
+    }
+
+    #[test]
+    fn works_without_a_leading_system_message() {
+        let mut messages = vec![user("u1"), assistant("a1"), user("u2")];
+        compact_messages(&mut messages, assistant("summary"), 1);
+
+        assert_eq!(messages.len(), 2);
+        assert!(content_text(&messages[0]).contains("summary"));
+        assert!(content_text(&messages[1]).contains("u2"));
+    }
+
+    #[test]
+    fn is_a_no_op_when_there_are_not_more_than_keep_last_n_messages() {
+        let mut messages = vec![system("sys"), user("u1"), assistant("a1")];
+        let before = messages.len();
+        compact_messages(&mut messages, assistant("summary"), 2);
+
+        assert_eq!(messages.len(), before);
+        assert!(content_text(&messages[0]).contains("sys"));
+        assert!(content_text(&messages[1]).contains("u1"));
+        assert!(content_text(&messages[2]).contains("a1"));
+    }
 
     #[tokio::test]
     async fn bounds_large_batches_and_preserves_result_order() {

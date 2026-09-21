@@ -300,6 +300,20 @@ default:
   （`default.cache: true` を上書きします）。`--cache`/`--no-cache` は同時に指定できません。
 - `lait cache clear` で `.lait/cache/` の内容をすべて削除できます。
 
+## ツール周回の要約による圧縮（`compaction`）
+
+長い tool loop の履歴を定期的にモデル自身の要約で圧縮したい場合は `default.compaction:` を
+指定します。詳しくは[ツール周回の要約による圧縮（default.compaction）](./compaction.md)を
+参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  compaction:
+    trigger_rounds: 6
+    keep_last_n: 4
+```
+
 ## `.env` ファイルの自動読み込み
 
 起動時にカレントディレクトリの `.env` ファイルが自動で読み込まれ、**未設定の環境変数のみ**が

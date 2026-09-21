@@ -379,6 +379,9 @@ default:
   history: true
   cache: true
   cache_ttl: 3600
+  compaction:
+    trigger_rounds: 6
+    keep_last_n: 4
 models:
   local:
     - provider:

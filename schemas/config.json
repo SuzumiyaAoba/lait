@@ -111,7 +111,18 @@
         "render": { "type": "boolean" },
         "history": { "type": "boolean" },
         "cache": { "type": "boolean" },
-        "cache_ttl": { "type": "integer", "minimum": 0 }
+        "cache_ttl": { "type": "integer", "minimum": 0 },
+        "compaction": { "$ref": "#/$defs/compactionConfig" }
+      }
+    },
+    "compactionConfig": {
+      "description": "Periodically shrinks a tool loop's growing message history by replacing older rounds with a model-generated summary. lait.config.yml-global only: no CLI flag, no per-agent-file/per-workflow-node override yet.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger_rounds"],
+      "properties": {
+        "trigger_rounds": { "type": "integer", "minimum": 1 },
+        "keep_last_n": { "type": "integer", "minimum": 0 }
       }
     },
     "mcpServerConfig": {

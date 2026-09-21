@@ -23,6 +23,7 @@
 ## ツール・拡張
 
 - [MCP サーバーのツールを使う](./mcp.md) — MCP サーバーの登録、ツール制限、チャット・agent・workflow からの利用。
+- [ツール周回の要約による圧縮（default.compaction）](./compaction.md) — 長い tool loop の履歴をモデル自身の要約で圧縮する方法。
 - [スキルを使う](./skills.md) — Markdown スキルの登録と、agent／workflow のシステムプロンプトへの追加。
 - [サブエージェントを使う](./subagents.md) — agent Markdown をモデルから呼び出せるツールとして公開する方法。
 - [カスタムシェルツールを使う](./tools.md) — ローカルコマンドを MCP なしのモデル呼び出しツールとして公開する方法。

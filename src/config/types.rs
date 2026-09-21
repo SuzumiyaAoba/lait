@@ -192,6 +192,37 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 /// The `default:` block shared by `lait.config.yml` and a workflow file: a
+/// `default.compaction:` — periodically shrinks a tool loop's growing
+/// message history by replacing older rounds with a model-generated summary,
+/// so a long-running tool loop (many `mcp`/`subagents`/`tools` round trips)
+/// can actually reach `max_tool_rounds` without first hitting the
+/// *provider's* context-window/token limit (an error outside lait's own
+/// control) — see `engine::transport`'s `compact_tool_loop`, the only
+/// consumer. Deliberately not itself resolved through `overrides::
+/// CapabilityOverrides` the way `mcp`/`max_tool_rounds`/`skills`/etc. are:
+/// this is a `lait.config.yml`-global-only setting for now (no CLI flag, no
+/// per-agent-file/per-workflow-node override) — a smaller, addable-later
+/// surface, not a design ceiling.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompactionConfig {
+    /// Compact every `trigger_rounds`-th round (`round % trigger_rounds ==
+    /// 0`), right before that round's request is sent. Must be at least 1;
+    /// validated by `check_compaction_config` at config-load time the same
+    /// way `check_shell_tool_definitions` validates `tools:`.
+    pub(crate) trigger_rounds: usize,
+    /// How many of the tool loop's most recent messages survive a
+    /// compaction verbatim (a leading system message, if any, always
+    /// survives too, uncounted). Defaults to 4 — roughly the last two
+    /// tool-call/tool-result round trips — when omitted.
+    #[serde(default = "default_compaction_keep_last_n")]
+    pub(crate) keep_last_n: usize,
+}
+
+fn default_compaction_keep_last_n() -> usize {
+    4
+}
+
 /// fallback model/reasoning effort used when a step (or, for the config file,
 /// the CLI/env) doesn't specify its own.
 #[derive(Debug, Default, Deserialize)]
@@ -246,6 +277,9 @@ pub(crate) struct DefaultSettings {
     /// and the cache entry is refreshed). `None` (the default) means cached
     /// responses never expire on their own. See `crate::cache`.
     pub(crate) cache_ttl: Option<u64>,
+    /// See `CompactionConfig`'s own doc comment. `None` (the default) never
+    /// compacts a tool loop's history at all — today's existing behavior.
+    pub(crate) compaction: Option<CompactionConfig>,
 }
 
 impl DefaultSettings {
@@ -269,6 +303,7 @@ impl DefaultSettings {
             history: project.history.or(global.history),
             cache: project.cache.or(global.cache),
             cache_ttl: project.cache_ttl.or(global.cache_ttl),
+            compaction: project.compaction.or(global.compaction),
         }
     }
 }

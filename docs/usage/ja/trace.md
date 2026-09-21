@@ -30,7 +30,7 @@ $ lait trace show trace.jsonl
 | フィールド | 内容 |
 |---|---|
 | `seq` | 記録順を表す通番(0始まり)。並行実行(`parallel`/`for_each` の `max_concurrency` > 1)されたイベント同士のタイムスタンプ順序が前後することがあるため、読み出し順序はこちらを基準にします。 |
-| `operation` | イベント種別。`"chat"`(モデル補完リクエスト)または `"execute_tool"`(MCP・サブエージェント・シェルツールの呼び出し)。 |
+| `operation` | イベント種別。`"chat"`(モデル補完リクエスト)・`"execute_tool"`(MCP・サブエージェント・シェルツールの呼び出し)・`"compact"`([ツール周回の要約による圧縮](./compaction.md)が発生した箇所)のいずれか。 |
 | `label` | そのイベントを引き起こしたもの — ワークフローのステップ id、または `tool '<修飾済みツール名>'`。`--show-usage` が使うラベルと同じ値です。 |
 | `start` / `end` | ISO 8601 形式のタイムスタンプ(UTC)。 |
 | `duration_ms` | `end - start` をミリ秒に丸めたもの。 |
@@ -55,9 +55,21 @@ Semantic Conventions に対応する項目がないものです。
 | キー | 内容 |
 |---|---|
 | `gen_ai.tool.name` | 修飾済みツール名(`mcp__<server>__<tool>`/`agent__<name>`/`tool__<name>`)。 |
+| `gen_ai.tool.arguments` | モデルが渡した生の JSON 引数文字列。 |
+| `lait.step.label` | そのツール呼び出しを発生させたモデル呼び出し自身のラベル(`label` フィールドと同じ値 — `tool_called` アサーションの `args_jq` はこの値ではなくこちらの引数を評価します)。 |
 | `lait.tool.round` | そのツール呼び出しが何ラウンド目の tool loop で発生したか(1始まり)。 |
 | `lait.tool.decision` | `"allowed"`/`"denied"`。`tool_policy` の deny か `--approve-tools` での拒否かは区別されません。 |
 | `lait.tool.denial_reason` | `"denied"` の場合のみ設定される、モデルに返された拒否理由の文字列。 |
+
+### `"compact"` イベントの `attributes`
+
+| キー | 内容 |
+|---|---|
+| `lait.compaction.round` | 圧縮が発生したラウンド番号(1始まり)。 |
+| `lait.compaction.messages_before` / `lait.compaction.messages_after` | 圧縮前後のメッセージ件数。 |
+
+圧縮自体が送信する要約用リクエストは、この `"compact"` イベントとは別に、通常の `"chat"`
+イベントとしても記録されます([ツール周回の要約による圧縮](./compaction.md)を参照)。
 
 ## 記録されないもの
 

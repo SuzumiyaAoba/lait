@@ -60,7 +60,9 @@ use async_openai::types::chat::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::{cache, cassette, llm, mcp, report, response, shell_tool, skill, subagent, trace};
+use crate::{
+    cache, cassette, config, llm, mcp, report, response, shell_tool, skill, subagent, trace,
+};
 
 use super::{
     PromptTurn, RequestSettings, RunContext,
@@ -128,6 +130,14 @@ fn check_tool_name_collisions(
     }
     Ok(())
 }
+
+/// The user-turn `RequestSettings::compact_tool_loop` appends to a tool
+/// loop's own message history before asking the model to summarize it — see
+/// `config::CompactionConfig`'s doc comment.
+const COMPACTION_INSTRUCTION: &str = "Summarize our conversation so far concisely: the overall \
+     goal, what has been tried, what was learned, and what (if anything) remains to be done. \
+     This summary will replace the detailed history above in the ongoing conversation, so \
+     include everything needed to continue effectively.";
 
 /// The streaming-only options `complete_stream` needs beyond what `complete`
 /// already takes (`response_format`/`turn`/`cancellation`/...) — grouped so
@@ -225,6 +235,11 @@ impl RequestSettings {
             .await?;
         loop {
             tool_loop.next_round(self.max_tool_rounds)?;
+
+            if let Some(compaction) = &env.services.file_config.default.compaction {
+                self.maybe_compact(&mut tool_loop, compaction, env, cancellation.clone())
+                    .await?;
+            }
 
             let response = self
                 .complete_recorded(
@@ -327,6 +342,91 @@ impl RequestSettings {
             tools,
             self.usage_label.clone(),
         ))
+    }
+
+    /// Compacts `tool_loop` when its about-to-be-sent round is a
+    /// `compaction.trigger_rounds` multiple — see `config::CompactionConfig`'s
+    /// doc comment for why, and [`compact_tool_loop`] for how. Only `complete`
+    /// calls this (not `complete_stream`): a workflow `prompt`/`agent` node —
+    /// the case this is chiefly aimed at, a long `mcp`/`subagents`/`tools`
+    /// round-trip loop — always goes through `complete`, never streaming; see
+    /// docs/usage/ja/compaction.md for this and `--trace-file`'s matching
+    /// scope note.
+    ///
+    /// [`compact_tool_loop`]: Self::compact_tool_loop
+    async fn maybe_compact(
+        &self,
+        tool_loop: &mut ToolLoop,
+        compaction: &config::CompactionConfig,
+        env: &RunContext,
+        cancellation: CancellationToken,
+    ) -> Result<()> {
+        if compaction.trigger_rounds == 0 {
+            bail!("default.compaction.trigger_rounds must be at least 1");
+        }
+        if !tool_loop.round().is_multiple_of(compaction.trigger_rounds) {
+            return Ok(());
+        }
+        self.compact_tool_loop(tool_loop, compaction, env, cancellation)
+            .await
+    }
+
+    /// Shrinks `tool_loop`'s growing message history by asking the model to
+    /// summarize everything so far, then replacing all but the most recent
+    /// `compaction.keep_last_n` messages with that summary (see
+    /// `ToolLoop::splice_compacted`). The summarization request itself goes
+    /// through `complete_recorded` — the same single choke point every other
+    /// request in this file does — so it participates in `--cache`/
+    /// `--record`/`--replay` and is recorded into `env.usage`/`env.trace`
+    /// exactly like an ordinary round: a `--replay` run needs a cassette for
+    /// it too, the same way it needs one for every round the original
+    /// recording made. Also records its own `"compact"` trace event
+    /// (distinct from the `"chat"` event `complete_recorded` already records
+    /// for the summarization call itself), so a `--trace-file` reader can
+    /// tell a compaction happened without inferring it from message content.
+    async fn compact_tool_loop(
+        &self,
+        tool_loop: &mut ToolLoop,
+        compaction: &config::CompactionConfig,
+        env: &RunContext,
+        cancellation: CancellationToken,
+    ) -> Result<()> {
+        let start = chrono::Utc::now();
+        let messages_before = tool_loop.messages().len();
+
+        let mut request_messages = tool_loop.messages().to_vec();
+        request_messages.push(llm::user_message(COMPACTION_INSTRUCTION, &[])?);
+        let response = self
+            .complete_recorded(env, None, &request_messages, &[], cancellation)
+            .await?;
+        let summary = response::content_text(&response);
+        let summary_message = llm::assistant_message(&format!(
+            "(summary of the conversation so far, produced by compaction: {summary})"
+        ))?;
+
+        tool_loop.splice_compacted(summary_message, compaction.keep_last_n);
+
+        env.trace.record(
+            "compact",
+            self.usage_label.clone(),
+            start,
+            chrono::Utc::now(),
+            trace::attrs([
+                (
+                    "lait.compaction.round",
+                    Value::from(tool_loop.round() as u64),
+                ),
+                (
+                    "lait.compaction.messages_before",
+                    Value::from(messages_before as u64),
+                ),
+                (
+                    "lait.compaction.messages_after",
+                    Value::from(tool_loop.messages().len() as u64),
+                ),
+            ]),
+        );
+        Ok(())
     }
 
     /// Records a `"chat"`-operation [`trace::TraceEvent`] under
