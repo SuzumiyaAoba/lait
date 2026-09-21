@@ -272,3 +272,147 @@ cases:
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["passed"], true);
 }
+
+#[test]
+fn usage_assertion_is_isolated_per_concurrent_case() {
+    // Two cases run concurrently against the same target; each response
+    // reports a different token count. If a case's `TrajectoryContext` ever
+    // saw another case's usage mixed into its own (the bug `eval::run_case`
+    // giving each run its own `RunContext` fixes), the contaminated case's
+    // total would exceed 150 (15 + 150 = 165) and fail its own bound —
+    // regardless of which case's request the mock server happens to answer
+    // first, so this doesn't depend on request ordering.
+    let server = MockServer::start_sequence(&[
+        (
+            "200 OK",
+            r#"{"id":"c1","object":"chat.completion","created":0,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"small"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"id":"c2","object":"chat.completion","created":0,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"large"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#,
+        ),
+    ]);
+    let scratch = ScratchDir::new();
+    scratch.write("lait.config.yml", &model_config(&server.base_url));
+    scratch.write(
+        "eval.yml",
+        r#"
+target:
+  model: m
+  prompt: "Summarize: {{ input }}"
+cases:
+  - input: "case one"
+    assert:
+      - type: usage
+        max_total_tokens: 150
+  - input: "case two"
+    assert:
+      - type: usage
+        max_total_tokens: 150
+"#,
+    );
+
+    let output = test_command()
+        .current_dir(scratch.path())
+        .arg("eval")
+        .arg("eval.yml")
+        .output()
+        .expect("failed to execute lait eval");
+
+    server.receive_request();
+    server.receive_request();
+    server.finish();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "lait eval failed: {output:?}\nstdout: {stdout}"
+    );
+    assert!(stdout.contains("2 of 2 case(s) fully passed"), "{stdout}");
+}
+
+fn tool_call_response(tool: &str, arguments: &str) -> String {
+    format!(
+        r#"{{"id":"chatcmpl-1","object":"chat.completion","created":0,"model":"workflow-model","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":[{{"id":"call_1","type":"function","function":{{"name":"{tool}","arguments":"{arguments}"}}}}]}},"finish_reason":"tool_calls"}}]}}"#
+    )
+}
+
+const FINAL_ANSWER_BODY: &str = r#"{"id":"chatcmpl-2","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#;
+
+#[test]
+fn tool_called_and_step_output_assertions_pass_for_a_workflow_target() {
+    let server = MockServer::start_sequence(&[
+        (
+            "200 OK",
+            &tool_call_response("tool__echo", r#"{\"text\":\"hi\"}"#),
+        ),
+        ("200 OK", FINAL_ANSWER_BODY),
+    ]);
+    let scratch = ScratchDir::new();
+    scratch.write(
+        "lait.config.yml",
+        "tools:\n  echo:\n    command: [\"echo\", \"{{ input.text }}\"]\n",
+    );
+    scratch.write(
+        "workflow.yml",
+        &format!(
+            r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+nodes:
+  ask:
+    type: prompt
+    prompt: "{{{{ input }}}}"
+    tools: [echo]
+steps:
+  - use: ask
+"#,
+            server.base_url
+        ),
+    );
+    scratch.write(
+        "eval.yml",
+        r#"
+target:
+  workflow: ./workflow.yml
+cases:
+  - input: "what does echo say?"
+    assert:
+      - type: equals
+        value: "done"
+      - type: tool_called
+        name: tool__echo
+        min: 1
+        max: 1
+        args_jq: '.text == "hi"'
+      - type: step_output
+        id: ask
+        assert:
+          - type: equals
+            value: "done"
+"#,
+    );
+
+    let output = test_command()
+        .current_dir(scratch.path())
+        .arg("eval")
+        .arg("eval.yml")
+        .output()
+        .expect("failed to execute lait eval");
+
+    server.receive_request();
+    server.receive_request();
+    server.finish();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "lait eval failed: {output:?}\nstdout: {stdout}"
+    );
+    assert!(stdout.contains("1 of 1 case(s) fully passed"), "{stdout}");
+}

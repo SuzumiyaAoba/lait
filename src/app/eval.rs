@@ -91,7 +91,13 @@ impl Target {
         }
     }
 
-    async fn run(&self, env: &RunContext, input: &str) -> Result<String> {
+    /// Runs this target against `input`, returning its output text alongside
+    /// the run's `$steps` map — empty for `Target::Prompt` (a single model
+    /// call has no steps of its own), the workflow's own `steps_outputs` for
+    /// `Target::Workflow` — so `step_output` trajectory assertions can look
+    /// up a named step's output the same way `lait test` does (see
+    /// `run_case`, this method's only caller).
+    async fn run(&self, env: &RunContext, input: &str) -> Result<(String, workflow::StepOutputs)> {
         match self {
             Target::Workflow { wf, scope } => {
                 let operation = env.operation_token();
@@ -109,7 +115,7 @@ impl Target {
                     },
                 )
                 .await?;
-                Ok(outcome.output)
+                Ok((outcome.output, outcome.steps_outputs))
             }
             Target::Prompt { settings, template } => {
                 let rendered = template::render(
@@ -127,7 +133,10 @@ impl Target {
                         env.operation_token(),
                     )
                     .await?;
-                Ok(response::content_text(&response).to_owned())
+                Ok((
+                    response::content_text(&response).to_owned(),
+                    workflow::StepOutputs::new(),
+                ))
             }
         }
     }
@@ -201,29 +210,42 @@ impl CaseOutcome {
     }
 }
 
+/// Runs one (case, repeat) — see [`run`], the only caller, for how the
+/// flattened `(case, repeat)` list is built. Builds its own [`RunContext`]
+/// (sharing `services`, the run's registries/caches, but with a fresh
+/// `usage`/`trace` accumulator) rather than reusing one passed in: several
+/// of these run concurrently (`run`'s `buffered(SUITE_CONCURRENCY)`), and a
+/// trajectory assertion (`tool_called`/`usage`/`step_output`) needs *this*
+/// run's own events/usage, not a running total polluted by whichever other
+/// case/repeat happened to be in flight at the same time.
 async fn run_case(
     target: &Target,
-    env: &RunContext,
+    services: Arc<AppServices>,
+    cancel: tokio_util::sync::CancellationToken,
     case: &EvalCase,
     default_model: Option<&str>,
     file_config: &ConfigFile,
 ) -> RunResult {
-    match target.run(env, &case.input).await {
-        Ok(output) => {
+    let env = RunContext::new(services, cancel);
+    match target.run(&env, &case.input).await {
+        Ok((output, steps_outputs)) => {
             let judge = LlmJudgeContext {
-                env,
+                env: &env,
                 file_config,
                 default_model,
                 input: Some(case.input.as_str()),
             };
-            // `None`: `run_case` shares one `env` (and thus one
-            // `TraceCollector`/`UsageTally`) across every concurrently
-            // running case/repeat — see `assert`'s own doc comment on why a
-            // trajectory assertion isn't supported here yet.
+            let events = env.trace.events();
+            let trajectory = assert::TrajectoryContext {
+                events: &events,
+                steps_outputs: &steps_outputs,
+                usage_total: env.usage.total(),
+                cost_total: env.usage.total_cost(),
+            };
             let failures = assert::evaluate(
                 &case.assert,
                 Some(&judge),
-                None,
+                Some(&trajectory),
                 &output,
                 env.operation_token(),
             )
@@ -307,22 +329,24 @@ pub(super) async fn run(
     let default_model = target.default_model(&file_config);
 
     let services = Arc::new(AppServices::new(Arc::clone(&file_config)));
-    let env = RunContext::new(Arc::clone(&services), cancel);
     let repeat = args.repeat.max(1);
 
-    // Every (case, repeat) run is independent — same target, same
-    // read-only env — so they're flattened into one future list and run
-    // with a fixed concurrency cap instead of one at a time; a 30-case
-    // suite with `--repeat 3` used to be 90 fully serial model round-trips.
-    // `buffered` (not `buffer_unordered`) preserves the flattened order, so
-    // `runs` below can just `take` each case's slice off the front in turn
-    // without needing to track which case a given run belonged to.
+    // Every (case, repeat) run is independent — same target, same shared
+    // `services` (registries/caches), but its own `RunContext` (see
+    // `run_case`'s doc comment) — so they're flattened into one future list
+    // and run with a fixed concurrency cap instead of one at a time; a
+    // 30-case suite with `--repeat 3` used to be 90 fully serial model
+    // round-trips. `buffered` (not `buffer_unordered`) preserves the
+    // flattened order, so `runs` below can just `take` each case's slice off
+    // the front in turn without needing to track which case a given run
+    // belonged to.
     let mut run_futures = Vec::with_capacity(definition.cases.len() * repeat as usize);
     for case in &definition.cases {
         for _ in 0..repeat {
             run_futures.push(run_case(
                 &target,
-                &env,
+                Arc::clone(&services),
+                cancel.clone(),
                 case,
                 default_model.as_deref(),
                 &file_config,

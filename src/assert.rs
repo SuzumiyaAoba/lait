@@ -7,12 +7,13 @@
 //! `lait test` never passes an [`LlmJudgeContext`] (it is replay-only and
 //! makes no model calls), so an `llm_judge` assertion there always fails
 //! with a clear "not supported" message rather than silently skipping it.
-//! Conversely, `lait eval` never passes a [`TrajectoryContext`] today (its
-//! `run_case` shares one `RunContext`/`TraceCollector` across several
-//! concurrently running cases/repeats — see `eval::run` — so per-case trace
-//! attribution isn't possible yet), so a trajectory assertion there fails
-//! the same way in the opposite direction. Both "not supported here" cases
-//! report clearly rather than silently passing or mixing in unrelated data.
+//! Both `lait test` and `lait eval` always pass a [`TrajectoryContext`]:
+//! `lait test` runs its target workflow through a `RunContext` owned by
+//! that one test file, and `lait eval`'s `run_case` gives every (case,
+//! repeat) run its own fresh `RunContext` (sharing only the read-only
+//! `AppServices` registries/caches) specifically so a trajectory
+//! assertion's events/usage are never polluted by another concurrently
+//! running case — see `eval::run_case`'s doc comment.
 
 use std::{future::Future, pin::Pin};
 
@@ -147,11 +148,14 @@ pub(crate) struct LlmJudgeContext<'a> {
 }
 
 /// The per-run execution data a trajectory assertion
-/// (`tool_called`/`usage`/`step_output`) needs — passed by `lait test`,
-/// which always runs its target workflow through a fresh `RunContext` owned
-/// by that one test file (see `test_run::run_test_file_inner`), so `events`/
-/// `usage_total` are unambiguously "this run's, and only this run's" data.
-/// `lait eval` passes `None` instead — see this module's doc comment for why.
+/// (`tool_called`/`usage`/`step_output`) needs — passed by `lait test`
+/// (`test_run::run_test_file_inner`) and `lait eval` (`eval::run_case`),
+/// both of which give the run producing `events`/`usage_total` its own
+/// `RunContext`, so this is unambiguously "this run's, and only this run's"
+/// data — see this module's doc comment. `None` when a caller genuinely has
+/// no such context to offer (`evaluate`'s only other caller today is
+/// `test_run`/`eval` themselves, so this is currently more a documented
+/// possibility than a live code path).
 pub(crate) struct TrajectoryContext<'a> {
     /// Every model-call/tool-call event `crate::trace::TraceCollector`
     /// recorded during the run, in recording order (see
@@ -171,11 +175,10 @@ pub(crate) struct TrajectoryContext<'a> {
 
 /// The message every trajectory assertion (`tool_called`/`usage`/
 /// `step_output`) fails with when no [`TrajectoryContext`] is available —
-/// see this module's doc comment for why `lait eval` doesn't have one yet.
+/// see [`TrajectoryContext`]'s own doc comment for when that happens.
 fn trajectory_unsupported_message() -> String {
     "trajectory assertions (tool_called/usage/step_output) are not \
-     supported here (no per-run trace context is available in this \
-     context yet; use `lait test`)"
+     supported here (no per-run trace context is available in this context)"
         .to_owned()
 }
 
