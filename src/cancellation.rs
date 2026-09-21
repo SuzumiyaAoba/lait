@@ -20,8 +20,16 @@ use anyhow::{Result, bail};
 use tokio_util::sync::CancellationToken;
 
 /// A flag that is never set: the blocking-worker side's "no cancellation
-/// wired" value. One shared `static` suffices because flag consumers only
-/// ever read it.
+/// wired" value. One shared `static` suffices *only* because every current
+/// consumer (`file_walk::DirWalker`, `async_io::read_to_string_sync`,
+/// `jq::apply_bool`) only ever reads it. This is a contract callers must
+/// keep, not something the type system enforces: `&'static AtomicBool` is
+/// freely writable, and a future call site that `.store()`s into a borrowed
+/// flag parameter — expecting to affect only its own caller — would instead
+/// flip this single process-wide `static`, cancelling every other unrelated
+/// sentinel consumer at once. `Option<&AtomicBool>::None` made this
+/// unrepresentable in the type system; the sentinel form does not, so keep
+/// treating every `&NEVER_SET` reference as read-only.
 pub(crate) static NEVER_SET: AtomicBool = AtomicBool::new(false);
 
 /// The token side's "no cancellation wired" value: a parentless token that
