@@ -2,10 +2,15 @@
 
 [ドキュメント目次に戻る](./README.md)
 
-`lait schema workflow|config|agent` サブコマンドで、`workflow.yml`・`lait.config.yml`・
-エージェント Markdown ファイルのフロントマターそれぞれの JSON Schema（draft 2020-12）を
+`lait schema <KIND>` サブコマンドで、各種ファイルの JSON Schema（draft 2020-12）を
 標準出力に出力できます。エディタの YAML 補完・検証（[yaml-language-server](https://github.com/redhat-developer/yaml-language-server)
 など）に使うことを想定しています。
+
+| `<KIND>` | 対象 |
+| --- | --- |
+| `workflow` | `workflow.yml` |
+| `config` | `lait.config.yml` |
+| `agent` | エージェント Markdown ファイルのフロントマター |
 
 ```sh
 lait schema workflow > workflow.schema.json

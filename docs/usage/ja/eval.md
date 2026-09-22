@@ -35,15 +35,30 @@ cases:
         threshold: 0.7
 ```
 
-- `target:` は次のいずれか一方:
-  - `workflow: <path>` — このeval.ymlファイルからの相対パスにあるワークフローファイルを、各ケースの`input`を初期入力として実行する。
-  - `model: <name>`/`prompt: <template>` — `prompt:` は`{{ input }}`を参照できるテンプレートで、ケースごとにレンダリングして単発のモデル呼び出しを行う。
-- `cases[].input`: そのケースの入力文字列。
-- `cases[].assert`: そのケースの出力に対するアサーションのリスト。`lait test`の`assert:`と語彙を共有しており、`equals`(完全一致)も使えます。
-  - `contains`: 出力に`value`が部分文字列として含まれること。
-  - `jq`: `expr`を出力に対して評価し、真(jqの真偽値ルール — `false`/`null`以外はすべて真)であること。出力がJSONとしてパース可能ならそのJSON値、そうでなければ生文字列をJSON文字列値として評価対象にする。
-  - `llm_judge`: `criteria`をもとにLLMに0.0〜1.0でスコアを付けさせ、`threshold`(省略時0.7)以上ならpass。`model`を省略した場合はevalの`target`が使っているモデル(`target.model`、またはワークフローの`default.model`)にフォールバックする。判定はStructured Outputsで`{"score": number, "reasoning": string}`を1回のモデル呼び出しで取得して行う。
-  - `tool_called`/`usage`/`step_output`([実行トレース](./trace.md)を参照する trajectory アサーション、[決定的テスト](./testing.md#実行軌跡trajectoryのアサーション)を参照)も使えます。`--repeat`・複数ケースは並行実行されますが、各 (ケース, リピート) は専用の実行コンテキストを持つため、他のケース/リピートのイベントやトークン使用量が混ざることはありません。
+`target:` は次のいずれか一方の形式を取ります。
+
+| 形式 | 説明 |
+| --- | --- |
+| `workflow: <path>` | このeval.ymlファイルからの相対パスにあるワークフローファイルを、各ケースの`input`を初期入力として実行する。 |
+| `model: <name>`/`prompt: <template>` | `prompt:` は`{{ input }}`を参照できるテンプレートで、ケースごとにレンダリングして単発のモデル呼び出しを行う。 |
+
+その他のフィールドは次のとおりです。
+
+| フィールド | 説明 |
+| --- | --- |
+| `cases[].input` | そのケースの入力文字列。 |
+| `cases[].assert` | そのケースの出力に対するアサーションのリスト。`lait test`の`assert:`と語彙を共有しており、`equals`(完全一致)も使えます。 |
+
+`assert:` の `type:` に指定できる値は次のとおりです。
+
+| `type` | 説明 |
+| --- | --- |
+| `contains` | 出力に`value`が部分文字列として含まれること。 |
+| `jq` | `expr`を出力に対して評価し、真(jqの真偽値ルール — `false`/`null`以外はすべて真)であること。出力がJSONとしてパース可能ならそのJSON値、そうでなければ生文字列をJSON文字列値として評価対象にする。 |
+| `llm_judge` | `criteria`をもとにLLMに0.0〜1.0でスコアを付けさせ、`threshold`(省略時0.7)以上ならpass。`model`を省略した場合はevalの`target`が使っているモデル(`target.model`、またはワークフローの`default.model`)にフォールバックする。判定はStructured Outputsで`{"score": number, "reasoning": string}`を1回のモデル呼び出しで取得して行う。 |
+| `tool_called`/`usage`/`step_output` | [実行トレース](./trace.md)を参照する trajectory アサーション（[決定的テスト](./testing.md#実行軌跡trajectoryのアサーション)を参照）。 |
+
+`--repeat`・複数ケースは並行実行されますが、各 (ケース, リピート) は専用の実行コンテキストを持つため、他のケース/リピートのイベントやトークン使用量が混ざることはありません。
 
 ## `--repeat N`
 

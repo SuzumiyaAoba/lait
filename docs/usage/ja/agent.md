@@ -53,11 +53,20 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 ファイルや `workflow.yml` 自体の場所からの相対パスではないため、`workflow.yml` を別ディレクトリから
 実行する場合は注意してください。
 
-`model` / `reasoning_effort` / `temperature` / `top_p` / `max_tokens` は省略可能で、
-`lait.config.yml` の `default:` にフォールバックします。直接 `lait agent run` を実行する場合、
-CLI の `--model` などでエージェントファイルの値を上書きすることはできません。
-`temperature`（`0.0`〜`2.0`）・`top_p`（`0.0`〜`1.0`）・`max_tokens`（`1`以上）は、範囲外の値を
-指定するとファイルの読み込み時点でエラーになります。
+frontmatter のモデル・サンプリング関連フィールドは次のとおりです。
+
+| フィールド | 説明 |
+| --- | --- |
+| `model` | 使用するモデル（alias またはモデル ID）。 |
+| `reasoning_effort` | 推論 effort レベル。 |
+| `temperature` | サンプリング温度（`0.0`〜`2.0`）。 |
+| `top_p` | nucleus sampling の確率質量（`0.0`〜`1.0`）。 |
+| `max_tokens` | 最大出力トークン数（`1`以上）。 |
+
+いずれも省略可能で、`lait.config.yml` の `default:` にフォールバックします。直接
+`lait agent run` を実行する場合、CLI の `--model` などでエージェントファイルの値を上書きする
+ことはできません。`temperature`・`top_p`・`max_tokens` は、範囲外の値を指定するとファイルの
+読み込み時点でエラーになります。
 
 ## 入力の渡し方
 

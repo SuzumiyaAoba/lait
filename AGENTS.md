@@ -25,6 +25,10 @@ A bare `cargo`/`makers` on `PATH` may not resolve to a toolchain with the `clipp
 
 Use standard `rustfmt` formatting (four-space indentation) and keep Clippy warning-free. Rust modules, functions, variables, and test names use `snake_case`; types and enums use `PascalCase`; constants use `UPPER_SNAKE_CASE`. Keep TypeScript/TSX consistent with neighboring files and run the site type check after site changes.
 
+## Documentation Conventions
+
+`docs/usage/ja/` の記法ルール: CLI オプション・設定フィールド・列挙値など、「項目とその意味・取りうる値」の対応を説明するときは Markdown テーブルを使います（箇条書きや本文中の羅列ではなく）。`docs/usage/ja/getting-started.md` の CLI オプション表や `docs/usage/ja/troubleshooting.md` の終了コード表が先例です。
+
 ## Testing Guidelines
 
 Unit tests are colocated in `#[cfg(test)]` modules; behavior-level coverage belongs in `tests/*.rs`. Name tests descriptively, such as `rejects_invalid_schema`. Prefer `tests/support` mock servers and temporary fixtures over real network calls or shared files. No explicit coverage threshold is configured. Once a module's inline `mod tests { ... }` body grows to roughly 400 lines, externalize it into a sibling `<module>/tests.rs` file (`#[cfg(test)] mod tests;` in the parent, mirroring how a `<module>/` directory already groups a module with its submodules) — see `src/async_io/tests.rs`, `src/schema/tests.rs`, `src/cli/tests.rs`, `src/lint/tests.rs`, `src/config/tests.rs`, and `src/jq/tests.rs` for precedent.

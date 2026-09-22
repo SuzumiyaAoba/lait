@@ -38,14 +38,11 @@ MCP クライアント側の設定例（Claude Desktop の `claude_desktop_confi
 
 ## 公開されるツール
 
-- `agents:` の各エントリは `agent__<名前>` というツールになります（例: `agent__reviewer`）。
-  引数のスキーマは、そのエージェントファイル自身の `input_schema:`（[エージェント Markdown
-  ファイル](./agent.md#入力の検証input_schema)を参照）がそのまま使われます。`input_schema:`
-  を持たないエージェントは、[サブエージェント](./subagents.md)と同じ汎用スキーマ
-  （`{"input": "..."}`、文字列または JSON）になります。
-- `workflows:` の各エントリは `workflow__<名前>` というツールになります（例:
-  `workflow__release_notes`）。引数は常に `{"input": "..."}` 固定です（`lait run <名前>
-  <INPUT>` の `INPUT` に対応する、ワークフロー自身は `input_schema:` の概念を持ちません）。
+| 登録元 | ツール名 | 引数スキーマ |
+| --- | --- | --- |
+| `agents:` の各エントリ | `agent__<名前>`（例: `agent__reviewer`） | そのエージェントファイル自身の `input_schema:`（[エージェント Markdown ファイル](./agent.md#入力の検証input_schema)を参照）がそのまま使われます。`input_schema:` を持たないエージェントは、[サブエージェント](./subagents.md)と同じ汎用スキーマ（`{"input": "..."}`、文字列または JSON）になります。 |
+| `workflows:` の各エントリ | `workflow__<名前>`（例: `workflow__release_notes`） | 常に `{"input": "..."}` 固定です（`lait run <名前> <INPUT>` の `INPUT` に対応する、ワークフロー自身は `input_schema:` の概念を持ちません）。 |
+
 - ツールの `description` は、エージェントファイルの `description:`／ワークフローファイルの
   トップレベル `description:` から取られます（未設定なら `Run the '<名前>' agent/workflow.`
   という既定文）。

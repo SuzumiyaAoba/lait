@@ -9,8 +9,10 @@
 
 履歴はユーザー共通の JSON Lines ファイルに保存されます。
 
-- `XDG_DATA_HOME` が設定されている場合: `$XDG_DATA_HOME/lait/history.jsonl`
-- `XDG_DATA_HOME` が未設定の場合: `$HOME/.local/share/lait/history.jsonl`
+| 条件 | 保存先 |
+| --- | --- |
+| `XDG_DATA_HOME` が設定されている場合 | `$XDG_DATA_HOME/lait/history.jsonl` |
+| `XDG_DATA_HOME` が未設定の場合 | `$HOME/.local/share/lait/history.jsonl` |
 
 実行ごとに1行の JSON を追記します。会話セッション（`.lait/sessions/`）とは保存場所と用途が異なります。
 
@@ -48,9 +50,10 @@ Rustは安全性と性能を両立した言語です。
 
 ## 記録の無効化
 
-- `--no-history`: その回だけ記録しません。チャット・`lait chat`・`lait agent run`・`lait run`・
-  `lait prompt run` のいずれでも指定できます。
-- `lait.config.yml` の `default.history: false`: 既定で記録しないようにします。
+| 方法 | 効果 |
+| --- | --- |
+| `--no-history` | その回だけ記録しません。チャット・`lait chat`・`lait agent run`・`lait run`・`lait prompt run` のいずれでも指定できます。 |
+| `lait.config.yml` の `default.history: false` | 既定で記録しないようにします。 |
 
 ## 記録される内容についての注意
 
@@ -58,11 +61,13 @@ Rustは安全性と性能を両立した言語です。
 
 各行には次の項目が含まれます。
 
-- `timestamp`: 実行が完了した時刻（UTC）
-- `kind`: `chat`、`agent`、`workflow`、`prompt` のいずれか
-- `model`: 使用したモデル。ワークフローでは複数ステップで異なるモデルを使えるため記録されません
-- `prompt` / `response`: 送信したプロンプトとモデルの応答
-- `usage`: サーバーが報告したトークン使用量（取得できた場合のみ）
+| 項目 | 説明 |
+| --- | --- |
+| `timestamp` | 実行が完了した時刻（UTC） |
+| `kind` | `chat`、`agent`、`workflow`、`prompt` のいずれか |
+| `model` | 使用したモデル。ワークフローでは複数ステップで異なるモデルを使えるため記録されません |
+| `prompt` / `response` | 送信したプロンプトとモデルの応答 |
+| `usage` | サーバーが報告したトークン使用量（取得できた場合のみ） |
 
 記録は実行が成功した場合のみ行われます。`lait chat` のストリーミングターンで
 `--show-usage` を指定していない場合も、usage は記録されません。トークン数を取得するための

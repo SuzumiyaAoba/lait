@@ -49,10 +49,15 @@ description: 差分レビューの観点
 - 境界値・off-by-one エラーを疑う
 ```
 
-- `name`/`description` はどちらも省略可能です。`name` を省略した場合は、`lait.config.yml` の
-  `skills:` でそのファイルに付けたエントリ名が使われます。
-- 本文は handlebars テンプレートとしてレンダリングされません。エージェントファイルの
-  システムプロンプトとは異なり、`{{ }}` を含むコード例などをそのまま書けます。
+frontmatter のフィールドは次のとおりです。
+
+| フィールド | 説明 |
+| --- | --- |
+| `name` | 任意。省略した場合は、`lait.config.yml` の `skills:` でそのファイルに付けたエントリ名が使われます。 |
+| `description` | 任意。スキルの説明。 |
+
+本文は handlebars テンプレートとしてレンダリングされません。エージェントファイルの
+システムプロンプトとは異なり、`{{ }}` を含むコード例などをそのまま書けます。
 
 ## スキルの登録（`lait.config.yml`）
 
@@ -64,9 +69,10 @@ skills:
   style-guide: skills/style-guide/       # ディレクトリを指定すると SKILL.md を読む
 ```
 
-ディレクトリを指定した場合は、その直下の `SKILL.md` が使われます。これは Anthropic の Agent
-Skills の慣習（`<name>/SKILL.md`）に合わせたもので、既存の `.claude/skills/<name>/` のような
-ディレクトリをそのまま指せます。
+| 値 | 解決 |
+| --- | --- |
+| ファイルへのパス | そのファイルがスキル Markdown として使われます。 |
+| ディレクトリへのパス | その直下の `SKILL.md` が使われます（Anthropic の Agent Skills の慣習（`<name>/SKILL.md`）に合わせたもので、既存の `.claude/skills/<name>/` のようなディレクトリをそのまま指せます）。 |
 
 パスは、`agent:`/`file_path:` と同じく、常にコマンドを実行したディレクトリ（カレントディレクトリ）
 からの相対パスとして解決されます。未登録の名前を `skills:`（agent ファイル／ノード／`default:`）に
