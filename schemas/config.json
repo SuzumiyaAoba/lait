@@ -112,7 +112,8 @@
         "history": { "type": "boolean" },
         "cache": { "type": "boolean" },
         "cache_ttl": { "type": "integer", "minimum": 0 },
-        "compaction": { "$ref": "#/$defs/compactionConfig" }
+        "compaction": { "$ref": "#/$defs/compactionConfig" },
+        "skill_progressive_disclosure": { "type": "boolean" }
       }
     },
     "compactionConfig": {

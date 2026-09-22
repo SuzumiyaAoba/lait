@@ -12,7 +12,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::{llm, mcp, response, shell_tool, subagent, trace};
+use crate::{llm, mcp, response, shell_tool, skill, subagent, trace};
 
 use super::approval::{ToolDecision, tool_decision};
 use super::{RunContext, call_subagent_tool};
@@ -28,6 +28,7 @@ pub(super) struct ToolLoop {
     mcp_tool_set: mcp::ToolSet,
     subagent_tool_set: subagent::ToolSet,
     shell_tool_set: shell_tool::ToolSet,
+    skill_tool_set: skill::ToolSet,
     tools: Vec<ChatCompletionTools>,
     round: usize,
     /// The same label `usage::UsageTally`/`trace::TraceCollector` record
@@ -44,6 +45,7 @@ impl ToolLoop {
         mcp_tool_set: mcp::ToolSet,
         subagent_tool_set: subagent::ToolSet,
         shell_tool_set: shell_tool::ToolSet,
+        skill_tool_set: skill::ToolSet,
         tools: Vec<ChatCompletionTools>,
         usage_label: String,
     ) -> Self {
@@ -52,6 +54,7 @@ impl ToolLoop {
             mcp_tool_set,
             subagent_tool_set,
             shell_tool_set,
+            skill_tool_set,
             tools,
             round: 0,
             usage_label,
@@ -232,6 +235,13 @@ impl ToolLoop {
         } else if let Some(tool_name) = self.shell_tool_set.tool_name(name) {
             let definition = &env.services.file_config.tools[tool_name];
             shell_tool::call(definition, &tool_call.function.arguments, cancellation).await?
+        } else if let Some(skill_name) = self.skill_tool_set.tool_name(name) {
+            let body = env
+                .services
+                .skill_cache
+                .skill_body(skill_name, cancellation)
+                .await?;
+            (*body).clone()
         } else {
             bail!("model called unknown tool '{name}'");
         };

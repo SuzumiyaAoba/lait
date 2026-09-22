@@ -314,6 +314,19 @@ default:
     keep_last_n: 4
 ```
 
+## スキルの progressive disclosure（`skill_progressive_disclosure`）
+
+`default.skill_progressive_disclosure: true` を指定すると、`skills:` の内容をシステムプロンプトへ
+常時全文追記する代わりに、各スキルの `name`/`description`（frontmatter）だけを追記し、本文は
+モデルが `skill__<スキル名>` ツールを呼び出したときにだけ読ませるようになります。詳しくは
+[スキルを使う](./skills.md#progressive-disclosureskill_progressive_disclosure)を参照してください。
+
+```yaml
+# lait.config.yml
+default:
+  skill_progressive_disclosure: true
+```
+
 ## `.env` ファイルの自動読み込み
 
 起動時にカレントディレクトリの `.env` ファイルが自動で読み込まれ、**未設定の環境変数のみ**が

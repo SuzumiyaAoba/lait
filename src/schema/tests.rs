@@ -382,6 +382,7 @@ default:
   compaction:
     trigger_rounds: 6
     keep_last_n: 4
+  skill_progressive_disclosure: true
 models:
   local:
     - provider:

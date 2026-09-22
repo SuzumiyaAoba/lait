@@ -104,16 +104,20 @@ fn require_content_key(content_key: &Option<String>) -> &str {
 }
 
 /// Checks that no qualified tool name is claimed by more than one of the
-/// three tool sources a request can combine — `mcp::qualify_tool_name`
-/// prefixes each source differently (`<server>__`/`agent__`/`tool__`), so a
-/// collision only happens if two *different* servers/agents/shell tools
-/// happen to render to the same sanitized name (or a `tools:` entry is
-/// literally named the same as an `agents:` entry, etc.). Shared by
-/// `complete`/`complete_stream`, which both assemble the same three sets.
+/// four tool sources a request can combine — `mcp::qualify_tool_name`
+/// prefixes each source differently (`<server>__`/`agent__`/`tool__`/
+/// `skill__`), so a collision only happens if two *different*
+/// servers/agents/shell tools/skills happen to render to the same sanitized
+/// name (or a `tools:` entry is literally named the same as an `agents:`
+/// entry, etc.). Shared by `complete`/`complete_stream`, which both assemble
+/// the same four sets — `skill_tool_set` is empty unless
+/// `default.skill_progressive_disclosure` is `true` (see
+/// `assemble_tool_sets`), so this is a no-op extra loop in the common case.
 fn check_tool_name_collisions(
     mcp_tool_set: &mcp::ToolSet,
     subagent_tool_set: &subagent::ToolSet,
     shell_tool_set: &shell_tool::ToolSet,
+    skill_tool_set: &skill::ToolSet,
 ) -> Result<()> {
     for name in subagent_tool_set.names() {
         if mcp_tool_set.contains(name) {
@@ -126,6 +130,17 @@ fn check_tool_name_collisions(
         }
         if subagent_tool_set.subagent_name(name).is_some() {
             bail!("tool name collision: a subagent and a shell tool both qualify to '{name}'");
+        }
+    }
+    for name in skill_tool_set.names() {
+        if mcp_tool_set.contains(name) {
+            bail!("tool name collision: an MCP tool and a skill both qualify to '{name}'");
+        }
+        if subagent_tool_set.subagent_name(name).is_some() {
+            bail!("tool name collision: a subagent and a skill both qualify to '{name}'");
+        }
+        if shell_tool_set.tool_name(name).is_some() {
+            bail!("tool name collision: a shell tool and a skill both qualify to '{name}'");
         }
     }
     Ok(())
@@ -224,7 +239,11 @@ impl RequestSettings {
             .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
 
-        if self.mcp.is_empty() && self.subagents.is_empty() && self.tools.is_empty() {
+        if self.mcp.is_empty()
+            && self.subagents.is_empty()
+            && self.tools.is_empty()
+            && !self.skills_need_tool_loop(env)
+        {
             return self
                 .complete_recorded(env, response_format, &messages, &[], cancellation)
                 .await;
@@ -281,19 +300,40 @@ impl RequestSettings {
         }
     }
 
-    /// Builds the three tool sets (`mcp:`, `subagents:`, `tools:`) `complete`/
-    /// `complete_stream` dispatch calls against, plus their merged OpenAI-
-    /// shaped `tools:` payload — shared by both since streamed and
-    /// non-streamed requests assemble tools identically, only how each round
-    /// is issued differs. `agent_registry.tools`/`shell_tool::tools` are both
-    /// synchronous (they only read local subagent files/`file_config.tools`),
+    /// Whether `self.skills` needs the tool loop entered even though
+    /// `self.mcp`/`self.subagents`/`self.tools` are all empty: only true when
+    /// `default.skill_progressive_disclosure` is `true` and `self.skills`
+    /// actually names at least one skill, since only then does a
+    /// `skill__<name>` tool exist for the model to call. With progressive
+    /// disclosure off (the default), `self.skills` is still resolved into
+    /// the system prompt by `system_prompt_with_skills`, but never needs a
+    /// tool round trip — see `docs/usage/ja/skills.md`.
+    fn skills_need_tool_loop(&self, env: &RunContext) -> bool {
+        env.services
+            .file_config
+            .default
+            .skill_progressive_disclosure
+            == Some(true)
+            && !self.skills.is_empty()
+    }
+
+    /// Builds the four tool sets (`mcp:`, `subagents:`, `tools:`, and —
+    /// only when `default.skill_progressive_disclosure` is `true` —
+    /// `skills:`) `complete`/`complete_stream` dispatch calls against, plus
+    /// their merged OpenAI-shaped `tools:` payload — shared by both since
+    /// streamed and non-streamed requests assemble tools identically, only
+    /// how each round is issued differs. `agent_registry.tools`/
+    /// `shell_tool::tools`/`skill::tools` are all synchronous (they only
+    /// read local subagent files/`file_config.tools`/`file_config.skills`),
     /// so joining the MCP round trip with the subagent one lets both proceed
     /// together instead of paying the MCP latency before ever touching disk;
-    /// `shell_tool::tools` is cheap enough to just call inline after.
+    /// `shell_tool::tools`/`skill::tools` are cheap enough to just call
+    /// inline after.
     ///
     /// Callers must not call this when `self.mcp`/`self.subagents`/
-    /// `self.tools` are all empty — that's the plain-completion fast path,
-    /// handled separately above.
+    /// `self.tools` are all empty and `self.skills_need_tool_loop(env)` is
+    /// `false` — that's the plain-completion fast path, handled separately
+    /// above.
     async fn assemble_tool_sets(
         &self,
         env: &RunContext,
@@ -302,6 +342,7 @@ impl RequestSettings {
         mcp::ToolSet,
         subagent::ToolSet,
         shell_tool::ToolSet,
+        skill::ToolSet,
         Vec<ChatCompletionTools>,
     )> {
         let (mut mcp_tool_set, mut subagent_tool_set) = tokio::try_join!(
@@ -311,7 +352,25 @@ impl RequestSettings {
                 .tools_cancellable(&self.subagents, cancellation.clone()),
         )?;
         let mut shell_tool_set = shell_tool::tools(&self.tools, &env.services.file_config.tools)?;
-        check_tool_name_collisions(&mcp_tool_set, &subagent_tool_set, &shell_tool_set)?;
+        let progressive_skill_names: &[String] = if env
+            .services
+            .file_config
+            .default
+            .skill_progressive_disclosure
+            == Some(true)
+        {
+            &self.skills
+        } else {
+            &[]
+        };
+        let mut skill_tool_set =
+            skill::tools(progressive_skill_names, &env.services.file_config.skills)?;
+        check_tool_name_collisions(
+            &mcp_tool_set,
+            &subagent_tool_set,
+            &shell_tool_set,
+            &skill_tool_set,
+        )?;
         // Only `.contains()`/`.subagent_name()`/`.tool_name()` (which read
         // `.index`, not `.tools`) are used by callers below, so `.tools`
         // doesn't need to survive past this merge — moving it out avoids
@@ -319,7 +378,14 @@ impl RequestSettings {
         let mut tools = std::mem::take(&mut mcp_tool_set.tools);
         tools.extend(std::mem::take(&mut subagent_tool_set.tools));
         tools.extend(std::mem::take(&mut shell_tool_set.tools));
-        Ok((mcp_tool_set, subagent_tool_set, shell_tool_set, tools))
+        tools.extend(std::mem::take(&mut skill_tool_set.tools));
+        Ok((
+            mcp_tool_set,
+            subagent_tool_set,
+            shell_tool_set,
+            skill_tool_set,
+            tools,
+        ))
     }
 
     /// Builds the stateful tool loop used by either completion transport.
@@ -332,13 +398,14 @@ impl RequestSettings {
         messages: Vec<ChatCompletionRequestMessage>,
         cancellation: CancellationToken,
     ) -> Result<ToolLoop> {
-        let (mcp_tool_set, subagent_tool_set, shell_tool_set, tools) =
+        let (mcp_tool_set, subagent_tool_set, shell_tool_set, skill_tool_set, tools) =
             self.assemble_tool_sets(env, cancellation.clone()).await?;
         Ok(ToolLoop::new(
             messages,
             mcp_tool_set,
             subagent_tool_set,
             shell_tool_set,
+            skill_tool_set,
             tools,
             self.usage_label.clone(),
         ))
@@ -761,7 +828,11 @@ impl RequestSettings {
             .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
 
-        if self.mcp.is_empty() && self.subagents.is_empty() && self.tools.is_empty() {
+        if self.mcp.is_empty()
+            && self.subagents.is_empty()
+            && self.tools.is_empty()
+            && !self.skills_need_tool_loop(env)
+        {
             let stream = self
                 .stream_endpoint(
                     env,
@@ -868,15 +939,32 @@ impl RequestSettings {
     }
 
     /// Shared by `complete`/`complete_stream`: resolves `self.skills` against
-    /// `skill_cache` and appends the result to `system_prompt` — see
-    /// `with_skills`.
+    /// `env.services.skill_cache` and appends the result to `system_prompt`
+    /// — see `with_skills`. Renders full skill bodies (`SkillCache::render`)
+    /// unless `default.skill_progressive_disclosure` is `true`, in which case
+    /// only each skill's frontmatter is appended
+    /// (`SkillCache::render_frontmatter`) and the body is instead read on
+    /// demand through a `skill__<name>` tool — see `skills_need_tool_loop`.
     async fn system_prompt_with_skills<'a>(
         &self,
-        skill_cache: &skill::SkillCache,
+        env: &RunContext,
         system_prompt: Option<&'a str>,
         cancellation: CancellationToken,
     ) -> Result<Option<Cow<'a, str>>> {
-        let skills_text = skill_cache.render(&self.skills, cancellation).await?;
+        let skill_cache = &env.services.skill_cache;
+        let skills_text = if env
+            .services
+            .file_config
+            .default
+            .skill_progressive_disclosure
+            == Some(true)
+        {
+            skill_cache
+                .render_frontmatter(&self.skills, cancellation)
+                .await?
+        } else {
+            skill_cache.render(&self.skills, cancellation).await?
+        };
         Ok(with_skills(
             system_prompt,
             skills_text.as_deref().map(String::as_str),
@@ -898,7 +986,7 @@ impl RequestSettings {
         cancellation: CancellationToken,
     ) -> Result<Vec<ChatCompletionRequestMessage>> {
         let system_prompt = self
-            .system_prompt_with_skills(&env.services.skill_cache, turn.system_prompt, cancellation)
+            .system_prompt_with_skills(env, turn.system_prompt, cancellation)
             .await?;
         llm::initial_messages(
             system_prompt.as_deref(),

@@ -1,12 +1,14 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 use serde::Deserialize;
 
-use crate::{async_cache::AsyncCache, async_io, config, frontmatter, registry};
+use crate::{async_cache::AsyncCache, async_io, config, frontmatter, mcp, registry};
 
 /// The single wording used everywhere this module reports a cancelled skill
 /// render — both the immediate pre-checks (`bail!(error::cancelled(..))`)
@@ -138,36 +140,64 @@ fn format_skill(skill: &SkillFile) -> String {
     section
 }
 
-/// A skill's rendered `## Skill: ...` section, cached by name for the
+/// The progressive-disclosure counterpart to `format_skill`: a skill's
+/// `name`/`description` only, plus a pointer to the `skill__<name>` tool
+/// (see `tools`) that reads the body those two lines don't include. Used
+/// instead of `format_skill` only when `default.skill_progressive_disclosure`
+/// is `true` — see `SkillCache::render_frontmatter`.
+fn format_skill_frontmatter(skill: &SkillFile, qualified_tool_name: &str) -> String {
+    let mut section = format!("## Skill: {}\n", skill.name);
+    if let Some(description) = &skill.description {
+        section.push('\n');
+        section.push_str(description);
+        section.push('\n');
+    }
+    section.push('\n');
+    section.push_str(&format!(
+        "(Call the `{qualified_tool_name}` tool to read this skill's full instructions before following it.)"
+    ));
+    section
+}
+
+/// A skill file's parsed frontmatter and body, cached by name for the
 /// `SkillCache`'s lifetime: a skill file's content doesn't change over the
-/// course of one `lait run`/`lait agent run`/chat invocation, so every
-/// `render()` call after the first for a given name reuses this instead of
-/// re-reading and re-parsing the file (which a `for_each`/`loop` node with
-/// `skills:` set would otherwise do on every iteration). `AsyncCache` gives
-/// each name its own `OnceCell`, so concurrent branches requesting the same
-/// name share one load while different names can load independently. The
-/// cached value is an `Arc<String>` rather than a bare `String`, so a cache
-/// hit is a refcount bump instead of a clone of the skill's Markdown body.
+/// course of one `lait run`/`lait agent run`/chat invocation, so every call
+/// after the first for a given name reuses this instead of re-reading and
+/// re-parsing the file (which a `for_each`/`loop` node with `skills:` set
+/// would otherwise do on every iteration, and which
+/// `default.skill_progressive_disclosure: true` would otherwise do twice per
+/// name — once for the system prompt's frontmatter, once for a
+/// `skill__<name>` tool call reading the body). `AsyncCache` gives each name
+/// its own `OnceCell`, so concurrent branches requesting the same name share
+/// one load while different names can load independently.
 pub(crate) struct SkillCache {
     skills_map: config::SkillMap,
-    sections: AsyncCache<String, String>,
+    parsed: AsyncCache<String, SkillFile>,
     /// `render`'s own combined-text result, cached by its exact `names` list
-    /// (order matters — it's the order sections are joined in). Sections
-    /// were already cached per-name, but the `"\n\n"`-joined combination of
-    /// them was rebuilt from scratch on every single `render` call for the
-    /// same `skills:` list — every `for_each`/`loop` iteration re-walks and
-    /// re-joins the same `Vec<Arc<String>>`. Caching the join result too
-    /// turns a repeat `render` call for the same list into a refcount bump,
-    /// same as a repeat `section` call already was.
+    /// (order matters — it's the order sections are joined in). Parsed
+    /// skills were already cached per-name, but the `"\n\n"`-joined
+    /// combination of their formatted sections was rebuilt from scratch on
+    /// every single `render` call for the same `skills:` list — every
+    /// `for_each`/`loop` iteration re-walks and re-joins the same
+    /// `Vec<Arc<SkillFile>>`. Caching the join result too turns a repeat
+    /// `render` call for the same list into a refcount bump.
     joined: AsyncCache<Vec<String>, String>,
+    /// `render_frontmatter`'s own combined-text cache — kept separate from
+    /// `joined` (rather than sharing one cache keyed only by `names`) so a
+    /// run that somehow called both `render` and `render_frontmatter` for the
+    /// same `names` (never happens in practice: the effective mode is one
+    /// config-wide boolean) could never see one call's cached text returned
+    /// for the other's key.
+    joined_frontmatter: AsyncCache<Vec<String>, String>,
 }
 
 impl SkillCache {
     pub(crate) fn new(skills_map: config::SkillMap) -> Self {
         Self {
             skills_map,
-            sections: AsyncCache::new(),
+            parsed: AsyncCache::new(),
             joined: AsyncCache::new(),
+            joined_frontmatter: AsyncCache::new(),
         }
     }
 
@@ -191,6 +221,9 @@ impl SkillCache {
     /// `joined`) is a refcount bump instead of a full copy of the combined
     /// text — `engine::with_skills`'s caller only ever needs to borrow it for
     /// the span of building one request's messages.
+    ///
+    /// Used unless `default.skill_progressive_disclosure` is `true` — see
+    /// `render_frontmatter` for that mode's counterpart.
     pub(crate) async fn render(
         &self,
         names: &[String],
@@ -206,15 +239,15 @@ impl SkillCache {
                 names.to_vec(),
                 cancellation.clone(),
                 || async {
-                    let sections = futures_util::future::try_join_all(
+                    let skills = futures_util::future::try_join_all(
                         names
                             .iter()
-                            .map(|name| self.section(name, cancellation.clone())),
+                            .map(|name| self.parsed(name, cancellation.clone())),
                     )
                     .await?;
-                    let joined = sections
+                    let joined = skills
                         .iter()
-                        .map(|section| section.as_str())
+                        .map(|skill| format_skill(skill))
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     Ok(Arc::new(joined))
@@ -225,14 +258,69 @@ impl SkillCache {
         Ok(Some(joined))
     }
 
-    async fn section(
+    /// The `default.skill_progressive_disclosure: true` counterpart to
+    /// `render`: joins each name's `name`/`description` only (see
+    /// `format_skill_frontmatter`), never its body. A model that needs a
+    /// skill's full instructions calls the matching `skill__<name>` tool
+    /// (see `tools`/`skill_body`), which this text points it at by qualified
+    /// name.
+    pub(crate) async fn render_frontmatter(
+        &self,
+        names: &[String],
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<Arc<String>>> {
+        if names.is_empty() {
+            return Ok(None);
+        }
+        crate::cancellation::check(&cancellation, SKILL_RENDERING_CANCELLED)?;
+        let joined = self
+            .joined_frontmatter
+            .get_or_try_init(
+                names.to_vec(),
+                cancellation.clone(),
+                || async {
+                    let skills = futures_util::future::try_join_all(
+                        names
+                            .iter()
+                            .map(|name| self.parsed(name, cancellation.clone())),
+                    )
+                    .await?;
+                    let mut sections = Vec::with_capacity(names.len());
+                    for (name, skill) in names.iter().zip(skills.iter()) {
+                        let qualified = mcp::qualify_tool_name("skill", "skill", name)?;
+                        sections.push(format_skill_frontmatter(skill, &qualified));
+                    }
+                    Ok(Arc::new(sections.join("\n\n")))
+                },
+                SKILL_RENDERING_CANCELLED,
+            )
+            .await?;
+        Ok(Some(joined))
+    }
+
+    /// The full `## Skill: ...` section for exactly one skill (never
+    /// joined with any other), for a `skill__<name>` tool call's result —
+    /// see `engine::tool_loop::ToolLoop::dispatch_tool_call`. Reuses the same
+    /// per-name `parsed` cache `render`/`render_frontmatter` populate, so a
+    /// skill named in both this run's `skills:` list and a tool call it
+    /// triggers is only ever read from disk once.
+    pub(crate) async fn skill_body(
         &self,
         name: &str,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<Arc<String>> {
+        let skill = self.parsed(name, cancellation).await?;
+        Ok(Arc::new(format_skill(&skill)))
+    }
+
+    async fn parsed(
+        &self,
+        name: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<SkillFile>> {
         let init_cancellation = cancellation.clone();
-        let section = self
-            .sections
+        let skill = self
+            .parsed
             .get_or_try_init(
                 name.to_owned(),
                 cancellation,
@@ -246,18 +334,85 @@ impl SkillCache {
                     let read_cancellation = init_cancellation.clone();
                     let skill = load_skill(name, configured_path, init_cancellation).await?;
                     crate::cancellation::check(&read_cancellation, SKILL_RENDERING_CANCELLED)?;
-                    Ok(Arc::new(format_skill(&skill)))
+                    Ok(Arc::new(skill))
                 },
                 SKILL_RENDERING_CANCELLED,
             )
             .await?;
-        Ok(section)
+        Ok(skill)
     }
+}
+
+/// The skill-tool half of `mcp::ToolSet`/`subagent::ToolSet`/
+/// `shell_tool::ToolSet`: an OpenAI tool list plus an index from each tool's
+/// qualified name (`skill__<name>`, see `mcp::qualify_tool_name`) back to the
+/// plain `skills:` name `SkillCache::skill_body` needs. Only populated when
+/// `default.skill_progressive_disclosure` is `true` — see
+/// `engine::transport`'s `assemble_tool_sets` — so a run with progressive
+/// disclosure off never offers a `skill__*` tool at all, matching that mode's
+/// promise of no extra tool round trip.
+#[derive(Debug)]
+pub(crate) struct ToolSet {
+    pub(crate) tools: Vec<ChatCompletionTools>,
+    index: HashMap<String, String>,
+}
+
+impl ToolSet {
+    /// The `skills:` name `qualified_name` (as returned in this set's
+    /// `tools`) refers to, if any.
+    pub(crate) fn tool_name(&self, qualified_name: &str) -> Option<&str> {
+        self.index.get(qualified_name).map(String::as_str)
+    }
+
+    /// Every qualified tool name this set defines, used only to check for a
+    /// collision against the other tool sources — see
+    /// `engine::RequestSettings::complete`/`complete_stream`.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.index.keys().map(String::as_str)
+    }
+}
+
+/// Resolves `names` (a request's `skills:` list) against `skills_map`
+/// (`file_config.skills`) into a [`ToolSet`] — one no-argument tool per name,
+/// each reading that one skill's full body when called (see
+/// `SkillCache::skill_body`). Callers only build this when
+/// `default.skill_progressive_disclosure` is `true`; with it off, `names`
+/// should be `&[]` so this returns an empty set (see `ToolSet`'s doc
+/// comment).
+pub(crate) fn tools(names: &[String], skills_map: &config::SkillMap) -> Result<ToolSet> {
+    let empty_parameters = serde_json::json!({ "type": "object", "properties": {} });
+    let mut tools = Vec::with_capacity(names.len());
+    let mut index = HashMap::with_capacity(names.len());
+    for name in names {
+        if !skills_map.contains_key(name) {
+            bail!(
+                "unknown skill '{name}'; define it under 'skills:' in {}",
+                config::CONFIG_FILE_NAME
+            );
+        }
+        let qualified = mcp::qualify_tool_name("skill", "skill", name)?;
+        if index.contains_key(&qualified) {
+            bail!("duplicate skill name '{name}' in 'skills:'");
+        }
+        tools.push(ChatCompletionTools::Function(ChatCompletionTool {
+            function: FunctionObject {
+                name: qualified.clone(),
+                description: Some(format!(
+                    "Read the full instructions for the '{name}' skill. Only its name and \
+                     description are shown by default; call this before following it."
+                )),
+                parameters: Some(empty_parameters.clone()),
+                strict: None,
+            },
+        }));
+        index.insert(qualified, name.clone());
+    }
+    Ok(ToolSet { tools, index })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SkillCache, parse_skill};
+    use super::{SkillCache, parse_skill, tools};
     #[cfg(unix)]
     use std::time::Duration;
     use std::{collections::HashMap, fs, sync::Arc};
@@ -463,5 +618,101 @@ mod tests {
         )
         .expect("skill should parse");
         assert_eq!(skill.body, "Use {{ input.field }} literally.");
+    }
+
+    #[tokio::test]
+    async fn render_frontmatter_includes_the_description_and_tool_hint_but_not_the_body() {
+        let path = crate::test_support::unique_temp_path("lait-test-skill-frontmatter", ".md");
+        fs::write(
+            &path,
+            "---\nname: code-review\ndescription: reviews a diff for bugs\n---\nLook for off-by-one errors.\n",
+        )
+        .unwrap();
+        let mut skills_map = HashMap::new();
+        skills_map.insert("code-review".to_owned(), path.clone());
+        let cache = SkillCache::new(Arc::new(skills_map));
+
+        let text = cache
+            .render_frontmatter(&["code-review".to_owned()], crate::cancellation::none())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(text.contains("## Skill: code-review"));
+        assert!(text.contains("reviews a diff for bugs"));
+        assert!(text.contains("skill__code-review"));
+        assert!(!text.contains("off-by-one"), "text: {text}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn render_frontmatter_returns_none_for_an_empty_name_list() {
+        let cache = SkillCache::new(Arc::new(HashMap::new()));
+        assert!(
+            cache
+                .render_frontmatter(&[], crate::cancellation::none())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_body_returns_the_same_full_text_render_would_have_shown() {
+        let path = crate::test_support::unique_temp_path("lait-test-skill-body", ".md");
+        fs::write(
+            &path,
+            "---\nname: code-review\ndescription: reviews a diff for bugs\n---\nLook for off-by-one errors.\n",
+        )
+        .unwrap();
+        let mut skills_map = HashMap::new();
+        skills_map.insert("code-review".to_owned(), path.clone());
+        let cache = SkillCache::new(Arc::new(skills_map));
+        let names = ["code-review".to_owned()];
+
+        let rendered = cache
+            .render(&names, crate::cancellation::none())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = cache
+            .skill_body("code-review", crate::cancellation::none())
+            .await
+            .unwrap();
+
+        assert_eq!(rendered.as_str(), body.as_str());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tools_qualifies_each_name_and_carries_a_description() {
+        let mut skills_map = HashMap::new();
+        skills_map.insert(
+            "code-review".to_owned(),
+            std::path::PathBuf::from("skill.md"),
+        );
+        let names = vec!["code-review".to_owned()];
+
+        let tool_set = tools(&names, &Arc::new(skills_map)).unwrap();
+
+        assert_eq!(tool_set.tools.len(), 1);
+        assert_eq!(
+            tool_set.tool_name("skill__code-review"),
+            Some("code-review")
+        );
+        assert!(tool_set.names().eq(["skill__code-review"]));
+    }
+
+    #[test]
+    fn tools_is_empty_for_an_empty_name_list() {
+        let tool_set = tools(&[], &Arc::new(HashMap::new())).unwrap();
+        assert!(tool_set.tools.is_empty());
+        assert_eq!(tool_set.names().count(), 0);
+    }
+
+    #[test]
+    fn tools_errors_on_an_unknown_skill_name() {
+        let error = tools(&["missing".to_owned()], &Arc::new(HashMap::new())).unwrap_err();
+        assert!(error.to_string().contains("missing"));
     }
 }

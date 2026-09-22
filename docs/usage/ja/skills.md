@@ -127,7 +127,51 @@ nodes:
 `prompt:` を使う通常のノードやチャットのように、もともとシステムプロンプトを持たない呼び出しでは、
 スキルの内容だけがシステムプロンプトになります。
 
-## `mcp`/`--stream`/`structured_output` との違い
+## progressive disclosure（`skill_progressive_disclosure`）
+
+既定では、スキルの本文は常にシステムプロンプトへ全文追記されます。スキルを多く使う・本文が
+長いなどの理由でコンテキストを節約したい場合は、`lait.config.yml` の `default:` に
+`skill_progressive_disclosure: true` を指定してください。有効にすると:
+
+- システムプロンプトに追記されるのは各スキルの `name`/`description`（frontmatter）だけになり、
+  本文は追記されません。
+- 代わりに、`skill__<スキル名>`（例: `skill__code-review`）という引数なしのツールがモデルに
+  渡されます。モデルがこのツールを呼び出すと、その1件だけの本文（`## Skill: ...` の完全な形）が
+  ツール結果として返ります。
+- frontmatter のテキストには、どのツールを呼べばよいかの案内（`skill__<name>` の名前）が
+  含まれます。
+
+```yaml
+# lait.config.yml
+default:
+  skill_progressive_disclosure: true
+  skills: [code-review]
+skills:
+  code-review: skills/code-review.md
+```
+
+**config ファイル全体で1つの真偽値**です（`default.compaction` と同じ位置づけ）。CLI フラグや
+agent ファイル/ワークフローノード単位の上書きはありません。
+
+### 有効化の影響
+
+- **ツール往復が発生します。** 本文が必要なスキルごとに、モデルが `skill__<name>` を呼び出す
+  ラウンドが最低1回増えます。下の「`mcp`/`--stream`/`structured_output` との違い」の内容は、
+  この設定を有効にした場合には当てはまらなくなります（`max_tool_rounds` を消費し、
+  `structured_output` との併用で追加のラウンドトリップが発生します）。
+- **ツール呼び出しの弱いモデルでは、本文が読まれないまま無視される可能性があります。** ローカル
+  LLM など、ツール呼び出しの精度が低いモデルを使う場合は、既定（常時全文追記）のままにする
+  ことを推奨します。
+- **`tool_policy`/`--approve-tools` の対象になります。** `skill__*` も
+  [`tool_policy`（allow/deny）と `--approve-tools`](./mcp.md#tool_policyallowdenyと---approve-tools対話的承認)
+  で他のツールと同じように扱われます。`deny: ["*"]` のような包括的な deny を設定していると、
+  スキルの本文が一切読めなくなる点に注意してください。
+- **`--record`/`--replay` のカセットに互換性がありません。** この設定を有効にする前に記録した
+  カセットは、`skill__<name>` の呼び出しラウンドを含まないため、有効化後の `--replay` では
+  再生に失敗します。設定を切り替えたら、影響するワークフロー/エージェントのカセットを録り直して
+  ください。
+
+## `mcp`/`--stream`/`structured_output` との違い（既定: `skill_progressive_disclosure` 未設定）
 
 スキルは、MCP ツールのようにモデルへ「呼び出し可能な機能」として渡されるのではなく、リクエスト
 前にシステムプロンプトへ静的に追記されるだけです（[MCP サーバーのツールを使う](./mcp.md)
@@ -136,3 +180,6 @@ nodes:
 - `--stream` との併用に制限はありません。
 - `structured_output`（`output_schema`）との併用にも追加のラウンドトリップは発生しません。
 - `max_tool_rounds` の消費対象にはなりません。
+
+これらはすべて既定（`skill_progressive_disclosure` を有効にしない場合）の話です。有効にした
+場合の挙動は上の「progressive disclosure」の節を参照してください。

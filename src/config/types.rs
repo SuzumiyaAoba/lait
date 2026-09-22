@@ -311,6 +311,15 @@ pub(crate) struct DefaultSettings {
     /// See `CompactionConfig`'s own doc comment. `None` (the default) never
     /// compacts a tool loop's history at all — today's existing behavior.
     pub(crate) compaction: Option<CompactionConfig>,
+    /// Whether `skills:` content is disclosed progressively: `false`/absent
+    /// (the default) keeps today's behavior — every named skill's full body
+    /// is always appended to the system prompt, no tool call involved. `true`
+    /// appends only each skill's `name`/`description` (its frontmatter) and
+    /// exposes a `skill__<name>` tool the model must call to read the rest —
+    /// see `crate::skill::SkillCache::render_frontmatter` and
+    /// `docs/usage/ja/skills.md`. config-file-global only, like `compaction`:
+    /// no CLI flag, no per-agent-file/per-workflow-node override.
+    pub(crate) skill_progressive_disclosure: Option<bool>,
 }
 
 impl DefaultSettings {
@@ -335,6 +344,9 @@ impl DefaultSettings {
             cache: project.cache.or(global.cache),
             cache_ttl: project.cache_ttl.or(global.cache_ttl),
             compaction: project.compaction.or(global.compaction),
+            skill_progressive_disclosure: project
+                .skill_progressive_disclosure
+                .or(global.skill_progressive_disclosure),
         }
     }
 }
