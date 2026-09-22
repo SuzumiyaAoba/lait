@@ -83,6 +83,44 @@ mcp_servers:
 リストの場合は、モデルが実際にどのツールを呼び出すかを事前には知りようがないため、警告は出ません
 （実行時にそのつど拒否されるだけです）。
 
+## サーバーからの対話的な質問に答える（`allow_elicitation`）
+
+MCP サーバーは `tools/call` の途中で `elicitation/create` を送り、ユーザーへの追加の質問を
+lait 経由で挟むことができます（MCP の Multi Round-Trip Requests 機構の一部）。lait は既定では
+これを常に declined（拒否）で即答します。`mcp_servers.<name>.allow_elicitation: true` を
+指定すると、実際に標準エラー出力へ質問を表示し、標準入力から回答を読み取るようになります。
+
+```yaml
+mcp_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    allow_elicitation: true
+```
+
+- サーバーがユーザーへ対話的に質問できることは、`allowed_tools` と同様の信頼のエスカレーション
+  です。そのため既定は無効（`false`）で、サーバーごとに opt-in する必要があります。
+- 標準入力が対話端末でない場合（CI・パイプ・`lait serve --mcp` の被呼び出し側など）は、
+  `allow_elicitation` の値に関わらず、プロンプトを一切表示せずに即座に declined を返します
+  （`workflow: ask` ノードの「非対話的な標準入力には答えようがない」という判断と同じです）。
+- 質問（`message`）と、回答に必要なフィールド名・型・説明が標準エラー出力に表示されます。回答は
+  1行の JSON オブジェクトとして入力してください（例: `{"name": "Tokyo"}`）。`decline`/`cancel`
+  という単語をそのまま入力すると、それぞれ拒否／キャンセルとして扱われます。JSON オブジェクトとして
+  解釈できない入力は拒否として扱われます（再入力のプロンプトはありません）。
+- URL 型の elicitation（ブラウザで URL を開いて続行する形式）は、URL を標準エラー出力に表示する
+  だけで、常に declined を返します — ブラウザを開く・完了を待つといった動作には対応していません。
+- 複数の MCP サーバーが同時に elicitation を送ってきた場合、標準入力への出力が1つのプロセス
+  全体で直列化されます（同時に2つの質問が混ざって表示されることはありません）。ただし
+  `--approve-tools` の対話的承認プロンプトとは別の排他制御なので、両方が同時に発生した場合は
+  出力が混ざる可能性があります。
+
+**sampling（`sampling/createMessage`）・roots（`roots/list`）には対応していません。**
+どちらも MCP の SEP-2577 で非推奨（deprecated）になったプリミティブです。「2026-07-28 仕様への
+追従」を掲げる本項目としては、非推奨になった仕組みへ新規に対応するのではなく、現行仕様で現役の
+elicitation にのみ対応する、というのが妥当な判断だと考えています。両者を必要とするサーバーへ
+接続した場合、lait はそれらのリクエストを常にエラー（method not found）で返します（rmcp の既定
+挙動のままです）。
+
 ## `tool_policy`（allow/deny）と `--approve-tools`（対話的承認）
 
 `allowed_tools` がサーバーごとの設定なのに対し、`lait.config.yml` トップレベルの `tool_policy:`

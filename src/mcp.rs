@@ -1,26 +1,32 @@
 //! MCP (Model Context Protocol) client: connects to `mcp_servers:` entries,
-//! lists and calls their tools, and enforces the resource limits a
-//! third-party server must not be trusted to respect on its own.
+//! lists and calls their tools, answers a server-initiated
+//! `elicitation/create` request (see [`elicitation`]), and enforces the
+//! resource limits a third-party server must not be trusted to respect on
+//! its own.
 //!
-//! Three largely independent concerns share the `MAX_*` byte/depth
-//! constants below and the same `McpRegistry` entry point, so each has its
-//! own submodule: [`registry`] (connection lifecycle, per-server tool-list
+//! Four largely independent concerns share the `MAX_*` byte/depth constants
+//! below and the same `McpRegistry` entry point, so each has its own
+//! submodule: [`registry`] (connection lifecycle, per-server tool-list
 //! caching, tool-name qualification — re-exported here as `McpRegistry`/
 //! `ToolSet`), [`stdio`] (spawns the server as a child process, wraps its
-//! stdout in a frame-size-limited reader), and [`http_client`] (a
+//! stdout in a frame-size-limited reader), [`http_client`] (a
 //! `reqwest`-backed `StreamableHttpClient` with its own Content-Length and
 //! SSE-event-size enforcement, since `rmcp` does not cap either — named
 //! `http_client` rather than `http` to avoid shadowing the `http` crate this
-//! file also depends on). What stays here is what both transports and the
-//! registry share: the constants, the transport-agnostic `McpConnection`/
+//! file also depends on), and [`elicitation`] (`LaitClientHandler`, the
+//! `ClientHandler` every connection uses in place of rmcp's do-nothing `()`
+//! default). What stays here is what every transport and the registry
+//! share: the constants, the transport-agnostic `McpConnection`/
 //! `CleanupWait` lifecycle types, `connect` (which builds whichever
-//! transport a server's config names and hands it to `serve_with_timeout`),
-//! and `qualify_tool_name`/`render_tool_result`.
+//! transport a server's config names, wraps it in a `LaitClientHandler`, and
+//! hands both to `serve_with_timeout`), and `qualify_tool_name`/
+//! `render_tool_result`.
 //!
 //! `qualify_tool_name`, at the bottom, is shared with `subagent` — MCP tools
 //! and subagent tools both need the same `server__tool` naming scheme so the
 //! two capability kinds cannot collide in one tool-call dispatch table.
 
+mod elicitation;
 mod http_client;
 mod registry;
 mod stdio;
@@ -42,6 +48,7 @@ use rmcp::{Peer, RoleClient, ServiceExt, service::RunningService};
 use tokio_util::sync::CancellationToken;
 
 use crate::config;
+use elicitation::LaitClientHandler;
 use http_client::LimitedHttpClient;
 use stdio::{ManagedStdioTransport, owned_process_command};
 
@@ -151,7 +158,7 @@ struct McpConnection {
 
 impl McpConnection {
     fn from_running(
-        running: RunningService<RoleClient, ()>,
+        running: RunningService<RoleClient, LaitClientHandler>,
         cancellation: CancellationToken,
     ) -> Self {
         let peer = running.peer().clone();
@@ -216,13 +223,14 @@ impl Drop for McpConnection {
 async fn serve_with_timeout<T, E, A>(
     name: &str,
     transport: T,
+    handler: LaitClientHandler,
     cancellation: CancellationToken,
-) -> Result<RunningService<RoleClient, ()>>
+) -> Result<RunningService<RoleClient, LaitClientHandler>>
 where
     T: rmcp::transport::IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let serve = ().serve_with_ct(transport, cancellation.clone());
+    let serve = handler.serve_with_ct(transport, cancellation.clone());
     tokio::pin!(serve);
     tokio::select! {
         biased;
@@ -247,17 +255,23 @@ where
     }
 }
 
-/// Opens one MCP connection over the given transport, using the default
-/// (do-nothing) `ClientHandler` — lait only ever calls tools, so it never
-/// needs to answer server-initiated requests (sampling, roots, elicitation).
+/// Opens one MCP connection over the given transport, using a
+/// [`LaitClientHandler`] built from this server's own `allow_elicitation` —
+/// see that type's doc comment for what it actually answers.
+/// `elicitation_gate` is shared across every server this registry connects
+/// to (owned by `McpRegistry`), so two servers eliciting at once can't
+/// interleave their stdin prompts.
 async fn connect(
     name: &str,
     transport: config::McpTransport,
+    allow_elicitation: bool,
+    elicitation_gate: Arc<tokio::sync::Mutex<()>>,
     cancellation: CancellationToken,
 ) -> Result<McpConnection> {
     if cancellation.is_cancelled() {
         return Err(crate::error::cancelled(MCP_OPERATION_CANCELLED));
     }
+    let handler = LaitClientHandler::new(name.to_owned(), allow_elicitation, elicitation_gate);
     match transport {
         config::McpTransport::Stdio {
             command,
@@ -281,7 +295,7 @@ async fn connect(
                     .with_context(|| {
                         format!("failed to spawn MCP server '{name}' (command '{command}')")
                     })?;
-            match serve_with_timeout(name, transport, cancellation.clone()).await {
+            match serve_with_timeout(name, transport, handler, cancellation.clone()).await {
                 Ok(running) => Ok(McpConnection::from_running(running, cancellation)),
                 Err(error) => {
                     // On initialization failure rmcp has dropped the
@@ -317,7 +331,8 @@ async fn connect(
                 ),
                 transport_config,
             );
-            let running = serve_with_timeout(name, transport, cancellation.clone()).await?;
+            let running =
+                serve_with_timeout(name, transport, handler, cancellation.clone()).await?;
             Ok(McpConnection::from_running(running, cancellation))
         }
     }

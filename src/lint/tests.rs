@@ -150,6 +150,7 @@ fn accepts_a_known_mcp_server_name() {
             url: None,
             headers: HashMap::new(),
             allowed_tools: None,
+            allow_elicitation: false,
         },
     );
     let wf = parse_workflow_fixture(
@@ -175,6 +176,7 @@ fn flags_a_referenced_mcp_server_whose_allowed_tools_is_empty() {
             url: None,
             headers: HashMap::new(),
             allowed_tools: Some(Vec::new()),
+            allow_elicitation: false,
         },
     );
     let wf = parse_workflow_fixture(

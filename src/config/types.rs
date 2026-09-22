@@ -392,6 +392,15 @@ pub(crate) struct McpServerConfig {
     /// bare `Vec` defaulting to empty) — see `McpRegistry::call`, which
     /// enforces this before ever opening a connection to the server.
     pub(crate) allowed_tools: Option<Vec<String>>,
+    /// Whether this server may send an `elicitation/create` request
+    /// mid-tool-call and have lait actually prompt on stdin/stderr for an
+    /// answer. `false` (the default) always declines without prompting — an
+    /// MCP server asking the user interactively for information is a trust
+    /// escalation the same way an unrestricted `allowed_tools` is, so it's
+    /// opt-in per server. See `mcp::elicitation` and
+    /// `docs/usage/ja/mcp.md`'s elicitation section.
+    #[serde(default)]
+    pub(crate) allow_elicitation: bool,
 }
 
 /// The transport settings for one MCP server, after resolving `${VAR}`

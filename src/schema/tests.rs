@@ -401,6 +401,7 @@ mcp_servers:
     env:
       TOKEN: abc
     allowed_tools: [read_file]
+    allow_elicitation: true
 skills:
   style: ./skills/style.md
 agents:

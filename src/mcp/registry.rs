@@ -69,6 +69,10 @@ pub(crate) struct McpRegistry {
     /// trip (which a `for_each`/`loop` node with `mcp:` set would otherwise
     /// do on every iteration).
     tool_lists: tokio::sync::Mutex<HashMap<String, ToolListCell>>,
+    /// Shared across every server this registry connects to, so an
+    /// `elicitation/create` request from one server can't interleave its
+    /// stdin prompt with another's — see `mcp::elicitation::LaitClientHandler`.
+    elicitation_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The OpenAI-shaped tool definitions for one completion request, plus the
@@ -117,6 +121,7 @@ impl McpRegistry {
             servers,
             connections: tokio::sync::Mutex::new(HashMap::new()),
             tool_lists: tokio::sync::Mutex::new(HashMap::new()),
+            elicitation_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -416,9 +421,17 @@ impl McpRegistry {
                             config::CONFIG_FILE_NAME
                         )
                     })?;
+                    let allow_elicitation = server.allow_elicitation;
                     let transport = server.resolve_transport(name)?;
                     Ok::<_, anyhow::Error>(Arc::new(
-                        connect(name, transport, initializer_cancellation.clone()).await?,
+                        connect(
+                            name,
+                            transport,
+                            allow_elicitation,
+                            Arc::clone(&self.elicitation_gate),
+                            initializer_cancellation.clone(),
+                        )
+                        .await?,
                     ))
                 })
                 .await;
@@ -727,6 +740,7 @@ mod tests {
                 url: None,
                 headers: HashMap::new(),
                 allowed_tools,
+                allow_elicitation: false,
             },
         );
         McpRegistry::new(Arc::new(servers))
@@ -831,6 +845,7 @@ mod tests {
                 url: None,
                 headers: HashMap::new(),
                 allowed_tools: None,
+                allow_elicitation: false,
             },
         );
         let registry = McpRegistry::new(Arc::new(servers));

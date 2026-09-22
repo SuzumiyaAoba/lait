@@ -137,7 +137,8 @@
         "cwd": { "type": "string" },
         "url": { "type": "string" },
         "headers": { "type": "object", "additionalProperties": { "type": "string" } },
-        "allowed_tools": { "type": "array", "items": { "type": "string" } }
+        "allowed_tools": { "type": "array", "items": { "type": "string" } },
+        "allow_elicitation": { "type": "boolean" }
       }
     },
     "promptDefinition": {

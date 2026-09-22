@@ -334,6 +334,7 @@ fn stdio_config(command: &str) -> McpServerConfig {
         url: None,
         headers: HashMap::new(),
         allowed_tools: None,
+        allow_elicitation: false,
     }
 }
 
@@ -346,6 +347,7 @@ fn http_config(url: &str) -> McpServerConfig {
         url: Some(url.to_owned()),
         headers: HashMap::new(),
         allowed_tools: None,
+        allow_elicitation: false,
     }
 }
 
@@ -379,6 +381,7 @@ fn rejects_a_server_with_neither_command_nor_url() {
         url: None,
         headers: HashMap::new(),
         allowed_tools: None,
+        allow_elicitation: false,
     };
     let error = config.resolve_transport("test").unwrap_err();
     assert!(error.to_string().contains("neither"));
