@@ -245,6 +245,7 @@ models:
       pricing:
         input_per_1m: 1.0
         output_per_1m: 2.0
+      api: responses
 json_schemas:
   inline_example:
     schema:
@@ -394,6 +395,7 @@ models:
       pricing:
         input_per_1m: 1.0
         output_per_1m: 2.0
+      api: responses
 mcp_servers:
   fs:
     command: npx

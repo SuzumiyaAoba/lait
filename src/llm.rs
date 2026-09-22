@@ -1,3 +1,8 @@
+/// The Responses API (`POST /responses`) wire format, used instead of
+/// everything below only for a model definition whose `api:` is
+/// `responses` — see that module's own doc comment.
+pub(crate) mod responses;
+
 use anyhow::{Result, bail};
 use async_openai::{
     Client,

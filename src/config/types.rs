@@ -527,6 +527,25 @@ impl Pricing {
     }
 }
 
+/// Which OpenAI-compatible wire format a model's requests use. `ChatCompletions`
+/// (the default, and the only option before this field existed) sends
+/// `POST /chat/completions`; `Responses` sends `POST /responses` — OpenAI's
+/// newer API, whose only benefit lait actually implements (as of this field)
+/// is that a reasoning model's `reasoning` output items survive being
+/// echoed back on the *next* round of the same tool-free multi-turn call
+/// (`--session`, or a workflow's own step-to-step history), rather than
+/// being silently dropped the way they are in a Chat Completions message
+/// history. See `docs/usage/ja/config.md`'s Responses API section for the
+/// full list of what `api: responses` does *not* yet support (tool calling,
+/// `--stream`, provider-side `previous_response_id` chaining).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApiKind {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelDefinition {
@@ -546,6 +565,15 @@ pub(crate) struct ModelDefinition {
     /// `gen_ai.request.model` trace attribute already are — see
     /// `engine::transport`'s `complete_recorded` doc comment.
     pricing: Option<Pricing>,
+    /// See `ApiKind`'s own doc comment. Like `pricing`, only the *primary*
+    /// `models:` definition's `api:` is ever consulted — a fallback
+    /// candidate always uses Chat Completions regardless of the primary's
+    /// setting (see `FallbackCandidate`, which deliberately carries no
+    /// `api` field at all), so a Responses-API model's fallback silently
+    /// downgrades to Chat Completions rather than failing outright. This
+    /// matches `pricing`'s own "primary only" precedent.
+    #[serde(default)]
+    api: ApiKind,
 }
 
 impl ModelDefinition {
@@ -567,6 +595,7 @@ impl ModelDefinition {
             top_p: self.default_top_p,
             max_tokens: self.default_max_tokens,
             pricing: self.pricing,
+            api: self.api,
         }
     }
 
@@ -637,6 +666,9 @@ pub(crate) struct ResolvedModel {
     pub(crate) top_p: Option<f64>,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) pricing: Option<Pricing>,
+    /// See `ApiKind`. Always `ApiKind::ChatCompletions` for a bare model
+    /// name (no `models:` alias) — see `resolve_model`'s own construction.
+    pub(crate) api: ApiKind,
 }
 
 /// Rejects `api_key`/`api_key_cmd` set together at the same config layer —

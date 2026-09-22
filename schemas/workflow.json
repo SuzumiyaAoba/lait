@@ -84,7 +84,8 @@
         "default_temperature": { "type": "number", "minimum": 0, "maximum": 2 },
         "default_top_p": { "type": "number", "minimum": 0, "maximum": 1 },
         "default_max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
-        "pricing": { "$ref": "#/$defs/pricing" }
+        "pricing": { "$ref": "#/$defs/pricing" },
+        "api": { "type": "string", "enum": ["chat_completions", "responses"] }
       }
     },
     "modelMap": {

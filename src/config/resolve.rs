@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow, bail};
 
 use super::types::{
-    ApiKeySource, CommandSpec, ConfigFile, Endpoint, ModelMap, ResolvedModel, check_api_key_source,
+    ApiKeySource, ApiKind, CommandSpec, ConfigFile, Endpoint, ModelMap, ResolvedModel,
+    check_api_key_source,
 };
 
 pub(crate) fn resolve_model_alias(
@@ -172,6 +173,7 @@ pub(crate) fn resolve_model(model_name: String, config: &ConfigFile) -> Result<R
         top_p: None,
         max_tokens: None,
         pricing: None,
+        api: ApiKind::ChatCompletions,
     })
 }
 

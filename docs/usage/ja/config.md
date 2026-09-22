@@ -101,6 +101,7 @@ CLI の `--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独�
 | `provider.api_key` / `provider.api_key_cmd` | 任意。API キー（平文、または外部コマンドからの取得）。 |
 | `default_reasoning_effort` / `default_temperature` / `default_top_p` / `default_max_tokens` | 任意。そのモデルの既定値。 |
 | `pricing` | 任意。トークン単価（[コスト概算](#コスト概算pricing)を参照）。 |
+| `api` | 任意。`chat_completions`（既定）または `responses`。[Responses API を使う](#responses-api-を使うapi-responses)を参照。 |
 
 ```yaml
 # lait.config.yml
@@ -153,6 +154,49 @@ models:
 - `pricing:` を省略したモデルは「コスト不明」として扱われ、`--show-usage` の出力にコストは
   表示されません（`$0.00` のような誤解を招く値にはなりません）。
 - 概算値であり、実際の請求額と一致する保証はありません。
+
+### Responses API を使う（`api: responses`）
+
+先頭要素（フォールバック先には効きません — 下記参照）に `api: responses` を指定すると、
+そのモデルへのリクエストは `POST /chat/completions` の代わりに OpenAI の Responses API
+（`POST /responses`）を使うようになります。省略時（既定）は従来どおり `chat_completions` です。
+
+```yaml
+models:
+  cloud:
+    - provider:
+        base_url: https://api.openai.com/v1
+        api_key: "${OPENAI_API_KEY}"
+      model_id: gpt-5.1
+      api: responses
+```
+
+**現時点でのメリットは限定的です。** Responses API 対応で実際に効くのは、推論モデルの
+`reasoning` 出力アイテムが Chat Completions のメッセージ履歴では失われてしまうところを、
+そのまま次のラウンドへ引き継げる、という一点だけです。会話履歴は毎回丸ごと送り直します
+（`previous_response_id`/`conversation` によるサーバー側の会話状態保持は使いません）。
+これは意図的な設計です — サーバー側に会話状態を持たせると、レスポンスのディスクキャッシュ
+（`--cache`）や `--record`/`--replay`（[決定的テスト](./testing.md)）が前提とする
+「同じリクエスト内容なら同じキー」という不変条件が崩れるためです。`api: responses` を
+指定しても、これらの機能はそのまま使えます。
+
+**v1 では次に対応していません**（それぞれ、指定すると実行前に明確なエラーになります）。
+
+- `mcp:`/`subagents:`/`tools:` によるツール呼び出し。Responses API 自体はツール呼び出しに
+  対応していますが、lait 側の変換はまだ実装していません。
+- `--image` によるファイル・画像添付。
+- `--stream`。Responses API は独自のストリーミングイベント形式を持ちますが、専用のパーサーは
+  まだ実装していません。
+- `previous_response_id`/`conversation` によるサーバー側の会話状態保持（上記のとおり意図的
+  にスコープ外です）。
+
+`skills:`（システムプロンプトへの追記のみで、ツール呼び出しを伴わない）は上記の制約に該当
+しないため、`api: responses` のモデルでも通常どおり使えます。
+
+フォールバック先（[複数プロバイダーによるフォールバック](#複数プロバイダーによるフォールバック)
+の2番目以降の定義）は、先頭要素の `api:` に関わらず常に `chat_completions` を使います
+（`default_reasoning_effort` などと同じく、フォールバック先の設定は先頭要素からしか読まれ
+ません）。
 
 ## 複数プロバイダーによるフォールバック
 

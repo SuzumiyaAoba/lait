@@ -235,6 +235,7 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         cancellation: CancellationToken,
     ) -> Result<response::ChatCompletionResponse> {
+        self.check_responses_api_support(turn.image_urls, false)?;
         let messages = self
             .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
@@ -315,6 +316,47 @@ impl RequestSettings {
             .skill_progressive_disclosure
             == Some(true)
             && !self.skills.is_empty()
+    }
+
+    /// Rejects a `config::ApiKind::Responses` model's request for anything
+    /// `llm::responses` doesn't translate yet: `mcp:`/`subagents:`/`tools:`
+    /// (no function-calling translation — see `llm::responses`'s own doc
+    /// comment on why messages are guaranteed plain System/User/Assistant
+    /// text by the time they reach it), an `--image` attachment (no
+    /// multipart content translation), or streaming (`streaming` is `true`
+    /// only from `complete_stream`, which has no Responses-API SSE parser
+    /// at all — a Responses-API model rejects *every* `complete_stream`
+    /// call, tool-free or not, unlike the other two checks). A no-op for a
+    /// Chat-Completions model (`ApiKind`'s default), so every existing
+    /// caller is unaffected. Checked eagerly, before `complete`/
+    /// `complete_stream` do anything else, so the error is immediate and
+    /// specific rather than an opaque failure deep inside `llm::responses`'s
+    /// own translation. See `docs/usage/ja/config.md`'s Responses API
+    /// section.
+    fn check_responses_api_support(&self, image_urls: &[String], streaming: bool) -> Result<()> {
+        if self.resolved_model.api != config::ApiKind::Responses {
+            return Ok(());
+        }
+        let model_id = &self.resolved_model.model_id;
+        if streaming {
+            bail!(
+                "model '{model_id}' uses the Responses API ('api: responses'), which does not \
+                 support --stream yet"
+            );
+        }
+        if !self.mcp.is_empty() || !self.subagents.is_empty() || !self.tools.is_empty() {
+            bail!(
+                "model '{model_id}' uses the Responses API ('api: responses'), which does not \
+                 support mcp:/subagents:/tools: yet"
+            );
+        }
+        if !image_urls.is_empty() {
+            bail!(
+                "model '{model_id}' uses the Responses API ('api: responses'), which does not \
+                 support --image attachments yet"
+            );
+        }
+        Ok(())
     }
 
     /// Builds the four tool sets (`mcp:`, `subagents:`, `tools:`, and —
@@ -664,6 +706,12 @@ impl RequestSettings {
 
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
+        // Only the *primary* candidate ever uses the Responses API — a
+        // fallback candidate (`config::FallbackCandidate` deliberately
+        // carries no `api` field, see its own doc comment) always falls
+        // back to Chat Completions, so this flips to `false` the moment
+        // `advance_to_next_candidate` succeeds, below.
+        let mut use_responses_api = self.resolved_model.api == config::ApiKind::Responses;
         loop {
             let attempt_start = chrono::Utc::now();
             let api_key = env
@@ -680,7 +728,12 @@ impl RequestSettings {
                 tools,
                 cancellation.clone(),
             );
-            match llm::complete(request).await {
+            let attempt = if use_responses_api {
+                llm::responses::complete(request).await
+            } else {
+                llm::complete(request).await
+            };
+            match attempt {
                 Ok(response) => {
                     env.usage.record_response(
                         &self.usage_label,
@@ -728,6 +781,7 @@ impl RequestSettings {
                     )? {
                         return Err(error);
                     }
+                    use_responses_api = false;
                 }
                 Err(error) => return Err(error),
             }
@@ -824,6 +878,7 @@ impl RequestSettings {
             show_reasoning,
             output_path,
         } = stream;
+        self.check_responses_api_support(turn.image_urls, true)?;
         let messages = self
             .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
