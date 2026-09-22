@@ -63,11 +63,13 @@ pub(crate) fn resolve_run_target(argument: &Path, file_config: &ConfigFile) -> P
         return argument.to_path_buf();
     };
     match file_config.workflows.get(name) {
+        // The registry also covers names `lait deps` materialized under
+        // `.lait/deps/` (merged in by `config::load`), so the note names
+        // the registry rather than the specific file it came from.
         Some(resolved) => {
             report::note(format_args!(
-                "resolved '{name}' to '{}' via 'workflows:' in {}",
+                "resolved '{name}' to '{}' via 'workflows:'",
                 resolved.display(),
-                crate::config::CONFIG_FILE_NAME
             ));
             resolved.clone()
         }

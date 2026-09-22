@@ -398,6 +398,7 @@ fn embedded_schema_source(kind: SchemaKind) -> &'static str {
         SchemaKind::Workflow => include_str!("../schemas/workflow.json"),
         SchemaKind::Config => include_str!("../schemas/config.json"),
         SchemaKind::Agent => include_str!("../schemas/agent.json"),
+        SchemaKind::Deps => include_str!("../schemas/deps.json"),
     }
 }
 

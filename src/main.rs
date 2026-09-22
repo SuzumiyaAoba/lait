@@ -11,6 +11,7 @@ mod chat;
 mod checkpoint;
 mod cli;
 mod config;
+mod deps;
 mod docgen;
 mod dotenv;
 mod engine;

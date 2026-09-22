@@ -159,36 +159,41 @@ pub(super) async fn run_agent(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::signal::spawn_handler(cancel.clone());
-    // These four reads are independent of each other: stdin/argument input
-    // resolution only needs `args.input`, loading and canonicalizing the
-    // agent file only need `args.file`, and config loading only needs
-    // `config_source`. Running them concurrently rather than one after
-    // another shortens the wall-clock delay before the agent actually
-    // starts.
-    //
-    // Behavior note: when two of these fail at once, which error surfaces
-    // is now whichever `try_join!` polls to a `Result::Err` first rather
-    // than a fixed left-to-right order (stdin/input, then agent file, then
-    // config) — none of these four reads name each other in their error
-    // text, so there is no risk of a confusing partial message, only a
-    // different tie-break among independent failures.
-    let (raw_input, agent_file, canonical_agent_path, config) = tokio::try_join!(
+    // stdin/input resolution and config loading are independent of each
+    // other and run concurrently. The agent file itself loads only after
+    // the config is known: `args.file` may be an `agents:` registry name
+    // (including a `lait deps`-materialized one), which needs the merged
+    // config to resolve — the same ordering `run_workflow` applies for
+    // `workflows:` names.
+    let (raw_input, config) = tokio::try_join!(
         chat::resolve_input_with_stdin_cancellable(args.input.clone(), cancel.clone()),
-        agent::load_agent_cancellable(&args.file, cancel.clone()),
-        async {
-            crate::async_io::canonicalize(&args.file, cancel.clone())
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to resolve agent file path '{}'",
-                        args.file.display()
-                    )
-                })
-        },
         config::load_config_cancellable(&config_source, cancel.clone()),
     )?;
     let raw_input = raw_input.ok_or_else(missing_input_error)?;
     let file_config = Arc::new(config);
+
+    let argument = args.file.clone();
+    let registry_config = Arc::clone(&file_config);
+    let resolved_file = crate::async_io::run_blocking(
+        move |_| Ok(agent::resolve_run_target(&argument, &registry_config)),
+        cancel.clone(),
+    )
+    .await?;
+
+    let canonical_target = resolved_file.clone();
+    let (agent_file, canonical_agent_path) = tokio::try_join!(
+        agent::load_agent_cancellable(&resolved_file, cancel.clone()),
+        async {
+            crate::async_io::canonicalize(&canonical_target, cancel.clone())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to resolve agent file path '{}'",
+                        canonical_target.display()
+                    )
+                })
+        },
+    )?;
 
     announce_named_file(
         "==>",
@@ -199,12 +204,12 @@ pub(super) async fn run_agent(
     let input = template::parse_input(&raw_input);
     agent_file
         .validate_input(&input)
-        .with_context(|| format!("agent '{}'", args.file.display()))?;
+        .with_context(|| format!("agent '{}'", resolved_file.display()))?;
 
     let usage_label = agent_file
         .name
         .clone()
-        .unwrap_or_else(|| args.file.display().to_string());
+        .unwrap_or_else(|| resolved_file.display().to_string());
     let settings =
         agent_file_settings(&agent_file, &file_config, None)?.with_usage_label(usage_label);
 
@@ -220,7 +225,7 @@ pub(super) async fn run_agent(
             env.operation_token(),
         ))
         .await
-        .with_context(|| format!("agent '{}'", args.file.display()))?;
+        .with_context(|| format!("agent '{}'", resolved_file.display()))?;
     finish_prompt_or_agent_run(
         "agent",
         &output,

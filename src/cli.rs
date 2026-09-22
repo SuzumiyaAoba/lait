@@ -196,6 +196,11 @@ pub(crate) enum Command {
     Runs(RunsCommand),
     /// Manage the response disk cache (`.lait/cache/`, see `--cache`).
     Cache(CacheCommand),
+    /// Import GitHub-published workflow/agent/skill files as project
+    /// dependencies (`lait.deps.yml` + `lait.lock`, materialized under
+    /// `.lait/deps/` and reachable by name like a `workflows:`/`agents:`/
+    /// `skills:` entry). See docs/usage/ja/deps.md.
+    Deps(DepsCommand),
     /// Print the JSON Schema (draft 2020-12) for workflow.yml, lait.config.yml,
     /// or an agent file's frontmatter, for editor completion/validation (e.g.
     /// yaml-language-server). See docs/usage/ja/schema.md.
@@ -260,6 +265,9 @@ pub(crate) enum SchemaKind {
     Config,
     /// The schema for an agent Markdown file's YAML frontmatter (`agent.md`).
     Agent,
+    /// The schema for the dependency manifest `lait deps` manages
+    /// (`lait.deps.yml`).
+    Deps,
 }
 
 #[derive(Debug, Args)]
@@ -359,6 +367,84 @@ pub(crate) struct CacheCommand {
 pub(crate) enum CacheAction {
     /// Delete every cached response under `.lait/cache/`.
     Clear,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DepsCommand {
+    #[command(subcommand)]
+    pub(crate) action: DepsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DepsAction {
+    /// Fetch a GitHub-hosted file, register it under NAME (derived from the
+    /// file name when omitted), and pin its resolved commit in lait.lock.
+    Add(DepsAddArgs),
+    /// Materialize every lait.deps.yml entry under .lait/deps/ as pinned by
+    /// lait.lock (re-resolving — and re-locking — only what the lock does
+    /// not cover).
+    Install(DepsInstallArgs),
+    /// Re-resolve each dependency's ref and move its lait.lock entry when
+    /// the ref now points at a different commit.
+    Update(DepsUpdateArgs),
+    /// Drop a dependency from lait.deps.yml and lait.lock and delete its
+    /// materialized file.
+    Remove(DepsNameArgs),
+    /// List every declared dependency with its lock/install status.
+    List,
+    /// Hash every materialized payload against lait.lock (CI integrity
+    /// check; nonzero exit on missing/modified/not-locked entries).
+    Verify,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DepsAddArgs {
+    /// What to fetch: OWNER/REPO/PATH[@REF], the same prefixed with
+    /// `github:`, or a github.com/raw.githubusercontent.com file URL.
+    /// PATH's extension decides the kind (.yml/.yaml = workflow, .md =
+    /// agent, SKILL.md = skill) unless --kind is given.
+    #[arg(value_name = "SPEC")]
+    pub(crate) spec: String,
+
+    /// The name the file is registered under (`lait run <NAME>`,
+    /// `lait agent run <NAME>`, `skills: [NAME]`, ...). Defaults to the
+    /// file's basename minus its extension (or, for SKILL.md, its parent
+    /// directory).
+    #[arg(long, value_name = "NAME")]
+    pub(crate) name: Option<String>,
+
+    /// The branch, tag, or commit to fetch at — overrides an `@REF` inside
+    /// SPEC and is stored as the entry's `ref:` in lait.deps.yml.
+    #[arg(long = "ref", value_name = "REF")]
+    pub(crate) git_ref: Option<String>,
+
+    /// The registry kind when it cannot be inferred from the path's
+    /// extension.
+    #[arg(long, value_enum, value_name = "KIND")]
+    pub(crate) kind: Option<crate::deps::DepKind>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DepsInstallArgs {
+    /// Fail instead of updating lait.lock when a manifest entry is not
+    /// covered by it — the CI/reproducible-checkout mode.
+    #[arg(long)]
+    pub(crate) frozen: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DepsUpdateArgs {
+    /// Dependencies to re-resolve (every entry in lait.deps.yml when
+    /// omitted).
+    #[arg(value_name = "NAME")]
+    pub(crate) names: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DepsNameArgs {
+    /// The dependency name (a `deps.<name>` key in lait.deps.yml).
+    #[arg(value_name = "NAME")]
+    pub(crate) name: String,
 }
 
 #[derive(Debug, Args)]

@@ -30,7 +30,7 @@ export default defineConfig({
       },
       {
         label: "設定",
-        items: ["/config", "/prompts", "/schema"],
+        items: ["/config", "/prompts", "/schema", "/deps"],
       },
       {
         label: "ワークフロー",

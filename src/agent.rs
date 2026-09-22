@@ -1,11 +1,14 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::{
-    async_io, frontmatter, llm,
+    async_io,
+    config::ConfigFile,
+    frontmatter, llm,
     reasoning::ReasoningEffort,
+    report,
     schema::{self, JsonSchemaEntry},
 };
 
@@ -70,6 +73,42 @@ impl AgentFile {
     }
 }
 
+/// Resolves `lait agent run`'s `FILE` argument: `argument` itself when it
+/// exists as a file, else an `agents:` registry entry of that name — the
+/// agent-side counterpart of `workflow::resolve_run_target`, same
+/// file-wins-with-a-note shadowing rule and same already-absolute registry
+/// paths (see its doc). The registry here also covers names `lait deps`
+/// materialized into `.lait/deps/`, which `config::load` merges into
+/// `agents:` before this ever runs.
+pub(crate) fn resolve_run_target(argument: &Path, file_config: &ConfigFile) -> PathBuf {
+    if argument.is_file() {
+        if let Some(name) = argument.to_str()
+            && file_config.agents.contains_key(name)
+        {
+            report::note(format_args!(
+                "'{name}' exists as a file and is also an 'agents:' entry; running the file"
+            ));
+        }
+        return argument.to_path_buf();
+    }
+    let Some(name) = argument.to_str() else {
+        return argument.to_path_buf();
+    };
+    match file_config.agents.get(name) {
+        // A dep-sourced entry resolves here too, so the note names the
+        // registry rather than the file it happened to come from (a dep's
+        // own `lait.deps.yml` isn't `lait.config.yml`).
+        Some(resolved) => {
+            report::note(format_args!(
+                "resolved '{name}' to '{}' via 'agents:'",
+                resolved.display(),
+            ));
+            resolved.clone()
+        }
+        None => argument.to_path_buf(),
+    }
+}
+
 fn read_agent_context(path_or_name: impl std::fmt::Display) -> String {
     format!("failed to read agent file '{path_or_name}'")
 }
@@ -97,7 +136,10 @@ pub(crate) async fn load_agent_cancellable(
     parse_agent(&contents).with_context(|| parse_agent_context(path.display()))
 }
 
-fn parse_agent(contents: &str) -> Result<AgentFile> {
+/// `pub(crate)` rather than private because `deps::ops` validates a fetched
+/// agent file's bytes with it before the dependency is registered — the
+/// same parse a later `agent run` would do, moved to the fetch boundary.
+pub(crate) fn parse_agent(contents: &str) -> Result<AgentFile> {
     let (mut agent, body) = frontmatter::parse::<AgentFile>(contents, "agent file")?;
 
     if agent.structured_output && agent.output_schema.is_none() {

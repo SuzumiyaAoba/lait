@@ -10,11 +10,13 @@
 | --- | --- |
 | `workflow` | `workflow.yml` |
 | `config` | `lait.config.yml` |
+| `deps` | `lait.deps.yml`（[GitHub 依存のマニフェスト](./deps.md)） |
 | `agent` | エージェント Markdown ファイルのフロントマター |
 
 ```sh
 lait schema workflow > workflow.schema.json
 lait schema config   > config.schema.json
+lait schema deps     > deps.schema.json
 lait schema agent    > agent.schema.json
 ```
 
@@ -35,10 +37,10 @@ steps:
   - use: summarize
 ```
 
-`lait.config.yml`・agent frontmatter でも同様に、それぞれ `schemas/config.json`・
-`schemas/agent.json` を指定します（agent ファイルの場合、スキーマが効くのは `---` で
-囲まれたフロントマター部分のみで、その後の本文（システムプロンプトのテンプレート）は
-対象外です）。
+`lait.config.yml`・`lait.deps.yml`・agent frontmatter でも同様に、それぞれ
+`schemas/config.json`・`schemas/deps.json`・`schemas/agent.json` を指定します（agent
+ファイルの場合、スキーマが効くのは `---` で囲まれたフロントマター部分のみで、その後の
+本文（システムプロンプトのテンプレート）は対象外です）。
 
 複数ファイルにまとめて適用したい場合は、エディタ側の設定（VS Code の `yaml.schemas`
 設定など）でファイル名パターンに対してスキーマ URL を紐付ける方法もあります。

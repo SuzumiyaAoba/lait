@@ -212,7 +212,12 @@ fn temp_fixture_path(label: &str, extension: &str) -> std::path::PathBuf {
 
 #[test]
 fn every_embedded_schema_compiles() {
-    for kind in [SchemaKind::Workflow, SchemaKind::Config, SchemaKind::Agent] {
+    for kind in [
+        SchemaKind::Workflow,
+        SchemaKind::Config,
+        SchemaKind::Agent,
+        SchemaKind::Deps,
+    ] {
         compiled_schema(kind);
     }
 }
@@ -677,6 +682,63 @@ fn config_schema_requires_exactly_one_mcp_transport() {
         assert!(
             !validator.is_valid(&yaml_to_json(&source)),
             "schema accepted {source}"
+        );
+    }
+}
+
+const COMPREHENSIVE_DEPS_YAML: &str = r#"
+version: 1
+deps:
+  review:
+    source: github:owner/repo/workflows/review.yml
+    ref: main
+    kind: workflow
+  helper:
+    source: github:owner/repo/agents/helper.md
+  style:
+    source: github:owner/repo/skills/style/SKILL.md
+    ref: v1.2.3
+"#;
+
+#[test]
+fn deps_schema_accepts_a_document_the_real_parser_accepts() {
+    let parsed = crate::deps::DepsManifest::parse(
+        std::path::Path::new("lait.deps.yml"),
+        COMPREHENSIVE_DEPS_YAML,
+    );
+    parsed.expect("fixture must be accepted by the real deps manifest parser");
+
+    let validator = compiled_schema(SchemaKind::Deps);
+    let instance = yaml_to_json(COMPREHENSIVE_DEPS_YAML);
+    assert!(
+        validator.is_valid(&instance),
+        "schema rejected a document the real parser accepts: {:?}",
+        validator.iter_errors(&instance).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn deps_schema_and_parser_reject_invalid_documents() {
+    let validator = compiled_schema(SchemaKind::Deps);
+    for source in [
+        // An unknown top-level field (`deny_unknown_fields` /
+        // `additionalProperties: false`).
+        "deps: {}\nnot_a_field: 1\n",
+        // An unknown field inside a dep entry.
+        "deps:\n  x:\n    source: github:o/r/f.yml\n    url: 'https://example.com'\n",
+        // A dep entry missing `source` (the one required field).
+        "deps:\n  x:\n    ref: main\n",
+        // A `kind` outside the enum.
+        "deps:\n  x:\n    source: github:o/r/f.yml\n    kind: prompt\n",
+        // A name outside the charset `deps::spec::validate_name` enforces.
+        "deps:\n  'has space':\n    source: github:o/r/f.yml\n",
+    ] {
+        let instance = yaml_to_json(source);
+        assert!(!validator.is_valid(&instance), "schema accepted {source}");
+        assert!(
+            crate::deps::DepsManifest::parse(std::path::Path::new("lait.deps.yml"), source)
+                .is_err(),
+            "the real deps manifest parser must also reject {source}"
         );
     }
 }

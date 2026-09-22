@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SuzumiyaAoba/lait/master/schemas/deps.json",
+  "title": "lait.deps.yml",
+  "description": "lait's dependency manifest: GitHub-hosted workflow/agent/skill files fetched by `lait deps`. See docs/usage/ja/deps.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Manifest format version (currently 1)."
+    },
+    "deps": {
+      "type": "object",
+      "description": "Dependency name -> requirement. The name is the registry key the materialized file is reachable under (`lait run <name>`, `lait agent run <name>`, `skills: [name]`).",
+      "propertyNames": { "pattern": "^[A-Za-z0-9_-]+$" },
+      "additionalProperties": { "$ref": "#/$defs/depRequirement" }
+    }
+  },
+  "$defs": {
+    "depRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "github:OWNER/REPO/PATH (the canonical form `lait deps add` writes), or any spelling `deps add` accepts."
+        },
+        "ref": {
+          "type": "string",
+          "description": "Branch, tag, or commit to fetch `source` at. Absent tracks the repository's default branch, re-resolved on `deps update`."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["workflow", "agent", "skill"],
+          "description": "Which registry the file joins. Inferred from the source path's extension when absent (.yml/.yaml = workflow, .md = agent, SKILL.md = skill)."
+        }
+      }
+    }
+  }
+}

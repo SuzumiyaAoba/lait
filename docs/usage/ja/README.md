@@ -10,7 +10,8 @@
 
 - [設定ファイル](./config.md) — `lait.config.yml`、モデル alias、優先順位、`.env`、各種レジストリの登録。
 - [名前付きプロンプトテンプレート（prompts）](./prompts.md) — 繰り返し使うプロンプトと `--var` の定義・実行。
-- [JSON Schema でエディタ補完（lait schema）](./schema.md) — `workflow.yml`/`lait.config.yml`/agent frontmatter の JSON Schema と yaml-language-server 連携。
+- [JSON Schema でエディタ補完（lait schema）](./schema.md) — `workflow.yml`/`lait.config.yml`/`lait.deps.yml`/agent frontmatter の JSON Schema と yaml-language-server 連携。
+- [GitHub 上のファイルを依存として取り込む（lait deps）](./deps.md) — GitHub リポジトリのワークフロー/エージェント/スキルを `lait.deps.yml` と `lait.lock` で管理し、名前で参照する方法。
 
 ## ワークフロー
 

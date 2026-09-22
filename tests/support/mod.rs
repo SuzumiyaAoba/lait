@@ -605,6 +605,182 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// A route-aware mock of the GitHub REST endpoints `lait deps` calls —
+/// `GET /repos/{owner}/{repo}` (default branch), `GET /repos/{o}/{r}/
+/// commits/{ref}` (ref → commit resolution), and `GET /repos/{o}/{r}/
+/// contents/{path}?ref={sha}` (raw file body) — driven off a small
+/// interior-mutable table rather than a fixed response sequence, because
+/// the request order is the client's business and a `deps update` test must
+/// move a branch mid-test. Unmatched routes answer `404` the way the real
+/// API does (`{"message": ...}` JSON).
+pub(crate) struct MockGitHub {
+    api_url: String,
+    state: std::sync::Arc<std::sync::Mutex<GitHubState>>,
+    requests: Receiver<HttpRequest>,
+}
+
+#[derive(Default)]
+struct GitHubState {
+    /// `"owner/repo"` → the repository's default branch name.
+    default_branches: std::collections::HashMap<String, String>,
+    /// `"owner/repo@ref"` → the commit SHA that ref currently resolves to.
+    commits: std::collections::HashMap<String, String>,
+    /// `"owner/repo@sha:path/in/repo"` → the file's raw body at that commit.
+    files: std::collections::HashMap<String, String>,
+}
+
+impl MockGitHub {
+    /// Binds a listener and spawns the accept loop on a detached thread
+    /// (the loop runs until the test process ends — there is nothing to
+    /// join, unlike `MockServer`'s bounded sequence).
+    pub(crate) fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind mock GitHub");
+        let address = listener
+            .local_addr()
+            .expect("failed to get mock GitHub address");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(GitHubState::default()));
+        let (request_sender, requests) = mpsc::channel();
+
+        let worker_state = std::sync::Arc::clone(&state);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let Ok(request) = read_request(&mut stream) else {
+                    continue;
+                };
+                let _ = request_sender.send(request.clone_for_mock());
+                let state = worker_state.lock().expect("mock GitHub state poisoned");
+                let (status, content_type, body) = state.answer(&request.target);
+                drop(state);
+                if write_response(&mut stream, status, content_type, &body).is_err() {
+                    continue;
+                }
+            }
+        });
+
+        Self {
+            api_url: format!("http://{address}"),
+            state,
+            requests,
+        }
+    }
+
+    /// The value to pass as `GITHUB_API_URL` — the API root, no `/v1`-style
+    /// suffix (unlike `MockServer::base_url`, whose path is OpenAI-shaped).
+    pub(crate) fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    /// Registers a repository with its default branch (what a `ref`-less
+    /// dependency resolves through).
+    pub(crate) fn add_repo(&self, slug: &str, default_branch: &str) {
+        self.state
+            .lock()
+            .expect("mock GitHub state poisoned")
+            .default_branches
+            .insert(slug.to_owned(), default_branch.to_owned());
+    }
+
+    /// Makes `ref` on `slug` resolve to `sha` — call again mid-test to move
+    /// a branch for a `deps update` scenario.
+    pub(crate) fn set_commit(&self, slug: &str, git_ref: &str, sha: &str) {
+        self.state
+            .lock()
+            .expect("mock GitHub state poisoned")
+            .commits
+            .insert(format!("{slug}@{git_ref}"), sha.to_owned());
+    }
+
+    /// The file body the contents endpoint serves for `path` at `sha`.
+    pub(crate) fn set_file(&self, slug: &str, sha: &str, path: &str, body: &str) {
+        self.state
+            .lock()
+            .expect("mock GitHub state poisoned")
+            .files
+            .insert(format!("{slug}@{sha}:{path}"), body.to_owned());
+    }
+
+    pub(crate) fn receive_request(&self) -> HttpRequest {
+        self.requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock GitHub did not receive a request")
+    }
+}
+
+impl GitHubState {
+    /// Routes one request target (`/path?query`) to a canned
+    /// `(status, content-type, body)` — see the struct doc for the routes.
+    fn answer(&self, target: &str) -> (&'static str, &'static str, String) {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let not_found = || {
+            (
+                "404 Not Found",
+                "application/json",
+                r#"{"message": "Not Found"}"#.to_owned(),
+            )
+        };
+        match segments.as_slice() {
+            // GET /repos/{owner}/{repo}
+            ["repos", owner, repo] => {
+                let slug = format!("{owner}/{repo}");
+                match self.default_branches.get(&slug) {
+                    Some(branch) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::json!({ "default_branch": branch }).to_string(),
+                    ),
+                    None => not_found(),
+                }
+            }
+            // GET /repos/{owner}/{repo}/commits/{ref...} — the ref is the
+            // whole rest of the path (branch names can contain slashes).
+            ["repos", owner, repo, "commits", git_ref @ ..] if !git_ref.is_empty() => {
+                let key = format!("{owner}/{repo}@{}", git_ref.join("/"));
+                match self.commits.get(&key) {
+                    Some(sha) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::json!({ "sha": sha }).to_string(),
+                    ),
+                    None => not_found(),
+                }
+            }
+            // GET /repos/{owner}/{repo}/contents/{path...}?ref={sha}
+            ["repos", owner, repo, "contents", rest @ ..] if !rest.is_empty() => {
+                let file_path = rest.join("/");
+                let git_ref = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("ref="))
+                    .unwrap_or_default();
+                let key = format!("{owner}/{repo}@{git_ref}:{file_path}");
+                match self.files.get(&key) {
+                    // The real contents endpoint answers raw bytes with the
+                    // file's own media type under the `+raw` accept —
+                    // anything non-JSON keeps the client's
+                    // directory-listing detection out of the way.
+                    Some(body) => ("200 OK", "application/octet-stream", body.clone()),
+                    None => not_found(),
+                }
+            }
+            _ => not_found(),
+        }
+    }
+}
+
+impl HttpRequest {
+    /// `HttpRequest` isn't `Clone` (the channel sends it once); the mock
+    /// GitHub needs to both record a request and read its own copy for
+    /// routing, so it duplicates the fields it needs.
+    fn clone_for_mock(&self) -> Self {
+        Self {
+            method: self.method.clone(),
+            target: self.target.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+        }
+    }
+}
+
 /// A hand-rolled streamable-HTTP MCP server for integration tests: routes on
 /// the JSON-RPC `method` field (something `MockServer` can't do, since it
 /// just replays canned bodies in connection order) and answers `initialize`

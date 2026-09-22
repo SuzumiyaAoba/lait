@@ -88,6 +88,12 @@ CLI の `--temperature`/`--top-p`/`--max-tokens` と同じく、それぞれ独�
 `--config <PATH>` を指定した場合はそのファイルだけを読み込み、グローバル設定は一切
 参照しません。`--no-config` を指定した場合もグローバル設定を含めて何も読み込みません。
 
+プロジェクトの `lait.deps.yml`（[`lait deps`](./deps.md) で管理する GitHub 依存の
+マニフェスト）が見つかった場合、その依存が実体化するファイルも `workflows:`/`agents:`/
+`skills:` のエントリとして読み込まれます。優先順位は `グローバル設定 < lait.deps.yml <
+プロジェクトの lait.config.yml` で、同じ名前がプロジェクト設定にあれば依存よりそちらが
+勝ちます。`--no-config` の実行では `lait.deps.yml` も読み込まれません。
+
 ## モデル定義と alias
 
 複数の呼び出しモデルを設定ファイルに定義し、alias で使い回せます。`models` は alias をキー、

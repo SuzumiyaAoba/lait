@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::async_io;
+use crate::{async_io, deps};
 
 use super::types::{ConfigFile, DefaultSettings, ToolPolicy};
 use super::{CONFIG_FILE_NAME, ConfigSource};
@@ -187,6 +187,25 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
     }
 }
 
+/// The deps manifest's registry contribution expressed as a `ConfigFile`
+/// layer — only the three maps `lait deps` materializes into are populated
+/// — so the existing [`merge_config`] gives dependency entries their
+/// precedence for free: `merge_config(deps_layer, project)` leaves project
+/// `workflows:`/`agents:`/`skills:` entries winning over same-named deps
+/// (a local file deliberately shadows an imported one), and a subsequent
+/// `merge_config(global, …)` puts deps ahead of the global config (a
+/// project dependency is more specific than a user-wide entry). Every
+/// other field is `Default`, which `merge_config`'s per-field `or`
+/// semantics treat as "not set".
+fn deps_layer(entries: deps::RegistryEntries) -> ConfigFile {
+    ConfigFile {
+        workflows: entries.workflows.into_iter().collect(),
+        agents: Arc::new(entries.agents.into_iter().collect()),
+        skills: Arc::new(entries.skills.into_iter().collect()),
+        ..ConfigFile::default()
+    }
+}
+
 /// Loads the config `resolve_request_settings`/every other reader sees:
 /// [`ConfigSource::Search`] merges the project config (found by walking
 /// upward from the current directory) with the global config at
@@ -195,6 +214,14 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
 /// global file at all.
 pub(crate) fn load_config(source: &ConfigSource) -> Result<ConfigFile> {
     let project = load_config_at(source, resolve_config_path(source)?)?;
+    // `lait.deps.yml` entries merge as a layer between global and project
+    // (see `deps_layer`). `Disabled` skips the lookup entirely —
+    // `--no-config` is meant to isolate the invocation from project
+    // configuration, and dependency names are project configuration.
+    let project = match source {
+        ConfigSource::Disabled => project,
+        _ => merge_config(deps_layer(deps::load_registry_entries()?), project),
+    };
     match source {
         ConfigSource::Search => match load_global_config()? {
             Some(global) => Ok(merge_config(global, project)),
@@ -231,18 +258,31 @@ pub(crate) async fn load_config_cancellable(
     }
     match source {
         ConfigSource::Search => {
-            let (project, global) = tokio::try_join!(
+            // The manifest read is a third independent branch of the
+            // `try_join!` — same upward walk, different file name (see
+            // `deps::manifest`), and the merge only needs all three
+            // results, not any ordering between them.
+            let (project, global, dep_entries) = tokio::try_join!(
                 load_project(source, cancellation.clone()),
-                load_global_config_cancellable(cancellation),
+                load_global_config_cancellable(cancellation.clone()),
+                deps::load_registry_entries_cancellable(cancellation),
             )?;
+            let project = merge_config(deps_layer(dep_entries), project);
             Ok(match global {
                 Some(global) => merge_config(global, project),
                 None => project,
             })
         }
-        ConfigSource::Explicit(_) | ConfigSource::Disabled => {
-            load_project(source, cancellation).await
+        ConfigSource::Explicit(_) => {
+            let (project, dep_entries) = tokio::try_join!(
+                load_project(source, cancellation.clone()),
+                deps::load_registry_entries_cancellable(cancellation),
+            )?;
+            Ok(merge_config(deps_layer(dep_entries), project))
         }
+        // `--no-config` means no project configuration at all, deps
+        // included — see `load_config`'s comment.
+        ConfigSource::Disabled => load_project(source, cancellation).await,
     }
 }
 

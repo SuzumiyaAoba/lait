@@ -128,6 +128,13 @@ fn parse_skill(name: &str, contents: &str) -> Result<SkillFile> {
     })
 }
 
+/// `deps add`/`install`/`update`'s validation boundary: checks `contents`
+/// parse as a skill file under `name` without keeping the parsed body —
+/// `SkillFile` itself stays private since only the skill loader consumes it.
+pub(crate) fn validate_skill(name: &str, contents: &str) -> Result<()> {
+    parse_skill(name, contents).map(|_| ())
+}
+
 fn format_skill(skill: &SkillFile) -> String {
     let mut section = format!("## Skill: {}\n", skill.name);
     if let Some(description) = &skill.description {

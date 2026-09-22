@@ -28,13 +28,14 @@ use crate::{
     chat, checkpoint,
     cli::{
         AgentAction, AgentCommand, AgentRunArgs, CacheCommand, ChatArgs, ChatReplArgs, Command,
-        CompareArgs, CompletionsArgs, DoctorArgs, EvalArgs, GraphArgs, GraphFormat, HistoryArgs,
+        CompareArgs, CompletionsArgs, DepsAction, DepsAddArgs, DepsCommand, DepsInstallArgs,
+        DepsNameArgs, DepsUpdateArgs, DoctorArgs, EvalArgs, GraphArgs, GraphFormat, HistoryArgs,
         InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction, PromptCommand, PromptRunArgs,
         RunArgs, RunsCommand, SchemaArgs, ServeArgs, SessionsCommand, SkillAction, SkillCommand,
         TestArgs, TraceAction, TraceCommand, TraceShowArgs, WorkflowAction, WorkflowCommand,
     },
     config::{self, ConfigSource},
-    docgen,
+    deps, docgen,
     engine::{AppServices, RunContext},
     error, history, lint, skill, subagent, trace, workflow,
 };
@@ -81,6 +82,9 @@ pub(crate) enum SyncCommand {
     Cache(CacheCommand),
     Schema(SchemaArgs),
     TraceShow(TraceShowArgs),
+    DepsRemove(DepsNameArgs),
+    DepsList,
+    DepsVerify,
 }
 
 /// Every subcommand (and the bare invocation) that awaits a model request or
@@ -98,6 +102,11 @@ pub(crate) enum AsyncCommand {
     Test(TestArgs),
     Eval(EvalArgs),
     Serve(ServeArgs),
+    /// The `lait deps` actions that reach GitHub — `remove`/`list`/`verify`
+    /// are the [`SyncCommand`] half, being manifest/lock/disk-only.
+    DepsAdd(DepsAddArgs),
+    DepsInstall(DepsInstallArgs),
+    DepsUpdate(DepsUpdateArgs),
     /// The no-subcommand invocation (`lait [OPTIONS] [PROMPT]`). Carries no
     /// payload here — unlike every other variant, its arguments
     /// (`cli::Cli::chat`) live directly on `Cli` rather than on a `Command`
@@ -173,6 +182,17 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         Some(Command::Test(args)) => Dispatch::Async(Box::new(AsyncCommand::Test(args))),
         Some(Command::Eval(args)) => Dispatch::Async(Box::new(AsyncCommand::Eval(args))),
         Some(Command::Serve(args)) => Dispatch::Async(Box::new(AsyncCommand::Serve(args))),
+        // `deps` classifies by action like `prompt`/`agent` do: the three
+        // fetch-bound actions are async, the manifest/lock/disk-only ones
+        // stay off the Tokio runtime entirely.
+        Some(Command::Deps(DepsCommand { action })) => match action {
+            DepsAction::Add(args) => Dispatch::Async(Box::new(AsyncCommand::DepsAdd(args))),
+            DepsAction::Install(args) => Dispatch::Async(Box::new(AsyncCommand::DepsInstall(args))),
+            DepsAction::Update(args) => Dispatch::Async(Box::new(AsyncCommand::DepsUpdate(args))),
+            DepsAction::Remove(args) => Dispatch::Sync(SyncCommand::DepsRemove(args)),
+            DepsAction::List => Dispatch::Sync(SyncCommand::DepsList),
+            DepsAction::Verify => Dispatch::Sync(SyncCommand::DepsVerify),
+        },
         Some(Command::Trace(TraceCommand {
             action: TraceAction::Show(args),
         })) => Dispatch::Sync(SyncCommand::TraceShow(args)),
@@ -236,6 +256,13 @@ pub(crate) async fn run(
         AsyncCommand::Test(test_args) => test_run::run(test_args, config_source, cancel).await,
         AsyncCommand::Eval(eval_args) => eval::run(eval_args, config_source, cancel).await,
         AsyncCommand::Serve(serve_args) => serve::run(serve_args, config_source, cancel).await,
+        // Deps commands take no `config_source`: they operate on
+        // `lait.deps.yml`/`lait.lock`, which are discovered from the current
+        // directory independently of the config search (see `deps::manifest`
+        // for the shared upward-walk rule).
+        AsyncCommand::DepsAdd(args) => deps::run_add(args, cancel).await,
+        AsyncCommand::DepsInstall(args) => deps::run_install(args, cancel).await,
+        AsyncCommand::DepsUpdate(args) => deps::run_update(args, cancel).await,
         AsyncCommand::Bare => {
             run_chat_or_repl(
                 bare_chat,
@@ -290,6 +317,9 @@ pub(crate) fn run_blocking(command: SyncCommand, config_source: ConfigSource) ->
         SyncCommand::Cache(cache_command) => crate::cache::run(cache_command),
         SyncCommand::Schema(schema_args) => crate::schema::run(schema_args),
         SyncCommand::TraceShow(trace_show_args) => run_trace_show(trace_show_args),
+        SyncCommand::DepsRemove(args) => deps::run_remove(args),
+        SyncCommand::DepsList => deps::run_list(),
+        SyncCommand::DepsVerify => deps::run_verify(),
     }
 }
 
@@ -478,6 +508,15 @@ mod tests {
             (&["lait", "test", "case.yml"], Lane::Async),
             (&["lait", "eval", "eval.yml"], Lane::Async),
             (&["lait", "trace", "show", "trace.jsonl"], Lane::Sync),
+            (
+                &["lait", "deps", "add", "owner/repo/workflow.yml"],
+                Lane::Async,
+            ),
+            (&["lait", "deps", "install"], Lane::Async),
+            (&["lait", "deps", "update"], Lane::Async),
+            (&["lait", "deps", "remove", "name"], Lane::Sync),
+            (&["lait", "deps", "list"], Lane::Sync),
+            (&["lait", "deps", "verify"], Lane::Sync),
             (&["lait", "serve", "--mcp"], Lane::Async),
             (&["lait", "hi"], Lane::Async),
             (&["lait"], Lane::Async),

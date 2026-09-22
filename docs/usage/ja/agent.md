@@ -42,6 +42,11 @@ schema_name: city_fact
 cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人です。"}'
 ```
 
+`<FILE>` はパスの代わりに `lait.config.yml` の `agents:` に登録した名前（または
+[`lait deps`](./deps.md) で取り込んだ `agent` 依存の名前）でも指定できます。`lait run` の
+`workflows:` 解決と同じく、実在するファイルがあればそちらが優先され、存在しない場合にだけ
+`agents:` から名前解決されます。
+
 ## ファイルの構成とパス
 
 ファイルは1行目が必ず `---` で始まり、次に現れる `---` 行までが frontmatter（YAML）、
