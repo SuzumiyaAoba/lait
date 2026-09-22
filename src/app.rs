@@ -30,8 +30,8 @@ use crate::{
         AgentAction, AgentCommand, AgentRunArgs, CacheCommand, ChatArgs, ChatReplArgs, Command,
         CompareArgs, CompletionsArgs, DoctorArgs, EvalArgs, GraphArgs, GraphFormat, HistoryArgs,
         InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction, PromptCommand, PromptRunArgs,
-        RunArgs, RunsCommand, SchemaArgs, SessionsCommand, SkillAction, SkillCommand, TestArgs,
-        TraceAction, TraceCommand, TraceShowArgs, WorkflowAction, WorkflowCommand,
+        RunArgs, RunsCommand, SchemaArgs, ServeArgs, SessionsCommand, SkillAction, SkillCommand,
+        TestArgs, TraceAction, TraceCommand, TraceShowArgs, WorkflowAction, WorkflowCommand,
     },
     config::{self, ConfigSource},
     docgen,
@@ -46,6 +46,7 @@ mod eval;
 mod models;
 mod prompt_run;
 mod repl;
+mod serve;
 mod test_run;
 mod workflow_run;
 
@@ -96,6 +97,7 @@ pub(crate) enum AsyncCommand {
     Compare(CompareArgs),
     Test(TestArgs),
     Eval(EvalArgs),
+    Serve(ServeArgs),
     /// The no-subcommand invocation (`lait [OPTIONS] [PROMPT]`). Carries no
     /// payload here — unlike every other variant, its arguments
     /// (`cli::Cli::chat`) live directly on `Cli` rather than on a `Command`
@@ -170,6 +172,7 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         Some(Command::Compare(args)) => Dispatch::Async(Box::new(AsyncCommand::Compare(args))),
         Some(Command::Test(args)) => Dispatch::Async(Box::new(AsyncCommand::Test(args))),
         Some(Command::Eval(args)) => Dispatch::Async(Box::new(AsyncCommand::Eval(args))),
+        Some(Command::Serve(args)) => Dispatch::Async(Box::new(AsyncCommand::Serve(args))),
         Some(Command::Trace(TraceCommand {
             action: TraceAction::Show(args),
         })) => Dispatch::Sync(SyncCommand::TraceShow(args)),
@@ -232,6 +235,7 @@ pub(crate) async fn run(
         }
         AsyncCommand::Test(test_args) => test_run::run(test_args, config_source, cancel).await,
         AsyncCommand::Eval(eval_args) => eval::run(eval_args, config_source, cancel).await,
+        AsyncCommand::Serve(serve_args) => serve::run(serve_args, config_source, cancel).await,
         AsyncCommand::Bare => {
             run_chat_or_repl(
                 bare_chat,
@@ -474,6 +478,7 @@ mod tests {
             (&["lait", "test", "case.yml"], Lane::Async),
             (&["lait", "eval", "eval.yml"], Lane::Async),
             (&["lait", "trace", "show", "trace.jsonl"], Lane::Sync),
+            (&["lait", "serve", "--mcp"], Lane::Async),
             (&["lait", "hi"], Lane::Async),
             (&["lait"], Lane::Async),
             (&["lait", "--cache", "hi"], Lane::Async),

@@ -76,6 +76,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 - [MCP サーバーのツールを使う](./docs/usage/ja/mcp.md) — 外部ツールをモデルから呼び出す方法。
 - [ツール周回の要約による圧縮（default.compaction）](./docs/usage/ja/compaction.md) — 長い tool loop の履歴をモデル自身の要約で圧縮する方法。
 - [カスタムシェルツールを使う](./docs/usage/ja/tools.md) — ローカルコマンドをツールとして公開する方法。
+- [ワークフロー/エージェントを MCP サーバーとして公開する（lait serve --mcp）](./docs/usage/ja/serve.md) — `agents:`/`workflows:` を他の MCP クライアントから呼び出せるツールとして公開する方法。
 - [出力例](./docs/usage/ja/output.md) — 通常出力、ストリーミング、JSON、Markdown 表示。
 - [実行トレース（lait trace）](./docs/usage/ja/trace.md) — モデル呼び出し・ツール呼び出しを JSONL として記録し、実行軌跡を検査する方法。
 - [モデル比較（lait compare）](./docs/usage/ja/compare.md) — 同一プロンプトを複数モデルへ並行送信して比較する方法。

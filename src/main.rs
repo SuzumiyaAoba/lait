@@ -26,6 +26,7 @@ mod lint;
 mod llm;
 mod logging;
 mod mcp;
+mod mcp_server;
 mod nesting;
 mod overrides;
 mod process;

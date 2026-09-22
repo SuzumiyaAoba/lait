@@ -56,6 +56,7 @@ export default defineConfig({
             { slug: 'docs/skills' },
             { slug: 'docs/subagents' },
             { slug: 'docs/tools' },
+            { slug: 'docs/serve' },
             { slug: 'docs/attachments' },
           ],
         },

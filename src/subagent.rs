@@ -61,6 +61,14 @@ impl LoadedAgent {
         }
         schema::validate_input_against_schema(&self.tool_parameters, input)
     }
+
+    /// The OpenAI/MCP-shaped tool `parameters` schema resolved for this
+    /// agent — see this struct's own doc comment. Exposed read-only so
+    /// `mcp_server::build_agent_tool` (`lait serve --mcp`) can reuse it
+    /// without re-deriving the same `input_schema`-or-generic-wrapper logic.
+    pub(crate) fn tool_parameters(&self) -> &serde_json::Value {
+        &self.tool_parameters
+    }
 }
 
 /// The agent files in play for one `lait run`/`lait agent run`/chat

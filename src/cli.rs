@@ -221,6 +221,21 @@ pub(crate) enum Command {
     /// Inspect a `--trace-file`-written JSONL trace log (`lait trace show`).
     /// See docs/usage/ja/trace.md.
     Trace(TraceCommand),
+    /// Run lait as a long-lived server process. Currently only `--mcp` is
+    /// supported: an MCP (Model Context Protocol) server over stdio,
+    /// exposing every `agents:`/`workflows:` entry in lait.config.yml as a
+    /// callable MCP tool. See docs/usage/ja/serve.md.
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ServeArgs {
+    /// Serve as an MCP server over stdio. Required — `lait serve` currently
+    /// has no other mode, but this stays an explicit flag (rather than the
+    /// only behavior of a bare `lait serve`) so a future second mode doesn't
+    /// need a breaking change to introduce.
+    #[arg(long)]
+    pub(crate) mcp: bool,
 }
 
 #[derive(Debug, Args)]

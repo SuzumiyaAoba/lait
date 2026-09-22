@@ -27,6 +27,7 @@
 - [スキルを使う](./skills.md) — Markdown スキルの登録と、agent／workflow のシステムプロンプトへの追加。
 - [サブエージェントを使う](./subagents.md) — agent Markdown をモデルから呼び出せるツールとして公開する方法。
 - [カスタムシェルツールを使う](./tools.md) — ローカルコマンドを MCP なしのモデル呼び出しツールとして公開する方法。
+- [ワークフロー/エージェントを MCP サーバーとして公開する（lait serve --mcp）](./serve.md) — `agents:`/`workflows:` の各エントリを MCP ツールとして他のクライアントに公開する方法。
 - [ファイル・画像の添付](./attachments.md) — `--file` と `--image` で入力にファイルや画像を添付する方法。
 
 ## 運用・診断
