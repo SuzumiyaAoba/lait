@@ -1,0 +1,51 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import { withBase } from "blume/components/islands/base-path";
+import data from "blume:data";
+
+const { config } = data;
+---
+
+<PageLayout
+  site={{ title: config.title, description: config.description }}
+  logo={config.logo}
+  banner={config.banner}
+  analytics={config.analytics}
+  navigation={data.navigation}
+  favicon={config.favicon}
+  appleIcon={config.appleIcon}
+  fontCssVars={data.fontCssVars}
+  themeMode={config.theme.mode}
+  searchEnabled={config.search.enabled}
+  siteUrl={config.site}
+  ogEnabled={config.og.enabled}
+  structuredDataEnabled={config.structuredData}
+  page={{ title: "lait", description: config.description, route: "/" }}
+>
+  <section class="mx-auto max-w-3xl px-6 py-24 text-center">
+    <h1 class="font-bold text-5xl tracking-tight">lait</h1>
+    <p class="mt-6 text-lg text-muted-foreground">
+      YAML で定義したハーネス、Agent Loop、Flow を CLI から実行・制御する Lightweight AI Tool
+    </p>
+    <div class="mt-10 flex items-center justify-center gap-4">
+      <a
+        href={withBase("/docs")}
+        class="rounded-blume bg-accent px-6 py-3 font-medium text-accent-foreground transition-colors hover:opacity-90"
+      >
+        ドキュメントを見る
+      </a>
+      <a
+        href="https://github.com/SuzumiyaAoba/lait"
+        class="rounded-blume border border-border px-6 py-3 font-medium transition-colors hover:bg-muted"
+      >
+        GitHub
+      </a>
+    </div>
+    <p class="mt-16 text-muted-foreground leading-relaxed">
+      <code>lait</code> は OpenAI Compatible API に接続し、単体のプロンプトや YAML
+      で定義したワークフロー、エージェントを実行できる CLI ツールです。詳しい使い方は
+      <a href={withBase("/docs")} class="text-accent underline underline-offset-4">ドキュメント</a>
+      を参照してください。
+    </p>
+  </section>
+</PageLayout>

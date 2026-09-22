@@ -6,17 +6,13 @@
   "scripts": {
     "sync-docs": "node scripts/sync-docs.mjs",
     "sync-docs:check": "node scripts/sync-docs.mjs --check",
-    "dev": "node scripts/sync-docs.mjs && astro dev",
-    "build": "node scripts/sync-docs.mjs && astro check && astro build",
-    "preview": "astro preview",
-    "types:check": "node scripts/sync-docs.mjs && astro check"
+    "dev": "node scripts/sync-docs.mjs && blume dev",
+    "build": "node scripts/sync-docs.mjs && blume check && blume validate && blume build",
+    "preview": "blume preview",
+    "types:check": "node scripts/sync-docs.mjs && blume check",
+    "doctor": "blume doctor"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.41.10",
-    "astro": "^7.2.9"
-  },
-  "devDependencies": {
-    "@astrojs/check": "^0.9.10",
-    "typescript": "^6.0.3"
+    "blume": "1.7.0"
   }
 }

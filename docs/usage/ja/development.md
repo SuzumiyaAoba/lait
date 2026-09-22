@@ -101,6 +101,6 @@ pnpm sync-docs
 pnpm types:check
 ```
 
-`pnpm build` は同期と Astro のチェック・ビルドをまとめて実行します。
+`pnpm build` は同期と Blume のチェック・リンク検証・ビルドをまとめて実行します。
 
 GitHub Actions でも Rust の検証と `pnpm build` を実行します。

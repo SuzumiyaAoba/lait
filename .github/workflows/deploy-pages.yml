@@ -1,4 +1,4 @@
-# Builds the Astro/Starlight site under `website/` and publishes it to GitHub
+# Builds the Blume site under `website/` and publishes it to GitHub
 # Pages. The site is a project page served under the `/lait/` path prefix.
 name: Deploy website
 

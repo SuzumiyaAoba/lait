@@ -2,11 +2,12 @@
 /node_modules
 
 # generated content
+/.blume/
 /.astro/
 
 # generated from ../docs/usage/ja/ by scripts/sync-docs.mjs (`pnpm sync-docs`) —
 # docs/usage/ja/ is the source of truth, see AGENTS.md
-/src/content/docs/docs/*.md
+/docs/
 
 # test & build
 /coverage
