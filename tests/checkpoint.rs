@@ -10,32 +10,22 @@ use support::{ConfigDirectory, test_command};
 /// run always fails right after step 1, and `marker.txt` having exactly one
 /// line after a later `--resume` proves step 1 was not re-executed.
 const TWO_STEP_WORKFLOW: &str = r#"
-nodes:
-  mark:
-    type: command
-    command: ["sh", "-c", "echo ran >> marker.txt; cat"]
-  fail:
-    type: command
-    command: ["sh", "-c", "exit 1"]
 steps:
-  - use: mark
-  - use: fail
+  - id: mark
+    run: ["sh", "-c", "echo ran >> marker.txt; cat"]
+  - id: fail
+    run: ["sh", "-c", "exit 1"]
 "#;
 
 /// `TWO_STEP_WORKFLOW` with `fail` replaced by a command that succeeds and
 /// passes its input straight through — simulates the user fixing the
 /// workflow between a failed checkpointed run and `--resume`.
 const TWO_STEP_WORKFLOW_FIXED: &str = r#"
-nodes:
-  mark:
-    type: command
-    command: ["sh", "-c", "echo ran >> marker.txt; cat"]
-  fail:
-    type: command
-    command: ["cat"]
 steps:
-  - use: mark
-  - use: fail
+  - id: mark
+    run: ["sh", "-c", "echo ran >> marker.txt; cat"]
+  - id: fail
+    run: ["cat"]
 "#;
 
 fn marker_lines(dir: &ConfigDirectory) -> usize {
@@ -114,7 +104,7 @@ fn checkpoint_records_the_first_step_and_resume_does_not_rerun_it() {
 }
 
 #[test]
-fn a_stopped_nested_router_checkpoints_only_completed_named_outputs() {
+fn a_stopped_nested_control_step_records_the_stop_value_on_every_enclosing_step() {
     let dir = ConfigDirectory::empty();
     dir.write(
         "workflow.yml",
@@ -122,25 +112,21 @@ fn a_stopped_nested_router_checkpoints_only_completed_named_outputs() {
 steps:
   - id: outer
     switch:
-      cases:
-        - when: 'true'
-          steps:
-            - id: repeat
-              loop:
-                until: 'false'
-                max_iterations: 1
+      - when: 'true'
+        steps:
+          - id: repeat
+            until: 'false'
+            max_iterations: 1
+            steps:
+              - id: items
+                for_each: '[7, 8]'
                 steps:
-                  - id: items
-                    for_each:
-                      items: '[7, 8]'
-                      steps:
-                        - id: selected
-                          switch:
-                            cases:
-                              - when: 'true'
-                                steps:
-                                  - id: halt
-                                    stop: true
+                  - id: selected
+                    switch:
+                      - when: 'true'
+                        steps:
+                          - id: halt
+                            stop: true
 "#,
     );
 
@@ -167,11 +153,11 @@ steps:
     .unwrap();
     assert_eq!(checkpoint["status"], "completed");
     assert_eq!(checkpoint["counter"], 5);
-    assert_eq!(checkpoint["current_input"], "7");
+    assert_eq!(checkpoint["current_value"], 7);
     assert_eq!(
         checkpoint["steps_outputs"],
-        serde_json::json!({"halt": 7, "selected": 7, "outer": 7}),
-        "switch outputs should be recorded, but stopped loop/item aggregation remains unfinished"
+        serde_json::json!({"halt": 7, "selected": 7, "items": 7, "repeat": 7, "outer": 7}),
+        "a 'stop' value becomes the output of every enclosing control step it passes through"
     );
 }
 
@@ -319,25 +305,20 @@ fn a_run_without_checkpoint_records_nothing() {
 }
 
 #[test]
-fn resume_reuses_the_recorded_vars_when_var_is_not_repeated() {
+fn resume_reuses_the_recorded_inputs_when_input_is_not_repeated() {
     let dir = ConfigDirectory::empty();
     dir.write(
         "workflow.yml",
         r#"
-nodes:
-  mark:
-    type: command
-    command: ["sh", "-c", "echo ran >> marker.txt; cat"]
-  fail:
-    type: command
-    command: ["sh", "-c", "exit 1"]
-  greet:
-    type: transform
-    jq: '$vars.name'
+inputs:
+  name: string
 steps:
-  - use: mark
-  - use: fail
-  - use: greet
+  - id: mark
+    run: ["sh", "-c", "echo ran >> marker.txt; cat"]
+  - id: fail
+    run: ["sh", "-c", "exit 1"]
+  - id: greet
+    jq: '$inputs.name'
 "#,
     );
 
@@ -348,7 +329,7 @@ steps:
             "workflow.yml",
             "hello",
             "--checkpoint",
-            "--var",
+            "--input",
             "name=world",
             "--no-config",
         ])
@@ -360,20 +341,15 @@ steps:
     dir.write(
         "workflow.yml",
         r#"
-nodes:
-  mark:
-    type: command
-    command: ["sh", "-c", "echo ran >> marker.txt; cat"]
-  fail:
-    type: command
-    command: ["cat"]
-  greet:
-    type: transform
-    jq: '$vars.name'
+inputs:
+  name: string
 steps:
-  - use: mark
-  - use: fail
-  - use: greet
+  - id: mark
+    run: ["sh", "-c", "echo ran >> marker.txt; cat"]
+  - id: fail
+    run: ["cat"]
+  - id: greet
+    jq: '$inputs.name'
 "#,
     );
 
@@ -388,26 +364,21 @@ steps:
 }
 
 /// Locks in the documented behavior (docs/usage/ja/workflow.md, "実行の再開"):
-/// a `--var` passed alongside `--resume` overrides the recorded value for
+/// a `--input` passed alongside `--resume` overrides the recorded value for
 /// that run going forward — not just for the one resumed invocation.
 #[test]
-fn resume_with_var_persists_the_override_into_the_checkpoint() {
+fn resume_with_input_persists_the_override_into_the_checkpoint() {
     let dir = ConfigDirectory::empty();
     let broken = r#"
-nodes:
-  mark:
-    type: command
-    command: ["sh", "-c", "echo ran >> marker.txt; cat"]
-  fail:
-    type: command
-    command: ["sh", "-c", "exit 1"]
-  greet:
-    type: transform
-    jq: '$vars.name'
+inputs:
+  name: string
 steps:
-  - use: mark
-  - use: fail
-  - use: greet
+  - id: mark
+    run: ["sh", "-c", "echo ran >> marker.txt; cat"]
+  - id: fail
+    run: ["sh", "-c", "exit 1"]
+  - id: greet
+    jq: '$inputs.name'
 "#;
     dir.write("workflow.yml", broken);
 
@@ -418,7 +389,7 @@ steps:
             "workflow.yml",
             "null",
             "--checkpoint",
-            "--var",
+            "--input",
             "name=world",
             "--no-config",
         ])
@@ -427,7 +398,7 @@ steps:
     assert!(!failed.status.success());
     let run_id = run_ids(&dir)[0].clone();
 
-    // Resume with a different --var; this attempt still fails at the same
+    // Resume with a different --input; this attempt still fails at the same
     // step (the workflow is untouched), but the checkpoint must now record
     // 'universe', not the original 'world'.
     let resumed_with_override = test_command()
@@ -437,7 +408,7 @@ steps:
             "workflow.yml",
             "--resume",
             &run_id,
-            "--var",
+            "--input",
             "name=universe",
             "--no-config",
         ])
@@ -455,25 +426,20 @@ steps:
     assert!(show_stdout.contains("universe"), "{show_stdout}");
     assert!(!show_stdout.contains("world"), "{show_stdout}");
 
-    // Fix the workflow and resume once more without --var: the persisted
+    // Fix the workflow and resume once more without --input: the persisted
     // override ('universe'), not the original value, must be used.
     dir.write(
         "workflow.yml",
         r#"
-nodes:
-  mark:
-    type: command
-    command: ["sh", "-c", "echo ran >> marker.txt; cat"]
-  fail:
-    type: command
-    command: ["cat"]
-  greet:
-    type: transform
-    jq: '$vars.name'
+inputs:
+  name: string
 steps:
-  - use: mark
-  - use: fail
-  - use: greet
+  - id: mark
+    run: ["sh", "-c", "echo ran >> marker.txt; cat"]
+  - id: fail
+    run: ["cat"]
+  - id: greet
+    jq: '$inputs.name'
 "#,
     );
 

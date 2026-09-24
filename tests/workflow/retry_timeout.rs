@@ -15,15 +15,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{{{ input }}}}"
     retry:
       max_attempts: 2
-steps:
-  - id: call
-    use: call
 "#,
         server.base_url
     ));
@@ -55,21 +51,14 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{{{ input }}}}"
     retry:
       max_attempts: 2
-  recover:
-    type: transform
-    jq: '.input'
-steps:
-  - id: call
-    use: call
     on_error:
-      steps:
-        - use: recover
+      - id: recover
+        jq: '.input'
 "#,
         server.base_url
     ));
@@ -98,12 +87,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -130,14 +116,10 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    timeout: 1
 steps:
   - id: call
-    use: call
+    prompt: "{{{{ input }}}}"
+    timeout: 1
 "#,
         server.base_url
     ));
@@ -178,12 +160,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -200,5 +179,42 @@ steps:
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "mock response"
+    );
+}
+
+#[test]
+fn a_group_retries_and_recovers_as_one_unit() {
+    let dir = ConfigDirectory::empty();
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - id: attempt
+    retry: { max_attempts: 2 }
+    group:
+      - run: ["sh", "-c", "echo x >> attempts.txt; wc -l < attempts.txt | tr -d ' '"]
+        output: tonumber
+      - when: '. < 2'
+        jq: 'error("first attempt fails")'
+  - id: guarded
+    group:
+      - jq: 'error("always")'
+    on_error:
+      - jq: '{recovered: (.error | contains("always")), was: .input}'
+"#,
+    );
+
+    let output = test_command()
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&workflow.path)
+        .args(["start", "--no-history", "--no-config"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"{"recovered":true,"was":2}"#
     );
 }

@@ -9,7 +9,7 @@
 //! no tty under `cargo test`), so every case here exercises the
 //! non-interactive "decline without prompting" path — the same real,
 //! wire-level request/response round trip a real terminal session would use,
-//! just always answered the same way. `tests/ask.rs` covers `type: ask` the
+//! just always answered the same way. `tests/ask.rs` covers `ask:` steps the
 //! same way, for the same reason (see its own doc comment).
 
 #![cfg(unix)]
@@ -62,13 +62,10 @@ models:
     - provider:
         base_url: "{base_url}"
       model_id: test-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{{{ input }}}}"
     mcp: [mock]
-steps:
-  - use: call
 "#
     )
 }

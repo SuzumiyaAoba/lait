@@ -223,13 +223,11 @@ fn requires_model_option() {
 #[test]
 fn rejects_an_empty_or_whitespace_command_program_before_execution() {
     for program in ["", "  "] {
-        let workflow = WorkflowFile::new(&format!(
-            "nodes:\n  n:\n    type: command\n    command: [\"{program}\"]\nsteps:\n  - use: n\n"
-        ));
+        let workflow = WorkflowFile::new(&format!("steps:\n  - id: n\n    run: [\"{program}\"]\n"));
         let output = run_lait_workflow(&workflow.path, "input");
 
         assert!(!output.status.success(), "workflow unexpectedly succeeded");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("command[0]"), "stderr: {stderr}");
+        assert!(stderr.contains("run"), "stderr: {stderr}");
     }
 }

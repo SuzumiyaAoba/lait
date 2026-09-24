@@ -110,12 +110,9 @@ models:
         base_url: "{}"
         api_key_cmd: ["sh", "-c", "touch '{}' ; printf replay-secret"]
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: call
+  - id: call
+    prompt: "{{{{ input }}}}"
 "#,
             server.base_url,
             marker.display()

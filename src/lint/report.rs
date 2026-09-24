@@ -219,7 +219,7 @@ fn escape_github_annotation(message: &str) -> String {
 
 /// Best-effort line lookup for an issue that has no line of its own (i.e.
 /// everything except a YAML parse failure — see `yaml_error_line`): most
-/// lint messages name the offending thing in single quotes (`node 'x'`,
+/// lint messages name the offending thing in single quotes (`step 'x'`,
 /// `unknown MCP server 'y'`, ...), which is usually also how it appears
 /// literally in the source (a YAML mapping key, a list entry, ...). Returns
 /// the 1-based line of the first line containing that quoted text, or `None`
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn first_quoted_identifier_extracts_the_first_single_quoted_span() {
         assert_eq!(
-            first_quoted_identifier("node 'extract': unknown skill 'nope'"),
+            first_quoted_identifier("step 'extract': unknown skill 'nope'"),
             Some("extract")
         );
     }
@@ -260,13 +260,19 @@ mod tests {
 
     #[test]
     fn guess_line_finds_the_line_containing_the_quoted_identifier() {
-        let source = "nodes:\n  extract:\n    type: prompt\n    prompt: hi\n";
-        assert_eq!(guess_line(source, "node 'extract' is unused"), Some(2));
+        let source = "steps:\n  - id: extract\n    prompt: hi\n";
+        assert_eq!(
+            guess_line(source, "step 'extract' references input 'x'"),
+            Some(2)
+        );
     }
 
     #[test]
     fn guess_line_is_none_when_nothing_matches() {
-        let source = "nodes:\n  extract:\n    type: prompt\n";
-        assert_eq!(guess_line(source, "node 'missing' is unused"), None);
+        let source = "steps:\n  - id: extract\n    prompt: hi\n";
+        assert_eq!(
+            guess_line(source, "step 'missing' references input 'x'"),
+            None
+        );
     }
 }

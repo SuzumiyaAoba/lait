@@ -1,6 +1,11 @@
-use super::{
-    SchemaKind, document_schema_json, unrecognized_type_names, validate_input_against_schema,
-};
+use super::{SchemaKind, document_schema_json, unrecognized_type_names, validate_value};
+
+fn validate_input_against_schema(
+    schema: &serde_json::Value,
+    input: &serde_json::Value,
+) -> anyhow::Result<()> {
+    validate_value(schema, input, "input")
+}
 use serde_json::json;
 
 #[test]
@@ -223,13 +228,20 @@ fn every_embedded_schema_compiles() {
 }
 
 const COMPREHENSIVE_WORKFLOW_YAML: &str = r#"
-version: 1
+version: 2
 name: sample
 description: exercises most of the workflow vocabulary
+inputs:
+  topic: string
+  count: { type: integer, default: 3, description: how many }
+  anything:
+output: '{result: ., topic: $inputs.topic}'
+timeout: 120
 default:
   model: local
   reasoning_effort: medium
   temperature: 0.5
+  system: "you are concise"
   retry:
     max_attempts: 3
     delay_seconds: 1
@@ -239,7 +251,6 @@ default:
   skills: [style]
   subagents: [helper]
   tools: [echo]
-  workflow_timeout: 120
 models:
   local:
     - provider:
@@ -251,25 +262,30 @@ models:
         input_per_1m: 1.0
         output_per_1m: 2.0
       api: responses
-json_schemas:
+schemas:
   inline_example:
-    schema:
-      type: object
+    type: object
   file_example:
-    file_path: ./schema.json
-nodes:
-  summarize:
-    type: prompt
+    file: ./schema.json
+agents:
+  writer:
+    description: writes things
     model: local
+    output_schema: { type: object }
+    schema_name: written
+    tools: [echo]
+    system: "write about {{ input }}"
+steps:
+  - id: summarize
     prompt: "summarize {{ input }}"
-    system_prompt: "you are concise"
+    system: "you are concise"
+    model: local
     files: ["./context.txt"]
     images: ["./picture.png"]
     input_schema: inline_example
-    output_schema: inline_example
+    output_schema: { file: ./out.json }
     schema_name: summary
-    jq: ".summary"
-    write_file: ./out.txt
+    output: ".summary"
     retry:
       max_attempts: 2
     timeout: 10
@@ -278,59 +294,54 @@ nodes:
     skills: [style]
     subagents: [helper]
     tools: [echo]
-  delegate:
-    type: agent
-    agent: ./agents/researcher.md
+    when: "true"
+    input: "."
+    on_error:
+      - jq: ".error"
+  - agent: writer
+  - agent: ./agents/researcher.md
     model: local
-  sub:
-    type: workflow
-    workflow: ./sub.yml
-  run_cmd:
-    type: command
-    command: ["echo", "{{ input }}"]
-  reshape:
-    type: transform
-    jq: "."
-  confirm:
-    type: ask
-    prompt: "continue?"
+  - workflow: ./sub.yml
+    with: "{topic: $inputs.topic}"
+  - run: ["echo", "{{ input }}"]
+  - jq: "."
+  - ask: "continue?"
     choices: ["yes", "no"]
     default: "yes"
-steps:
+    multiline: false
+  - write: "./out/{{ inputs.topic }}.txt"
+  - group:
+      - jq: "."
   - id: route
     switch:
-      cases:
-        - when: "true"
-          steps:
-            - use: summarize
-      else:
-        - use: reshape
+      - when: "true"
+        steps:
+          - jq: "."
+    else:
+      - jq: "."
   - id: fanout
     parallel:
-      branches:
-        - id: branch-a
-          steps:
-            - use: run_cmd
-        - id: branch-b
-          steps:
-            - use: reshape
-      join: "."
+      branch-a:
+        - run: ["echo", "a"]
+      branch-b:
+        - jq: "."
   - id: repeat
-    loop:
-      while: "false"
-      max_iterations: 3
-      steps:
-        - use: reshape
+    while: "false"
+    max_iterations: 3
+    steps:
+      - jq: "."
+  - until: "true"
+    max_iterations: 3
+    steps:
+      - break: true
   - id: each
-    for_each:
-      items: "[1, 2, 3]"
-      max_concurrency: 2
-      steps:
-        - use: reshape
-  - use: delegate
-  - use: sub
-  - use: confirm
+    for_each: "[1, 2, 3]"
+    max_concurrency: 2
+    steps:
+      - write: "item-{{ loop.index }}.txt"
   - stop: true
+    when: "true"
+    output: "."
 "#;
 
 #[test]
@@ -475,12 +486,10 @@ temperature: 0.5
 top_p: 0.9
 max_tokens: 512
 input_schema:
-  schema:
-    type: object
-    required: [text]
+  type: object
+  required: [text]
 output_schema:
-  file_path: ./schema.json
-structured_output: true
+  file: ./schema.json
 schema_name: summary
 mcp: [fs]
 max_tool_rounds: 4
@@ -522,20 +531,30 @@ fn agent_schema_rejects_an_invalid_reasoning_effort() {
     );
 }
 #[test]
-fn workflow_schema_and_parser_reject_invalid_control_shapes() {
+fn workflow_schema_and_parser_reject_invalid_step_shapes() {
     let validator = compiled_schema(SchemaKind::Workflow);
     for step in [
         "{}",
+        "{id: x}",
         "{stop: false}",
         "{break: false}",
-        "{use: n, stop: true, break: true}",
-        "{use: n, loop: {while: 'true', max_iterations: 1, steps: [{use: n}]}}",
-        "{loop: {while: 'true', until: 'true', max_iterations: 1, steps: [{use: n}]}}",
-        "{parallel: {branches: []}}",
-        "{switch: {cases: []}}",
-        "{use: n, on_error: {steps: []}}",
+        "{stop: true, retry: {max_attempts: 1}}",
+        "{jq: '.', prompt: hi}",
+        "{jq: '.', model: local}",
+        "{while: 'true', until: 'true', max_iterations: 1, steps: [{jq: '.'}]}",
+        "{until: 'true', steps: [{jq: '.'}]}",
+        "{for_each: '.'}",
+        "{parallel: {}}",
+        "{switch: []}",
+        "{group: []}",
+        "{jq: '.', on_error: []}",
+        "{use: n}",
+        "{prompt: hi, schema_name: answer}",
+        "{run: []}",
+        "{ask: hi, choices: []}",
+        "{jq: '.', id: '1bad'}",
     ] {
-        let source = format!("nodes:\n  n: {{type: transform, jq: '.'}}\nsteps: [{step}]\n");
+        let source = format!("steps: [{step}]\n");
         assert!(
             crate::workflow::parse_workflow(&source).is_err(),
             "parser accepted {step}"
@@ -546,6 +565,7 @@ fn workflow_schema_and_parser_reject_invalid_control_shapes() {
         );
     }
 }
+
 #[test]
 fn published_schemas_reject_sampling_values_rejected_by_runtime() {
     for settings in [
@@ -582,7 +602,7 @@ fn published_schemas_reject_sampling_values_rejected_by_runtime() {
             (SchemaKind::Config, serde_json::json!({"default": settings})),
             (
                 SchemaKind::Workflow,
-                serde_json::json!({"default": settings, "steps": [{"stop": true}]}),
+                serde_json::json!({"default": settings, "steps": [{"jq": "."}]}),
             ),
         ] {
             assert!(
@@ -593,37 +613,9 @@ fn published_schemas_reject_sampling_values_rejected_by_runtime() {
     }
 }
 #[test]
-fn workflow_schema_and_parser_reject_incomplete_node_actions() {
-    let validator = compiled_schema(SchemaKind::Workflow);
-    for node in [
-        "{type: prompt}",
-        "{type: prompt, prompt: hi, schema_name: answer}",
-        "{type: transform}",
-        "{type: command, command: ['  ']}",
-        "{type: ask, prompt: '  '}",
-        "{type: ask, prompt: hi, choices: []}",
-        "{type: ask, prompt: hi, choices: ['']}",
-    ] {
-        let source = format!("nodes:\n  n: {node}\nsteps: [{{use: n}}]\n");
-        assert!(
-            crate::workflow::parse_workflow(&source).is_err(),
-            "parser accepted {node}"
-        );
-        assert!(
-            !validator.is_valid(&yaml_to_json(&source)),
-            "schema accepted {node}"
-        );
-    }
-}
-
-#[test]
-fn agent_schema_rejects_inconsistent_structured_output_settings() {
+fn agent_schema_and_parser_reject_a_schema_name_without_an_output_schema() {
     let validator = compiled_schema(SchemaKind::Agent);
-    for source in [
-        "structured_output: true\n",
-        "output_schema: {schema: {type: object}}\n",
-        "output_schema: {schema: {type: object}}\nstructured_output: false\n",
-    ] {
+    for source in ["schema_name: answer\n", "structured_output: true\n"] {
         let path = temp_fixture_path("agent-structured-output", "md");
         std::fs::write(&path, format!("---\n{source}---\nPrompt")).unwrap();
         let parsed = crate::agent::load_agent(&path);
@@ -635,15 +627,19 @@ fn agent_schema_rejects_inconsistent_structured_output_settings() {
         );
     }
 }
+
 #[test]
 fn workflow_schema_matches_runtime_retry_and_deadline_constraints() {
     let validator = compiled_schema(SchemaKind::Workflow);
-    for defaults in [
-        "{workflow_timeout: 0}",
-        "{retry: {}}",
-        "{retry: {max_attempts: 1, backoff: -1}}",
+    for document in [
+        "timeout: 0",
+        "default: {timeout: 0}",
+        "default: {retry: {}}",
+        "default: {retry: {max_attempts: 0}}",
+        "default: {retry: {max_attempts: 1, backoff: -1}}",
+        "default: {workflow_timeout: 5}",
     ] {
-        let source = format!("default: {defaults}\nsteps: [{{stop: true}}]\n");
+        let source = format!("{document}\nsteps: [{{jq: '.'}}]\n");
         assert!(crate::workflow::parse_workflow(&source).is_err());
         assert!(
             !validator.is_valid(&yaml_to_json(&source)),

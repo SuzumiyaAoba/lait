@@ -48,12 +48,9 @@ models:
     - provider:
         base_url: "{base_url}"
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: call
+  - id: call
+    prompt: "{{{{ input }}}}"
 "#
     )
 }

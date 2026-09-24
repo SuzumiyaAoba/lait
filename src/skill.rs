@@ -170,7 +170,7 @@ fn format_skill_frontmatter(skill: &SkillFile, qualified_tool_name: &str) -> Str
 /// `SkillCache`'s lifetime: a skill file's content doesn't change over the
 /// course of one `lait run`/`lait agent run`/chat invocation, so every call
 /// after the first for a given name reuses this instead of re-reading and
-/// re-parsing the file (which a `for_each`/`loop` node with `skills:` set
+/// re-parsing the file (which a `for_each`/`while`/`until` step with `skills:` set
 /// would otherwise do on every iteration, and which
 /// `default.skill_progressive_disclosure: true` would otherwise do twice per
 /// name — once for the system prompt's frontmatter, once for a

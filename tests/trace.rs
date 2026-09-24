@@ -30,13 +30,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
   - id: greet
-    use: call
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -92,13 +88,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
   - id: greet
-    use: call
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -159,14 +151,10 @@ models:
     - provider:
         base_url: "{base_url}"
       model_id: workflow-model
-nodes:
-  ask:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    tools: [echo]
 steps:
   - id: ask-step
-    use: ask
+    prompt: "{{{{ input }}}}"
+    tools: [echo]
 "#
     )
 }

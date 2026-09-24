@@ -16,7 +16,7 @@ use crate::file_lock;
 
 use super::blocking::run_blocking_with_path_lock;
 
-/// Writes a workflow node's output from a dedicated OS thread. The worker is
+/// Writes a workflow step's output from a dedicated OS thread. The worker is
 /// kept off Tokio's runtime because a write to a special file such as a FIFO
 /// can block indefinitely. A timeout sets the worker's cancellation flag and
 /// waits for it to finish; Unix special files are opened non-blocking so that
@@ -145,7 +145,7 @@ fn write_regular_output_file(file: &mut File, output: &str, cancelled: &AtomicBo
     // direct truncation is what preserves the existing inode, permissions,
     // hard links, and symlink-following semantics of `fs::write`, but it is
     // not an atomic replacement. The caller receives an error and must not
-    // treat the partial bytes as a completed node output.
+    // treat the partial bytes as a completed step output.
     file.set_len(0)?;
     for chunk in output.as_bytes().chunks(64 * 1024) {
         if cancelled.load(Ordering::Acquire) {

@@ -37,7 +37,7 @@ use crate::{
     config::{self, ConfigSource},
     deps, docgen,
     engine::{AppServices, RunContext},
-    error, history, lint, skill, subagent, trace, workflow,
+    history, lint, skill, subagent, trace, workflow,
 };
 
 mod chat_run;
@@ -54,10 +54,6 @@ mod workflow_run;
 use chat_run::run_chat_or_repl;
 use prompt_run::{run_agent, run_prompt};
 use workflow_run::run_workflow;
-
-/// Re-exported so `workflow_run::run_workflow` (a descendant module, via
-/// `super::missing_prompt_error`) keeps its existing reference path.
-pub(crate) use error::missing_prompt_error;
 
 /// Every subcommand (and the bare, no-subcommand invocation) that never
 /// awaits anything — no model request, no MCP connection — grouped by

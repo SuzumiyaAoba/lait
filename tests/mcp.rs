@@ -785,15 +785,12 @@ models:
     - provider:
         base_url: "{}"
       model_id: test-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{{{ input }}}}"
     mcp: [mock]
     retry:
       max_attempts: 2
-steps:
-  - use: call
 "#,
         llm_server.base_url
     ));
@@ -844,16 +841,13 @@ models:
     - provider:
         base_url: "{}"
       model_id: test-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{{{ input }}}}"
     mcp: [mock]
-    timeout: 1
     retry:
       max_attempts: 2
-steps:
-  - use: call
+    timeout: 1
 "#,
         llm_url
     ));
@@ -944,14 +938,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: test-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{{{ input }}}}"
     mcp: [mock]
     timeout: 1
-steps:
-  - use: call
 "#,
         llm_url
     ));
@@ -997,13 +988,10 @@ models:
     - provider:
         base_url: "{}"
       model_id: test-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{{{ input }}}}"
     mcp: [mock]
-steps:
-  - use: call
 "#,
         llm_server.base_url
     ));
@@ -1040,14 +1028,11 @@ models:
     - provider:
         base_url: "http://127.0.0.1:1/v1"
       model_id: test-model
-nodes:
-  call:
-    type: prompt
+steps:
+  - id: call
     prompt: "{{ input }}"
     mcp: [mock]
     timeout: 1
-steps:
-  - use: call
 "#,
     );
 

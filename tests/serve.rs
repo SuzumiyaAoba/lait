@@ -63,7 +63,7 @@ async fn serve_mcp_exposes_and_runs_configured_agents_and_workflows() {
     );
     config.write(
         "workflow.yml",
-        "default:\n  model: test-model\nnodes:\n  greet:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: greet\n",
+        "default:\n  model: test-model\nsteps:\n  - id: greet\n    prompt: \"{{ input }}\"\n",
     );
 
     let transport = TokioChildProcess::new(serve_command(config.path()))
@@ -162,7 +162,7 @@ async fn serve_mcp_skips_a_workflow_with_an_ask_node() {
     );
     config.write(
         "workflow.yml",
-        "nodes:\n  ask_it:\n    type: ask\n    prompt: \"pick one\"\n    default: \"a\"\nsteps:\n  - use: ask_it\n",
+        "steps:\n  - id: ask_it\n    ask: \"pick one\"\n    default: \"a\"\n",
     );
 
     let transport = TokioChildProcess::new(serve_command(config.path()))

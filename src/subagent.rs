@@ -29,16 +29,16 @@ pub(crate) fn list(file_config: &config::ConfigFile) -> Result<()> {
     })
 }
 
-/// One agent file (an `agents:` entry, or a workflow node's `agent:` path),
+/// One agent file (an `agents:` entry, or a workflow step's `agent:` path),
 /// loaded and canonicalized once then cached for the registry's lifetime
 /// (see `AgentRegistry`). `canonical_path` is kept alongside `file` because
 /// a recursive subagent call (a subagent whose own `subagents:` names
 /// another) needs it to detect a cycle or excessive nesting the same way
-/// `WorkflowScope`/`check_workflow_nesting` do for `workflow:` nodes — see
+/// `WorkflowScope`/`check_workflow_nesting` do for `workflow:` steps — see
 /// `engine::call_subagent_tool`. `tool_parameters` is resolved once here too
 /// (not rebuilt by `AgentRegistry::tools` on every call): it resolves
-/// `file.input_schema`, which for a `file_path:` entry means reading and
-/// parsing a JSON file — real I/O that a `for_each`/`loop` workflow node
+/// `file.input_schema`, which for a `{file: ...}` source means reading and
+/// parsing a JSON file — real I/O that a `for_each`/`while`/`until` workflow step
 /// would otherwise repeat on every iteration, the same waste
 /// `mcp::McpRegistry`'s own `tool_lists` cache avoids for MCP tools.
 #[derive(Debug)]
@@ -51,7 +51,7 @@ pub(crate) struct LoadedAgent {
 impl LoadedAgent {
     /// Validates a subagent tool call's `input` against `file.input_schema`,
     /// using the value already resolved into `tool_parameters` instead of
-    /// re-reading a `file_path:` schema from disk on every call the way
+    /// re-reading a `{file: ...}` schema from disk on every call the way
     /// `AgentFile::validate_input` does — the same repeated I/O
     /// `tool_parameters` itself was cached to avoid. A no-op when the agent
     /// has no `input_schema`, mirroring `AgentFile::validate_input`.
@@ -59,7 +59,7 @@ impl LoadedAgent {
         if self.file.input_schema.is_none() {
             return Ok(());
         }
-        schema::validate_input_against_schema(&self.tool_parameters, input)
+        schema::validate_value(&self.tool_parameters, input, "input")
     }
 
     /// The OpenAI/MCP-shaped tool `parameters` schema resolved for this
@@ -73,14 +73,14 @@ impl LoadedAgent {
 
 /// The agent files in play for one `lait run`/`lait agent run`/chat
 /// invocation: named `agents:` entries made available as callable "subagent"
-/// tools (see `AgentRegistry::tools`), and workflow nodes' own `agent:`
+/// tools (see `AgentRegistry::tools`), and workflow steps' own `agent:`
 /// paths (see `AgentRegistry::load_path`), both loaded through the same
 /// cache. Mirrors `skill::SkillCache`: agent files are loaded lazily
 /// (parsing never sees the config file) and cached by their configured path
 /// for the registry's lifetime, since an agent file's content doesn't change
-/// over the course of one invocation — without this, a `for_each`/`loop`
-/// node with `agent:` set would re-read and re-parse the same file (and its
-/// `file_path:` input schema) on every iteration. `AsyncCache` gives each
+/// over the course of one invocation — without this, a `for_each`/`while`/`until`
+/// step with `agent:` set would re-read and re-parse the same file (and its
+/// `{file: ...}` input schema) on every iteration. `AsyncCache` gives each
 /// path its own `OnceCell`, so two concurrent branches (or concurrent tool
 /// calls within one round — see `engine::RequestSettings::complete`) racing
 /// on the same path share one load instead of two.

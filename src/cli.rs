@@ -604,17 +604,15 @@ pub(crate) struct PromptRunArgs {
 }
 
 /// `--var KEY=VALUE`, shared by `lait prompt run <NAME>`, `-p`/
-/// `--prompt-name` on single-shot chat, and `lait run` — every entry point
-/// that renders a `{{ vars.<key> }}` template placeholder.
+/// `--prompt-name` on single-shot chat — every entry point that renders a
+/// `{{ vars.<key> }}` template placeholder (`lait run` binds a workflow's
+/// declared `inputs:` with `--input` instead).
 #[derive(Debug, Clone, Args)]
 pub(crate) struct VarArgs {
     /// Set a template variable: `--var KEY=VALUE`. Repeatable; a later
     /// `--var` for the same key wins. For a named prompt (`lait prompt run
     /// <NAME>` or `-p`/`--prompt-name`), overrides that prompt's `vars:`
-    /// default. For `lait run`, VALUE is parsed as JSON when possible
-    /// (`--var items='["a","b"]'`), otherwise used as a plain string;
-    /// exposed to step templates as `{{ vars.KEY }}` and to jq filters as
-    /// `$vars.KEY`.
+    /// default.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub(crate) var: Vec<String>,
 }
@@ -740,7 +738,7 @@ pub(crate) struct InitArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum InitKind {
-    /// A workflow YAML scaffold (`nodes:` + `steps:`).
+    /// A workflow YAML scaffold (`inputs:` + `steps:`).
     Workflow,
     /// An agent Markdown scaffold (frontmatter + system prompt).
     Agent,
@@ -781,17 +779,18 @@ pub(crate) struct RunArgs {
     #[arg(value_name = "FILE")]
     pub(crate) file: PathBuf,
 
-    /// The initial input passed to the first step's `{{ input }}` placeholder.
-    /// May be omitted when input is piped via stdin (which is then used as the
-    /// input; when both are given, the piped text is appended to PROMPT).
+    /// The initial value passed to the first step as `{{ input }}` (a
+    /// string). May be omitted when input is piped via stdin (which is then
+    /// used; when both are given, the piped text is appended to PROMPT), or
+    /// when the workflow declares `inputs:` (the initial value is then null).
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
 
     /// Show the resolved execution plan (step order, resolved model/
-    /// base_url, effective retry/timeout, and when/switch/parallel/loop/
-    /// for_each structure) without calling a model, spawning an MCP server,
-    /// or running a command. PROMPT/--var are used to render each step's
-    /// template as far as they can be (see docs/usage/ja/workflow.md).
+    /// base_url, effective retry/timeout, and control-flow structure) without
+    /// calling a model, spawning an MCP server, or running a command.
+    /// PROMPT/--input are used to render templates as far as they can be
+    /// (see docs/usage/ja/workflow.md).
     #[arg(long)]
     pub(crate) dry_run: bool,
 
@@ -835,8 +834,13 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) trace_file: Option<PathBuf>,
 
-    #[command(flatten)]
-    pub(crate) var: VarArgs,
+    /// Bind one of the workflow's declared `inputs:`: `--input KEY=VALUE`.
+    /// Repeatable; a later `--input` for the same key wins. VALUE is kept
+    /// verbatim for an input declared `type: string`, and parsed as JSON
+    /// otherwise when possible (`--input items='["a","b"]'`). Exposed to
+    /// templates as `{{ inputs.KEY }}` and to jq as `$inputs.KEY`.
+    #[arg(long = "input", value_name = "KEY=VALUE")]
+    pub(crate) input: Vec<String>,
 
     #[command(flatten)]
     pub(crate) reporting: ReportingArgs,

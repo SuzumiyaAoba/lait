@@ -42,15 +42,16 @@ macOS arm64 で `ld: library not found for -liconv` が発生する場合は、`
   共有サービスの終了は最上位の所有者が行い、個々の実行コンテキストから終了させません。
   `config::Endpoint` は認証情報の取得方法を選ぶだけで、シークレット取得コマンドは
   実際の要求時に `SecretResolver` が非同期で実行します。
-- `workflow::NodeSettings` はノード共通の設定を借用して参照するための型です。
-  YAML の読み込み型はノード種別ごとに保ち、不適切なフィールドを引き続き拒否します。
-  各制御構造の実行処理は `workflow/exec.rs` の専用関数に分かれています。
-- `workflow/raw.rs` のステップは読み込み専用です。ノード参照と制御構造の配置を検証してから、
-  `FlowStep` の実行用列挙型へ変換します。実行・lint・graph はこの検証済みの型だけを受け取り、
-  YAML を直接実行用ステップへ deserialize しません。構文の制約を変更する場合は
-  `schemas/workflow.json` も更新し、パーサーと Schema の整合性テストを追加します。
-  `use:` の参照先も変換時に確定し、ノード定義を `Arc` で共有します。実行中の再検索や
-  「ノードが存在するはず」という `expect` に依存しません。
+- ワークフローは `workflow/parse.rs` が YAML を読み込み、ステップの種類キー・フィールドの
+  組み合わせ・id の重複・スキーマ参照・jq/テンプレートの構文・`break`/`stop`/`ask`/`write`
+  の配置をすべて検証してから、`workflow/model.rs` の `Step`/`StepKind` へ変換します。
+  実行（`workflow/exec.rs`）・dry-run・graph・lint はこの検証済みの型だけを受け取ります。
+  構文を変更する場合は `schemas/workflow.json` も更新し、パーサーと Schema の整合性テストを
+  追加します。
+- `workflow/exec.rs` はステップ間の値を `serde_json::Value` のまま扱い、テキストが必要な
+  境界（ユーザーメッセージ・標準入力・書き出し・最終出力）でだけ `template::to_text` で
+  文字列にします。jq とテンプレートは `jq::Globals`（`$steps`/`$inputs`/`$loop`）という
+  同じ文脈を共有します。
 - `engine::ToolLoop` はモデルとの会話履歴、ツール集合、ラウンド上限、ツール実行を管理します。
   ストリームの有無にかかわらず同じ状態管理を使います。
 - `engine/stream.rs` はストリームの集約と表示を扱います。出力先を `AsyncWrite` として

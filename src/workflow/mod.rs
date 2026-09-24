@@ -1,15 +1,15 @@
 //! Workflow file loading, validation, and the registry `lait run`/`lait
 //! lint` resolve a `FILE` argument or a `workflows:` registry name against
-//! (see [`resolve_run_target`]). The step/router/node types themselves live
-//! in `model.rs` (re-exported here via `pub(crate) use model::*`) and their
-//! execution in `exec`; this module is the entry point that ties file
-//! resolution, parsing, and [`WorkflowScope`] construction together before
-//! handing off to `exec::run_steps`. [`WorkflowRegistry`] caches a loaded,
-//! validated `WorkflowFile` by canonical path so a `workflow:` node inside a
-//! `for_each`/`loop` body does not re-read and re-parse the same sub-workflow
-//! file on every iteration — the same `AsyncCache`-backed pattern
-//! `subagent::AgentRegistry` uses for its own by-path cache (`skill::SkillCache`
-//! caches the analogous way, but keyed by skill name rather than path).
+//! (see [`resolve_run_target`]). The document/step types live in `model.rs`
+//! (re-exported here via `pub(crate) use model::*`), YAML-to-model parsing
+//! and load-time validation in `parse.rs`, `inputs:` binding in `inputs.rs`,
+//! and execution in `exec`; this module is the entry point that ties file
+//! resolution and parsing together before handing off to
+//! `exec::run_document`. [`WorkflowRegistry`] caches a loaded, validated
+//! `WorkflowFile` by path so a `workflow:` step inside a `for_each`/`while`/
+//! `until` body does not re-read and re-parse the same sub-workflow file on
+//! every iteration — the same `AsyncCache`-backed pattern
+//! `subagent::AgentRegistry` uses for its own by-path cache.
 
 use std::{
     path::{Path, PathBuf},
@@ -18,22 +18,28 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{async_cache::AsyncCache, async_io, config::ConfigFile, jq, registry, report};
-
-#[cfg(test)]
-use crate::template;
+use crate::{async_cache::AsyncCache, async_io, config::ConfigFile, registry, report};
 
 mod ask;
 pub(crate) mod dryrun;
 pub(crate) mod exec;
 pub(crate) mod graph;
-mod model;
-mod raw;
+pub(crate) mod inputs;
+pub(crate) mod model;
+pub(crate) mod parse;
 pub(crate) mod scope;
-mod validate;
 
 pub(crate) use model::*;
 pub(crate) use scope::WorkflowScope;
+
+/// Named step outputs recorded by `id` while a workflow runs, exposed to
+/// templates as `{{ steps.<id> }}` and to jq as the `$steps` global. Only
+/// steps with an explicit `id` are recorded — the auto-generated `step-N`
+/// label used in progress output is not a stable name to reference. A
+/// copy-on-write `Arc` wrapper (see `jq::Steps`), so handing a snapshot to a
+/// jq worker, a `parallel` branch, or a checkpoint write is a refcount bump
+/// rather than a deep copy.
+pub(crate) type StepOutputs = crate::jq::Steps;
 
 #[cfg(test)]
 mod tests;
@@ -94,11 +100,11 @@ pub(crate) fn list(file_config: &ConfigFile) -> Result<()> {
 pub(crate) fn load_workflow(path: &Path) -> Result<WorkflowFile> {
     let contents = async_io::read_to_string_sync(path)
         .with_context(|| format!("failed to read workflow file '{}'", path.display()))?;
-    parse_workflow(&contents)
+    parse::parse_workflow(&contents, base_dir_of(path))
         .with_context(|| format!("failed to parse workflow file '{}'", path.display()))
 }
 
-/// Loads and compiles a workflow without blocking the async executor. The
+/// Loads and validates a workflow without blocking the async executor. The
 /// worker owns the bounded read and parsing work, and observes cancellation
 /// while waiting for a FIFO writer or reading the source.
 pub(crate) async fn load_workflow_cancellable(
@@ -114,7 +120,7 @@ pub(crate) async fn load_workflow_cancellable(
                 async_io::MAX_READ_BYTES,
             )
             .with_context(|| format!("failed to read workflow file '{}'", path.display()))?;
-            parse_workflow(&contents)
+            parse::parse_workflow(&contents, base_dir_of(&path))
                 .with_context(|| format!("failed to parse workflow file '{}'", path.display()))
         },
         cancellation,
@@ -122,15 +128,13 @@ pub(crate) async fn load_workflow_cancellable(
     .await
 }
 
-/// Caches parsed sub-workflow files across a run, keyed by their configured
-/// path spelling (matching `AgentRegistry`/`SkillCache`'s own per-path
-/// caches — see `AppServices`). Without this, a `for_each`/`loop` body
-/// with a `workflow:` node would re-read and re-parse the same YAML on
-/// every iteration; agents and skills already avoid exactly this. A
-/// canonical path (after symlink/`..` resolution) would collapse more
-/// aliases into one cache entry, but `scope::resolve_nested_path` already
-/// canonicalizes and cycle-checks before this is ever consulted, so in
-/// practice every call already sees the same spelling for the same file.
+/// Caches parsed sub-workflow files across a run, keyed by their canonical
+/// path (see `WorkflowScope::check_nested_path`, which canonicalizes and
+/// cycle-checks before this is ever consulted), matching `AgentRegistry`/
+/// `SkillCache`'s own caches — see `AppServices`. Without this, a
+/// `for_each`/`while`/`until` body with a `workflow:` step would re-read and
+/// re-parse the same YAML on every iteration; agents and skills already
+/// avoid exactly this.
 pub(crate) struct WorkflowRegistry {
     loaded: AsyncCache<PathBuf, WorkflowFile>,
 }
@@ -166,77 +170,19 @@ impl WorkflowRegistry {
     }
 }
 
-pub(crate) fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
-    let workflow: model::RawWorkflowFile = serde_yaml::from_str(contents).map_err(|error| {
-        // A node with no `type:` at all — the pre-version schema's shape —
-        // fails here with a "missing field `type`" message from the
-        // now-tagged `NodeDefinition` enum. That message alone doesn't say
-        // *why*, so point the author at the fix instead of leaving them to
-        // find B-1's changelog entry.
-        if error.to_string().contains("missing field `type`") {
-            anyhow::Error::new(error).context(
-                "every entry under 'nodes:' requires a 'type:' \
-                 (prompt/agent/workflow/command/transform/ask); see docs/usage/ja/workflow.md",
-            )
-        } else {
-            error.into()
-        }
-    })?;
-    workflow.validate()
-}
-
-/// Builds the `vars` object a `lait run --var KEY=VALUE` invocation exposes
-/// to step templates as `{{ vars.<key> }}` and to jq filters as
-/// `$vars.<key>` (see `engine::RunContext::vars`). Unlike a named prompt's
-/// `--var` (`prompt::build_vars`, always a string), each VALUE is parsed as
-/// JSON when possible — `--var items='["a","b"]'` becomes a structured
-/// array/object rather than its literal text — falling back to a plain JSON
-/// string otherwise, so `--var lang=ja` still renders as `ja`. A later
-/// `--var` for the same key wins.
-pub(crate) fn build_vars(
-    cli_vars: &[String],
-) -> Result<serde_json::Map<String, serde_json::Value>> {
-    let mut vars = serde_json::Map::new();
-    for raw in cli_vars {
-        let (key, value) = crate::prompt::parse_var(raw)?;
-        vars.insert(key, crate::template::parse_input(&value));
+/// The directory relative definition references in a workflow file are
+/// resolved against.
+fn base_dir_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
-    Ok(vars)
 }
 
-/// Named step outputs recorded by `id` while a workflow runs, exposed to
-/// prompts as `{{ steps.<id> }}` and to jq filters (`when`/`jq`/`switch`
-/// cases/`loop` conditions/`for_each.items`/every `join`) as the `$steps`
-/// global variable. Only steps with an explicit `id` are recorded — the
-/// auto-generated `step-N` label used in progress output is not a stable name
-/// to reference.
-pub(crate) type StepOutputs = jq::Steps;
-
-/// Evaluates a `when`/case-condition jq filter against the current input on a
-/// bounded blocking worker. Input coercion/serialization is performed by the
-/// worker as well, so a very large plain-text input cannot block a Tokio
-/// executor thread before jq starts evaluating it. `steps` is exposed to the
-/// filter as `$steps` (see `StepOutputs`), `vars` as `$vars` (see
-/// `engine::RunContext::vars`).
-pub(crate) async fn eval_when_async(
-    filter: &str,
-    current_input: &str,
-    steps: &StepOutputs,
-    vars: &StepOutputs,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<bool> {
-    jq::apply_bool_cancellable_async(filter, current_input, steps, vars, cancellation)
-        .await
-        .context("failed to evaluate 'when' condition")
-}
-
-/// Synchronous helper retained for the pure workflow unit tests. Runtime
-/// execution uses [`eval_when_async`] so jq never runs on Tokio's executor.
-#[cfg(test)]
-pub(crate) fn eval_when(filter: &str, current_input: &str, steps: &StepOutputs) -> Result<bool> {
-    let value = template::parse_input(current_input);
-    let input_json = serde_json::to_string(&value)
-        .context("failed to serialize the current input for a 'when' condition")?;
-    jq::apply_bool(filter, &input_json, steps, &StepOutputs::new())
-        .context("failed to evaluate 'when' condition")
+/// Parses workflow YAML as if it lived in the current directory: used by
+/// `deps::ops` to validate a fetched workflow file's bytes before the
+/// dependency is registered (the same parse a later `lait run` would do,
+/// moved to the fetch boundary), and by tests and schema cross-checks.
+pub(crate) fn parse_workflow(contents: &str) -> Result<WorkflowFile> {
+    parse::parse_workflow(contents, Path::new("."))
 }

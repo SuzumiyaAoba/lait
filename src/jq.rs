@@ -1,16 +1,14 @@
-//! jq filter evaluation for `when:`/`jq:`/`for_each.items`/`join`/assert
-//! conditions across the workflow engine — the sync and cancellable-async
-//! entry points (`apply*`/`apply*_cancellable*`) both funnel into
-//! `run_filter_with`, which compiles through the process-wide
-//! [`FILTER_CACHE`] rather than reparsing `filter_source` and the jq
-//! standard-library prelude on every call. Lives at the crate root rather
-//! than under `workflow/` because `lint.rs`'s `check_syntax` path validates
-//! filter syntax independently of any one workflow node type, and because
-//! this module itself depends on `template::parse_input` for normalizing a
-//! filter's input value.
+//! jq expression evaluation for every jq-valued workflow field (`when:`,
+//! `jq:`, `output:`, `for_each:`, `while:`/`until:`, `switch` cases, a
+//! top-level `output:`) and `assert` conditions. Every evaluation must
+//! produce exactly one value ([`eval_one_async`]/[`eval_bool_async`]), and
+//! both funnel into `run_filter_with`, which compiles through the
+//! process-wide [`FILTER_CACHE`] rather than reparsing `filter_source` and
+//! the jq standard-library prelude on every call. Lives at the crate root
+//! rather than under `workflow/` because `lint.rs`'s `check_syntax` path
+//! validates filter syntax independently of any one workflow step kind.
 
 use std::{
-    borrow::Cow,
     mem::size_of,
     sync::{Arc, LazyLock, atomic::AtomicBool},
 };
@@ -24,11 +22,11 @@ use jaq_core::{
 use jaq_json::{Val, read};
 use serde::{Deserialize, Serialize};
 
-use crate::{async_io, sync_cache::SyncCache, template};
+use crate::{async_io, sync_cache::SyncCache};
 
 mod limits;
 
-use limits::{OutputWriter, render_value_into};
+use limits::render_value_into;
 
 /// A compiled jq filter, keyed by its source text in [`FILTER_CACHE`]. The
 /// lookup-table representation a filter compiles to (`jaq_core::Filter`'s
@@ -43,30 +41,31 @@ const _: fn() = || {
     assert_send_sync_static::<CompiledFilter>();
 };
 
+/// A compiled filter plus which of [`GLOBAL_NAMES`] its own source text ever
+/// mentions — see [`compiled_filter`]'s doc comment for why a substring
+/// search is a sound proxy for "does this filter read the global", and
+/// [`run_filter_with`] for how the flags are used.
+struct CachedFilter {
+    filter: Arc<CompiledFilter>,
+    uses_steps: bool,
+    uses_inputs: bool,
+    uses_loop: bool,
+}
+
 /// Filters compiled by [`compiled_filter`], shared across every jq call in
 /// the process. Every `run_filter_with`/`check_syntax` invocation parses and
 /// compiles the same fixed prelude (`jaq_core`/`jaq_std`/`jaq_json`'s
 /// `defs()`, ~200 lines of jq source) plus `filter_source` itself; caching
 /// the compiled result means only the first call for a given filter text
-/// pays that cost, which matters most for `for_each`/`loop` bodies that
-/// re-evaluate the same `when:`/`jq:` filter many times. Deliberately left
-/// unbounded: for a single `lait run`/`lait chat` process, a workflow's set
-/// of distinct filter strings is fixed at parse time, so this cannot grow
-/// without bound the way a per-request cache could. `lait lint <DIR>`
+/// pays that cost, which matters most for `for_each`/`while`/`until` bodies
+/// that re-evaluate the same `when:`/`jq:` filter many times. Deliberately
+/// left unbounded: for a single `lait run`/`lait chat` process, a workflow's
+/// set of distinct filter strings is fixed at parse time, so this cannot
+/// grow without bound the way a per-request cache could. `lait lint <DIR>`
 /// recursing over many workflow files is the one case where this grows
 /// across a whole directory tree rather than one workflow — still bounded
 /// by the number of distinct filter strings on disk, and the process exits
 /// once linting finishes, so this is not a genuine leak.
-/// A compiled filter plus whether its own source text ever mentions
-/// `$steps`/`$vars` — see [`compiled_filter`]'s doc comment for why a
-/// substring search is a sound proxy for "does this filter read the
-/// global", and [`run_filter_with`] for how the two `bool`s are used.
-struct CachedFilter {
-    filter: Arc<CompiledFilter>,
-    uses_steps: bool,
-    uses_vars: bool,
-}
-
 static FILTER_CACHE: LazyLock<SyncCache<CachedFilter>> = LazyLock::new(SyncCache::new);
 
 /// Parses and compiles `filter_source` (defs/funs prelude plus the filter
@@ -80,21 +79,19 @@ static FILTER_CACHE: LazyLock<SyncCache<CachedFilter>> = LazyLock::new(SyncCache
 /// parse/compile below is never cached, so presence in the cache is sound
 /// evidence validation already passed.
 ///
-/// The prelude and `with_global_vars(["$steps", "$vars"])` are fixed across
-/// every caller (`run_filter_with` and `check_syntax` alike), so neither
-/// needs to be part of the cache key.
+/// The prelude and `with_global_vars(GLOBAL_NAMES)` are fixed across every
+/// caller (`run_filter_with` and `check_syntax` alike), so neither needs to
+/// be part of the cache key.
 ///
-/// Also records whether `filter_source` mentions `$steps`/`$vars` at all
-/// (see [`CachedFilter`]), computed once here rather than on every
+/// Also records whether `filter_source` mentions each global at all (see
+/// [`CachedFilter`]), computed once here rather than on every
 /// [`run_filter_with`] call. jq has no syntax for constructing a variable
 /// name dynamically — a global reference is always the literal token
-/// `$steps`/`$vars` somewhere in the source, including inside a string
-/// interpolation like `"\($steps.a)"` — so a plain substring search never
-/// produces a false negative. A string *literal* that merely contains the
-/// text `"$steps"` (with no `$` — jq string literals cannot themselves
-/// interpolate a bare `$name` without the interpolation syntax) is the only
-/// possible false positive, and it only costs the global a construction
-/// that then goes unused, never a missing one.
+/// `$steps`/`$inputs`/`$loop` somewhere in the source, including inside a
+/// string interpolation like `"\($steps.a)"` — so a plain substring search
+/// never produces a false negative. A string *literal* that merely contains
+/// the text is the only possible false positive, and it only costs the
+/// global a construction that then goes unused, never a missing one.
 fn compiled_filter(filter_source: &str) -> Result<Arc<CachedFilter>> {
     FILTER_CACHE.get_or_init(filter_source, |filter_source| {
         let program = File {
@@ -104,10 +101,10 @@ fn compiled_filter(filter_source: &str) -> Result<Arc<CachedFilter>> {
         let defs = jaq_core::defs()
             .chain(jaq_std::defs())
             .chain(jaq_json::defs());
-        // Turbofished for the same reason `check_syntax` used to spell it out:
-        // nothing downstream of `compiled_filter` builds a `Ctx` to pin `D`
-        // retroactively, since the whole point is to hand back a filter whose
-        // `D` is already fixed to `data::JustLut<Val>` (see `CompiledFilter`).
+        // Turbofished: nothing downstream of `compiled_filter` builds a `Ctx`
+        // to pin `D` retroactively, since the whole point is to hand back a
+        // filter whose `D` is already fixed to `data::JustLut<Val>` (see
+        // `CompiledFilter`).
         let funs = jaq_core::funs::<data::JustLut<Val>>()
             .chain(jaq_std::funs())
             .chain(jaq_json::funs());
@@ -119,7 +116,7 @@ fn compiled_filter(filter_source: &str) -> Result<Arc<CachedFilter>> {
             .map_err(|errors| anyhow!("failed to parse jq filter {filter_source:?}: {errors:?}"))?;
         let filter: CompiledFilter = Compiler::default()
             .with_funs(funs)
-            .with_global_vars(["$steps", "$vars"])
+            .with_global_vars(GLOBAL_NAMES)
             .compile(modules)
             .map_err(|errors| {
                 anyhow!("failed to compile jq filter {filter_source:?}: {errors:?}")
@@ -128,23 +125,23 @@ fn compiled_filter(filter_source: &str) -> Result<Arc<CachedFilter>> {
         Ok(CachedFilter {
             filter: Arc::new(filter),
             uses_steps: filter_source.contains("$steps"),
-            uses_vars: filter_source.contains("$vars"),
+            uses_inputs: filter_source.contains("$inputs"),
+            uses_loop: filter_source.contains("$loop"),
         })
     })
 }
 
 /// jq is intentionally run in a bounded worker rather than on Tokio's
-/// executor. These limits keep a filter that emits an unbounded stream from
-/// growing the final rendered output without limit. Values are rendered as
-/// they are yielded instead of being collected into a `Vec<Val>` first: the
-/// latter makes a stream-producing filter an easy memory exhaustion vector.
-/// A filter that needs more output should be split into smaller workflow
-/// steps. The worker still observes workflow cancellation between yielded
-/// values; the outer async wrapper bounds cleanup if jaq is inside one very
-/// expensive value-producing operation.
+/// executor. These limits keep a filter from materializing an unbounded
+/// result: every evaluation must produce exactly one value (see
+/// [`eval_one`]/[`eval_bool`]), and that value is rendered into a bounded
+/// buffer before jaq is asked for a second one, so a stream-producing filter
+/// is rejected after its second value instead of being collected. The worker
+/// observes workflow cancellation between yielded values; the outer async
+/// wrapper bounds cleanup if jaq is inside one very expensive
+/// value-producing operation.
 const MAX_FILTER_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_OUTPUT_VALUES: usize = 100_000;
 const MAX_RENDERED_BYTES: usize = 16 * 1024 * 1024;
 /// Upper bound for the approximate heap occupied by one yielded value. The
 /// rendered-size limit alone is insufficient: a value such as
@@ -156,17 +153,14 @@ const MAX_VALUE_STRUCTURE_BYTES: usize = 64 * 1024 * 1024;
 /// produced by jq rather than just values parsed from input.
 const MAX_VALUE_DEPTH: usize = 1024;
 
-/// Named step outputs recorded by `id` (see `workflow::StepOutputs`), exposed
-/// to jq filters as the `$steps` global variable (e.g. `$steps.extract.city`).
-/// The same type also holds `--var KEY=VALUE` overrides exposed as `$vars`
-/// (e.g. `$vars.lang`, see `engine::RunContext::vars`) — both are flat JSON
-/// objects keyed by name.
+/// A flat JSON object keyed by name: recorded step outputs (`$steps`, see
+/// `workflow::StepOutputs`) or a workflow's resolved inputs (`$inputs`).
 ///
 /// Copy-on-write over an `Arc`, not a plain `serde_json::Map`: a `for_each`
-/// item/`parallel` branch/`loop` iteration each need their own independent
+/// item/`parallel` branch/`while`/`until` iteration each need their own independent
 /// view of the accumulated step outputs so far (see `workflow::exec`'s
 /// `record_step_output`, this type's one write path), and every jq call
-/// (`when:`/`jq:`/`for_each.items`/every `join`) previously paid a full deep
+/// (`when:`/`jq:`/`output:`/`for_each:`/every loop condition) previously paid a full deep
 /// clone of that accumulated map just to hand a worker thread an owned copy
 /// it only ever reads (`run_cancellable_async` below). `Deref` makes reads
 /// (`.get`, iteration, `RenderScope::new`'s `&serde_json::Map` parameter via
@@ -245,184 +239,128 @@ impl From<serde_json::Map<String, serde_json::Value>> for Steps {
     }
 }
 
-/// Runs a jq filter while allowing a caller that owns the evaluation worker
-/// to request a cooperative stop.  jaq evaluates filters lazily, so checking
-/// between yielded values lets large/infinite generators stop promptly after
-/// a workflow timeout without leaving a detached thread running to completion.
-/// The check is also made around parsing/compilation and while rendering the
-/// collected values so cancellation cannot accidentally turn into success.
-fn apply_cancellable(
-    filter_source: &str,
-    input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
-    cancelled: &AtomicBool,
-) -> Result<String> {
-    check_cancelled(cancelled)?;
-    let mut output = OutputWriter::new(cancelled);
-    run_filter_with(filter_source, input_json, steps, vars, cancelled, |value| {
-        output.render(filter_source, &value)
-    })?;
-    output.finish(filter_source)
+/// The global variables every jq expression can reference, in the order
+/// they are declared to the compiler (see [`GLOBAL_NAMES`]).
+pub(crate) const GLOBAL_NAMES: [&str; 3] = ["$steps", "$inputs", "$loop"];
+
+/// The values bound to [`GLOBAL_NAMES`] for one evaluation: `$steps` (the
+/// outputs recorded by `id` so far), `$inputs` (the running workflow file's
+/// resolved `inputs:`), and `$loop` (the innermost `for_each`/`while`/
+/// `until` iteration's `{index, item}` object, `null` outside any loop).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Globals {
+    pub(crate) steps: Steps,
+    pub(crate) inputs: Steps,
+    pub(crate) loop_context: serde_json::Value,
 }
 
-/// Shared scaffolding for the three `*_cancellable_async` entry points below:
-/// owns the input/steps/vars so the operation can run on a dedicated blocking
-/// worker, normalizes the input once inside that worker (so parsing a large
-/// plain-text input cannot monopolize a Tokio executor thread before the
-/// worker gets a chance to observe cancellation), then delegates to the
-/// synchronous, already-cancellable variant.
+/// Evaluates a jq filter that must produce exactly one value, returning it.
+/// Zero or several outputs are an error: collect a stream explicitly with
+/// `[...]` instead.
+#[cfg(test)]
+pub(crate) fn eval_one(
+    filter_source: &str,
+    input: &serde_json::Value,
+    globals: &Globals,
+) -> Result<serde_json::Value> {
+    let input_json = serialize_input(input)?;
+    eval_one_inner(
+        filter_source,
+        &input_json,
+        globals,
+        &crate::cancellation::NEVER_SET,
+    )
+}
+
+/// Evaluates a jq filter as a condition: it must produce exactly one value,
+/// which is falsy iff it is `false` or `null` (jq's own truthiness rules).
+#[cfg(test)]
+pub(crate) fn eval_bool(
+    filter_source: &str,
+    input: &serde_json::Value,
+    globals: &Globals,
+) -> Result<bool> {
+    let input_json = serialize_input(input)?;
+    eval_bool_inner(
+        filter_source,
+        &input_json,
+        globals,
+        &crate::cancellation::NEVER_SET,
+    )
+}
+
+/// [`eval_one`] on a bounded blocking worker. The input is serialized inside
+/// the worker, so a very large value cannot block a Tokio executor thread
+/// before cancellation gets a chance to win.
+pub(crate) async fn eval_one_async(
+    filter_source: &str,
+    input: &serde_json::Value,
+    globals: &Globals,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<serde_json::Value> {
+    run_cancellable_async(filter_source, input, globals, cancellation, eval_one_inner).await
+}
+
+/// [`eval_bool`] on a bounded blocking worker.
+pub(crate) async fn eval_bool_async(
+    filter_source: &str,
+    input: &serde_json::Value,
+    globals: &Globals,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<bool> {
+    run_cancellable_async(filter_source, input, globals, cancellation, eval_bool_inner).await
+}
+
+/// Owns the filter/input/globals so the operation can run on a dedicated
+/// blocking worker, serializes the input there, then delegates to the
+/// synchronous, cancellable evaluation.
 async fn run_cancellable_async<T, F>(
     filter_source: &str,
-    input: &str,
-    steps: &Steps,
-    vars: &Steps,
+    input: &serde_json::Value,
+    globals: &Globals,
     cancellation: tokio_util::sync::CancellationToken,
     op: F,
 ) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&str, &str, &Steps, &Steps, &AtomicBool) -> Result<T> + Send + 'static,
+    F: FnOnce(&str, &str, &Globals, &AtomicBool) -> Result<T> + Send + 'static,
 {
     let filter_source = filter_source.to_owned();
-    let input = input.to_owned();
-    let steps = steps.clone();
-    let vars = vars.clone();
+    let input = input.clone();
+    let globals = globals.clone();
     async_io::run_blocking(
         move |cancelled| {
-            let input_json = normalize_input(&input)?;
-            op(&filter_source, &input_json, &steps, &vars, cancelled)
+            check_cancelled(cancelled)?;
+            let input_json = serialize_input(&input)?;
+            op(&filter_source, &input_json, &globals, cancelled)
         },
         cancellation,
     )
     .await
 }
 
-/// Runs a cancellable jq transform through the same bounded blocking-worker
-/// pool as filesystem operations. Keeping worker admission here means every
-/// node jq call shares one global thread limit instead of creating an
-/// unbounded detached OS thread per timeout.
-pub(crate) async fn apply_cancellable_async(
-    filter_source: &str,
-    input: &str,
-    steps: &Steps,
-    vars: &Steps,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<String> {
-    run_cancellable_async(
-        filter_source,
-        input,
-        steps,
-        vars,
-        cancellation,
-        apply_cancellable,
-    )
-    .await
-}
-
-/// Runs a jq filter as a boolean condition on a bounded blocking worker.
-pub(crate) async fn apply_bool_cancellable_async(
-    filter_source: &str,
-    input: &str,
-    steps: &Steps,
-    vars: &Steps,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<bool> {
-    run_cancellable_async(
-        filter_source,
-        input,
-        steps,
-        vars,
-        cancellation,
-        apply_bool_cancellable,
-    )
-    .await
-}
-
-/// Runs a jq filter that must produce exactly one value on a bounded blocking
-/// worker. This is the execution path used by `for_each.items`; it retains
-/// JSON quoting for string results, unlike `apply`'s jq-style raw rendering.
-pub(crate) async fn apply_one_cancellable_async(
-    filter_source: &str,
-    input: &str,
-    steps: &Steps,
-    vars: &Steps,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<String> {
-    run_cancellable_async(
-        filter_source,
-        input,
-        steps,
-        vars,
-        cancellation,
-        apply_one_cancellable,
-    )
-    .await
-}
-
-/// Runs a jq filter as a boolean condition (used by workflow `when:` guards).
-/// The filter must produce exactly one output value; that value is falsy iff
-/// it is JSON `false` or `null` (jq's own truthiness rules), truthy otherwise.
-/// Kept `pub(crate)` (not just test-only, despite the `#[cfg(test)]` at its
-/// only call site) because `workflow::eval_when` — itself `#[cfg(test)]`,
-/// retained for the pure workflow unit tests — calls this directly rather
-/// than `apply_bool_cancellable_async`; removing it would also break
-/// `src/workflow/tests.rs`'s dependency on that synchronous chain.
-#[cfg(test)]
-pub(crate) fn apply_bool(
-    filter_source: &str,
-    input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
-) -> Result<bool> {
-    apply_bool_inner(
-        filter_source,
-        input_json,
-        steps,
-        vars,
-        &crate::cancellation::NEVER_SET,
-    )
+fn serialize_input(input: &serde_json::Value) -> Result<String> {
+    serde_json::to_string(input).context("failed to serialize jq input")
 }
 
 /// Parses and compiles `filter_source` without running it against any input,
 /// to check its syntax statically (used by the workflow/agent linter, which
-/// has no `$steps`/input value at hand yet). Goes through the same
+/// has no input value at hand yet). Goes through the same
 /// [`compiled_filter`] cache `run_filter_with` uses, so a filter the linter
-/// already checked (or that a prior workflow run already compiled) doesn't
-/// pay the parse/compile cost twice. A filter that only references `$steps`
-/// still compiles here, since `with_global_vars` is declared the same way
-/// `run_filter_with` does.
+/// already checked doesn't pay the parse/compile cost twice. Every name in
+/// [`GLOBAL_NAMES`] is declared, the same way `run_filter_with` declares
+/// them, so a filter that references `$steps`/`$inputs`/`$loop` still
+/// compiles here.
 pub(crate) fn check_syntax(filter_source: &str) -> Result<()> {
     validate_filter_source(filter_source)?;
     compiled_filter(filter_source)?;
     Ok(())
 }
 
-fn apply_bool_cancellable(
+fn eval_bool_inner(
     filter_source: &str,
     input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
-    cancelled: &AtomicBool,
-) -> Result<bool> {
-    apply_bool_inner(filter_source, input_json, steps, vars, cancelled)
-}
-
-fn apply_one_cancellable(
-    filter_source: &str,
-    input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
-    cancelled: &AtomicBool,
-) -> Result<String> {
-    apply_one_inner(filter_source, input_json, steps, vars, cancelled)
-}
-
-fn apply_bool_inner(
-    filter_source: &str,
-    input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
+    globals: &Globals,
     cancelled: &AtomicBool,
 ) -> Result<bool> {
     // Conditions do not return their value to the caller, but they still
@@ -432,29 +370,28 @@ fn apply_bool_inner(
     run_single_value(
         filter_source,
         input_json,
-        steps,
-        vars,
+        globals,
         cancelled,
         "condition",
         |value, _| Ok(!matches!(value, Val::Null | Val::Bool(false))),
     )
 }
 
-fn apply_one_inner(
+fn eval_one_inner(
     filter_source: &str,
     input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
+    globals: &Globals,
     cancelled: &AtomicBool,
-) -> Result<String> {
+) -> Result<serde_json::Value> {
     run_single_value(
         filter_source,
         input_json,
-        steps,
-        vars,
+        globals,
         cancelled,
         "filter",
-        |_, rendered| String::from_utf8(rendered).context("jq rendered output was not valid UTF-8"),
+        |_, rendered| {
+            serde_json::from_slice(&rendered).context("jq rendered output was not valid JSON")
+        },
     )
 }
 
@@ -463,37 +400,29 @@ fn apply_one_inner(
 /// (sole) value into a bounded scratch buffer before handing it to `extract`
 /// — importantly, that render happens before the filter is asked for its
 /// next value, so a second, oversized value cannot slip through uncounted.
-/// `label` distinguishes the two callers' error text ("condition" for
-/// `when:` guards, "filter" for `for_each.items`).
+/// `label` distinguishes conditions from value-producing filters in error
+/// text.
 fn run_single_value<T>(
     filter_source: &str,
     input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
+    globals: &Globals,
     cancelled: &AtomicBool,
     label: &str,
     mut extract: impl FnMut(Val, Vec<u8>) -> Result<T>,
 ) -> Result<T> {
     let mut result = None;
     let mut count = 0usize;
-    run_filter_with(filter_source, input_json, steps, vars, cancelled, |value| {
+    run_filter_with(filter_source, input_json, globals, cancelled, |value| {
         count += 1;
         if count > 1 {
             bail!(
-                "jq {label} {filter_source:?} produced {count} outputs; expected exactly one value"
+                "jq {label} {filter_source:?} produced {count} outputs; expected exactly one value \
+                 (wrap a stream in '[...]' to collect it into an array)"
             );
         }
         let mut rendered = Vec::new();
-        render_value_into(
-            &value,
-            false,
-            &mut rendered,
-            0,
-            MAX_RENDERED_BYTES,
-            MAX_RENDERED_BYTES,
-            cancelled,
-        )
-        .with_context(|| format!("jq {label} {filter_source:?}"))?;
+        render_value_into(&value, &mut rendered, cancelled)
+            .with_context(|| format!("jq {label} {filter_source:?}"))?;
         result = Some(extract(value, rendered)?);
         Ok(())
     })?;
@@ -505,8 +434,7 @@ fn run_single_value<T>(
 fn run_filter_with<F>(
     filter_source: &str,
     input_json: &str,
-    steps: &Steps,
-    vars: &Steps,
+    globals: &Globals,
     cancelled: &AtomicBool,
     mut on_value: F,
 ) -> Result<()>
@@ -530,76 +458,64 @@ where
     let cached = compiled_filter(filter_source)?;
     check_cancelled(cancelled)?;
 
-    // Skip converting a `Steps` value into a jaq `Val` tree (`parse_global_var`
-    // walks the whole thing — see its doc comment) when `filter_source`
-    // never references the corresponding global. This is the "$steps
-    // conversion on every `for_each` item, even for a `when:` guard that
-    // never reads it" cost `Steps`'s `Arc`-wrapping (P7-3) left
-    // unaddressed — see that struct's doc comment for the measurement that
-    // found it. `Vars::new` is positional, not name-keyed, so the unused
-    // slot is simply never read; substituting `Val::Null` for it is safe
+    // Skip converting a global into a jaq `Val` tree (`parse_global_var`
+    // walks the whole thing) when `filter_source` never references it —
+    // the common case for a `when:` guard that only inspects the current
+    // value, where `$steps` may have accumulated every named step's output
+    // so far. `Vars::new` is positional, not name-keyed, so an unused slot
+    // is simply never read; substituting `Val::Null` for it is safe
     // regardless of which position it occupies.
     let steps_val = if cached.uses_steps {
-        parse_global_var(steps, "$steps")?
+        parse_global_var(globals.steps.as_map(), "$steps")?
     } else {
         Val::Null
     };
     check_cancelled(cancelled)?;
-    let vars_val = if cached.uses_vars {
-        parse_global_var(vars, "$vars")?
+    let inputs_val = if cached.uses_inputs {
+        parse_global_var(globals.inputs.as_map(), "$inputs")?
+    } else {
+        Val::Null
+    };
+    check_cancelled(cancelled)?;
+    let loop_val = if cached.uses_loop {
+        parse_global_var(&globals.loop_context, "$loop")?
     } else {
         Val::Null
     };
     check_cancelled(cancelled)?;
 
-    let ctx = Ctx::<data::JustLut<Val>>::new(&cached.filter.lut, Vars::new([steps_val, vars_val]));
-    for (output_count, result) in cached
-        .filter
-        .id
-        .run((ctx, input))
-        .map(unwrap_valr)
-        .enumerate()
-    {
+    let ctx = Ctx::<data::JustLut<Val>>::new(
+        &cached.filter.lut,
+        Vars::new([steps_val, inputs_val, loop_val]),
+    );
+    for result in cached.filter.id.run((ctx, input)).map(unwrap_valr) {
         check_cancelled(cancelled)?;
-        if output_count >= MAX_OUTPUT_VALUES {
-            bail!(
-                "jq filter {filter_source:?} produced more than the configured limit of {} outputs",
-                MAX_OUTPUT_VALUES
-            );
-        }
         let value =
             result.map_err(|error| anyhow!("jq filter {filter_source:?} failed: {error}"))?;
-        // `on_value` is invoked before jaq is asked to produce its next value.
-        // In particular, apply_bool/apply_one reject the second value here,
-        // instead of collecting the rest of an otherwise unbounded stream.
+        // `on_value` is invoked before jaq is asked to produce its next value,
+        // so `run_single_value` rejects the second value here instead of
+        // collecting the rest of an otherwise unbounded stream.
         on_value(value)?;
     }
     check_cancelled(cancelled)?;
     Ok(())
 }
 
-/// Converts a `Steps`-shaped global (`$steps` or `$vars`) directly into a jaq
+/// Converts a global (`$steps`/`$inputs`, or `$loop`) directly into a jaq
 /// `Val`, bounding its resulting structure the same way the jq input itself
-/// is bounded. `label` (`"$steps"`/`"$vars"`) names the global in the error
-/// text.
-///
-/// This used to go through `serde_json::to_string` followed by
-/// `read::parse_single` — a full JSON-text serialize-then-reparse round trip
-/// paid on every single jq call (every `when:` guard, every `jq:` node,
-/// every `for_each` item), where `value` is `steps_outputs`: the accumulated
-/// output of every named step so far, which for LLM workflows can be
-/// KB-to-MB sized and only grows as a run progresses. `Val` implements
-/// `serde::Deserialize` (the `jaq-json` "serde" feature enables this), and
-/// `serde_json::Map<String, Value>` implements `serde::Deserializer`
-/// directly over its own borrowed tree — so this walks `value` once, in
-/// memory, with no intermediate JSON text at all. The old `json.len() >
-/// MAX_INPUT_BYTES` pre-check existed to avoid parsing an oversized text
-/// blob; with no text produced there is nothing to pre-check, so
-/// `validate_value_structure` below — which bounds the resulting `Val`
-/// tree's depth/heap estimate directly — is now this function's only limit,
-/// same as it already is for the jq input value in `run_filter_with`.
-fn parse_global_var(value: &Steps, label: &str) -> Result<Val> {
-    let parsed = Val::deserialize(value.as_map())
+/// is bounded. `label` names the global in the error text. `Val` implements
+/// `serde::Deserialize` (the `jaq-json` "serde" feature) and
+/// `serde_json`'s borrowed `Map`/`Value` implement `serde::Deserializer`
+/// directly over their own trees, so this walks `value` once, in memory,
+/// with no intermediate JSON text — `$steps` can accumulate KB-to-MB of
+/// model output over a run, and a serialize-then-reparse round trip on
+/// every jq call would pay for that twice.
+fn parse_global_var<'a, D>(value: D, label: &str) -> Result<Val>
+where
+    D: serde::Deserializer<'a>,
+    D::Error: std::fmt::Display,
+{
+    let parsed = Val::deserialize(value)
         .map_err(|error| anyhow!("failed to convert {label} data to a jq value: {error}"))?;
     validate_value_structure(&parsed)
         .with_context(|| format!("jq '{label}' structure exceeds the configured memory limit"))?;
@@ -607,20 +523,14 @@ fn parse_global_var(value: &Steps, label: &str) -> Result<Val> {
 }
 
 /// The byte-length and nesting-depth checks below are a full char-by-char
-/// scan of `filter_source`, run on every call — including a `for_each`/`loop`
-/// body that calls the same `when:`/`jq:` filter hundreds of times over. Both
-/// callers (`check_syntax`, `run_filter_with`) already look this same
-/// `filter_source` up in [`FILTER_CACHE`] shortly afterwards via
-/// [`compiled_filter`], and a filter only ever enters that cache *after*
+/// scan of `filter_source`. Both callers (`check_syntax`, `run_filter_with`)
+/// look this same `filter_source` up in [`FILTER_CACHE`] shortly afterwards
+/// via [`compiled_filter`], and a filter only ever enters that cache *after*
 /// this exact scan has already passed (`compiled_filter` never caches a
 /// filter that failed to parse/compile, and this function is always called
-/// before it — see `compiled_filter`'s own doc comment for that invariant).
-/// So a cache hit here is sound evidence the scan below already ran once
+/// before it). So a cache hit here is sound evidence the scan already ran
 /// successfully for this exact source text; short-circuit on it instead of
-/// repeating the scan. This turns per-item validation into an O(1) lock +
-/// hash lookup after the first call for a given filter, while a filter that
-/// has never been seen (or that previously failed to compile, since a
-/// failure is never cached) still pays the full scan — exactly as before.
+/// repeating the scan for every `for_each` item or loop iteration.
 fn validate_filter_source(filter_source: &str) -> Result<()> {
     if FILTER_CACHE.contains(filter_source) {
         return Ok(());
@@ -678,35 +588,6 @@ fn validate_filter_source(filter_source: &str) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Converts workflow input to the JSON representation jq consumes. Valid JSON
-/// is preserved verbatim; plain text becomes a JSON string. This is kept in
-/// the blocking worker's closure so even the serialization of a very large
-/// plain-text input cannot block a Tokio executor thread.
-///
-/// The validity probe below only needs a yes/no answer, but deserializing
-/// into `serde_json::Value` builds a complete owned tree just to throw it
-/// away — for a large `input` (the previous step's output, potentially a
-/// sizeable model response), that is a full parse and allocation wasted on
-/// every call whose input happens to be valid JSON. `serde::de::IgnoredAny`
-/// still walks the whole input (so a truncated/invalid tail is still
-/// rejected exactly as before) but discards each value as it goes instead
-/// of materializing it, so this is `run_filter_with`'s own `read::
-/// parse_single` call doing the one real parse instead of two.
-///
-/// Returns `Cow` rather than `String` for the same reason: valid JSON is
-/// already exactly what jq should see, so the caller only needs to borrow
-/// `input` right back — `Cow::Borrowed` skips the copy that a `-> String`
-/// return type would have forced via `.to_owned()`. Only the plain-text
-/// path (which must build a new JSON string quoting the input) allocates.
-fn normalize_input(input: &str) -> Result<Cow<'_, str>> {
-    if serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok() {
-        return Ok(Cow::Borrowed(input));
-    }
-    serde_json::to_string(&template::parse_input(input))
-        .map(Cow::Owned)
-        .context("failed to serialize plain-text jq input")
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {

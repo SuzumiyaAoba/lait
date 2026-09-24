@@ -32,8 +32,7 @@ use support::{
 
 #[test]
 fn lint_reports_ok_for_a_valid_workflow_file() {
-    let workflow =
-        WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n");
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    prompt: hi\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
@@ -55,7 +54,7 @@ fn lint_reports_ok_for_a_valid_agent_file() {
 
 #[test]
 fn lint_fails_on_a_workflow_file_with_no_steps() {
-    let workflow = WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps: []\n");
+    let workflow = WorkflowFile::new("steps: []\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
@@ -85,9 +84,9 @@ fn lint_fails_on_an_agent_file_without_frontmatter() {
 }
 
 #[test]
-fn lint_warns_about_an_unused_node() {
+fn lint_warns_about_an_unused_schema() {
     let workflow = WorkflowFile::new(
-        "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
+        "schemas:\n  unused:\n    type: object\nsteps:\n  - id: used\n    prompt: hi\n",
     );
 
     let output = run_lait_lint(&[&workflow.path]);
@@ -105,9 +104,7 @@ fn lint_flags_an_unknown_mcp_server_name() {
     // rather than report every name as unknown), this exercises the "found a
     // config, but this name isn't in it" path.
     let config = ConfigDirectory::new("mcp_servers: {}\n");
-    let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
-    );
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    prompt: hi\n    mcp: [nope]\n");
 
     let output = test_command()
         .current_dir(config.path())
@@ -130,9 +127,7 @@ fn lint_flags_an_unknown_mcp_server_name() {
 #[test]
 fn lint_accepts_a_known_mcp_server_name() {
     let config = ConfigDirectory::new("mcp_servers:\n  known:\n    command: \"true\"\n");
-    let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
-    );
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    prompt: hi\n    mcp: [known]\n");
 
     let output = test_command()
         .current_dir(config.path())
@@ -169,9 +164,7 @@ fn lint_flags_an_unknown_skill_name_in_an_agent_file() {
 #[test]
 fn lint_skips_mcp_and_skill_checks_and_still_succeeds_without_a_config_file() {
     let config = ConfigDirectory::empty();
-    let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
-    );
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    prompt: hi\n    mcp: [nope]\n");
 
     // `--no-config` is a global flag, but `Cli::args_conflicts_with_subcommands`
     // means it must come after the subcommand's own args, not before (see
@@ -244,7 +237,7 @@ fn lint_detects_a_workflow_call_cycle() {
     std::fs::write(
         &a_path,
         format!(
-            "nodes:\n  sub:\n    type: workflow\n    workflow: {}\nsteps:\n  - use: sub\n",
+            "steps:\n  - id: sub\n    workflow: {}\n",
             b_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -252,7 +245,7 @@ fn lint_detects_a_workflow_call_cycle() {
     std::fs::write(
         &b_path,
         format!(
-            "nodes:\n  sub:\n    type: workflow\n    workflow: {}\nsteps:\n  - use: sub\n",
+            "steps:\n  - id: sub\n    workflow: {}\n",
             a_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -270,31 +263,31 @@ fn lint_detects_a_workflow_call_cycle() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cycle"), "stdout: {stdout}");
     assert!(
-        stdout.contains("in 'workflow:"),
+        stdout.contains("in workflow '"),
         "expected the cycle message to be attributed to the sub-workflow that found it: {stdout}"
     );
 }
 
-/// A sub-workflow referenced by two sibling nodes (not a cycle) is loaded
+/// A sub-workflow referenced by two sibling steps (not a cycle) is loaded
 /// from disk once per reference before `LintCtx::loaded_workflows`, but this
 /// pins that the *lint itself* still runs fully for each reference site: the
-/// shared file's own "unused node" warning must be reported twice, each
-/// correctly attributed to the node that referenced it, not deduplicated
-/// away by the load cache.
+/// shared file's own "unused schema" warning must be reported twice, each
+/// correctly attributed to the file it came from, not deduplicated away by
+/// the load cache.
 #[test]
-fn lint_reports_a_shared_sub_workflow_reference_from_each_referencing_node() {
+fn lint_reports_a_shared_sub_workflow_reference_from_each_referencing_step() {
     let shared_path = next_temp_path("lait-test-lint-shared", ".yml");
     let top_path = next_temp_path("lait-test-lint-top", ".yml");
 
     std::fs::write(
         &shared_path,
-        "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
+        "schemas:\n  unused: {type: object}\nsteps:\n  - id: used\n    prompt: hi\n",
     )
     .expect("failed to write shared sub-workflow file");
     std::fs::write(
         &top_path,
         format!(
-            "nodes:\n  first:\n    type: workflow\n    workflow: {shared}\n  second:\n    type: workflow\n    workflow: {shared}\nsteps:\n  - use: first\n  - use: second\n",
+            "steps:\n  - id: first\n    workflow: ./{shared}\n  - id: second\n    workflow: ./{shared}\n",
             shared = shared_path.file_name().unwrap().to_str().unwrap(),
         ),
     )
@@ -309,13 +302,13 @@ fn lint_reports_a_shared_sub_workflow_reference_from_each_referencing_node() {
     let unused_warnings = stdout.matches("'unused' is defined").count();
     assert_eq!(
         unused_warnings, 2,
-        "each of the two referencing nodes should surface the shared file's own unused-node \
+        "each of the two referencing steps should surface the shared file's own unused-schema \
          warning independently, not share a single cached result: {stdout}"
     );
     let shared_name = shared_path.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         stdout
-            .matches(&format!("in 'workflow: {shared_name}'"))
+            .matches(&format!("{shared_name}': schema 'unused'"))
             .count(),
         2,
         "each reference site should attribute its own copy of the shared file's issues: {stdout}"
@@ -324,9 +317,8 @@ fn lint_reports_a_shared_sub_workflow_reference_from_each_referencing_node() {
 
 #[test]
 fn lint_flags_an_agent_referenced_by_a_node_that_does_not_exist() {
-    let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    type: agent\n    agent: /nonexistent/lait-lint-test-agent.md\nsteps:\n  - use: a\n",
-    );
+    let workflow =
+        WorkflowFile::new("steps:\n  - id: a\n    agent: /nonexistent/lait-lint-test-agent.md\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
@@ -340,9 +332,7 @@ fn lint_flags_an_agent_referenced_by_a_node_that_does_not_exist() {
 
 #[test]
 fn lint_flags_an_invalid_jq_filter_in_a_when_condition() {
-    let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
-    );
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    when: \".[\"\n    prompt: hi\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
@@ -356,40 +346,36 @@ fn lint_flags_an_invalid_jq_filter_in_a_when_condition() {
 
 #[test]
 fn lint_flags_an_invalid_node_system_prompt_template() {
-    let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    system_prompt: \"{{ input\"\nsteps:\n  - use: a\n",
-    );
+    let workflow =
+        WorkflowFile::new("steps:\n  - id: a\n    prompt: hi\n    system: \"{{ input\"\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("'system'"), "stdout: {stdout}");
     assert!(
-        stdout.contains("'system_prompt' template"),
+        stdout.contains("failed to parse template"),
         "stdout: {stdout}"
     );
 }
 
 #[test]
 fn lint_flags_an_invalid_workflow_default_system_prompt_template() {
-    let workflow = WorkflowFile::new(
-        "default:\n  system_prompt: \"{{ input\"\nnodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
-    );
+    let workflow =
+        WorkflowFile::new("default:\n  system: \"{{ input\"\nsteps:\n  - id: a\n    prompt: hi\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("'system_prompt' template"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("'default.system'"), "stdout: {stdout}");
 }
 
 #[test]
 fn lint_warns_about_an_unrecognized_type_in_an_input_schema() {
     let workflow = WorkflowFile::new(
-        "json_schemas:\n  bad:\n    schema:\n      type: object\n      properties:\n        age:\n          type: sting\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    input_schema: bad\nsteps:\n  - use: a\n",
+        "schemas:\n  bad:\n    type: object\n    properties:\n      age:\n        type: sting\nsteps:\n  - id: a\n    prompt: hi\n    input_schema: bad\n",
     );
 
     let output = run_lait_lint(&[&workflow.path]);
@@ -405,15 +391,16 @@ fn lint_warns_about_an_unrecognized_type_in_an_input_schema() {
 
 #[test]
 fn lint_flags_an_empty_command_program() {
-    let workflow = WorkflowFile::new(
-        "nodes:\n  a:\n    type: command\n    command: [\"  \"]\nsteps:\n  - use: a\n",
-    );
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    run: [\"  \"]\n");
 
     let output = run_lait_lint(&[&workflow.path]);
 
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("command[0]"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("'run' must start with the program"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -421,8 +408,7 @@ fn lint_flags_a_model_definition_with_both_api_key_and_api_key_cmd() {
     let config = ConfigDirectory::new(
         "models:\n  cloud:\n    - provider:\n        base_url: https://api.example.com/v1\n        api_key: plain-key\n        api_key_cmd: \"printf x\"\n      model_id: cloud-model\n",
     );
-    let workflow =
-        WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n");
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    prompt: hi\n");
 
     let output = test_command()
         .current_dir(config.path())
@@ -442,10 +428,7 @@ fn lint_flags_a_model_definition_with_both_api_key_and_api_key_cmd() {
 #[test]
 fn lint_recurses_into_a_directory_argument() {
     let dir = ScratchDir::new();
-    dir.write(
-        "sub/workflow.yml",
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
-    );
+    dir.write("sub/workflow.yml", "steps:\n  - id: a\n    prompt: hi\n");
     dir.write("sub/agent.md", "---\nname: city-fact\n---\nbody\n");
     dir.write("sub/README.md", "# not an agent file, no frontmatter\n");
 
@@ -461,10 +444,7 @@ fn lint_recurses_into_a_directory_argument() {
 #[test]
 fn lint_directory_recursion_skips_target_and_node_modules() {
     let dir = ScratchDir::new();
-    dir.write(
-        "top.yml",
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
-    );
+    dir.write("top.yml", "steps:\n  - id: a\n    prompt: hi\n");
     // Deliberately invalid, so an accidental descent into either directory
     // would flip the overall exit code and show up in stdout.
     dir.write("target/build.yml", "steps: []\n");
@@ -514,9 +494,9 @@ fn lint_format_json_reports_a_structured_error_finding() {
 }
 
 #[test]
-fn lint_format_json_guesses_a_line_number_for_an_unused_node() {
+fn lint_format_json_guesses_a_line_number_for_an_unused_schema() {
     let workflow = WorkflowFile::new(
-        "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
+        "steps:\n  - id: used\n    prompt: hi\nschemas:\n  unused:\n    type: object\n",
     );
 
     let output = test_command()
@@ -566,8 +546,7 @@ fn lint_format_github_reports_error_annotations() {
 fn lint_format_json_reports_config_registry_errors_with_a_null_line() {
     let config =
         ConfigDirectory::new("workflows:\n  missing: /nonexistent/lait-lint-missing.yml\n");
-    let workflow =
-        WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n");
+    let workflow = WorkflowFile::new("steps:\n  - id: a\n    prompt: hi\n");
 
     let output = test_command()
         .current_dir(config.path())

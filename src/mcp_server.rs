@@ -14,21 +14,21 @@
 //! writes to `lait history` and never prints a `--show-usage` summary. This
 //! is a deliberate v1 boundary, not an oversight.
 //!
-//! # Why an `ask:` node is refused
+//! # Why an `ask:` step is refused
 //!
 //! stdout/stdin are the MCP JSON-RPC channel here (see `app::serve`), not a
-//! human terminal. A workflow's `ask:` node (`workflow::ask::run_ask`)
+//! human terminal. A workflow's `ask:` step (`workflow::ask::run_ask`)
 //! already guards itself against a non-interactive stdin (it falls back to
 //! `default:`/errors instead of reading), so the common case — a real MCP
 //! client, whose spawned child process never gets a tty for stdin — is safe
-//! on its own. But a workflow exposed here is refused outright if it defines
-//! an `ask:` node, so a user manually running `lait serve --mcp` from an
-//! interactive shell (where stdin *is* a tty) cannot accidentally race
-//! `workflow::ask::run_ask`'s blocking read against `rmcp`'s own JSON-RPC
-//! reader on the same file descriptor. This check only looks at the
-//! workflow file's own `nodes:` map — a nested `workflow:` node's *own*
-//! `ask:` node, in a different file, is not caught. See
-//! docs/usage/ja/serve.md.
+//! on its own. But a workflow exposed here is refused outright if any of its
+//! steps (at any nesting depth within the file) is an `ask:` step, so a user
+//! manually running `lait serve --mcp` from an interactive shell (where
+//! stdin *is* a tty) cannot accidentally race `workflow::ask::run_ask`'s
+//! blocking read against `rmcp`'s own JSON-RPC reader on the same file
+//! descriptor. This check only looks at the workflow file itself — a nested
+//! `workflow:` step's *own* `ask:` step, in a different file, is not caught.
+//! See docs/usage/ja/serve.md.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -45,10 +45,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     engine::{self, AppServices, RunContext},
-    mcp, report,
+    mcp, report, template,
     workflow::{
         self,
-        exec::{RunStepsFrame, run_steps},
+        exec::{Frame, run_document},
+        inputs,
     },
 };
 
@@ -156,25 +157,23 @@ impl LaitMcpServer {
         arguments_json: &str,
         cancellation: CancellationToken,
     ) -> Result<String> {
-        let input = workflow_tool_input(arguments_json)?;
-        let mut wf = workflow::load_workflow_cancellable(path, cancellation.clone()).await?;
-        let scope = workflow::WorkflowScope::top_level(&mut wf, path, cancellation.clone()).await?;
+        let (input, provided) = workflow_tool_input(arguments_json)?;
+        let wf = workflow::load_workflow_cancellable(path, cancellation.clone()).await?;
+        let resolved = inputs::resolve(&wf.inputs, inputs::from_object(provided))?;
+        let initial = match input {
+            Some(text) => {
+                inputs::resolve_initial(&wf, inputs::InitialInput::Text(text), cancellation.clone())
+                    .await?
+            }
+            None if wf.declares_inputs() => serde_json::Value::Null,
+            None => anyhow::bail!("workflow tool call is missing the required 'input' field"),
+        };
+        let scope =
+            workflow::WorkflowScope::top_level(&wf, path, resolved, cancellation.clone()).await?;
         let env = RunContext::new(Arc::clone(&self.services), cancellation.clone());
-        let outcome = run_steps(
-            &wf.steps,
-            input,
-            workflow::StepOutputs::new(),
-            RunStepsFrame {
-                scope: &scope,
-                env: &env,
-                start_counter: 0,
-                progress_prefix: "",
-                cancellation,
-                placement: Default::default(),
-            },
-        )
-        .await?;
-        Ok(outcome.output)
+        let (output, _) =
+            run_document(&wf, initial, Frame::new(&scope, &env, cancellation)).await?;
+        Ok(template::to_text(&output))
     }
 }
 
@@ -210,7 +209,7 @@ async fn build_agent_tool(
 }
 
 /// Returns `Ok(None)` (already reported via `report::note`) for a workflow
-/// this server declines to expose (an `ask:` node — see this module's doc
+/// this server declines to expose (an `ask:` step — see this module's doc
 /// comment); `Err` for a load/parse/qualify failure, which the caller
 /// reports itself so every skip reason is worded consistently.
 async fn build_workflow_tool(
@@ -221,13 +220,9 @@ async fn build_workflow_tool(
     let wf = workflow::load_workflow_cancellable(path, cancellation)
         .await
         .with_context(|| format!("failed to load workflow '{}'", path.display()))?;
-    if wf
-        .nodes
-        .values()
-        .any(|node| matches!(node.as_ref(), workflow::NodeDefinition::Ask(_)))
-    {
+    if contains_ask(&wf.steps) {
         report::note(format_args!(
-            "skipping workflow '{name}' as an MCP tool: it defines an 'ask:' node, which reads \
+            "skipping workflow '{name}' as an MCP tool: it has an 'ask:' step, which reads \
              stdin — unsafe under 'lait serve --mcp' (see docs/usage/ja/serve.md)"
         ));
         return Ok(None);
@@ -239,55 +234,112 @@ async fn build_workflow_tool(
         .unwrap_or_else(|| format!("Run the '{name}' workflow."));
     Ok(Some((
         qualified.clone(),
-        Tool::new(qualified, description, workflow_input_schema()),
+        Tool::new(qualified, description, workflow_input_schema(&wf)),
     )))
 }
 
-/// The fixed MCP tool schema for every `workflow__<name>` tool: a single
-/// required `input` string, matching `lait run <name> <INPUT>`'s own
-/// positional argument exactly — a workflow file has no `input_schema`
-/// concept of its own (unlike an agent file's `input_schema:`, which
-/// `build_agent_tool` exposes verbatim), so this is deliberately not
-/// per-workflow.
-fn workflow_input_schema() -> serde_json::Map<String, serde_json::Value> {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "input": {
-                "type": "string",
-                "description": "The input passed as {{ input }} to this workflow: a plain-text \
-                    string, or JSON text if the workflow expects structured input."
-            }
-        },
-        "required": ["input"]
+/// Whether any step in `steps`, at any nesting depth within this file, is
+/// an `ask:` step — see this module's doc comment.
+fn contains_ask(steps: &[workflow::Step]) -> bool {
+    steps.iter().any(|step| {
+        if matches!(step.kind, workflow::StepKind::Ask(_)) {
+            return true;
+        }
+        let mut found = false;
+        step.for_each_child(|_, children| found = found || contains_ask(children));
+        found
     })
-    .as_object()
-    .cloned()
-    .expect("literal above is a JSON object")
+}
+
+/// The MCP tool schema for a `workflow__<name>` tool: an `input` string
+/// matching `lait run <name> <PROMPT>`'s own positional argument (required
+/// unless the workflow declares `inputs:`, the same rule `lait run` applies),
+/// and an `inputs` object carrying the workflow's declared `inputs:` — each
+/// entry's own JSON Schema verbatim, required unless it has a `default`.
+fn workflow_input_schema(
+    wf: &workflow::WorkflowFile,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "input".to_owned(),
+        serde_json::json!({
+            "type": "string",
+            "description": "The workflow's initial value ({{ input }} of its first step): a \
+                plain-text string, or JSON text if the workflow's 'input_schema' expects \
+                structured input."
+        }),
+    );
+    let mut required = Vec::new();
+    if wf.declares_inputs() {
+        let mut input_properties = serde_json::Map::new();
+        let mut required_inputs = Vec::new();
+        for (name, definition) in &wf.inputs {
+            let mut schema = definition.schema.clone();
+            if let (Some(description), Some(object)) =
+                (&definition.description, schema.as_object_mut())
+            {
+                object
+                    .entry("description")
+                    .or_insert_with(|| serde_json::Value::String(description.clone()));
+            }
+            input_properties.insert(name.clone(), schema);
+            if definition.default.is_none() {
+                required_inputs.push(serde_json::Value::String(name.clone()));
+            }
+        }
+        properties.insert(
+            "inputs".to_owned(),
+            serde_json::json!({
+                "type": "object",
+                "description": "Values for the workflow's declared 'inputs:'.",
+                "properties": input_properties,
+                "required": required_inputs,
+            }),
+        );
+        if !required_inputs.is_empty() {
+            required.push(serde_json::Value::String("inputs".to_owned()));
+        }
+    } else {
+        required.push(serde_json::Value::String("input".to_owned()));
+    }
+    let mut schema = serde_json::Map::new();
+    schema.insert("type".to_owned(), "object".into());
+    schema.insert("properties".to_owned(), properties.into());
+    schema.insert("required".to_owned(), required.into());
+    schema
 }
 
 /// Unwraps a `workflow__<name>` tool call's raw JSON `arguments` into the
-/// input text `call_workflow_tool` runs the workflow with — the `{"input":
-/// ...}` wrapper `workflow_input_schema` declares, mirrored on the read side.
+/// initial input text and declared-input values `call_workflow_tool` runs the
+/// workflow with — the `{"input": ..., "inputs": {...}}` shape
+/// `workflow_input_schema` declares, mirrored on the read side.
 /// `value_to_input_text` (shared with `engine::agent`'s own subagent-tool
 /// unwrapping) passes a JSON string through unquoted and serializes any
 /// other JSON value to compact text.
-fn workflow_tool_input(arguments_json: &str) -> Result<String> {
+fn workflow_tool_input(
+    arguments_json: &str,
+) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>)> {
     let arguments: serde_json::Value = if arguments_json.trim().is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
     } else {
         serde_json::from_str(arguments_json)
             .context("failed to parse workflow tool call arguments as JSON")?
     };
-    let input_value = match arguments {
-        serde_json::Value::Object(mut map) => map.remove("input"),
-        _ => None,
-    }
-    .ok_or_else(|| anyhow!("workflow tool call is missing the required 'input' field"))?;
-    engine::value_to_input_text(
-        &input_value,
-        "failed to serialize workflow tool call 'input'",
-    )
+    let serde_json::Value::Object(mut arguments) = arguments else {
+        anyhow::bail!("workflow tool call arguments must be a JSON object");
+    };
+    let input = arguments
+        .remove("input")
+        .map(|value| {
+            engine::value_to_input_text(&value, "failed to serialize workflow tool call 'input'")
+        })
+        .transpose()?;
+    let provided = match arguments.remove("inputs") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => anyhow::bail!("workflow tool call 'inputs' must be a JSON object"),
+    };
+    Ok((input, provided))
 }
 
 impl ServerHandler for LaitMcpServer {

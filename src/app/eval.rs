@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde::Deserialize;
 
@@ -26,7 +26,7 @@ use crate::{
     response, storage, template,
     workflow::{
         self, WorkflowScope,
-        exec::{RunStepsFrame, run_steps},
+        exec::{Frame, run_document},
     },
 };
 
@@ -42,14 +42,18 @@ struct EvalDefinition {
 
 /// `target:` is either a workflow file to run, or an inline model + prompt
 /// template (rendered with `{{ input }}`, like `crate::prompt::render_named`)
-/// — the same two-shape pattern `schema::JsonSchemaEntry` uses.
+/// — an untagged two-shape enum.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
 enum EvalTarget {
     /// Path to the target workflow file, relative to this eval definition
-    /// file's own directory.
-    Workflow { workflow: PathBuf },
+    /// file's own directory, and values for its declared `inputs:`.
+    Workflow {
+        workflow: PathBuf,
+        #[serde(default)]
+        inputs: serde_json::Map<String, serde_json::Value>,
+    },
     /// A model alias/id and a Handlebars prompt template referencing
     /// `{{ input }}`.
     Prompt { model: String, prompt: String },
@@ -64,7 +68,7 @@ struct EvalCase {
 }
 
 /// A loaded, ready-to-run `target:` — a workflow kept alive for the whole
-/// eval run (so its `nodes:`/`models:`/`json_schemas:` are only ever resolved
+/// eval run (so its `models:`/`schemas:`/`agents:` are only ever resolved
 /// once, not per case/repeat), or a resolved model + prompt template.
 enum Target {
     Workflow {
@@ -100,22 +104,16 @@ impl Target {
     async fn run(&self, env: &RunContext, input: &str) -> Result<(String, workflow::StepOutputs)> {
         match self {
             Target::Workflow { wf, scope } => {
-                let operation = env.operation_token();
-                let outcome = run_steps(
-                    &wf.steps,
-                    input.to_owned(),
-                    workflow::StepOutputs::new(),
-                    RunStepsFrame {
-                        scope,
-                        env,
-                        start_counter: 0,
-                        progress_prefix: "",
-                        cancellation: operation.clone(),
-                        placement: Default::default(),
-                    },
+                let initial = workflow::inputs::resolve_initial(
+                    wf,
+                    workflow::inputs::InitialInput::Text(input.to_owned()),
+                    env.operation_token(),
                 )
                 .await?;
-                Ok((outcome.output, outcome.steps_outputs))
+                let (output, steps_outputs) =
+                    run_document(wf, initial, Frame::new(scope, env, env.operation_token()))
+                        .await?;
+                Ok((template::to_text(&output), steps_outputs))
             }
             Target::Prompt { settings, template } => {
                 let rendered = template::render(
@@ -149,11 +147,16 @@ async fn load_target(
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Target> {
     match target {
-        EvalTarget::Workflow { workflow } => {
+        EvalTarget::Workflow { workflow, inputs } => {
             let workflow_path = base_dir.join(workflow);
-            let mut wf =
+            let wf =
                 workflow::load_workflow_cancellable(&workflow_path, cancellation.clone()).await?;
-            let scope = WorkflowScope::top_level(&mut wf, &workflow_path, cancellation).await?;
+            let inputs = workflow::inputs::resolve(
+                &wf.inputs,
+                workflow::inputs::from_object(inputs.clone()),
+            )
+            .with_context(|| format!("workflow '{}'", workflow_path.display()))?;
+            let scope = WorkflowScope::top_level(&wf, &workflow_path, inputs, cancellation).await?;
             Ok(Target::Workflow {
                 wf: Box::new(wf),
                 scope,

@@ -270,7 +270,7 @@ pub(crate) fn validate_sampling_params(
     Ok(())
 }
 
-/// Checks a `max_tool_rounds` value (a CLI/agent-file/node/workflow-default
+/// Checks a `max_tool_rounds` value (a CLI/agent-file/step/workflow-default
 /// setting, or the value once every fallback layer has resolved it) is at
 /// least 1, the same "validate eagerly everywhere, then again once resolved"
 /// pattern as [`validate_sampling_params`]. Called from `agent::parse_agent`,

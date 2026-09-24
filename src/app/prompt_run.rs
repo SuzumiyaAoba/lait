@@ -18,7 +18,7 @@ use crate::{
         agent_file_settings, call_agent, resolve_request_settings,
     },
     prompt, report, response, template, usage,
-    workflow::{self, exec::announce_named_file},
+    workflow::exec::announce_named_file,
 };
 
 use super::build_run_context;
@@ -220,7 +220,7 @@ pub(super) async fn run_agent(
             &settings,
             &env,
             AgentTurn::simple(&input, &raw_input),
-            &workflow::StepOutputs::new(),
+            &crate::jq::Globals::default(),
             std::slice::from_ref(&canonical_agent_path),
             env.operation_token(),
         ))

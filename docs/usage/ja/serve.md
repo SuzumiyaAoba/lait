@@ -41,7 +41,7 @@ MCP クライアント側の設定例（Claude Desktop の `claude_desktop_confi
 | 登録元 | ツール名 | 引数スキーマ |
 | --- | --- | --- |
 | `agents:` の各エントリ | `agent__<名前>`（例: `agent__reviewer`） | そのエージェントファイル自身の `input_schema:`（[エージェント Markdown ファイル](./agent.md#入力の検証input_schema)を参照）がそのまま使われます。`input_schema:` を持たないエージェントは、[サブエージェント](./subagents.md)と同じ汎用スキーマ（`{"input": "..."}`、文字列または JSON）になります。 |
-| `workflows:` の各エントリ | `workflow__<名前>`（例: `workflow__release_notes`） | 常に `{"input": "..."}` 固定です（`lait run <名前> <INPUT>` の `INPUT` に対応する、ワークフロー自身は `input_schema:` の概念を持ちません）。 |
+| `workflows:` の各エントリ | `workflow__<名前>`（例: `workflow__release_notes`） | `{"input": "...", "inputs": {...}}` です。`input` は `lait run <名前> <PROMPT>` の `PROMPT` に対応する文字列で（ワークフローの `input_schema:` に従って解釈されます）、ワークフローが `inputs:` を宣言していなければ必須です。`inputs` は宣言された `inputs:` の値のオブジェクトで、各入力のスキーマがそのままプロパティのスキーマになり、`default` を持たない入力は必須になります。 |
 
 - ツールの `description` は、エージェントファイルの `description:`／ワークフローファイルの
   トップレベル `description:` から取られます（未設定なら `Run the '<名前>' agent/workflow.`
@@ -60,16 +60,16 @@ MCP クライアント側の設定例（Claude Desktop の `claude_desktop_confi
 - **`lait serve` は起動時に一度だけ `lait.config.yml` を読み込みます。** サーバー起動後に
   `agents:`/`workflows:` を追記しても、再起動するまでは反映されません（他のすべての `lait` コ
   マンドと同じ「1回の起動につき1回の設定読み込み」という前提です）。
-- **`ask:` ノードを含むワークフローは公開されません。** `lait serve --mcp` では標準入出力が
-  MCP の JSON-RPC 通信そのものに使われているため、`ask:` ノード（[ワークフロー](./workflow.md
-  #対話的ユーザー入力type-ask)）が対話端末からの回答を待とうとすると、MCP の通信と衝突しかねません。
-  `ask:` ノードは非対話的な標準入力（実際の MCP クライアントが `lait serve` を子プロセスとして
+- **`ask:` ステップを含むワークフローは公開されません。** `lait serve --mcp` では標準入出力が
+  MCP の JSON-RPC 通信そのものに使われているため、`ask:` ステップ（[ワークフロー](./workflow.md
+  #ask--人間に尋ねる)）が対話端末からの回答を待とうとすると、MCP の通信と衝突しかねません。
+  `ask:` ステップは非対話的な標準入力（実際の MCP クライアントが `lait serve` を子プロセスとして
   起動する場合は常にこちら）に対してはもともと `default:` へフォールバックする安全策を持って
   いますが、`lait serve --mcp` を対話端末から直接手動で試す場合はその安全策が効かず、標準入力
-  の奪い合いになり得ます。このため、公開対象を組み立てる際に `ask:` ノードを1つでも含む
-  ワークフローは無条件に除外し、`note:` 行でその理由を表示します（このチェックはそのワーク
-  フローファイル自身の `nodes:` だけを見ます — `workflow:` ノードで参照する別ファイル側の
-  `ask:` ノードまでは検出しません）。
+  の奪い合いになり得ます。このため、公開対象を組み立てる際に `ask:` ステップを1つでも含む
+  （制御ステップの内側に入れ子になったものも含む）ワークフローは無条件に除外し、`note:` 行で
+  その理由を表示します（このチェックはそのワークフローファイル自身のステップだけを見ます —
+  `workflow:` ステップで呼び出す別ファイル側の `ask:` ステップまでは検出しません）。
 - **`--approve-tools`（対話的なツール承認）は使えません。** 同じ理由（標準入力が MCP 通信専用）
   により、served なエージェント/ワークフロー自身の tool loop は常に非対話的に実行されます。
   `tool_policy`（allow/deny）は通常どおり効きます。

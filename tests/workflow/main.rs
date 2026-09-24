@@ -29,7 +29,7 @@ fn create_fifo(path: &Path) {
 }
 
 #[cfg(unix)]
-fn timeout_workflow(node_fields: &str) -> WorkflowFile {
+fn timeout_workflow(step_fields: &str) -> WorkflowFile {
     WorkflowFile::new(&format!(
         r#"
 default:
@@ -39,11 +39,9 @@ models:
     - provider:
         base_url: http://127.0.0.1:1/v1
       model_id: workflow-model
-nodes:
-  call:
-{node_fields}
 steps:
-  - use: call
+  - id: call
+{step_fields}
 "#,
     ))
 }
@@ -114,6 +112,32 @@ fn assert_fifo_read_times_out(workflow: &Path) {
     );
 }
 
+fn run_workflow_with(workflow: &WorkflowFile, args: &[&str]) -> std::process::Output {
+    test_command()
+        .arg("run")
+        .arg(&workflow.path)
+        .args(args)
+        .args(["--no-history", "--no-config"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to execute lait run")
+}
+
+fn completion_with_content(content: &str) -> String {
+    serde_json::json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "workflow-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string()
+}
+
 mod agents;
 mod attachments;
 mod command;
@@ -122,11 +146,11 @@ mod control_flow;
 mod dry_run;
 mod env_vars;
 mod fifo_cancellation;
+mod inputs;
 mod loops;
 mod prompts;
 mod retry_timeout;
 mod routers;
-mod run_vars;
 mod schemas;
 mod settings;
 mod step_outputs;

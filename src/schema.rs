@@ -1,174 +1,164 @@
-//! JSON Schema loading and validation: a workflow's top-level `json_schemas:`
-//! map ([`JsonSchemaMap`]/[`JsonSchemaEntry`]), `--json-schema`/`response_format:`
-//! resolution into an OpenAI-compatible [`ResponseFormat`], and `lait schema`
-//! itself ([`run`]). `load_schema_value`/`resolve_named_schema_value` (used by
-//! the sync `lait lint`/agent-loading paths) each exist in a sync and a
-//! `_cancellable` async twin sharing a pure parsing core
-//! (`parse_schema_entry_contents`); `load_json_schema_cancellable` (used by
-//! every request/workflow-node path, all of them already async) has only the
-//! async form, sharing its own pure parsing core
-//! (`parse_json_schema_contents`).
+//! JSON Schema loading and validation: [`SchemaSource`] (an inline schema or
+//! a `{file: ...}` reference, used by a workflow's `schemas:`, a step's
+//! `input_schema`/`output_schema`, and an agent's), `--json-schema`/
+//! `response_format:` resolution into an OpenAI-compatible
+//! [`ResponseFormat`], and `lait schema` itself ([`run`]).
+//! `load_schema_value` (used by the sync `lait lint`/agent-loading paths)
+//! and `load_schema_value_cancellable` share a pure parsing core
+//! (`parse_schema_file_contents`); `load_json_schema_cancellable` (used by
+//! every request path, all of them already async) has only the async form,
+//! sharing its own pure parsing core (`parse_json_schema_contents`).
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use async_openai::types::chat::{ResponseFormat, ResponseFormatJsonSchema};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::{
     async_io,
     cli::{SchemaArgs, SchemaKind},
 };
 
-/// A map of schema name to its definition, as used by a workflow file's
-/// top-level `json_schemas:` and an agent file's `input_schema:`/`output_schema:`.
-pub(crate) type JsonSchemaMap = HashMap<String, JsonSchemaEntry>;
-
-/// A named schema definition: either a path to a JSON schema file, or the
-/// schema body written directly inline.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(untagged)]
-pub(crate) enum JsonSchemaEntry {
-    FilePath { file_path: PathBuf },
-    Inline { schema: serde_json::Value },
+/// Where a JSON Schema body comes from: written inline, or `{file: path}`
+/// pointing at a JSON file. Used by a workflow's `schemas:` entries, a
+/// step's inline `input_schema`/`output_schema`, and an agent's
+/// `input_schema`/`output_schema`.
+///
+/// A mapping whose only key is `file` (with a string value) is a file
+/// reference; any other mapping is the schema itself. `file` is not a JSON
+/// Schema keyword, so the two shapes cannot be confused.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SchemaSource {
+    Inline(serde_json::Value),
+    File(PathBuf),
 }
 
-/// The "failed to read/parse JSON schema file '{}'" messages this module
-/// repeats at every one of its (sync, `_cancellable`) read pairs — some
-/// identify the file by `Path::display()`, others by an already-resolved
-/// `name_or_path: &str` (see [`resolve_named_schema_value`]), hence
-/// `impl Display` rather than `&Path` specifically.
-fn read_schema_context(path_or_name: impl std::fmt::Display) -> String {
-    format!("failed to read JSON schema file '{path_or_name}'")
-}
-fn parse_schema_context(path_or_name: impl std::fmt::Display) -> String {
-    format!("failed to parse JSON schema file '{path_or_name}'")
+impl<'de> Deserialize<'de> for SchemaSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_value(value).map_err(serde::de::Error::custom)
+    }
 }
 
-/// The pure part of resolving a file-backed schema entry, shared by
-/// [`load_schema_value`]/[`load_schema_value_cancellable`]: only the read
-/// (`async_io::read_to_string_sync` vs. the cancellation-aware worker)
-/// differs between them.
-fn parse_schema_entry_contents(contents: &str, file_path: &Path) -> Result<serde_json::Value> {
-    serde_json::from_str(contents).with_context(|| parse_schema_context(file_path.display()))
-}
+impl SchemaSource {
+    pub(crate) fn from_value(value: serde_json::Value) -> Result<Self, String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.len() == 1
+                    && let Some(file) = map.get("file")
+                {
+                    return match file {
+                        serde_json::Value::String(path) if !path.is_empty() => {
+                            Ok(Self::File(PathBuf::from(path)))
+                        }
+                        _ => Err("'file' must be a non-empty path string".to_owned()),
+                    };
+                }
+                Ok(Self::Inline(serde_json::Value::Object(map)))
+            }
+            serde_json::Value::Bool(_) => Ok(Self::Inline(value)),
+            other => Err(format!(
+                "expected a JSON Schema object or '{{file: <path>}}', got {other}"
+            )),
+        }
+    }
 
-/// Resolves an entry to its JSON Schema body, reading the file for a
-/// `FilePath` entry.
-pub(crate) fn load_schema_value(entry: &JsonSchemaEntry) -> Result<serde_json::Value> {
-    match entry {
-        JsonSchemaEntry::Inline { schema } => Ok(schema.clone()),
-        JsonSchemaEntry::FilePath { file_path } => {
-            let contents = async_io::read_to_string_sync(file_path)
-                .with_context(|| read_schema_context(file_path.display()))?;
-            parse_schema_entry_contents(&contents, file_path)
+    /// Resolves a relative `File` path against `base_dir` (the directory of
+    /// the workflow/agent file that wrote it). Inline schemas and absolute
+    /// paths are unchanged.
+    pub(crate) fn resolve_relative_to(&mut self, base_dir: &Path) {
+        if let Self::File(path) = self
+            && path.is_relative()
+        {
+            *path = base_dir.join(&*path);
+        }
+    }
+
+    /// A short description for dry-run/lint output.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Inline(_) => "inline schema".to_owned(),
+            Self::File(path) => format!("file '{}'", path.display()),
         }
     }
 }
 
-/// Resolves a schema entry through the cancellation-aware filesystem worker
+/// A workflow's top-level `schemas:` map, keyed by the name steps refer to.
+/// Ordered so lint/dry-run output is stable.
+pub(crate) type SchemaMap = BTreeMap<String, SchemaSource>;
+
+/// The "failed to read/parse JSON schema file '{}'" messages this module
+/// repeats at every one of its (sync, `_cancellable`) read pairs.
+fn read_schema_context(path: impl std::fmt::Display) -> String {
+    format!("failed to read JSON schema file '{path}'")
+}
+fn parse_schema_context(path: impl std::fmt::Display) -> String {
+    format!("failed to parse JSON schema file '{path}'")
+}
+
+/// The pure part of resolving a file-backed schema source, shared by
+/// [`load_schema_value`]/[`load_schema_value_cancellable`]: only the read
+/// (`async_io::read_to_string_sync` vs. the cancellation-aware worker)
+/// differs between them.
+fn parse_schema_file_contents(contents: &str, path: &Path) -> Result<serde_json::Value> {
+    serde_json::from_str(contents).with_context(|| parse_schema_context(path.display()))
+}
+
+/// Resolves a source to its JSON Schema body, reading the file for a `File`
+/// source.
+pub(crate) fn load_schema_value(source: &SchemaSource) -> Result<serde_json::Value> {
+    match source {
+        SchemaSource::Inline(schema) => Ok(schema.clone()),
+        SchemaSource::File(path) => {
+            let contents = async_io::read_to_string_sync(path)
+                .with_context(|| read_schema_context(path.display()))?;
+            parse_schema_file_contents(&contents, path)
+        }
+    }
+}
+
+/// Resolves a schema source through the cancellation-aware filesystem worker
 /// used by timed workflow steps. Inline schemas remain an inexpensive clone;
 /// file-backed schemas are read in bounded chunks and Unix special files are
 /// opened non-blocking by [`async_io::read_file`].
 pub(crate) async fn load_schema_value_cancellable(
-    entry: &JsonSchemaEntry,
+    source: &SchemaSource,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value> {
-    match entry {
-        JsonSchemaEntry::Inline { schema } => Ok(schema.clone()),
-        JsonSchemaEntry::FilePath { file_path } => {
-            let contents = async_io::read_to_string_cancellable(
-                file_path,
-                cancellation,
-                async_io::MAX_READ_BYTES,
-            )
-            .await
-            .with_context(|| read_schema_context(file_path.display()))?;
-            parse_schema_entry_contents(&contents, file_path)
-        }
-    }
-}
-
-/// Resolves an entry to a Structured Outputs `response_format`, under `name`,
-/// while allowing timed workflow steps to cancel file-backed schema reads.
-pub(crate) async fn build_response_format_from_entry_cancellable(
-    entry: &JsonSchemaEntry,
-    name: &str,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<ResponseFormat> {
-    build_json_schema(
-        load_schema_value_cancellable(entry, cancellation).await?,
-        name,
-    )
-}
-
-/// Resolves a `StepDefinition::input_schema` value to its schema body: first
-/// as a key into a workflow's `json_schemas:`, falling back to treating it as
-/// a path to a JSON schema file (the same two-step lookup `json_schema` uses
-/// for output schemas).
-pub(crate) fn resolve_named_schema_value(
-    json_schemas: &JsonSchemaMap,
-    name_or_path: &str,
-) -> Result<serde_json::Value> {
-    match json_schemas.get(name_or_path) {
-        Some(entry) => load_schema_value(entry),
-        None => {
-            let path = Path::new(name_or_path);
-            let contents = async_io::read_to_string_sync(path)
-                .with_context(|| read_schema_context(name_or_path))?;
-            parse_schema_entry_contents(&contents, path)
-        }
-    }
-}
-
-/// Cancellation-aware counterpart to [`resolve_named_schema_value`], used for
-/// a workflow node's `input_schema` before its model call starts.
-pub(crate) async fn resolve_named_schema_value_cancellable(
-    json_schemas: &JsonSchemaMap,
-    name_or_path: &str,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<serde_json::Value> {
-    match json_schemas.get(name_or_path) {
-        Some(entry) => load_schema_value_cancellable(entry, cancellation).await,
-        None => {
-            let path = PathBuf::from(name_or_path);
+    match source {
+        SchemaSource::Inline(schema) => Ok(schema.clone()),
+        SchemaSource::File(path) => {
             let contents =
-                async_io::read_to_string_cancellable(&path, cancellation, async_io::MAX_READ_BYTES)
+                async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
                     .await
-                    .with_context(|| read_schema_context(name_or_path))?;
-            parse_schema_entry_contents(&contents, &path)
+                    .with_context(|| read_schema_context(path.display()))?;
+            parse_schema_file_contents(&contents, path)
         }
     }
 }
 
-/// Checks `input` against `schema` well enough to catch the common mistakes:
-/// the top level must be a JSON object, and then — recursively, through
-/// `properties`/`items` — every value present is checked against its
-/// sub-schema's `type` (including a JSON Schema array-of-types) and `enum`,
-/// and every object checked against its sub-schema's `required`. This still
+/// Checks `value` against `schema` well enough to catch the common mistakes:
+/// recursively, through `properties`/`items`, every value present is checked
+/// against its sub-schema's `type` (including a JSON Schema array-of-types)
+/// and `enum`, and every object against its sub-schema's `required`. This
 /// isn't full JSON Schema validation: `format`, `pattern`, numeric bounds,
 /// `additionalProperties`, `oneOf`/`anyOf`/`allOf`, and `$ref` are not
 /// checked, and a field the schema doesn't mention is never rejected (a
 /// schema written for a Structured Outputs `output_schema` — which requires
 /// `additionalProperties: false` in strict mode — must stay reusable as an
-/// `input_schema` without also rejecting extra input fields). Just enough to
-/// fail fast with a clear message before a template silently renders a hole
-/// where a field should be, or a request is sent with a field of the wrong
-/// shape.
-pub(crate) fn validate_input_against_schema(
+/// `input_schema` without also rejecting extra input fields). `what` names
+/// the value in error messages (e.g. `"input"`, `"output"`, `"inputs.lang"`).
+pub(crate) fn validate_value(
     schema: &serde_json::Value,
-    input: &serde_json::Value,
+    value: &serde_json::Value,
+    what: &str,
 ) -> Result<()> {
-    if !input.is_object() {
-        bail!("input must be a JSON object matching the input schema");
-    }
-    validate_value_against_schema(schema, input, "input")
+    validate_value_against_schema(schema, value, what)
 }
-
 /// The JSON Schema `type` keyword's name for `value`'s own runtime type, used
 /// only to report a mismatch; `"integer"` is JSON Schema's term for a number
 /// with no fractional part, so a whole-number `serde_json::Value::Number` is
@@ -335,7 +325,7 @@ fn parse_json_schema_contents(contents: &str, path: &Path, name: &str) -> Result
 }
 
 /// Loads a file-backed Structured Outputs schema for `--json-schema`/a
-/// workflow node's file-backed `output_schema`. Cancellation-aware so a
+/// workflow step's file-backed `output_schema`. Cancellation-aware so a
 /// `--json-schema` read joins the same `tokio::try_join!` as the request's
 /// other independent reads (see `app::prepare_chat_request`) instead of
 /// blocking ahead of it on a dedicated call.
@@ -351,7 +341,7 @@ pub(crate) async fn load_json_schema_cancellable(
     parse_json_schema_contents(&contents, path, name)
 }
 
-/// Checks a Structured Outputs schema `name` (a node/agent's `schema_name`,
+/// Checks a Structured Outputs schema `name` (a step/agent's `schema_name`,
 /// defaulting to `"structured_output"`) against the constraints
 /// `build_json_schema` requires but which nothing checks before request time:
 /// 1-64 characters, ASCII letters/digits/underscore/hyphen only. Exposed on

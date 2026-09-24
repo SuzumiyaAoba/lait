@@ -15,7 +15,7 @@
 
 ## ワークフロー
 
-- [ワークフロー（workflow.yml）](./workflow.md) — ノードとステップ、分岐・ループ・並列実行、JSON/jq、チェックポイント。
+- [ワークフロー（workflow.yml）](./workflow.md) — ステップ・入力と出力・型付きの値、分岐・ループ・並列実行、チェックポイント、v1 からの移行。
 - [エージェント Markdown ファイル（agent.md）](./agent.md) — frontmatter とシステムプロンプトからエージェントを定義する方法。
 - [ワークフロー／エージェントファイルの静的チェック（lint）](./lint.md) — `lait lint` で構文・参照・テンプレートを実行前に検査する方法。
 - [決定的テスト（record & replay / lait test）](./testing.md) — `lait run --record`/`--replay` と `lait test` で、API を呼ばずに制御フローを検証する方法。

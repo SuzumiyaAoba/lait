@@ -30,13 +30,10 @@ models:
     - provider:
         base_url: "{base_url}"
       model_id: workflow-model
-nodes:
-  ask:
-    type: prompt
+steps:
+  - id: ask
     prompt: "{{{{ input }}}}"
     tools: [echo]
-steps:
-  - use: ask
 "#
     )
 }

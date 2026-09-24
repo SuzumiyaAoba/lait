@@ -6,17 +6,11 @@ use support::{WorkflowFile, test_command};
 fn graph_defaults_to_mermaid_and_wires_sequential_steps() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  extract:
-    type: prompt
-    prompt: "{{ input }}"
-  greet:
-    type: prompt
-    prompt: "{{ steps.extract }}"
 steps:
   - id: extract
-    use: extract
-  - use: greet
+    prompt: "{{ input }}"
+  - id: greet
+    prompt: "{{ steps.extract }}"
 "#,
     );
 
@@ -33,19 +27,16 @@ steps:
     assert!(stdout.starts_with("flowchart TD\n"), "stdout: {stdout}");
     assert!(stdout.contains("[extract]"), "stdout: {stdout}");
     assert!(stdout.contains("[greet]"), "stdout: {stdout}");
-    assert!(stdout.contains("type: prompt"), "stdout: {stdout}");
+    assert!(stdout.contains("<br/>prompt"), "stdout: {stdout}");
 }
 
 #[test]
 fn graph_dot_format_emits_a_digraph() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  a:
-    type: transform
-    jq: '.'
 steps:
-  - use: a
+  - id: a
+    jq: '.'
 "#,
     );
 
@@ -73,22 +64,15 @@ steps:
 fn graph_labels_a_switch_edge_with_its_when_condition() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  a:
-    type: transform
-    jq: '.'
-  b:
-    type: transform
-    jq: '.'
 steps:
   - switch:
-      cases:
-        - id: flagged
-          when: ".flag"
-          steps:
-            - use: a
-      else:
-        - use: b
+      - when: ".flag"
+        steps:
+          - id: a
+            jq: '.'
+    else:
+      - id: b
+        jq: '.'
 "#,
     );
 
@@ -103,7 +87,7 @@ steps:
     assert!(output.status.success(), "lait graph failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("switch"), "stdout: {stdout}");
-    assert!(stdout.contains("flagged: .flag"), "stdout: {stdout}");
+    assert!(stdout.contains("case 1: .flag"), "stdout: {stdout}");
     assert!(stdout.contains("else"), "stdout: {stdout}");
 }
 
@@ -111,16 +95,12 @@ steps:
 fn graph_groups_a_loop_body_into_a_subgraph() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  a:
-    type: transform
-    jq: '.'
 steps:
-  - loop:
-      while: ".continue"
-      max_iterations: 5
-      steps:
-        - use: a
+  - while: ".continue"
+    max_iterations: 5
+    steps:
+      - id: a
+        jq: '.'
 "#,
     );
 
@@ -134,7 +114,7 @@ steps:
 
     assert!(output.status.success(), "lait graph failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("loop: while .continue"), "stdout: {stdout}");
+    assert!(stdout.contains("while .continue"), "stdout: {stdout}");
     assert!(stdout.contains("max_iterations: 5"), "stdout: {stdout}");
     // Mermaid's subgraph grammar is `subgraph id[title]` — a bare quoted
     // title with no id is only accepted by some renderers.
@@ -144,17 +124,13 @@ steps:
 
 #[test]
 fn graph_shows_a_workflow_node_as_a_single_reference_without_expanding_it() {
-    let sub =
-        WorkflowFile::new("nodes:\n  a:\n    type: transform\n    jq: '.'\nsteps:\n  - use: a\n");
+    let sub = WorkflowFile::new("steps:\n  - id: a\n    jq: '.'\n");
     let sub_path = sub.path.to_str().expect("sub workflow path is utf-8");
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  call_sub:
-    type: workflow
-    workflow: "{sub_path}"
 steps:
-  - use: call_sub
+  - id: call_sub
+    workflow: "{sub_path}"
 "#,
     ));
 
@@ -168,13 +144,13 @@ steps:
 
     assert!(output.status.success(), "lait graph failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("type: workflow"), "stdout: {stdout}");
+    assert!(stdout.contains("<br/>workflow<br/>"), "stdout: {stdout}");
     assert!(stdout.contains(sub_path), "stdout: {stdout}");
 }
 
 #[test]
 fn graph_fails_on_an_invalid_workflow_file() {
-    let workflow = WorkflowFile::new("nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps: []\n");
+    let workflow = WorkflowFile::new("steps: []\n");
 
     let output = test_command()
         .args([

@@ -18,15 +18,13 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  answer:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    output_schema: "{}"
-    schema_name: answer_schema
-    jq: ".answer"
 steps:
-  - use: answer
+  - id: answer
+    prompt: "{{{{ input }}}}"
+    schema_name: answer_schema
+    output_schema:
+      file: "{}"
+    output: ".answer"
 "#,
         server.base_url,
         schema.path.display()
@@ -73,23 +71,19 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-json_schemas:
+schemas:
   answer:
-    schema:
-      type: object
-      properties:
-        answer:
-          type: string
-      required: [answer]
-      additionalProperties: false
-nodes:
-  answer:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    output_schema: answer
-    schema_name: answer_schema
+    type: object
+    properties:
+      answer:
+        type: string
+    required: [answer]
+    additionalProperties: false
 steps:
-  - use: answer
+  - id: answer
+    prompt: "{{{{ input }}}}"
+    schema_name: answer_schema
+    output_schema: answer
 "#,
         server.base_url
     ));
@@ -137,17 +131,14 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-json_schemas:
+schemas:
   answer:
-    file_path: "{}"
-nodes:
-  answer:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    output_schema: answer
-    schema_name: answer_schema
+    file: "{}"
 steps:
-  - use: answer
+  - id: answer
+    prompt: "{{{{ input }}}}"
+    schema_name: answer_schema
+    output_schema: answer
 "#,
         server.base_url,
         schema.path.display()
@@ -183,6 +174,7 @@ fn step_input_schema_allows_a_call_when_input_has_every_required_field() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let workflow = WorkflowFile::new(&format!(
         r#"
+input_schema: {{type: object}}
 default:
   model: local
 models:
@@ -190,18 +182,14 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-json_schemas:
+schemas:
   city:
-    schema:
-      type: object
-      required: [city]
-nodes:
-  echo:
-    type: prompt
+    type: object
+    required: [city]
+steps:
+  - id: echo
     prompt: "{{{{ json input }}}}"
     input_schema: city
-steps:
-  - use: echo
 "#,
         server.base_url
     ));
@@ -217,18 +205,15 @@ steps:
 fn step_input_schema_rejects_input_missing_a_required_field() {
     let workflow = WorkflowFile::new(
         r#"
-json_schemas:
+input_schema: {type: object}
+schemas:
   city:
-    schema:
-      type: object
-      required: [city]
-nodes:
-  echo:
-    type: prompt
+    type: object
+    required: [city]
+steps:
+  - id: echo
     prompt: "{{ input }}"
     input_schema: city
-steps:
-  - use: echo
 "#,
     );
 
@@ -248,6 +233,7 @@ fn step_input_schema_resolves_a_direct_file_path_when_no_json_schemas_map_entry_
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let workflow = WorkflowFile::new(&format!(
         r#"
+input_schema: {{type: object}}
 default:
   model: local
 models:
@@ -255,13 +241,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ json input }}}}"
-    input_schema: "{}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ json input }}}}"
+    input_schema:
+      file: "{}"
 "#,
         server.base_url,
         schema.path.display()
@@ -276,20 +260,22 @@ steps:
 
 #[test]
 fn step_input_schema_reports_a_missing_schema_file_with_path_context() {
-    let missing_path = support::next_temp_path("lait-missing-input-schema", ".json");
+    let missing_path = std::env::temp_dir().join(format!(
+        "lait-missing-input-schema-{}.json",
+        std::process::id()
+    ));
     assert!(
         !missing_path.exists(),
         "test schema path unexpectedly exists: {missing_path:?}"
     );
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    input_schema: "{}"
+input_schema: {{type: object}}
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
+    input_schema:
+      file: "{}"
 "#,
         missing_path.display()
     ));
@@ -308,5 +294,68 @@ steps:
     assert!(
         stderr.contains(missing_path.to_string_lossy().as_ref()),
         "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_structured_output_that_does_not_match_its_schema_fails_the_step() {
+    let body = completion_with_content(r#"{"town":"Tokyo"}"#);
+    let server = MockServer::start("200 OK", &body);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{{{ input }}}}"
+    output_schema: {{ type: object, required: [city] }}
+"#,
+        server.base_url
+    ));
+
+    let output = run_workflow_with(&workflow, &["hello"]);
+    server.receive_request();
+    server.finish();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("output is missing required field(s): city"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_text_response_that_looks_like_json_stays_a_string() {
+    let body = completion_with_content("42");
+    let server = MockServer::start("200 OK", &body);
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+default:
+  model: local
+models:
+  local:
+    - provider:
+        base_url: "{}"
+      model_id: workflow-model
+steps:
+  - prompt: "{{{{ input }}}}"
+  - jq: '[type, .]'
+"#,
+        server.base_url
+    ));
+
+    let output = run_workflow_with(&workflow, &["hello"]);
+    server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"["string","42"]"#
     );
 }

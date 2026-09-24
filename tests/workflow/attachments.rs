@@ -16,13 +16,10 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
+steps:
+  - id: echo
     prompt: "summarize: {{{{ input }}}}"
     files: ["{}"]
-steps:
-  - use: echo
 "#,
         server.base_url,
         file_path.display()
@@ -55,13 +52,10 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  describe:
-    type: prompt
+steps:
+  - id: describe
     prompt: "what is this? {{{{ input }}}}"
     images: ["{}"]
-steps:
-  - use: describe
 "#,
         server.base_url,
         image_path.display()
@@ -102,14 +96,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  describe:
-    type: agent
+steps:
+  - id: describe
     agent: "{}"
     files: ["{}"]
     images: ["{}"]
-steps:
-  - use: describe
 "#,
         server.base_url,
         agent.path.display(),

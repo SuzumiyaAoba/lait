@@ -48,37 +48,36 @@ models:
 /// The `lait init workflow` scaffold. Kept loadable by
 /// `workflow::load_workflow` by the tests in this module.
 const WORKFLOW_TEMPLATE: &str = r#"# lait のワークフロー定義。`lait run workflow.yml "入力"` で実行します。
-# nodes:(何をするか)と steps:(どう繋ぐか)を分けて書きます。
+# steps: に上から順に実行するステップを並べます。各ステップは prompt/agent/run/jq/
+# workflow/ask/write/group/switch/parallel/for_each/while/until/stop/break の
+# いずれか1つのキーで種類を決めます。
 # 詳細: https://github.com/SuzumiyaAoba/lait/blob/master/docs/usage/ja/workflow.md
 name: sample-workflow
 description: 入力を要約するサンプルワークフロー
 
-# このワークフロー内だけで使う既定値(lait.config.yml の default: より優先)。
+# 名前付きの入力。`lait run workflow.yml "入力" --input lines=5` のように渡します。
+inputs:
+  lines: { type: integer, default: 3, description: 要約の行数 }
+
+# このワークフロー内の LLM ステップの既定値(lait.config.yml の default: より優先)。
 # default:
 #   model: local
 
-nodes:
-  summarize:
-    type: prompt
-    # model: local  # 省略時は default.model にフォールバック
-    prompt: |
-      次の文章を3行で要約してください。
-
-      {{ input }}
-  # JSON 出力を jq で加工するノードの例:
-  # extract:
-  #   type: prompt
-  #   prompt: "..."
-  #   output_schema: ./schema.json
-  #   jq: '.summary'
-
 steps:
   - id: summarize
-    use: summarize
-  # 条件分岐 (when/switch)・並列 (parallel)・ループ (loop/for_each)・
-  # サブワークフロー (workflow:) も使えます。詳細は docs を参照してください。
-  # - use: extract
-  #   when: '. != ""'
+    # model: local  # 省略時は default.model にフォールバック
+    prompt: |
+      次の文章を{{ inputs.lines }}行で要約してください。
+
+      {{ input }}
+  # 構造化出力を jq で加工する例:
+  # - id: extract
+  #   prompt: "..."
+  #   output_schema: { file: ./schema.json }
+  #   output: '.summary'
+  # 条件付きで実行する例:
+  # - when: '. != ""'
+  #   write: summary.txt
 "#;
 
 /// The `lait init agent` scaffold. Kept parsable by `agent::load_agent` by
@@ -94,16 +93,14 @@ description: 文章を要約するエージェント
 # temperature: 0.7
 # 入力/出力を JSON Schema で縛る場合:
 # input_schema:
-#   schema:
-#     type: object
-#     required: [text]
-# structured_output: true
-# output_schema:
-#   schema:
-#     type: object
-#     properties:
-#       summary: { type: string }
-#     required: [summary]
+#   type: object
+#   required: [text]
+# output_schema:          # 指定すると Structured Outputs で JSON を返します
+#   type: object
+#   properties:
+#     summary: { type: string }
+#   required: [summary]
+#   additionalProperties: false
 ---
 
 あなたは要約の専門家です。与えられた文章の要点を保ったまま、簡潔に要約してください。

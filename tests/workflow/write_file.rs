@@ -6,7 +6,15 @@ fn write_file_writes_the_steps_output_without_changing_what_flows_downstream() {
         ("200 OK", CHAT_COMPLETION_BODY),
         ("200 OK", CHAT_COMPLETION_BODY),
     ]);
-    let output_path = support::next_temp_path("lait-test-write-file", ".txt");
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let output_path = std::env::temp_dir().join(format!("lait-test-write-file-{unique}.txt"));
     let workflow = WorkflowFile::new(&format!(
         r#"
 default:
@@ -16,18 +24,12 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  written:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    write_file: "{}"
-  echo:
-    type: prompt
-    prompt: "echo: {{{{ steps.written }}}}"
 steps:
   - id: written
-    use: written
-  - use: echo
+    prompt: "{{{{ input }}}}"
+  - write: "{}"
+  - id: echo
+    prompt: "echo: {{{{ steps.written }}}}"
 "#,
         server.base_url,
         output_path.display()
@@ -75,12 +77,9 @@ fn write_file_preserves_existing_inode_and_permissions() {
 
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  emit:
-    type: transform
-    write_file: "{}"
 steps:
-  - use: emit
+  - id: emit
+    write: "{}"
 "#,
         output_path.display()
     ));
@@ -136,12 +135,9 @@ fn write_file_follows_a_symlink_to_an_existing_file() {
 
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  emit:
-    type: transform
-    write_file: "{}"
 steps:
-  - use: emit
+  - id: emit
+    write: "{}"
 "#,
         link_path.display()
     ));
@@ -187,12 +183,9 @@ fn write_file_respects_an_existing_read_only_file() {
 
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  emit:
-    type: transform
-    write_file: "{}"
 steps:
-  - use: emit
+  - id: emit
+    write: "{}"
 "#,
         output_path.display()
     ));
@@ -241,12 +234,9 @@ fn write_file_respects_an_existing_read_only_file() {
 
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  emit:
-    type: transform
-    write_file: "{}"
 steps:
-  - use: emit
+  - id: emit
+    write: "{}"
 "#,
         output_path.display()
     ));
@@ -278,4 +268,51 @@ steps:
     writable_permissions.set_readonly(false);
     std::fs::set_permissions(&output_path, writable_permissions)
         .expect("failed to restore output fixture permissions");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_group_timeout_covers_a_blocking_write() {
+    use std::process::Stdio;
+
+    let config = ConfigDirectory::empty();
+    let fifo_path = config.path().join("blocked-output.fifo");
+    let fifo_status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("failed to create a FIFO for the timeout test");
+    assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+steps:
+  - id: emit
+    timeout: 1
+    group:
+      - run: ["printf", "done"]
+      - write: "{}"
+"#,
+        fifo_path.display()
+    ));
+
+    let started = Instant::now();
+    let output = test_command()
+        .current_dir(config.path())
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            workflow.path.to_str().unwrap(),
+            "hello",
+            "--no-history",
+        ])
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "blocking write_file ignored the node timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(!output.status.success(), "expected write_file to time out");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "stderr: {stderr}");
 }

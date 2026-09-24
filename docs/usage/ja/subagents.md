@@ -9,7 +9,7 @@
 モデルに返す、というやり取りを最終回答が出るまで自動で繰り返します（[MCP サーバーのツールを使う]
 (./mcp.md) と同じ tool loop の仕組みです）。
 
-`agent:`/`workflow:` ワークフローノードが「このステップでは必ずこのエージェント（サブワーク
+`agent:`/`workflow:` ステップが「このステップでは必ずこのエージェント（サブワーク
 フロー）を呼ぶ」という静的な配線であるのに対し、サブエージェントは「モデルが必要だと判断した
 ときだけ呼ぶ」という動的な委譲です。複数の専門エージェントを用意しておき、オーケストレーター役の
 モデルにタスクを振り分けさせる、といった構成に向いています。
@@ -71,7 +71,7 @@ agents:
 |---|---|
 | チャット（`lait "prompt"`） | `--subagent`（CLI フラグ、複数指定可）→ `lait.config.yml` の `default.subagents` |
 | `lait agent run` | agent ファイルの frontmatter `subagents:` → `lait.config.yml` の `default.subagents` |
-| `lait run`（workflow） | ノードの `subagents:` → （`agent:` ノードなら）agent ファイルの `subagents:` → ワークフローの `default.subagents` → `lait.config.yml` の `default.subagents` |
+| `lait run`（workflow） | ステップの `subagents:` → （`agent:` ステップなら）エージェント定義の `subagents:` → ワークフローの `default.subagents` → `lait.config.yml` の `default.subagents` |
 
 ```sh
 lait "prompt" --subagent researcher --subagent fact-checker
@@ -87,15 +87,13 @@ subagents: [researcher]
 
 ```yaml
 # workflow.yml
-nodes:
-  triage:
-    type: prompt
-    prompt: "{{ input }} について調べてください。"
+steps:
+  - prompt: "{{ input }} について調べてください。"
     subagents: [researcher, fact-checker]
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.md#サブエージェントの利用) と
-[ワークフロー（workflow.yml）](./workflow.md#サブエージェントの利用subagents) にもあります。
+[ワークフロー（workflow.yml）](./workflow.md#ツール連携mcp--skills--subagents--tools) にもあります。
 
 ## ツール名とツール引数の扱い
 
@@ -130,22 +128,22 @@ CLI フラグ（`--base-url`/`--api-key` など）や `--model` は、サブエ�
 引き継がれません。複数の呼び出し元から同じサブエージェントを使い回す場合は、`lait.config.yml`
 （あるいはエージェントファイル自身の frontmatter）に必要な設定をまとめておいてください。
 
-## `agent:`/`workflow:` ワークフローノードとの違い
+## `agent:`/`workflow:` ステップとの違い
 
-| | `agent:`/`workflow:` ノード | サブエージェント（`subagents:`） |
+| | `agent:`/`workflow:` ステップ | サブエージェント（`subagents:`） |
 |---|---|---|
 | いつ呼ばれるか | そのステップで必ず呼ばれる（静的な配線） | モデルが必要だと判断したときだけ呼ばれる（動的な委譲） |
 | 呼び出し単位 | ワークフローの1ステップ | tool loop の中の1回のツール呼び出し（複数回・0回もありうる） |
-| 入力の渡し方 | 前のステップの出力（`{{ input }}`） | モデルが組み立てたツール引数 |
+| 入力の渡し方 | 前のステップの値（`{{ input }}`） | モデルが組み立てたツール引数 |
 
-同じエージェント Markdown ファイルを、あるワークフローでは `agent:` ノードとして固定的に呼びつつ、
+同じエージェント Markdown ファイルを、あるワークフローでは `agent:` ステップとして固定的に呼びつつ、
 別の呼び出しでは `subagents:` に登録してモデルに判断を委ねる、という両方の使い方ができます。
 
-## `mcp`/`--stream`/`structured_output` との関係
+## `mcp`/`--stream`/`output_schema` との関係
 
 サブエージェントは MCP ツールと同じ tool loop の仕組みに乗るため、制約もほぼ同じです。
 
-- `output_schema`/`structured_output: true` と `subagents` は併用できます。`mcp` と同様、ツールを
+- `output_schema`（Structured Outputs）と `subagents` は併用できます。`mcp` と同様、ツールを
   呼び出している間は `response_format` を送らず、モデルがツール呼び出しを止めた最後のラウンドだけ
   `response_format` を付けて再送します。
 - `--stream` と `subagents` は併用できます。`mcp` と同様、ストリームの `tool_calls` は

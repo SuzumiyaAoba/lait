@@ -102,7 +102,7 @@ URL 形式の ref スラッシュ区切りは1セグメントだけなので、`
 | --- | --- |
 | `workflow` | `lait run <name>`、`lait workflow list`、workflow 内からの参照。 |
 | `agent` | `lait agent run <name>`、`subagents: [name]`、`lait agent list`。 |
-| `skill` | `skills: [name]`（agent frontmatter・workflow ノード・`default.skills`）、`lait skill list`。 |
+| `skill` | `skills: [name]`（agent frontmatter・workflow ステップ・`default.skills`）、`lait skill list`。 |
 
 `workflows:`/`agents:`/`skills:` のマージ順は `グローバル設定 < lait.deps.yml < プロジェクトの
 lait.config.yml` です。同名のエントリが `lait.config.yml` にあればそちらが勝つため、依存を

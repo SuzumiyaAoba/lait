@@ -1,9 +1,9 @@
 //! `lait graph`: renders a workflow's control-flow structure (step
 //! transitions, `when`/`switch` branches, `parallel` fan-out/fan-in,
-//! `loop`/`for_each` bodies) as a Mermaid or DOT graph — see
+//! `while`/`until`/`for_each` bodies, `group`s, `on_error` handlers) as a Mermaid or DOT graph — see
 //! docs/usage/ja/workflow.md. Building (`build`) walks the step tree once
 //! into a format-neutral [`GraphModel`]; `render_mermaid`/`render_dot` turn
-//! that into text. A `workflow:` node is rendered as a single node naming
+//! that into text. A `workflow:` step is rendered as a single node naming
 //! the sub-workflow file rather than expanded in place, so this module never
 //! has to load or cycle-check another file — inspect a sub-workflow with its
 //! own `lait graph <path>` call.
@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
-use super::{FlowStep, NodeDefinition, Router, WorkflowFile};
+use super::{Step, StepKind, WorkflowFile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GraphFormat {
@@ -22,9 +22,9 @@ pub(crate) enum GraphFormat {
 
 #[derive(Clone, Copy)]
 enum NodeShape {
-    /// A `use:` node (rectangle in both formats).
+    /// An action step (rectangle in both formats).
     Action,
-    /// A `switch`/`loop`/`for_each`/`parallel` control node (diamond).
+    /// A control step: `group`/`switch`/`parallel`/`for_each`/`while`/`until` (diamond).
     Decision,
     /// A `stop`/`break` terminal marker (rounded/stadium shape).
     Terminal,
@@ -112,7 +112,7 @@ impl GraphBuilder {
 
     /// Groups every node added since `since` (and not already claimed by a
     /// more deeply nested subgraph — see the module doc) into one subgraph
-    /// titled `title`. Called after rendering a `loop`/`for_each` body, or a
+    /// titled `title`. Called after rendering a loop/`for_each`/`group` body, or a
     /// `parallel` branch, so the diagram visually groups a repeated/
     /// concurrent body the way `docs/usage/ja/workflow.md` describes it.
     fn add_subgraph(&mut self, title: String, since: usize) {
@@ -142,15 +142,10 @@ impl GraphBuilder {
     }
 }
 
-/// Renders one step list (a workflow's top-level `steps`, a `switch` case's/
-/// `else`'s/`parallel` branch's/`loop`'s/`for_each`'s own `steps`) into
-/// `builder`, wiring each step to the next in sequence. Returns this list's
-/// own entry node (the first step's, or `None` for an empty list) and its
-/// exit nodes — normally just the last step's, but more than one when the
-/// last step is itself a `switch`/`parallel` router (each of *its* branches'
-/// own exits becomes an exit of this whole list, so whatever follows
-/// connects from all of them).
-fn render_chain(steps: &[FlowStep], builder: &mut GraphBuilder) -> (Option<String>, Vec<String>) {
+/// Renders one step list into `builder`, wiring each step to the next.
+/// Returns the list's entry node and its exit nodes — more than one when
+/// the last step branches (each branch's exits become the list's exits).
+fn render_chain(steps: &[Step], builder: &mut GraphBuilder) -> (Option<String>, Vec<String>) {
     let mut entry: Option<String> = None;
     let mut prev_exits: Vec<String> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
@@ -169,80 +164,57 @@ fn render_chain(steps: &[FlowStep], builder: &mut GraphBuilder) -> (Option<Strin
     (entry, prev_exits)
 }
 
-fn render_step(
-    step: &FlowStep,
-    label: &str,
-    builder: &mut GraphBuilder,
-) -> (Option<String>, Vec<String>) {
-    if let Some(router) = step.router() {
-        return render_router(router, label, builder);
-    }
-
-    match step.call() {
-        Some(call) => {
-            let node = call.definition;
-            let mut node_label = format!("[{label}]\ntype: {}", node.type_name());
-            if let NodeDefinition::Workflow(workflow_node) = node {
-                node_label.push_str(&format!("\n{}", workflow_node.workflow.display()));
-            }
-            if let Some(when) = step.when() {
-                node_label.push_str(&format!("\nwhen: {when}"));
-            }
-            let id = builder.add_node(node_label, NodeShape::Action);
-            if let Some(on_error) = step.on_error() {
-                let error_label = format!("{label}: on_error");
-                let since = builder.nodes.len();
-                let (on_error_entry, _) = render_chain(&on_error.steps, builder);
-                if let Some(on_error_entry) = on_error_entry {
-                    builder.add_edge(&id, &on_error_entry, Some("on_error".to_owned()));
-                }
-                builder.add_subgraph(error_label, since);
-            }
-            let mut exits = vec![id.clone()];
-            if step.control() == crate::workflow::Control::Stop {
-                let stop_id = builder.add_node("stop".to_owned(), NodeShape::Terminal);
-                builder.add_edge(&id, &stop_id, None);
-                exits = Vec::new();
-            } else if step.control() == crate::workflow::Control::Break {
-                let break_id = builder.add_node("break".to_owned(), NodeShape::Terminal);
-                builder.add_edge(&id, &break_id, None);
-                exits = Vec::new();
-            }
-            (Some(id), exits)
-        }
-        None => {
-            // A standalone `stop`/`break` (no `use`, no router).
-            let kind = if step.control() == crate::workflow::Control::Stop {
-                "stop"
-            } else {
-                "break"
-            };
-            let id = builder.add_node(kind.to_owned(), NodeShape::Terminal);
-            (Some(id), Vec::new())
-        }
+/// A one-line summary of what an action step does, for its node label.
+fn action_detail(kind: &StepKind) -> Option<String> {
+    match kind {
+        StepKind::Agent(agent) => Some(agent.agent.describe()),
+        StepKind::Workflow(workflow) => Some(workflow.workflow.describe()),
+        StepKind::Run(run) => Some(run.argv.join(" ")),
+        StepKind::Jq(filter) => Some(filter.clone()),
+        StepKind::Write(write) => Some(write.path.clone()),
+        _ => None,
     }
 }
 
-fn render_router(
-    router: Router<'_>,
+fn render_step(
+    step: &Step,
     label: &str,
     builder: &mut GraphBuilder,
 ) -> (Option<String>, Vec<String>) {
-    match router {
-        Router::Switch(switch) => {
-            let router_id = builder.add_node(format!("[{label}]\nswitch"), NodeShape::Decision);
+    let when = step
+        .when
+        .as_deref()
+        .map(|when| format!("\nwhen: {when}"))
+        .unwrap_or_default();
+    let (entry, exits) = match &step.kind {
+        StepKind::Stop | StepKind::Break => {
+            let id = builder.add_node(format!("{}{when}", step.kind.name()), NodeShape::Terminal);
+            (id, Vec::new())
+        }
+        StepKind::Group(body) => {
+            let group_id = builder.add_node(format!("[{label}]\ngroup{when}"), NodeShape::Decision);
+            let since = builder.nodes.len();
+            let (body_entry, body_exits) = render_chain(body, builder);
+            builder.add_subgraph(format!("[{label}] group"), since);
+            match body_entry {
+                Some(body_entry) => {
+                    builder.add_edge(&group_id, &body_entry, None);
+                    (group_id, body_exits)
+                }
+                None => (group_id.clone(), vec![group_id]),
+            }
+        }
+        StepKind::Switch(switch) => {
+            let router_id =
+                builder.add_node(format!("[{label}]\nswitch{when}"), NodeShape::Decision);
             let mut exits = Vec::new();
             for (index, case) in switch.cases.iter().enumerate() {
-                let case_label = case
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("case-{}", index + 1));
                 let (case_entry, case_exits) = render_chain(&case.steps, builder);
                 if let Some(case_entry) = case_entry {
                     builder.add_edge(
                         &router_id,
                         &case_entry,
-                        Some(format!("{case_label}: {}", case.when)),
+                        Some(format!("case {}: {}", index + 1, case.when)),
                     );
                 }
                 exits.extend(case_exits);
@@ -254,18 +226,15 @@ fn render_router(
                 }
                 exits.extend(else_exits);
             }
-            (Some(router_id), exits)
+            (router_id, exits)
         }
-        Router::Parallel(parallel) => {
-            let fork_id = builder.add_node(format!("[{label}]\nparallel"), NodeShape::Decision);
-            let join_label = match &parallel.join {
-                Some(filter) => format!("join\n{filter}"),
-                None => "join".to_owned(),
-            };
-            let join_id = builder.add_node(join_label, NodeShape::Decision);
-            for (index, branch) in parallel.branches.iter().enumerate() {
+        StepKind::Parallel(parallel) => {
+            let fork_id =
+                builder.add_node(format!("[{label}]\nparallel{when}"), NodeShape::Decision);
+            let join_id = builder.add_node("join".to_owned(), NodeShape::Decision);
+            for (name, body) in &parallel.branches {
                 let since = builder.nodes.len();
-                let (branch_entry, branch_exits) = render_chain(&branch.steps, builder);
+                let (branch_entry, branch_exits) = render_chain(body, builder);
                 match branch_entry {
                     Some(branch_entry) => {
                         builder.add_edge(&fork_id, &branch_entry, None);
@@ -275,73 +244,77 @@ fn render_router(
                     }
                     None => builder.add_edge(&fork_id, &join_id, None),
                 }
-                builder.add_subgraph(format!("branch '{}'", branch.label(index)), since);
+                builder.add_subgraph(format!("branch '{name}'"), since);
             }
-            (Some(fork_id), vec![join_id])
+            (fork_id, vec![join_id])
         }
-        Router::Loop(loop_def) => {
-            let condition = format!(
-                "{} {}",
-                loop_def.condition.keyword(),
-                loop_def.condition.filter()
-            );
-            let max_iterations = loop_def.max_iterations;
+        StepKind::Loop(loop_step) => {
             let loop_id = builder.add_node(
-                format!("[{label}]\nloop: {condition}\nmax_iterations: {max_iterations}"),
+                format!(
+                    "[{label}]\n{} {}\nmax_iterations: {}{when}",
+                    loop_step.condition.keyword(),
+                    loop_step.condition.filter(),
+                    loop_step.max_iterations
+                ),
                 NodeShape::Decision,
             );
-            render_self_looping_body(
-                loop_id,
-                &loop_def.steps,
-                "iterate",
-                "next iteration",
-                format!("[{label}] loop body"),
-                builder,
-            )
-        }
-        Router::ForEach(for_each) => {
-            let mut node_label = format!("[{label}]\nfor_each: {}", for_each.items);
-            if let Some(max_concurrency) = for_each.max_concurrency {
-                node_label.push_str(&format!("\nmax_concurrency: {max_concurrency}"));
+            let since = builder.nodes.len();
+            let (body_entry, body_exits) = render_chain(&loop_step.steps, builder);
+            if let Some(body_entry) = body_entry {
+                builder.add_edge(&loop_id, &body_entry, Some("iterate".to_owned()));
+                for exit in body_exits {
+                    builder.add_edge(&exit, &loop_id, Some("next iteration".to_owned()));
+                }
             }
+            builder.add_subgraph(format!("[{label}] loop body"), since);
+            (loop_id.clone(), vec![loop_id])
+        }
+        StepKind::ForEach(for_each) => {
+            let mut node_label = format!("[{label}]\nfor_each: {}", for_each.items);
+            if for_each.max_concurrency > 1 {
+                node_label.push_str(&format!("\nmax_concurrency: {}", for_each.max_concurrency));
+            }
+            node_label.push_str(&when);
             let for_each_id = builder.add_node(node_label, NodeShape::Decision);
-            render_self_looping_body(
-                for_each_id,
-                &for_each.steps,
-                "per item",
-                "next item",
-                format!("[{label}] for_each body"),
-                builder,
-            )
+            let since = builder.nodes.len();
+            let (body_entry, body_exits) = render_chain(&for_each.steps, builder);
+            if let Some(body_entry) = body_entry {
+                builder.add_edge(&for_each_id, &body_entry, Some("per item".to_owned()));
+                for exit in body_exits {
+                    builder.add_edge(&exit, &for_each_id, Some("next item".to_owned()));
+                }
+            }
+            builder.add_subgraph(format!("[{label}] for_each body"), since);
+            (for_each_id.clone(), vec![for_each_id])
         }
-    }
-}
-
-/// Shared by `Router::Loop`/`Router::ForEach`: both are a single decision
-/// node whose body chain feeds back into itself (its exits become its own
-/// re-entry edges, labeled `iterate_label`), wrapped in one subgraph — unlike
-/// `Router::Switch`/`Router::Parallel`, which fan out into multiple sibling
-/// chains instead of looping a single one. `enter_label` names the
-/// node-to-body edge (e.g. "iterate" vs "per item"); `iterate_label` names
-/// each body-exit-to-node edge (e.g. "next iteration" vs "next item").
-fn render_self_looping_body(
-    node_id: String,
-    steps: &[FlowStep],
-    enter_label: &str,
-    iterate_label: &str,
-    subgraph_title: String,
-    builder: &mut GraphBuilder,
-) -> (Option<String>, Vec<String>) {
-    let since = builder.nodes.len();
-    let (body_entry, body_exits) = render_chain(steps, builder);
-    if let Some(body_entry) = body_entry {
-        builder.add_edge(&node_id, &body_entry, Some(enter_label.to_owned()));
-        for exit in body_exits {
-            builder.add_edge(&exit, &node_id, Some(iterate_label.to_owned()));
+        action => {
+            let mut node_label = format!("[{label}]\n{}", action.name());
+            if let Some(detail) = action_detail(action) {
+                node_label.push_str(&format!("\n{detail}"));
+            }
+            node_label.push_str(&when);
+            let id = builder.add_node(node_label, NodeShape::Action);
+            (id.clone(), vec![id])
         }
+    };
+    // A `when`-guarded step can be skipped, so the next step is also
+    // reachable straight from its entry (this matters for a guarded
+    // `stop`/`break`, which otherwise has no exits).
+    let mut exits = exits;
+    if step.when.is_some() && !exits.contains(&entry) {
+        exits.push(entry.clone());
     }
-    builder.add_subgraph(subgraph_title, since);
-    (Some(node_id.clone()), vec![node_id])
+    if let Some(on_error) = &step.on_error {
+        let since = builder.nodes.len();
+        let (on_error_entry, on_error_exits) = render_chain(on_error, builder);
+        if let Some(on_error_entry) = on_error_entry {
+            builder.add_edge(&entry, &on_error_entry, Some("on_error".to_owned()));
+        }
+        builder.add_subgraph(format!("{label}: on_error"), since);
+        exits.extend(on_error_exits);
+        return (Some(entry), exits);
+    }
+    (Some(entry), exits)
 }
 
 fn render_mermaid(model: &GraphModel) -> String {

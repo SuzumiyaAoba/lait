@@ -34,7 +34,7 @@ lait schema agent    > agent.schema.json
 # yaml-language-server: $schema=https://raw.githubusercontent.com/SuzumiyaAoba/lait/master/schemas/workflow.json
 name: sample-workflow
 steps:
-  - use: summarize
+  - prompt: "{{ input }} を要約してください。"
 ```
 
 `lait.config.yml`・`lait.deps.yml`・agent frontmatter でも同様に、それぞれ

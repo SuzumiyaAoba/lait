@@ -66,7 +66,7 @@ makers run -- --model <MODEL_ID> "プロンプト"
 
 - [設定ファイル](./docs/usage/ja/config.md) — モデル alias、`.env`、ツールやレジストリの登録。
 - [GitHub 依存（lait deps）](./docs/usage/ja/deps.md) — GitHub 上のワークフロー/エージェント/スキルをロックファイル付きで取り込む方法。
-- [ワークフロー（workflow.yml）](./docs/usage/ja/workflow.md) — 複数ステップの自動化、分岐、ループ、並列実行。
+- [ワークフロー（workflow.yml）](./docs/usage/ja/workflow.md) — 型付きの入出力を持つ複数ステップの自動化、分岐、ループ、並列実行。
 - [エージェント Markdown ファイル（agent.md）](./docs/usage/ja/agent.md) — agent の定義と実行。
 - [JSON Schema でエディタ補完（lait schema）](./docs/usage/ja/schema.md) — workflow/config/deps/agent の JSON Schema と yaml-language-server 連携。
 - [決定的テスト（record & replay / lait test）](./docs/usage/ja/testing.md) — API を呼ばずにワークフローの制御フローを検証する方法。

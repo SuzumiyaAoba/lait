@@ -5,7 +5,10 @@ use super::*;
 fn a_child_workflow_waiting_on_a_fifo_observes_the_workflow_deadline() {
     let dir = support::ScratchDir::new();
     create_fifo(&dir.path().join("child.yml"));
-    let root = dir.write("root.yml", "default: {workflow_timeout: 1}\nnodes:\n  child: {type: workflow, workflow: child.yml}\nsteps: [{use: child}]\n");
+    let root = dir.write(
+        "root.yml",
+        "timeout: 1\nsteps:\n  - id: child\n    workflow: child.yml\n",
+    );
     let (output, elapsed) = run_workflow_until_timeout(&root);
     assert_eq!(output.status.code(), Some(5), "{output:?}");
     assert!(elapsed < Duration::from_secs(3));
@@ -24,7 +27,9 @@ fn a_recursive_fifo_workflow_is_rejected_before_waiting_for_another_writer() {
             .write(true)
             .open(writer_path)
             .unwrap();
-        writer.write_all(b"default: {workflow_timeout: 1}\nnodes:\n  again: {type: workflow, workflow: cycle.yml}\nsteps: [{use: again}]\n").unwrap();
+        writer
+            .write_all(b"timeout: 1\nsteps:\n  - id: again\n    workflow: cycle.yml\n")
+            .unwrap();
     });
     let (output, _) = run_workflow_until_timeout(&path);
     writer.join().unwrap();
@@ -36,7 +41,7 @@ fn a_recursive_fifo_workflow_is_rejected_before_waiting_for_another_writer() {
 #[test]
 fn on_error_receives_the_underlying_cause_not_only_the_step_label() {
     let workflow = WorkflowFile::new(
-        "nodes:\n  call: {type: command, command: [nonexistent-lait-test-executable]}\n  recover: {type: transform, jq: '.error'}\nsteps:\n  - use: call\n    on_error: {steps: [{use: recover}]}\n",
+        "steps:\n  - id: call\n    run: [nonexistent-lait-test-executable]\n    on_error:\n      - id: recover\n        jq: '.error'\n",
     );
     let output = test_command()
         .arg("run")

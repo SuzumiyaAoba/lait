@@ -18,7 +18,7 @@ fn workflow_list_shows_name_path_and_description() {
     write(
         &dir,
         "workflows/hello.yml",
-        "description: says hello\nnodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n",
+        "description: says hello\nsteps:\n  - id: echo\n    jq: '.'\n",
     );
 
     // `--config` is a global flag, but `args_conflicts_with_subcommands`
@@ -47,7 +47,7 @@ fn workflow_list_notes_a_missing_file_without_aborting() {
     write(
         &dir,
         "workflows/hello.yml",
-        "nodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n",
+        "steps:\n  - id: echo\n    jq: '.'\n",
     );
 
     let output = test_command()
@@ -123,7 +123,7 @@ fn run_resolves_a_registered_workflow_name_relative_to_the_config_file() {
     write(
         &dir,
         "workflows/hello.yml",
-        "nodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n",
+        "steps:\n  - id: echo\n    jq: '.'\n",
     );
 
     let output = test_command()
@@ -154,12 +154,12 @@ fn run_prefers_an_existing_file_over_a_same_named_registry_entry() {
     write(
         &dir,
         "workflows/hello.yml",
-        "nodes:\n  echo:\n    type: transform\n    jq: '\"from registry\"'\nsteps:\n  - use: echo\n",
+        "steps:\n  - id: echo\n    jq: '\"from registry\"'\n",
     );
     write(
         &dir,
         "hello",
-        "nodes:\n  echo:\n    type: transform\n    jq: '\"from file\"'\nsteps:\n  - use: echo\n",
+        "steps:\n  - id: echo\n    jq: '\"from file\"'\n",
     );
 
     let output = test_command()
@@ -187,11 +187,7 @@ fn run_prefers_an_existing_file_over_a_same_named_registry_entry() {
 #[test]
 fn lint_reports_a_missing_workflows_registry_path() {
     let dir = ConfigDirectory::new("workflows:\n  broken: ./workflows/missing.yml\n");
-    write(
-        &dir,
-        "some.yml",
-        "nodes:\n  a:\n    type: transform\n    jq: '.'\nsteps:\n  - use: a\n",
-    );
+    write(&dir, "some.yml", "steps:\n  - id: a\n    jq: '.'\n");
 
     let output = test_command()
         .args([
@@ -215,13 +211,9 @@ fn lint_reports_ok_for_a_valid_workflows_registry() {
     write(
         &dir,
         "workflows/hello.yml",
-        "nodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n",
+        "steps:\n  - id: echo\n    jq: '.'\n",
     );
-    write(
-        &dir,
-        "some.yml",
-        "nodes:\n  a:\n    type: transform\n    jq: '.'\nsteps:\n  - use: a\n",
-    );
+    write(&dir, "some.yml", "steps:\n  - id: a\n    jq: '.'\n");
 
     let output = test_command()
         .args([

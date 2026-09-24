@@ -182,19 +182,12 @@ fn trajectory_unsupported_message() -> String {
         .to_owned()
 }
 
-/// Recovers the text a workflow step's own output would have rendered as,
-/// from the JSON value `workflow::exec::run_steps` stored for it (see
-/// `steps_outputs.insert`'s doc comment: it stores `template::parse_input`'s
-/// result, the same JSON-if-parseable-else-wrapped-string duality
-/// [`normalize_jq_input`] applies in the other direction). A plain-text
-/// output round-trips exactly (`Value::String` unwraps to the original
-/// text); a JSON-producing step's output round-trips to equivalent
-/// (not necessarily byte-identical, e.g. key order/whitespace) JSON text.
+/// The text a workflow step's own output renders as (see
+/// `template::to_text`): a string output is its own text, any other value
+/// its compact JSON — the same text form a later step, `lait run`'s final
+/// output, or a written file sees.
 fn step_output_text(value: &serde_json::Value) -> String {
-    match value.as_str() {
-        Some(text) => text.to_owned(),
-        None => serde_json::to_string(value).expect("a parsed JSON value always re-serializes"),
-    }
+    crate::template::to_text(value)
 }
 
 /// Checks [`Assertion::ToolCalled`]: `events` must contain between `min`
@@ -236,7 +229,7 @@ async fn check_tool_called(
         ));
     }
     let expr = args_jq?;
-    let empty_steps = jq::Steps::new();
+    let globals = jq::Globals::default();
     for event in &matching {
         let Some(arguments) = event
             .attributes
@@ -245,11 +238,10 @@ async fn check_tool_called(
         else {
             continue;
         };
-        if let Ok(true) = jq::apply_bool_cancellable_async(
+        if let Ok(true) = jq::eval_bool_async(
             expr,
-            arguments,
-            &empty_steps,
-            &empty_steps,
+            &normalize_jq_input(arguments),
+            &globals,
             cancellation.clone(),
         )
         .await
@@ -368,19 +360,14 @@ async fn check_step_output(
     ))
 }
 
-/// Converts a workflow/model's final output text into the JSON text a jq
-/// expression evaluates `.` against: text that already parses as JSON is
-/// passed through unchanged (so a structured assertion like
-/// `.title | length > 0` works against a JSON-producing workflow), anything
-/// else is wrapped as a JSON string value (so a plain-text assertion like
-/// `contains("結論")` works against ordinary text output too).
-fn normalize_jq_input(output: &str) -> String {
-    if serde_json::from_str::<serde_json::Value>(output).is_ok() {
-        output.to_owned()
-    } else {
-        serde_json::to_string(&serde_json::Value::String(output.to_owned()))
-            .expect("serializing a string to JSON cannot fail")
-    }
+/// Converts a workflow/model's final output text into the value a jq
+/// expression evaluates `.` against: text that parses as JSON is used as
+/// that value (so a structured assertion like `.title | length > 0` works
+/// against a JSON-producing workflow), anything else is a JSON string (so a
+/// plain-text assertion like `contains("結論")` works against ordinary text
+/// output too).
+fn normalize_jq_input(output: &str) -> serde_json::Value {
+    crate::template::parse_input(output)
 }
 
 /// The JSON Schema an `llm_judge` call requests as its Structured Output, so
@@ -491,14 +478,12 @@ fn check_contains(value: &str, output: &str) -> Option<String> {
 /// produce exactly one value).
 async fn check_jq(
     expr: &str,
-    input_json: &str,
-    empty_steps: &jq::Steps,
+    input_value: &serde_json::Value,
+    globals: &jq::Globals,
     output: &str,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Option<String> {
-    match jq::apply_bool_cancellable_async(expr, input_json, empty_steps, empty_steps, cancellation)
-        .await
-    {
+    match jq::eval_bool_async(expr, input_value, globals, cancellation).await {
         Ok(true) => None,
         Ok(false) => Some(format!(
             "jq expression `{expr}` was false for output {output:?}"
@@ -572,10 +557,10 @@ pub(crate) async fn evaluate(
     output: &str,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Vec<AssertionFailure> {
-    let input_json = normalize_jq_input(output);
-    let empty_steps = jq::Steps::new();
-    let input_json = &input_json;
-    let empty_steps = &empty_steps;
+    let input_value = normalize_jq_input(output);
+    let globals = jq::Globals::default();
+    let input_value = &input_value;
+    let globals = &globals;
 
     let checks = assertions.iter().map(move |assertion| {
         let cancellation = cancellation.clone();
@@ -584,7 +569,7 @@ pub(crate) async fn evaluate(
                 Assertion::Equals { value } => check_equals(value, output),
                 Assertion::Contains { value } => check_contains(value, output),
                 Assertion::Jq { expr } => {
-                    check_jq(expr, input_json, empty_steps, output, cancellation).await
+                    check_jq(expr, input_value, globals, output, cancellation).await
                 }
                 Assertion::LlmJudge {
                     criteria,
@@ -664,12 +649,18 @@ mod tests {
 
     #[test]
     fn normalizes_plain_text_as_a_json_string() {
-        assert_eq!(normalize_jq_input("hello world"), "\"hello world\"");
+        assert_eq!(
+            normalize_jq_input("hello world"),
+            serde_json::json!("hello world")
+        );
     }
 
     #[test]
     fn passes_valid_json_text_through_unchanged() {
-        assert_eq!(normalize_jq_input(r#"{"a":1}"#), r#"{"a":1}"#);
+        assert_eq!(
+            normalize_jq_input(r#"{"a":1}"#),
+            serde_json::json!({"a": 1})
+        );
     }
 
     #[tokio::test]

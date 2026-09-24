@@ -261,7 +261,7 @@ models:
 | --- | --- |
 | 通常のチャット（`lait [OPTIONS] PROMPT`）と `-p/--prompt-name` | CLI 引数（環境変数のフォールバックを含む） → 名前付きプロンプトの値 → モデル alias の既定値 → `lait.config.yml` の `default:` → 組み込み既定値 |
 | `lait prompt run <NAME>` | `prompts.<name>.model` → `lait.config.yml` の `default.model`。この入口は `--model` や `--stream` などのチャット用上書きを受け付けません。 |
-| `lait agent run`／ワークフローノード | ノード自身（または agent Markdown の frontmatter） → agent Markdown の値 → ワークフローの `default:` → `lait.config.yml` の `default:` → 組み込み既定値 |
+| `lait agent run`／ワークフローの LLM ステップ | ステップ自身 → エージェント定義（agent Markdown の frontmatter やワークフローの `agents:`） → ワークフローの `default:` → `lait.config.yml` の `default:` → 組み込み既定値 |
 
 `default:` は、呼び出し側で指定していない値を補うための共通の既定値です。ワークフロー固有の設定については [ワークフロー](./workflow.md)、agent 固有の設定については [agent](./agent.md) を参照してください。
 
@@ -297,8 +297,9 @@ models:
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
 - 後述の [MCP サーバー](#mcp-サーバー) の `command`/`args`/`env`/`cwd`/`url`/`headers` も同じ
   規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
-  パス、`default.system`、ワークフローの `prompt:`/`system_prompt:` には**この展開は適用されません**
-  （こちらは `--var`/handlebars のテンプレート変数で渡してください）。
+  パス、`default.system`、ワークフローの `prompt:`/`system:` には**この展開は適用されません**
+  （名前付きプロンプトなら `--var`、ワークフローなら `inputs:`/`--input` のテンプレート変数で
+  渡してください）。
 
 ## `api_key_cmd` による外部コマンドからのシークレット取得
 
@@ -418,7 +419,7 @@ export HOST=api.example.com    # export プレフィックスも可
 ## MCP サーバー
 
 `mcp_servers:` に MCP (Model Context Protocol) サーバーを登録すると、`--mcp`（チャット）・
-agent ファイルの `mcp:`・ワークフローノードの `mcp:` から名前で参照してツールを使えるように
+agent ファイルの `mcp:`・ワークフローのステップの `mcp:` から名前で参照してツールを使えるように
 なります。詳しい使い方は [MCP サーバーのツールを使う](./mcp.md) を参照してください。
 
 ```yaml
@@ -505,7 +506,7 @@ prompts:
 ## スキル
 
 `skills:` にスキル Markdown ファイルを登録すると、`default.skills`（チャット）・agent ファイルの
-`skills:`・ワークフローノードの `skills:` から名前で参照して、その内容をシステムプロンプトに
+`skills:`・ワークフローのステップの `skills:` から名前で参照して、その内容をシステムプロンプトに
 追記できるようになります。詳しい使い方は [スキルを使う](./skills.md) を参照してください。
 
 ```yaml
@@ -528,7 +529,7 @@ skills:
 ## サブエージェント
 
 `agents:` にエージェント Markdown ファイルを登録すると、`--subagent`（チャット）・agent ファイルの
-`subagents:`・ワークフローノードの `subagents:` から名前で参照して、モデル自身が実行時に呼び出す
+`subagents:`・ワークフローのステップの `subagents:` から名前で参照して、モデル自身が実行時に呼び出す
 かどうかを判断できる「サブエージェント」ツールとして使えるようになります。詳しい使い方は
 [サブエージェントを使う](./subagents.md) を参照してください。
 
@@ -542,7 +543,7 @@ agents:
   researcher: agents/researcher.md
 ```
 
-- 値はエージェント Markdown ファイルへのパスです（`agent:` ノードと同じ形式のファイルを、
+- 値はエージェント Markdown ファイルへのパスです（`agent:` ステップと同じ形式のファイルを、
   そのまま名前を付けて登録します）。
 - パスは、`skills:` と同じく、その場では接続を持ちません。実際に使う最初の時点で
   Markdown を読み込み、一回の `lait` 実行中は同じ内容をキャッシュします。実行中にファイルを
@@ -551,7 +552,7 @@ agents:
 ## カスタムシェルツール
 
 `tools:` にローカルコマンドを登録すると、MCP サーバーを立てずに `--tool`（チャット）・agent
-ファイルの `tools:`・ワークフローノードの `tools:` から名前で参照して、モデルが呼び出せる
+ファイルの `tools:`・ワークフローのステップの `tools:` から名前で参照して、モデルが呼び出せる
 ツールとして使えます。詳しい使い方は [カスタムシェルツールを使う](./tools.md) を参照してください。
 
 ```yaml

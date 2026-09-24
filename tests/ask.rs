@@ -9,13 +9,9 @@ fn ask_uses_its_default_when_stdin_is_not_a_terminal() {
     // non-interactive path.
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
-    default: "yes"
 steps:
-  - use: confirm
+  - ask: "proceed?"
+    default: "yes"
 "#,
     );
 
@@ -29,12 +25,8 @@ steps:
 fn ask_fails_when_stdin_is_not_a_terminal_and_no_default_is_set() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
 steps:
-  - use: confirm
+  - ask: "proceed?"
 "#,
     );
 
@@ -53,39 +45,31 @@ steps:
 fn ask_records_its_answer_for_a_later_steps_jq_filter() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
-    default: "yes"
-  read_confirm:
-    type: transform
-    jq: '$steps.confirm'
 steps:
   - id: confirm
-    use: confirm
-  - use: read_confirm
+    ask: "proceed?"
+    default: "yes"
+  - jq: '{answer: $steps.confirm}'
 "#,
     );
 
     let output = run_lait_workflow(&workflow.path, "null");
 
     assert!(output.status.success(), "lait run failed: {output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "yes");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"{"answer":"yes"}"#
+    );
 }
 
 #[test]
-fn ask_applies_jq_to_its_answer() {
+fn ask_output_maps_its_answer() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "how many?"
-    default: "3"
-    jq: 'tonumber * 2'
 steps:
-  - use: confirm
+  - ask: "how many?"
+    default: "3"
+    output: 'tonumber * 2'
 "#,
     );
 
@@ -96,17 +80,28 @@ steps:
 }
 
 #[test]
+fn ask_renders_its_question_from_the_input() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - ask: "{{ input }}"
+    default: "ok"
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "question text");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+}
+
+#[test]
 fn ask_rejects_a_default_that_is_not_one_of_its_choices() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
-    choices: [yes, no]
-    default: "maybe"
 steps:
-  - use: confirm
+  - ask: "proceed?"
+    choices: ["yes", "no"]
+    default: "maybe"
 "#,
     );
 
@@ -115,21 +110,17 @@ steps:
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("which is not one of its 'choices'"),
+        stderr.contains("must be one of 'choices'"),
         "stderr: {stderr}"
     );
 }
 
 #[test]
-fn ask_rejects_an_empty_prompt() {
+fn ask_rejects_an_empty_question() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: ""
 steps:
-  - use: confirm
+  - ask: "  "
 "#,
     );
 
@@ -137,49 +128,35 @@ steps:
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("empty 'prompt'"), "stderr: {stderr}");
+    assert!(stderr.contains("non-empty question"), "stderr: {stderr}");
 }
 
 #[test]
 fn ask_rejects_an_empty_choices_list() {
-    let workflow = WorkflowFile::new(
-        r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
-    choices: []
-steps:
-  - use: confirm
-"#,
-    );
+    for choices in ["[]", "['']"] {
+        let workflow = WorkflowFile::new(&format!(
+            "steps:\n  - ask: \"proceed?\"\n    choices: {choices}\n"
+        ));
 
-    let output = run_lait_workflow(&workflow.path, "null");
+        let output = run_lait_workflow(&workflow.path, "null");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("choices"), "stderr: {stderr}");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("choices"), "stderr: {stderr}");
+    }
 }
 
 #[test]
 fn ask_is_rejected_inside_a_parallel_branch() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
-    default: "yes"
-  noop:
-    type: transform
-    jq: '.'
 steps:
   - parallel:
-      branches:
-        - steps:
-            - use: confirm
-        - steps:
-            - use: noop
+      confirm:
+        - ask: "proceed?"
+          default: "yes"
+      other:
+        - jq: '.'
 "#,
     );
 
@@ -187,7 +164,7 @@ steps:
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("'type: ask'"), "stderr: {stderr}");
+    assert!(stderr.contains("'ask'"), "stderr: {stderr}");
     assert!(stderr.contains("parallel"), "stderr: {stderr}");
 }
 
@@ -195,17 +172,12 @@ steps:
 fn ask_is_rejected_inside_a_concurrent_for_each_body() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
-    default: "yes"
 steps:
-  - for_each:
-      items: '[1, 2]'
-      max_concurrency: 2
-      steps:
-        - use: confirm
+  - for_each: '[1, 2]'
+    max_concurrency: 2
+    steps:
+      - ask: "proceed?"
+        default: "yes"
 "#,
     );
 
@@ -213,29 +185,26 @@ steps:
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("'type: ask'"), "stderr: {stderr}");
+    assert!(stderr.contains("'ask'"), "stderr: {stderr}");
 }
 
 #[test]
 fn ask_is_allowed_inside_a_sequential_for_each_body() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  confirm:
-    type: ask
-    prompt: "proceed?"
-    default: "yes"
 steps:
-  - for_each:
-      items: '[1, 2]'
-      steps:
-        - use: confirm
+  - for_each: '[1, 2]'
+    steps:
+      - ask: "proceed?"
+        default: "yes"
 "#,
     );
 
     let output = run_lait_workflow(&workflow.path, "null");
 
     assert!(output.status.success(), "lait run failed: {output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("yes"), "stdout: {stdout}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"["yes","yes"]"#
+    );
 }

@@ -2,7 +2,7 @@
 //! (see `config::ShellToolDefinition`): a local command exposed to the model
 //! as a callable tool without standing up an MCP server. Enabled the same
 //! way `mcp:`/`skills:`/`subagents:` are (a `tools:` list on the CLI/agent
-//! file/workflow node, or `default.tools`), gated by the same
+//! file/workflow step, or `default.tools`), gated by the same
 //! `tool_policy`/`--approve-tools` `engine::execute_tool_calls` already
 //! enforces for MCP/subagent tools — the qualified name this module produces
 //! (see `tools` below) flows through that same string-keyed dispatch, so
@@ -95,7 +95,7 @@ fn render_argv(
 ) -> Result<Vec<String>> {
     let empty_steps = serde_json::Map::new();
     let empty_vars = serde_json::Map::new();
-    let render_scope = template::RenderScope::new(input, &empty_steps, &empty_vars);
+    let render_scope = template::RenderScope::new(input, &empty_steps, &empty_vars)?;
     definition
         .command
         .iter()
@@ -166,7 +166,7 @@ pub(crate) async fn call(
 ) -> Result<String> {
     ensure_not_cancelled(&cancellation)?;
     let input = parse_call_arguments(arguments_json)?;
-    if let Err(error) = schema::validate_input_against_schema(&definition.parameters, &input) {
+    if let Err(error) = schema::validate_value(&definition.parameters, &input, "arguments") {
         return Ok(format!("tool arguments failed validation: {error:#}"));
     }
     let argv = match render_argv(definition, &input) {

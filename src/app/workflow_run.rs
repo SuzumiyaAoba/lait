@@ -9,35 +9,34 @@ use crate::{
     cli::RunArgs,
     config::ConfigSource,
     engine::RunContext,
-    report, trace,
+    report, template, trace,
     workflow::{
         self, WorkflowScope,
-        exec::{Flow, RunStepsFrame, StepsOutcome, announce_named_file, run_steps},
+        exec::{Flow, Frame, Outcome, State, announce_named_file, finish_output, run_steps},
     },
 };
 
 /// Runtime progress between top-level steps. Keeping the state together avoids
-/// mixing a router's nested counter with the checkpoint's top-level position.
+/// mixing a control step's nested counter with the checkpoint's top-level
+/// position.
 struct Progress {
     completed_index: usize,
-    counter: usize,
-    input: String,
-    outputs: workflow::StepOutputs,
+    state: State,
 }
 
 /// Immutable metadata shared by every snapshot in a run.
 struct CheckpointContext<'a> {
     run_id: &'a str,
     workflow_path: &'a str,
-    initial_prompt: &'a str,
-    vars: &'a serde_json::Map<String, serde_json::Value>,
+    initial_input: &'a serde_json::Value,
+    inputs: &'a serde_json::Map<String, serde_json::Value>,
     labels: &'a [String],
 }
 
 impl CheckpointContext<'_> {
     /// Every field here is borrowed (see `checkpoint::CheckpointRef`'s doc
     /// comment) — this write happens after *every* top-level step, and
-    /// `progress.outputs` in particular grows by one entry per completed
+    /// `progress.state.steps` in particular grows by one entry per completed
     /// step, so building an owned `Checkpoint` first would deep-clone it
     /// again on every single write.
     async fn save(
@@ -50,13 +49,13 @@ impl CheckpointContext<'_> {
             &checkpoint::CheckpointRef {
                 run_id: self.run_id,
                 workflow_path: self.workflow_path,
-                initial_prompt: self.initial_prompt,
-                vars: self.vars,
+                initial_input: self.initial_input,
+                inputs: self.inputs,
                 top_level_labels: self.labels,
                 completed_index: progress.completed_index,
-                counter: progress.counter,
-                current_input: &progress.input,
-                steps_outputs: &progress.outputs,
+                counter: progress.state.counter,
+                current_value: &progress.state.value,
+                steps_outputs: &progress.state.steps,
                 status,
             },
             cancellation,
@@ -75,7 +74,7 @@ impl RunDeadline {
                 biased;
                 () = cancel.cancelled() => {},
                 () = tokio::time::sleep(std::time::Duration::from_secs(seconds)) => {
-                    eprintln!("lait: 'default.workflow_timeout' ({seconds}s) exceeded; cancelling the run");
+                    eprintln!("lait: the workflow's 'timeout' ({seconds}s) was exceeded; cancelling the run");
                     cancel.cancel();
                 }
             }
@@ -91,15 +90,14 @@ impl Drop for RunDeadline {
     }
 }
 
-/// Every top-level step's label, by position: this site's own label (see
-/// `FlowStep::label`) if set, else `step-<position>` (1-based). Deliberately
-/// *not* the same value `run_steps`' own progress-counter fallback would
-/// produce for an unlabeled router site — that counter only exists once a
-/// run is actually executing (it also counts nested steps), whereas this
-/// only needs to name each top-level position stably, before anything has
-/// run, so `checkpoint::check_resumable` can detect whether the step
-/// sequence changed since a checkpoint was written.
-fn top_level_step_labels(steps: &[workflow::FlowStep]) -> Vec<String> {
+/// Every top-level step's stable label, by position: its `id`, else
+/// `step-<position>` (1-based). Deliberately *not* the same value
+/// `run_steps`' own progress-counter fallback would produce — that counter
+/// only exists once a run is actually executing (it also counts nested
+/// steps), whereas this only needs to name each top-level position stably,
+/// before anything has run, so `checkpoint::check_resumable` can detect
+/// whether the step sequence changed since a checkpoint was written.
+fn top_level_step_labels(steps: &[workflow::Step]) -> Vec<String> {
     steps
         .iter()
         .enumerate()
@@ -134,16 +132,22 @@ fn check_resume_compatible(
     Ok(())
 }
 
-/// Resolves the initial prompt, run vars, and starting [`Progress`] a run
-/// begins from — a `--resume` target restores all three from its checkpoint
-/// (unless `--var` overrides its saved vars), while a fresh run resolves the
-/// prompt from `PROMPT`/stdin and starts `Progress` at the beginning.
+/// Resolves the initial value, resolved `inputs`, and starting [`Progress`]
+/// a run begins from — a `--resume` target restores all three from its
+/// checkpoint (unless `--input` overrides its saved inputs), while a fresh
+/// run resolves the initial value from `PROMPT`/stdin and starts `Progress`
+/// at the beginning.
 async fn resolve_run_start(
     run_args: &RunArgs,
+    wf: &workflow::WorkflowFile,
     resumed: Option<&checkpoint::Checkpoint>,
     top_level_labels: &[String],
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<(String, serde_json::Map<String, serde_json::Value>, Progress)> {
+) -> Result<(
+    serde_json::Value,
+    serde_json::Map<String, serde_json::Value>,
+    Progress,
+)> {
     match resumed {
         Some(resumed) => {
             checkpoint::check_resumable(top_level_labels, resumed)?;
@@ -153,36 +157,54 @@ async fn resolve_run_start(
                 resumed.completed_index + 1,
                 top_level_labels.len(),
             );
-            let vars = if run_args.var.var.is_empty() {
-                resumed.vars.clone()
+            let inputs = if run_args.input.is_empty() {
+                resumed.inputs.clone()
             } else {
-                workflow::build_vars(&run_args.var.var)?
+                resolve_cli_inputs(wf, &run_args.input)?
             };
             Ok((
-                resumed.initial_prompt.clone(),
-                vars,
+                resumed.initial_input.clone(),
+                inputs,
                 Progress {
                     completed_index: resumed.completed_index,
-                    counter: resumed.counter,
-                    input: resumed.current_input.clone(),
-                    outputs: resumed.steps_outputs.clone(),
+                    state: State {
+                        value: resumed.current_value.clone(),
+                        counter: resumed.counter,
+                        steps: resumed.steps_outputs.clone(),
+                    },
                 },
             ))
         }
         None => {
             let prompt =
                 chat::resolve_input_with_stdin_cancellable(run_args.prompt.clone(), cancel.clone())
+                    .await?;
+            let initial_input = match prompt {
+                Some(prompt) => {
+                    workflow::inputs::resolve_initial(
+                        wf,
+                        workflow::inputs::InitialInput::Text(prompt),
+                        cancel.clone(),
+                    )
                     .await?
-                    .ok_or_else(super::missing_prompt_error)?;
-            let vars = workflow::build_vars(&run_args.var.var)?;
+                }
+                None if wf.declares_inputs() => serde_json::Value::Null,
+                None => bail!(
+                    "a PROMPT is required; provide one or pipe input via stdin (a workflow that \
+                     declares 'inputs:' may be run without one)"
+                ),
+            };
+            let inputs = resolve_cli_inputs(wf, &run_args.input)?;
             Ok((
-                prompt.clone(),
-                vars,
+                initial_input.clone(),
+                inputs,
                 Progress {
                     completed_index: 0,
-                    counter: 0,
-                    input: prompt,
-                    outputs: workflow::StepOutputs::new(),
+                    state: State {
+                        value: initial_input,
+                        counter: 0,
+                        steps: workflow::StepOutputs::new(),
+                    },
                 },
             ))
         }
@@ -212,20 +234,21 @@ pub(super) async fn run_workflow(
     };
     check_resume_compatible(resumed.as_ref(), &workflow_path)?;
 
-    let mut wf = workflow::load_workflow_cancellable(&resolved_file, cancel.clone()).await?;
+    let wf = workflow::load_workflow_cancellable(&resolved_file, cancel.clone()).await?;
     announce_named_file("==>", wf.name.as_deref(), wf.description.as_deref());
-    let scope = WorkflowScope::top_level(&mut wf, &resolved_file, cancel.clone()).await?;
     let top_level_labels = top_level_step_labels(&wf.steps);
 
-    let (initial_prompt, vars, progress) =
-        resolve_run_start(&run_args, resumed.as_ref(), &top_level_labels, &cancel).await?;
+    let (initial_input, inputs, progress) =
+        resolve_run_start(&run_args, &wf, resumed.as_ref(), &top_level_labels, &cancel).await?;
     let run_id = match &resumed {
         Some(resumed) => resumed.run_id.clone(),
         None => checkpoint::generate_run_id(),
     };
+    let scope =
+        WorkflowScope::top_level(&wf, &resolved_file, inputs.clone(), cancel.clone()).await?;
 
     if run_args.dry_run {
-        return workflow::dryrun::print_plan(&wf, &scope, &file_config, &initial_prompt, &vars);
+        return workflow::dryrun::print_plan(&wf, &scope, &file_config, &initial_input);
     }
 
     // `--resume` implies `--checkpoint`: a run started with `--checkpoint`
@@ -234,29 +257,33 @@ pub(super) async fn run_workflow(
     let checkpointing = run_args.checkpoint || resumed.is_some();
 
     let run_cancel = cancel.child_token();
-    let deadline = RunDeadline::start(scope.defaults.workflow_timeout, run_cancel.clone());
+    let deadline = RunDeadline::start(wf.timeout, run_cancel.clone());
 
     let (services, env) =
         super::build_run_context(&file_config, cache_override, approve_tools, run_cancel);
-    let env = env
-        .with_vars(vars.clone())
-        .with_record_replay(run_args.record.clone(), run_args.replay.clone())?;
+    let env = env.with_record_replay(run_args.record.clone(), run_args.replay.clone())?;
     let checkpoint = CheckpointContext {
         run_id: &run_id,
         workflow_path: &workflow_path,
-        initial_prompt: &initial_prompt,
-        vars: &vars,
+        initial_input: &initial_input,
+        inputs: &inputs,
         labels: &top_level_labels,
     };
-    let progress = services
-        .finish(run_top_level(
-            &wf.steps,
-            progress,
-            &scope,
-            &env,
-            checkpointing.then_some(&checkpoint),
-            &run_args.file,
-        ))
+    let (progress, output) = services
+        .finish(async {
+            let progress = run_top_level(
+                &wf.steps,
+                progress,
+                &scope,
+                &env,
+                checkpointing.then_some(&checkpoint),
+                &run_args.file,
+            )
+            .await?;
+            let output =
+                finish_output(&wf, &scope, progress.state.clone(), env.root_token()).await?;
+            Ok::<_, anyhow::Error>((progress, output))
+        })
         .await?;
     drop(deadline);
     if checkpointing {
@@ -268,7 +295,8 @@ pub(super) async fn run_workflow(
             )
             .await?;
     }
-    let current_input = progress.input;
+    let output_text = template::to_text(&output);
+    let prompt_text = template::to_text(&initial_input);
 
     if let Some(trace_path) = &run_args.trace_file {
         let events = env.trace.events();
@@ -282,7 +310,7 @@ pub(super) async fn run_workflow(
     }
 
     report::emit_run_output(
-        &current_input,
+        &output_text,
         env.usage.total(),
         &run_args.output,
         &file_config,
@@ -293,8 +321,8 @@ pub(super) async fn run_workflow(
         report::RunRecord {
             kind: "workflow",
             model: None,
-            prompt: &initial_prompt,
-            response: &current_input,
+            prompt: &prompt_text,
+            response: &output_text,
         },
         run_args.reporting.no_history,
         &file_config,
@@ -303,10 +331,18 @@ pub(super) async fn run_workflow(
     )
 }
 
-/// Runs and checkpoints only top-level boundaries; nested routers stay atomic
-/// from the resume protocol's perspective. Failed steps keep their prior state.
+fn resolve_cli_inputs(
+    wf: &workflow::WorkflowFile,
+    raw: &[String],
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    workflow::inputs::resolve(&wf.inputs, workflow::inputs::parse_cli_inputs(raw)?)
+}
+
+/// Runs and checkpoints only top-level boundaries; nested control steps stay
+/// atomic from the resume protocol's perspective. Failed steps keep their
+/// prior state. A `stop` ends the loop early (the run still completes).
 async fn run_top_level(
-    steps: &[workflow::FlowStep],
+    steps: &[workflow::Step],
     mut progress: Progress,
     scope: &WorkflowScope,
     env: &RunContext,
@@ -314,32 +350,18 @@ async fn run_top_level(
     requested_file: &std::path::Path,
 ) -> Result<Progress> {
     for (index, step) in steps.iter().enumerate().skip(progress.completed_index) {
-        let saved_state = checkpoint.map(|_| (progress.input.clone(), progress.outputs.clone()));
+        let saved_state = checkpoint.map(|_| progress.state.clone());
         let outcome = run_steps(
             std::slice::from_ref(step),
-            progress.input,
-            progress.outputs,
-            RunStepsFrame {
-                scope,
-                env,
-                start_counter: progress.counter,
-                progress_prefix: "",
-                cancellation: env.root_token(),
-                placement: Default::default(),
-            },
+            progress.state,
+            Frame::new(scope, env, env.root_token()),
         )
         .await;
-        let StepsOutcome {
-            output,
-            counter,
-            flow,
-            steps_outputs,
-        } = match outcome {
+        let Outcome { state, flow } = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                if let (Some(checkpoint), Some((input, outputs))) = (checkpoint, saved_state) {
-                    progress.input = input;
-                    progress.outputs = outputs;
+                if let (Some(checkpoint), Some(saved_state)) = (checkpoint, saved_state) {
+                    progress.state = saved_state;
                     // Persistence failure must not replace the execution error,
                     // especially its typed cancellation/API classification.
                     //
@@ -349,12 +371,11 @@ async fn run_top_level(
                     // root token is already cancelled. `async_io::
                     // run_blocking` bails immediately on an already-cancelled
                     // token before the write ever happens, so passing it
-                    // here silently turned every SIGINT into a checkpoint
-                    // that was never written (see the "warning: failed to
-                    // save checkpoint" path this used to hit
-                    // unconditionally). This is the run's last write on this
-                    // path — nothing downstream is waiting on it — so
-                    // letting it complete uncancelled is correct.
+                    // here would silently turn every SIGINT into a
+                    // checkpoint that was never written. This is the run's
+                    // last write on this path — nothing downstream is
+                    // waiting on it — so letting it complete uncancelled is
+                    // correct.
                     match checkpoint
                         .save(
                             &progress,
@@ -380,9 +401,7 @@ async fn run_top_level(
         };
         progress = Progress {
             completed_index: index + 1,
-            counter,
-            input: output,
-            outputs: steps_outputs,
+            state,
         };
         if let Some(checkpoint) = checkpoint {
             checkpoint

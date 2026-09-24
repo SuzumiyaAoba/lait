@@ -77,7 +77,7 @@ mcp_servers:
 `mcp_servers` は AGENTS.md が言うとおり「信頼されたコード」として扱われますが、実際にどのツール
 を実行するかはモデルが選ぶため、`allowed_tools` はその選択に対するユーザー側のガードレールです。
 
-`lait lint` は、あるノード/エージェントファイルが `mcp:` で参照しているサーバーの
+`lait lint` は、あるステップ/エージェント定義が `mcp:` で参照しているサーバーの
 `allowed_tools` が空リストの場合、警告を出します（そのサーバーへのツール呼び出しは実行前に
 必ず拒否されるため、参照していること自体がほぼ設定ミスだからです）。`allowed_tools` が空でない
 リストの場合は、モデルが実際にどのツールを呼び出すかを事前には知りようがないため、警告は出ません
@@ -102,7 +102,7 @@ mcp_servers:
   です。そのため既定は無効（`false`）で、サーバーごとに opt-in する必要があります。
 - 標準入力が対話端末でない場合（CI・パイプ・`lait serve --mcp` の被呼び出し側など）は、
   `allow_elicitation` の値に関わらず、プロンプトを一切表示せずに即座に declined を返します
-  （`workflow: ask` ノードの「非対話的な標準入力には答えようがない」という判断と同じです）。
+  （ワークフローの `ask:` ステップの「非対話的な標準入力には答えようがない」という判断と同じです）。
 - 質問（`message`）と、回答に必要なフィールド名・型・説明が標準エラー出力に表示されます。
   入力に応じた扱いは次のとおりです。
 
@@ -183,7 +183,7 @@ stderr に表示し、stdin で確認します。
 |---|---|
 | チャット（`lait "prompt"`） | `--mcp`（CLI フラグ、複数指定可）→ `lait.config.yml` の `default.mcp` |
 | `lait agent run` | agent ファイルの frontmatter `mcp:` → `lait.config.yml` の `default.mcp` |
-| `lait run`（workflow） | ノードの `mcp:` → （`agent:` ノードなら）agent ファイルの `mcp:` → ワークフローの `default.mcp` → `lait.config.yml` の `default.mcp` |
+| `lait run`（workflow） | ステップの `mcp:` → （`agent:` ステップなら）エージェント定義の `mcp:` → ワークフローの `default.mcp` → `lait.config.yml` の `default.mcp` |
 
 ```sh
 lait "prompt" --mcp filesystem --mcp remote-search
@@ -200,15 +200,13 @@ max_tool_rounds: 8
 
 ```yaml
 # workflow.yml
-nodes:
-  research:
-    type: prompt
-    prompt: "{{ input }} について調べてください。"
+steps:
+  - prompt: "{{ input }} について調べてください。"
     mcp: [filesystem, remote-search]
 ```
 
 それぞれの詳細は [エージェント Markdown ファイル（agent.md）](./agent.md#mcp-ツールの利用) と
-[ワークフロー（workflow.yml）](./workflow.md#mcp-ツールの利用mcp) にもあります。
+[ワークフロー（workflow.yml）](./workflow.md#ツール連携mcp--skills--subagents--tools) にもあります。
 
 ## ツール名の扱い
 
@@ -218,9 +216,9 @@ nodes:
 置き換えられ、修飾後の名前が64文字を超える場合や、2つのツールが同じ修飾名になる場合はエラーに
 なります。
 
-## `structured_output` との併用
+## `output_schema` との併用
 
-`output_schema`/`structured_output: true` と `mcp` は併用できます。ただし、多くの OpenAI
+`output_schema`（Structured Outputs）と `mcp` は併用できます。ただし、多くの OpenAI
 互換サーバーは厳密な `json_schema` の `response_format` を渡されると、スキーマ準拠の出力を強制し
 `tool_calls` を一切返さなくなります。そのため lait は、ツールを呼び出している間は
 `response_format` を送らず、モデルがツール呼び出しを止めた最後のラウンドだけ `response_format`
@@ -241,9 +239,9 @@ nodes:
   `max_tool_rounds` に達する前に接続先モデルのコンテキストウィンドウ/トークン上限に当たって
   しまう場合は、[ツール周回の要約による圧縮（default.compaction）](./compaction.md)で
   ラウンドあたりのメッセージ量を抑えられます。
-- ワークフローの `retry` はノードの「ツール周回全体」を1つの単位として包みます。リトライが
-  発生すると、副作用のあるツール呼び出し（ファイル書き込みなど）も含めてそのノードのツール
-  周回全体がやり直されるため、副作用のあるツールをリトライ対象のノードで使う場合は注意して
+- ワークフローの `retry` はステップの「ツール周回全体」を1つの単位として包みます。リトライが
+  発生すると、副作用のあるツール呼び出し（ファイル書き込みなど）も含めてそのステップのツール
+  周回全体がやり直されるため、副作用のあるツールをリトライ対象のステップで使う場合は注意して
   ください。
 
 ## 動作確認について

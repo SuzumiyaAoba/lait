@@ -1,4 +1,4 @@
-//! Runs a workflow `command:` node's child process and contains its whole
+//! Runs a workflow `run:` step's child process and contains its whole
 //! process tree (not just the direct child) so a cancellation/timeout can't
 //! leave descendants running. Extracted out of `app.rs`'s workflow
 //! interpreter — the only thing this module's callers need is

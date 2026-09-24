@@ -4,12 +4,9 @@ use super::*;
 fn a_command_node_pipes_the_current_input_to_stdin_and_its_stdout_becomes_the_next_input() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  upper:
-    type: command
-    command: ["tr", "a-z", "A-Z"]
 steps:
-  - use: upper
+  - id: upper
+    run: ["tr", "a-z", "A-Z"]
 "#,
     );
 
@@ -26,12 +23,9 @@ steps:
 fn a_command_nodes_arguments_are_rendered_as_templates() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  greet:
-    type: command
-    command: ["echo", "hello, {{ input }}"]
 steps:
-  - use: greet
+  - id: greet
+    run: ["echo", "hello, {{ input }}"]
 "#,
     );
 
@@ -48,12 +42,9 @@ steps:
 fn a_command_node_removes_only_one_trailing_crlf_from_stdout() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  endings:
-    type: command
-    command: ["printf", "a\r\n\r\n"]
 steps:
-  - use: endings
+  - id: endings
+    run: ["printf", "a\r\n\r\n"]
 "#,
     );
 
@@ -75,18 +66,12 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  count:
-    type: command
-    command: ["wc", "-l"]
-    jq: 'tonumber | {{lines: .}}'
-  echo:
-    type: prompt
-    prompt: "{{{{ json input }}}}"
 steps:
   - id: count
-    use: count
-  - use: echo
+    run: ["wc", "-l"]
+    output: 'tonumber | {{lines: .}}'
+  - id: echo
+    prompt: "{{{{ json input }}}}"
 "#,
         server.base_url
     ));
@@ -105,12 +90,9 @@ steps:
 fn a_commands_nonzero_exit_fails_the_step_with_stderr_in_the_error() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  fail:
-    type: command
-    command: ["sh", "-c", "echo boom >&2; exit 3"]
 steps:
-  - use: fail
+  - id: fail
+    run: ["sh", "-c", "echo boom >&2; exit 3"]
 "#,
     );
 
@@ -127,13 +109,10 @@ fn a_timed_out_command_is_killed_before_the_workflow_returns() {
     let pid_path = config.path().join("timed-out-command.pid");
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  stuck:
-    type: command
-    command: ["sh", "-c", "echo $$ > '{}'; sleep 5"]
-    timeout: 1
 steps:
-  - use: stuck
+  - id: stuck
+    run: ["sh", "-c", "echo $$ > '{}'; sleep 5"]
+    timeout: 1
 "#,
         pid_path.display()
     ));
@@ -171,13 +150,10 @@ fn a_timed_out_command_kills_descendants_in_its_process_group() {
     let pid_path = config.path().join("timed-out-descendant.pid");
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  stuck:
-    type: command
-    command: ["sh", "-c", "sleep 5 & echo $! > '{}'; wait"]
-    timeout: 1
 steps:
-  - use: stuck
+  - id: stuck
+    run: ["sh", "-c", "sleep 5 & echo $! > '{}'; wait"]
+    timeout: 1
 "#,
         pid_path.display()
     ));
@@ -238,13 +214,10 @@ fn a_timed_out_command_kills_descendants_in_its_job_object() {
     let pid_path = pid_path.to_string_lossy().replace('\\', "/");
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  stuck:
-    type: command
-    command: ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$p = Start-Process -FilePath powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Start-Sleep -Seconds 5"]
-    timeout: 1
 steps:
-  - use: stuck
+  - id: stuck
+    run: ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$p = Start-Process -FilePath powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Start-Sleep -Seconds 5"]
+    timeout: 1
 "#,
         pid_path
     ));
@@ -285,55 +258,6 @@ steps:
 
 #[cfg(unix)]
 #[test]
-fn command_timeout_covers_a_blocking_write_file_action() {
-    use std::process::Stdio;
-
-    let config = ConfigDirectory::empty();
-    let fifo_path = config.path().join("blocked-output.fifo");
-    let fifo_status = std::process::Command::new("mkfifo")
-        .arg(&fifo_path)
-        .status()
-        .expect("failed to create a FIFO for the timeout test");
-    assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
-    let workflow = WorkflowFile::new(&format!(
-        r#"
-nodes:
-  emit:
-    type: command
-    command: ["printf", "done"]
-    write_file: "{}"
-    timeout: 1
-steps:
-  - use: emit
-"#,
-        fifo_path.display()
-    ));
-
-    let started = Instant::now();
-    let output = test_command()
-        .current_dir(config.path())
-        .stdin(Stdio::null())
-        .args([
-            "run",
-            workflow.path.to_str().unwrap(),
-            "hello",
-            "--no-history",
-        ])
-        .output()
-        .expect("failed to execute lait run");
-
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "blocking write_file ignored the node timeout: {:?}",
-        started.elapsed()
-    );
-    assert!(!output.status.success(), "expected write_file to time out");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("timed out"), "stderr: {stderr}");
-}
-
-#[cfg(unix)]
-#[test]
 fn a_timed_out_write_file_does_not_reach_a_later_on_error_reader() {
     use std::process::Stdio;
 
@@ -346,26 +270,17 @@ fn a_timed_out_write_file_does_not_reach_a_later_on_error_reader() {
     assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  emit:
-    type: transform
-    write_file: "{}"
-    timeout: 1
-  consume:
-    type: command
-    command: ["sh", "-c", "IFS= read -r value < '{}' && printf 'stale:%s' \"$value\""]
-    timeout: 1
-  recover:
-    type: transform
-    jq: '"recovered"'
 steps:
-  - use: emit
+  - id: emit
+    write: "{}"
+    timeout: 1
     on_error:
-      steps:
-        - use: consume
-          on_error:
-            steps:
-              - use: recover
+      - id: consume
+        run: ["sh", "-c", "IFS= read -r value < '{}' && printf 'stale:%s' \"$value\""]
+        timeout: 1
+        on_error:
+          - id: recover
+            jq: '"recovered"'
 "#,
         fifo_path.display(),
         fifo_path.display()
@@ -436,17 +351,15 @@ fn a_timed_out_write_file_is_finished_before_a_retry_reuses_the_path() {
 
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  emit:
-    type: command
-    command: ["sh", "-c", "n=0; test -f '{}' && n=$(cat '{}'); n=$((n+1)); printf '%s' \"$n\" > '{}'; printf 'attempt%s' \"$n\""]
-    write_file: "{}"
-    timeout: 1
+steps:
+  - id: emit
     retry:
       max_attempts: 2
       delay_seconds: 1
-steps:
-  - use: emit
+    timeout: 1
+    group:
+      - run: ["sh", "-c", "n=0; test -f '{}' && n=$(cat '{}'); n=$((n+1)); printf '%s' \"$n\" > '{}'; printf 'attempt%s' \"$n\""]
+      - write: "{}"
 "#,
         counter_path.display(),
         counter_path.display(),
@@ -486,12 +399,9 @@ fn command_does_not_wait_for_a_stdin_writer_after_the_child_exits() {
 
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  exits:
-    type: command
-    command: ["sh", "-c", "sleep 5 >/dev/null 2>/dev/null & exit 0"]
 steps:
-  - use: exits
+  - id: exits
+    run: ["sh", "-c", "sleep 5 >/dev/null 2>/dev/null & exit 0"]
 "#,
     );
     let mut command = test_command();
@@ -522,13 +432,10 @@ steps:
 fn command_timeout_interrupts_reader_tasks_after_the_child_exits() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  exits:
-    type: command
-    command: ["sh", "-c", "sleep 5 & exit 0"]
-    timeout: 1
 steps:
-  - use: exits
+  - id: exits
+    run: ["sh", "-c", "sleep 5 & exit 0"]
+    timeout: 1
 "#,
     );
     let started = Instant::now();
@@ -551,20 +458,15 @@ fn a_timed_out_jq_worker_is_reaped_before_on_error_and_cannot_write_output() {
     let output_path = config.path().join("jq-timeout-output.txt");
     let workflow = WorkflowFile::new(&format!(
         r#"
-nodes:
-  spin:
-    type: transform
-    jq: 'range(0; 1000000000)'
-    write_file: "{}"
-    timeout: 1
-  recover:
-    type: transform
-    jq: '"recovered"'
 steps:
-  - use: spin
+  - group:
+      - id: spin
+        jq: 'range(0; 1000000000)'
+        timeout: 1
+      - write: "{}"
     on_error:
-      steps:
-        - use: recover
+      - id: recover
+        jq: '"recovered"'
 "#,
         output_path.display()
     ));
@@ -592,18 +494,12 @@ steps:
 fn a_nonzero_command_exit_can_be_caught_by_on_error() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  fail:
-    type: command
-    command: ["sh", "-c", "exit 1"]
-  recover:
-    type: transform
-    jq: '"recovered"'
 steps:
-  - use: fail
+  - id: fail
+    run: ["sh", "-c", "exit 1"]
     on_error:
-      steps:
-        - use: recover
+      - id: recover
+        jq: '"recovered"'
 "#,
     );
 
@@ -617,15 +513,12 @@ steps:
 }
 
 #[test]
-fn an_empty_command_list_is_a_clear_lint_error() {
+fn an_empty_run_list_is_rejected_before_running() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  n:
-    type: command
-    command: []
 steps:
-  - use: n
+  - id: n
+    run: []
 "#,
     );
 
@@ -633,5 +526,8 @@ steps:
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("empty 'command'"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("'run' must start with the program"),
+        "stderr: {stderr}"
+    );
 }

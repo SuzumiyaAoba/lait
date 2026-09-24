@@ -4,16 +4,13 @@ use super::*;
 fn concurrent_for_each_preserves_item_order_in_its_results_regardless_of_completion_order() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  times10:
-    type: transform
-    jq: '. * 10'
+input_schema: {type: object}
 steps:
-  - for_each:
-      items: '.items'
-      max_concurrency: 3
-      steps:
-        - use: times10
+  - for_each: '.items'
+    max_concurrency: 3
+    steps:
+      - id: times10
+        jq: '. * 10'
 "#,
     );
 
@@ -32,6 +29,7 @@ fn concurrent_for_each_calls_the_model_once_per_item() {
     ]);
     let workflow = WorkflowFile::new(&format!(
         r#"
+input_schema: {{type: object}}
 default:
   model: local
 models:
@@ -39,17 +37,13 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - for_each:
-      items: '.items'
-      max_concurrency: 3
-      steps:
-        - use: echo
-      join: 'length'
+  - for_each: '.items'
+    max_concurrency: 3
+    steps:
+      - id: echo
+        prompt: "{{{{ input }}}}"
+    output: 'length'
 "#,
         server.base_url
     ));
@@ -68,12 +62,12 @@ steps:
 fn concurrent_for_each_rejects_break_and_stop_in_its_steps_at_parse_time() {
     let break_workflow = WorkflowFile::new(
         r#"
+input_schema: {type: object}
 steps:
-  - for_each:
-      items: '.items'
-      max_concurrency: 2
-      steps:
-        - break: true
+  - for_each: '.items'
+    max_concurrency: 2
+    steps:
+      - break: true
 "#,
     );
     let output = run_lait_workflow(&break_workflow.path, r#"{"items":[1]}"#);
@@ -84,12 +78,12 @@ steps:
 
     let stop_workflow = WorkflowFile::new(
         r#"
+input_schema: {type: object}
 steps:
-  - for_each:
-      items: '.items'
-      max_concurrency: 2
-      steps:
-        - stop: true
+  - for_each: '.items'
+    max_concurrency: 2
+    steps:
+      - stop: true
 "#,
     );
     let output = run_lait_workflow(&stop_workflow.path, r#"{"items":[1]}"#);
@@ -102,8 +96,8 @@ steps:
 #[test]
 fn concurrent_parent_rejects_interactive_child_before_child_side_effects() {
     let dir = support::ScratchDir::new();
-    dir.write("child.yml", "nodes:\n  first: {type: transform, jq: '.', write_file: touched.txt}\n  question: {type: ask, prompt: continue, default: yes}\nsteps: [{use: first}, {use: question}]\n");
-    let root = dir.write("root.yml", "nodes:\n  child: {type: workflow, workflow: child.yml}\nsteps:\n  - parallel:\n      branches:\n        - steps: [{use: child}]\n");
+    dir.write("child.yml", "steps:\n  - id: first\n    jq: '.'\n  - write: touched.txt\n  - id: question\n    ask: continue\n    default: yes\n");
+    let root = dir.write("root.yml", "steps:\n  - parallel:\n      branch-1:\n        - id: child\n          workflow: child.yml\n");
     let output = test_command()
         .current_dir(dir.path())
         .arg("run")
@@ -126,12 +120,15 @@ fn concurrent_parent_rejects_interactive_child_before_child_side_effects() {
 #[test]
 fn concurrent_for_each_restrictions_cross_workflow_file_boundaries() {
     let dir = support::ScratchDir::new();
-    dir.write("grandchild.yml", "nodes:\n  save: {type: transform, jq: '.', write_file: result.txt}\nsteps: [{use: save}]\n");
+    dir.write(
+        "grandchild.yml",
+        "steps:\n  - id: save\n    jq: '.'\n  - write: result.txt\n",
+    );
     dir.write(
         "child.yml",
-        "nodes:\n  next: {type: workflow, workflow: grandchild.yml}\nsteps: [{use: next}]\n",
+        "steps:\n  - id: next\n    workflow: grandchild.yml\n",
     );
-    let root = dir.write("root.yml", "nodes:\n  child: {type: workflow, workflow: child.yml}\nsteps:\n  - for_each:\n      items: '.'\n      max_concurrency: 2\n      steps: [{use: child}]\n");
+    let root = dir.write("root.yml", "input_schema: {type: array}\nsteps:\n  - for_each: '.'\n    max_concurrency: 2\n    steps:\n      - id: child\n        workflow: child.yml\n");
     let output = test_command()
         .current_dir(dir.path())
         .arg("run")
@@ -142,7 +139,7 @@ fn concurrent_for_each_restrictions_cross_workflow_file_boundaries() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("concurrent") && stderr.contains("write_file"),
+        stderr.contains("concurrent") && stderr.contains("fixed path"),
         "{stderr}"
     );
     assert!(!dir.path().join("result.txt").exists());
@@ -152,7 +149,7 @@ fn concurrent_for_each_restrictions_cross_workflow_file_boundaries() {
 fn a_child_workflow_can_stop_locally_inside_a_parallel_parent() {
     let dir = support::ScratchDir::new();
     dir.write("child.yml", "steps: [{stop: true}]\n");
-    let root = dir.write("root.yml", "nodes:\n  child: {type: workflow, workflow: child.yml}\nsteps:\n  - parallel:\n      branches:\n        - id: a\n          steps: [{use: child}]\n        - id: b\n          steps: [{use: child}]\n");
+    let root = dir.write("root.yml", "steps:\n  - parallel:\n      a:\n        - id: child\n          workflow: child.yml\n      b:\n        - workflow: child.yml\n");
     let output = test_command()
         .current_dir(dir.path())
         .arg("run")

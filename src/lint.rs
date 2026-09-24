@@ -2,7 +2,7 @@
 //! without executing them.
 //!
 //! `lint_file`'s two entry points split by what they lint: workflow-YAML
-//! rules (`lint_workflow_file`, `walk_steps`, `lint_node`, most of the
+//! rules (`lint_workflow_file`, `lint_steps`/`lint_step`, most of the
 //! `check_*` family) live in [`workflow_lint`]; agent-Markdown rules
 //! (`lint_agent_file`/`lint_agent_contents`) and the capability-name checks
 //! both share (`check_capability_name_lists`/`check_capability_names`/
@@ -33,14 +33,14 @@ use crate::{
     agent::{self, AgentFile},
     cli::{LintArgs, LintFormat},
     config::{self, ConfigFile, ConfigSource},
-    schema, workflow,
+    workflow,
 };
 
 mod report;
 mod targets;
 mod workflow_lint;
 // `lint_workflow_file` is called directly by `lint_file` below; the rest
-// (`check_prompt_template`/`check_schema_entry`/`yaml_error_line`, each also
+// (`check_prompt_template`/`check_schema_source`/`yaml_error_line`, each also
 // called from this file's own `lint_agent_file`/`lint_agent_contents`, plus
 // everything `lint/tests.rs` reaches through its `use super::*;`) is
 // re-exported here rather than qualified as `workflow_lint::` at every call
@@ -50,7 +50,7 @@ use workflow_lint::*;
 /// How serious a `LintIssue` is. An `Error` names something that would fail
 /// at `run`/`agent run` time (a bad reference, invalid syntax, a structural
 /// mistake); a `Warning` names something that parses and would run, but is
-/// probably not what the author meant (an unused node, a latent template
+/// probably not what the author meant (an unused schema, a latent template
 /// failure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Severity {
@@ -314,27 +314,22 @@ pub(crate) fn run(lint_args: LintArgs, config_source: ConfigSource) -> Result<()
 /// up by every `mcp:`/`skills:` name check, and `skipped_capability_check` is
 /// set the first time one of those checks has no `config` to check against,
 /// so the report can note it once rather than repeat the same caveat next to
-/// every name. `issues` and `visited` used to be separate `&mut` parameters
-/// threaded through every function below (`lint_node`/`lint_workflow_node`/
-/// `lint_sub_workflow`/`check_capability_name_lists`/`check_capability_names`
-/// each took both); folding them in here removes that repetition the same
-/// way `workflow::dryrun::DryRunContext` bundles its own call-spanning,
-/// mostly-invariant state. `base_dir`/`json_schemas` stay as explicit
-/// parameters instead, since — unlike `issues`/`visited` — they actually
-/// change with every `workflow:` node recursed into (each sub-workflow file
-/// has its own directory and its own `json_schemas:` block).
+/// every name. `issues` and `visited` are folded in here rather than threaded
+/// as separate `&mut` parameters through every function in
+/// [`workflow_lint`], the same way `workflow::dryrun`'s own context bundles
+/// its call-spanning, mostly-invariant state.
 struct LintCtx<'a> {
     config: Option<&'a ConfigFile>,
     skipped_capability_check: bool,
     issues: Vec<LintIssue>,
     /// Canonical paths of every workflow file currently being linted, top to
     /// bottom of the current `workflow:` chain — mirrors
-    /// `WorkflowScope::nested`'s cycle/depth-cap bookkeeping at `run` time
+    /// `WorkflowScope::check_nested_path`'s cycle/depth-cap bookkeeping at `run` time
     /// (see `check_workflow_nesting`).
     visited: Vec<PathBuf>,
     /// Sub-workflow files already loaded during this `lint_file` call, keyed
     /// by canonical path: a `workflow:` file referenced by more than one
-    /// sibling node (not a cycle — a cycle is rejected before this cache is
+    /// sibling step (not a cycle — a cycle is rejected before this cache is
     /// consulted) would otherwise be re-read and re-parsed from disk once
     /// per reference. Mirrors `workflow::WorkflowRegistry`'s per-path cache
     /// at `run` time, which `lint` had no equivalent of until now. `Rc`
@@ -391,13 +386,12 @@ fn note_skipped_capability_check(ctx: &mut LintCtx) {
     }
 }
 
-/// Checks the parts of an agent file that `agent::load_agent` doesn't
-/// already validate: its system prompt template's handlebars syntax, its
-/// `input_schema`/`output_schema` (when set as an inline schema or a file
-/// path, whichever resolves without error), and its `mcp:`/`skills:` names.
-/// `context` names where this agent file came from in a lint message (e.g.
-/// `"the agent"` for a top-level `agent run`/`agent lint` target, or `"node
-/// 'x''s agent"` for a workflow node's `agent:`).
+/// Checks the parts of an agent definition that loading doesn't already
+/// validate: its system prompt template's syntax, whether its schemas load,
+/// and its capability names. `context` names where the definition came from
+/// in a lint message (e.g. `"the agent"` for a top-level `agent run`/`agent
+/// lint` target, `"agent 'x'"` for a workflow's inline `agents:` entry, or
+/// `"step 'x''s agent"` for a workflow step's agent file).
 fn lint_agent_contents(context: &str, agent_file: &AgentFile, ctx: &mut LintCtx) {
     check_prompt_template(
         context,
@@ -405,30 +399,13 @@ fn lint_agent_contents(context: &str, agent_file: &AgentFile, ctx: &mut LintCtx)
         &agent_file.system_prompt_template,
         &mut ctx.issues,
     );
-
-    check_schema_entry(
-        context,
-        "input_schema",
-        agent_file.input_schema.as_ref(),
-        &mut ctx.issues,
-    );
-    check_schema_entry(
-        context,
-        "output_schema",
-        agent_file.output_schema.as_ref(),
-        &mut ctx.issues,
-    );
-    // `structured_output: true` requires `output_schema` (checked at parse
-    // time by `agent::parse_agent`), so this is reached only when a
-    // `schema_name` (the agent's own, or the "structured_output" default) is
-    // actually sent as the Structured Outputs request's schema name — see
-    // the matching check in `lint_node`.
-    if agent_file.structured_output
-        && let Err(error) = schema::validate_schema_name(agent_file.schema_name())
-    {
-        ctx.issues.push(LintIssue::error(format!(
-            "{context} has an invalid 'schema_name': {error:#}"
-        )));
+    for (field, source) in [
+        ("input_schema", &agent_file.input_schema),
+        ("output_schema", &agent_file.output_schema),
+    ] {
+        if let Some(source) = source {
+            check_schema_source(context, field, source, &mut ctx.issues);
+        }
     }
 
     check_capability_name_lists(
@@ -441,7 +418,7 @@ fn lint_agent_contents(context: &str, agent_file: &AgentFile, ctx: &mut LintCtx)
     );
 }
 
-/// Warns when a node/agent references an MCP server whose `allowed_tools`
+/// Warns when a step/agent references an MCP server whose `allowed_tools`
 /// (see `McpRegistry::call`) is an explicit empty list — every tool call to
 /// it is unconditionally rejected at runtime, so referencing such a server
 /// at all is almost certainly a mistake. Distinct from
@@ -467,7 +444,7 @@ fn check_mcp_allowed_tools_not_empty(context: &str, names: Option<&[String]>, ct
 }
 
 /// Checks all four capability-name lists (`mcp`/`skills`/`subagents`/
-/// `tools`) a node/agent file may declare, in one call — every call site
+/// `tools`) a step/agent file may declare, in one call — every call site
 /// below always checks all four together. This used to be four near-
 /// identical 12-line wrappers (`check_mcp_names`/`check_skill_names`/
 /// `check_subagent_names`/`check_tool_names`) around `check_capability_names`,

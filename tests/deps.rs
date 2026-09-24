@@ -45,8 +45,7 @@ const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// A dep that needs no model: a `transform`/`jq` workflow echoes its input.
-const DEP_WORKFLOW_YML: &str =
-    "nodes:\n  echo:\n    type: transform\n    jq: '\"from dep\"'\nsteps:\n  - use: echo\n";
+const DEP_WORKFLOW_YML: &str = "steps:\n  - id: echo\n    jq: '\"from dep\"'\n";
 
 const DEP_AGENT_MD: &str =
     "---\nname: dep-agent\ndescription: fetched agent\n---\nEcho {{ input }}\n";
@@ -316,7 +315,7 @@ fn deps_update_moves_the_lock_to_the_new_commit() {
     );
     assert!(output.status.success(), "deps add failed: {output:?}");
 
-    let updated = "nodes:\n  echo:\n    type: transform\n    jq: '\"v2\"'\nsteps:\n  - use: echo\n";
+    let updated = "steps:\n  - id: echo\n    jq: '\"v2\"'\n";
     github.set_commit("o/r", "main", COMMIT_B);
     github.set_file("o/r", COMMIT_B, "workflows/review.yml", updated);
 

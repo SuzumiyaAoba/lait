@@ -1,5 +1,5 @@
 //! `lait test`: runs test definition YAML files (a target workflow, an
-//! input/vars, a `--record`ed replay cassette directory, and `assert:`
+//! input/inputs, a `--record`ed replay cassette directory, and `assert:`
 //! assertions), without replaying LLM API requests, reporting pass/fail per
 //! file. Workflow-side tools and other I/O retain their configured behavior.
 //! See docs/usage/ja/testing.md.
@@ -23,7 +23,7 @@ use crate::{
     signal, storage,
     workflow::{
         self, WorkflowScope,
-        exec::{RunStepsFrame, run_steps},
+        exec::{Frame, run_document},
     },
 };
 
@@ -36,16 +36,14 @@ struct TestDefinition {
     /// Path to the target workflow file, relative to this test definition
     /// file's own directory.
     workflow: PathBuf,
-    /// The initial input passed to the workflow's first step. Defaults to an
-    /// empty string when omitted (a workflow whose steps never reference
-    /// `{{ input }}` has no need for one).
+    /// The workflow's initial value (`{{ input }}` of its first step), as
+    /// typed YAML. Defaults to `null` when omitted.
     #[serde(default)]
-    input: String,
-    /// `{{ vars.<key> }}` overrides, in the same shape `--var` ultimately
-    /// builds — written directly as typed YAML here rather than
-    /// `KEY=VALUE` strings, since there is no shell to parse them from.
+    input: serde_json::Value,
+    /// Values for the workflow's declared `inputs:`, written directly as
+    /// typed YAML (there is no shell to parse `KEY=VALUE` strings from).
     #[serde(default)]
-    vars: serde_json::Map<String, serde_json::Value>,
+    inputs: serde_json::Map<String, serde_json::Value>,
     /// Path to a directory previously produced by `lait run --record`,
     /// relative to this test definition file's own directory. Every request
     /// the workflow makes is answered from here; one with no matching
@@ -236,27 +234,28 @@ async fn run_test_file_inner(
     let workflow_path = base_dir.join(&definition.workflow);
     let replay_dir = base_dir.join(&definition.replay);
 
-    let mut wf = workflow::load_workflow_cancellable(&workflow_path, cancel.clone()).await?;
-    let scope = WorkflowScope::top_level(&mut wf, &workflow_path, cancel.clone()).await?;
+    let wf = workflow::load_workflow_cancellable(&workflow_path, cancel.clone()).await?;
+    let inputs =
+        workflow::inputs::resolve(&wf.inputs, workflow::inputs::from_object(definition.inputs))
+            .with_context(|| format!("workflow '{}'", workflow_path.display()))?;
+    let scope = WorkflowScope::top_level(&wf, &workflow_path, inputs, cancel.clone()).await?;
+    let initial = workflow::inputs::resolve_initial(
+        &wf,
+        workflow::inputs::InitialInput::Value(definition.input),
+        cancel.clone(),
+    )
+    .await
+    .with_context(|| format!("workflow '{}'", workflow_path.display()))?;
 
     let services = Arc::new(AppServices::new(Arc::clone(file_config)));
     let env = RunContext::new(Arc::clone(&services), cancel)
-        .with_vars(definition.vars)
         .with_record_replay(None, Some(replay_dir))?;
 
-    let outcome = services
-        .finish(run_steps(
-            &wf.steps,
-            definition.input,
-            workflow::StepOutputs::new(),
-            RunStepsFrame {
-                scope: &scope,
-                env: &env,
-                start_counter: 0,
-                progress_prefix: "",
-                cancellation: env.root_token(),
-                placement: Default::default(),
-            },
+    let (output, steps_outputs) = services
+        .finish(run_document(
+            &wf,
+            initial,
+            Frame::new(&scope, &env, env.root_token()),
         ))
         .await
         .with_context(|| format!("workflow '{}'", workflow_path.display()))?;
@@ -264,7 +263,7 @@ async fn run_test_file_inner(
     let events = env.trace.events();
     let trajectory = assert::TrajectoryContext {
         events: &events,
-        steps_outputs: &outcome.steps_outputs,
+        steps_outputs: &steps_outputs,
         usage_total: env.usage.total(),
         cost_total: env.usage.total_cost(),
     };
@@ -272,7 +271,7 @@ async fn run_test_file_inner(
         &definition.assert,
         None,
         Some(&trajectory),
-        &outcome.output,
+        &crate::template::to_text(&output),
         env.operation_token(),
     )
     .await;

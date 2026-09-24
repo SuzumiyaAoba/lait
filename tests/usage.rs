@@ -134,15 +134,11 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  call:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
   - id: step-one
-    use: call
+    prompt: "{{{{ input }}}}"
   - id: step-two
-    use: call
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));

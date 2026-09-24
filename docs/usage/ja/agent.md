@@ -17,20 +17,17 @@ temperature: 0.7
 top_p: 0.9
 max_tokens: 512
 input_schema:
-  schema:
-    type: object
-    properties:
-      text: { type: string }
-    required: [text]
+  type: object
+  properties:
+    text: { type: string }
+  required: [text]
 output_schema:
-  schema:
-    type: object
-    properties:
-      city: { type: string }
-      population: { type: integer }
-    required: [city, population]
-    additionalProperties: false
-structured_output: true
+  type: object
+  properties:
+    city: { type: string }
+    population: { type: integer }
+  required: [city, population]
+  additionalProperties: false
 schema_name: city_fact
 ---
 次の文章から都市名と人口を JSON で抽出してください。
@@ -52,11 +49,9 @@ cargo run -- agent run city-fact.md '{"text":"東京の人口は約1400万人で
 ファイルは1行目が必ず `---` で始まり、次に現れる `---` 行までが frontmatter（YAML）、
 それ以降が本文（システムプロンプトのテンプレート）になります。
 
-`agent:`（ノード）や `file_path:`（`json_schemas:`/`input_schema:`/`output_schema:`）に書く
-パスは、既存の `--json-schema <FILE>` や `lait.config.yml` の探索と同じく、常にコマンドを
-実行したディレクトリ（カレントディレクトリ）からの相対パスとして解決されます。エージェント
-ファイルや `workflow.yml` 自体の場所からの相対パスではないため、`workflow.yml` を別ディレクトリから
-実行する場合は注意してください。
+`input_schema`/`output_schema` に `{file: <パス>}` で指定したスキーマファイルは、**この
+エージェントファイルのディレクトリ** からの相対パスとして解決されます。エージェントとスキーマを
+同じ場所に置けば、どこから実行しても同じように読み込めます。
 
 frontmatter のモデル・サンプリング関連フィールドは次のとおりです。
 
@@ -82,13 +77,13 @@ system ロールのメッセージとして送信され、`INPUT`（元の生テ
 
 ## 入力の検証（`input_schema`）
 
-`input_schema` / `output_schema` は、`json_schemas:` と同じ形式で、スキーマ本体を直接書く
-`schema:` と外部ファイルを指す `file_path:` のどちらか一方を指定します。
+`input_schema` / `output_schema` には、JSON Schema の本体を直接書くか、`{file: <パス>}` で
+JSON ファイルを指定します（`file` だけを持つマッピングがファイル参照、それ以外はスキーマ本体です）。
 
-`input_schema` を指定すると、`INPUT` が JSON オブジェクトであること、
-`input_schema.schema.required` に列挙したフィールドがすべて存在すること、さらに
-`properties`/`items` で宣言したフィールドの `type`/`enum` やネストしたオブジェクト・配列の
-中身までを実行前に再帰的に検証します。`format`・`pattern`・数値の範囲・`additionalProperties`・
+`input_schema` を指定すると、`INPUT` がスキーマの `type`（`type: object` なら JSON オブジェクト）
+に合うこと、`required` に列挙したフィールドがすべて存在すること、さらに `properties`/`items`
+で宣言したフィールドの `type`/`enum` やネストしたオブジェクト・配列の中身までを実行前に
+再帰的に検証します。`format`・`pattern`・数値の範囲・`additionalProperties`・
 `oneOf`/`anyOf`/`allOf`・`$ref` は検証しません。検証に失敗するとモデルを呼び出さずにエラーになります。
 
 ## テンプレートの書き方
@@ -98,23 +93,18 @@ system ロールのメッセージとして送信され、`INPUT`（元の生テ
 - `{{ input.city }}` のようにドット区切りでフィールドにアクセスできます。
 - オブジェクトや配列全体を JSON テキストとして埋め込むには、`{{ json input }}` または
   `{{ json input.field }}` を使います。
-- `{{ input }}` は `INPUT` が文字列・数値・真偽値のときに使えます。オブジェクト・配列に
-  使うとエラーになるため、`{{ json input }}` またはフィールドアクセスを使ってください。
+- `{{ input }}` は値のテキスト形式を出力します（文字列はそのまま、オブジェクト・配列などは
+  コンパクトな JSON）。`{{ json input }}` は文字列も引用符付きの JSON として出力します。
 - テンプレート中の未定義の変数を参照した場合もエラーになります。
 
-## 構造化出力（`structured_output` / `output_schema`）
+## 構造化出力（`output_schema`）
 
-`output_schema` と `structured_output` は、次の組み合わせで指定します。
+`output_schema` を指定すると Structured Outputs（`response_format` の `json_schema`、strict
+モード）を要求します。省略すると通常のテキスト応答です。`schema_name` はそのスキーマ名で、
+`output_schema` と一緒にだけ指定でき、省略時は `structured_output` です。
 
-| 指定 | 結果 |
-| --- | --- |
-| どちらも省略 | 通常のテキスト応答になります。 |
-| `structured_output: true` と `output_schema` | Structured Outputs を要求します。`output_schema` は必須です。 |
-| `structured_output: true` のみ | エラーになります。 |
-| `output_schema` のみ、または `structured_output: false` | エラーになります。 |
-
-`output_schema` は `schema:`（本体を直接記述）または `file_path:`（外部ファイル）で指定します。
-`schema_name` は `structured_output: true` のときだけ使われ、省略時は `structured_output` になります。
+ワークフローの `agent:` ステップとして実行した場合、`output_schema` を持つエージェントの結果は
+パース済みの JSON（スキーマで検証済み）として次のステップに渡ります。
 
 ## MCP ツールの利用
 
@@ -187,40 +177,38 @@ tools: [ripgrep]
 `tools:` を省略した場合は `lait.config.yml` の `default.tools` にフォールバックします。詳しい
 仕組みは [カスタムシェルツールを使う](./tools.md) を参照してください。
 
-## ワークフローからエージェントファイルを使う
+## ワークフローからエージェントを使う
 
-`workflow.yml` の `nodes:` エントリで `prompt`/`input_schema`/`output_schema`/`schema_name` の
-代わりに `agent:` を指定すると、そのノードはエージェント Markdown ファイルのシステムプロンプト・
-入出力スキーマ・`model`/`reasoning_effort` を使って実行されます。`agent:` は `prompt` と同時には
-指定できず、`input_schema`/`output_schema`/`schema_name` はエージェントファイル側で決まるため
-ノードには書けません。
+ワークフローの `agent:` ステップにエージェントファイルのパス（ワークフローファイルからの
+相対パス）を書くと、そのファイルのシステムプロンプト・入出力スキーマ・設定を使って実行します。
+ワークフローの `agents:` に同じ形式のエージェントを直接定義することもできます（本文の代わりに
+`system:` を書きます）。
 
 ```yaml
 # workflow.yml
 default:
   model: local
-nodes:
-  city-fact:
-    type: agent
-    agent: agents/city-fact.md
-    jq: ".city"
+agents:
+  translator:
+    model: cloud
+    system: "次の文章を英訳してください。"
 steps:
-  - use: city-fact
+  - id: city
+    agent: agents/city-fact.md
+    output: '.city'
+  - agent: translator
 ```
 
-`model`/`reasoning_effort`/`temperature`/`top_p`/`max_tokens` は `ノード` → エージェントファイルの
-frontmatter → ワークフローの `default:` の順に、それぞれ独立してフォールバックします。ステップの
-入力（前のステップの出力、または最初のステップでは `<PROMPT>`）は、`lait agent run` の `INPUT`
-と同じ規則でエージェントのシステムプロンプトに渡され、`{{ input.field }}` でアクセスできます。
+`model`/`reasoning_effort`/`temperature`/`top_p`/`max_tokens` やツール連携の設定は、ステップ →
+エージェント定義 → ワークフローの `default:` → `lait.config.yml` の `default:` の順に、それぞれ
+独立してフォールバックします。ステップの入力は `lait agent run` の `INPUT` と同じくユーザー
+メッセージとして送られ（オブジェクトなどはコンパクトな JSON テキスト）、システムプロンプトの
+テンプレートからは値として `{{ input.field }}` でアクセスできます。
 
-`prompt:` を使う通常のノードも同じ handlebars テンプレート（`{{ input.field }}`/`{{ json input }}`
-を含む）でレンダリングされるため、フィールドアクセスはエージェントファイルの本文に限りません。
-さらに、ワークフロー内で `id` を持つ他のステップの出力は、エージェントのシステムプロンプトから
-も `{{ steps.<id> }}` として参照できます（詳細は
-[ワークフロー（workflow.yml）](./workflow.md#ステップ間の値の受け渡し-stepsid---steps) を参照）。
-同様に `lait run --var KEY=VALUE` で渡した値も `{{ vars.<key> }}` として参照できます（詳細は
-[ワークフロー（workflow.yml）](./workflow.md#追加パラメータの受け渡しlait-run---var---varskey---vars) を参照）。
-これはワークフローのステップとして呼び出された場合に限ります（`lait agent run` から直接
-実行したときや、サブエージェントとして呼び出されたときは `vars` は空です）。
+ワークフローのステップとして実行した場合、システムプロンプトからは `{{ steps.<id> }}`（記録済みの
+ステップの値）・`{{ inputs.<name> }}`（ワークフローの入力）・`{{ loop.index }}` も参照できます
+（詳細は [ワークフロー（workflow.yml）](./workflow.md#値とテンプレートjq) を参照）。
+`lait agent run` から直接実行したときやサブエージェントとして呼び出されたときは、これらは
+使えません。
 
 関連: [ワークフロー（workflow.yml）](./workflow.md)、[サブエージェントを使う](./subagents.md)

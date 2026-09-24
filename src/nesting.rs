@@ -1,4 +1,4 @@
-//! Cycle/depth-limit checking shared by `workflow:` node nesting
+//! Cycle/depth-limit checking shared by `workflow:` step nesting
 //! (`WorkflowScope::nested`, `lint::lint_sub_workflow`) and subagent nesting
 //! (`call_subagent_tool`) — two otherwise-unrelated features that both need
 //! to reject a self-referential file before recursing into it. Lives outside
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// runtime error rather than left to overflow the stack or hang.
 pub(crate) const MAX_WORKFLOW_DEPTH: usize = 32;
 
-/// Why entering a self-referential file (a `workflow:` node or a subagent)
+/// Why entering a self-referential file (a `workflow:` step or a subagent)
 /// failed `check_nesting_depth` below.
 pub(crate) enum NestingDepthError {
     /// The file is already on the call stack.

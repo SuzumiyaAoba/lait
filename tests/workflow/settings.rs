@@ -13,12 +13,9 @@ models:
         base_url: "{}"
         api_key: workflow-key
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -49,9 +46,7 @@ fn run_emits_json_with_the_same_shape_as_chat() {
         "base_url: \"{}\"\ndefault:\n  model: test-model\n",
         server.base_url
     ));
-    let workflow = WorkflowFile::new(
-        "nodes:\n  echo:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: echo\n",
-    );
+    let workflow = WorkflowFile::new("steps:\n  - id: echo\n    prompt: \"{{ input }}\"\n");
 
     let output = test_command()
         .current_dir(config.path())
@@ -89,12 +84,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -126,12 +118,9 @@ fn step_falls_back_to_the_config_file_default_model_when_workflow_omits_one() {
     ));
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{ input }}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{ input }}"
 "#,
     );
 
@@ -171,15 +160,12 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
+steps:
+  - id: echo
+    prompt: "{{{{ input }}}}"
     temperature: 0.9
     top_p: 0.95
     max_tokens: 512
-    prompt: "{{{{ input }}}}"
-steps:
-  - use: echo
 "#,
         server.base_url
     ));
@@ -214,12 +200,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -247,12 +230,9 @@ fn step_falls_back_to_a_config_file_alias_when_not_defined_in_the_workflow() {
         r#"
 default:
   model: from-config
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{ input }}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{ input }}"
 "#,
     );
 
@@ -296,13 +276,10 @@ fn a_node_overrides_the_workflow_default_skills() {
 default:
   model: workflow-model
   skills: [from-default]
-nodes:
-  echo:
-    type: prompt
+steps:
+  - id: echo
     prompt: "{{ input }}"
     skills: [from-node]
-steps:
-  - use: echo
 "#,
     );
 

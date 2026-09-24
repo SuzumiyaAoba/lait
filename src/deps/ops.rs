@@ -73,7 +73,7 @@ fn validate_payload(kind: DepKind, name: &str, content: &[u8]) -> Result<()> {
     })?;
     match kind {
         DepKind::Workflow => workflow::parse_workflow(text).map(|_| ()),
-        DepKind::Agent => agent::parse_agent(text).map(|_| ()),
+        DepKind::Agent => agent::parse_agent(text, std::path::Path::new(".")).map(|_| ()),
         DepKind::Skill => skill::validate_skill(name, text),
     }
     .with_context(context)

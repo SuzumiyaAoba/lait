@@ -58,14 +58,12 @@ fn agent_run_requests_structured_output_when_configured() {
     let agent = AgentMarkdownFile::new(
         r#"---
 output_schema:
-  schema:
-    type: object
-    properties:
-      city:
-        type: string
-    required: [city]
-    additionalProperties: false
-structured_output: true
+  type: object
+  properties:
+    city:
+      type: string
+  required: [city]
+  additionalProperties: false
 schema_name: city_fact
 ---
 Extract the city.

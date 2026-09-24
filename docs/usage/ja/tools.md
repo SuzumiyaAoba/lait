@@ -61,7 +61,7 @@ tools:
 メモリを使い続けることを防ぎます。
 
 `env`/`cwd` による封じ込めは、今のところ `tools:`（このページ）にのみ対応しています。ワークフローの
-`command:` ノード（[ワークフロー](./workflow.md#任意コマンドの実行command)）にはまだ対応していません。
+`run:` ステップ（[ワークフロー](./workflow.md#run--コマンドを実行する)）にはまだ対応していません。
 
 ## 引数のテンプレート展開
 
@@ -82,7 +82,7 @@ tools:
 |---|---|
 | チャット（`lait "prompt"`） | `--tool`（CLI フラグ、複数指定可）→ `lait.config.yml` の `default.tools` |
 | `lait agent run` | agent ファイルの frontmatter `tools:` → `lait.config.yml` の `default.tools` |
-| `lait run`（workflow） | ノードの `tools:` → （`agent:` ノードなら）agent ファイルの `tools:` → ワークフローの `default.tools` → `lait.config.yml` の `default.tools` |
+| `lait run`（workflow） | ステップの `tools:` → （`agent:` ステップなら）エージェント定義の `tools:` → ワークフローの `default.tools` → `lait.config.yml` の `default.tools` |
 
 ```sh
 lait "prompt" --tool ripgrep --tool jq
@@ -98,10 +98,8 @@ tools: [ripgrep]
 
 ```yaml
 # workflow.yml
-nodes:
-  research:
-    type: prompt
-    prompt: "{{ input }} について調べてください。"
+steps:
+  - prompt: "{{ input }} について調べてください。"
     tools: [ripgrep]
 ```
 
@@ -141,7 +139,7 @@ tool_policy:
 
 `lait lint` は次を静的にチェックします。
 
-- `tools:` を参照する `default.tools`/ノードの`tools:`/agent frontmatter の `tools:` が
+- `tools:` を参照する `default.tools`/ステップの`tools:`/エージェント定義の `tools:` が
   `lait.config.yml` の `tools:` に実在するか
 - 各 `tools:` エントリの `command` が空でないか、`parameters` が JSON オブジェクトかどうか
   （参照されているかどうかに関わらず、定義されている全エントリをチェックします）

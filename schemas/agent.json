@@ -2,54 +2,121 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/SuzumiyaAoba/lait/master/schemas/agent.json",
   "title": "lait agent frontmatter",
-  "description": "The YAML frontmatter of a lait agent Markdown file (agent.md). The body after the closing '---' is the system prompt template and is not covered by this schema. See docs/usage/ja/agent.md.",
+  "description": "The YAML frontmatter of a lait agent Markdown file (agent.md). The body after the closing '---' is the system prompt template and is not covered by this schema. 'output_schema' alone requests Structured Outputs. See docs/usage/ja/agent.md.",
   "type": "object",
   "additionalProperties": false,
-  "allOf": [
-    {
-      "if": { "required": ["structured_output"], "properties": { "structured_output": { "const": true } } },
-      "then": { "required": ["output_schema"] }
-    },
-    {
-      "if": { "required": ["output_schema"] },
-      "then": { "required": ["structured_output"], "properties": { "structured_output": { "const": true } } }
-    }
-  ],
+  "dependentRequired": {
+    "schema_name": [
+      "output_schema"
+    ]
+  },
   "properties": {
-    "name": { "type": "string" },
-    "description": { "type": "string" },
-    "model": { "type": "string" },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
     "reasoning_effort": {
       "type": "string",
-      "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
     },
-    "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
-    "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
-    "max_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
-    "input_schema": { "$ref": "#/$defs/jsonSchemaEntry" },
-    "output_schema": { "$ref": "#/$defs/jsonSchemaEntry" },
-    "structured_output": { "type": "boolean" },
-    "schema_name": { "type": "string" },
-    "mcp": { "type": "array", "items": { "type": "string" } },
-    "max_tool_rounds": { "type": "integer", "minimum": 1 },
-    "skills": { "type": "array", "items": { "type": "string" } },
-    "subagents": { "type": "array", "items": { "type": "string" } },
-    "tools": { "type": "array", "items": { "type": "string" } }
+    "temperature": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "top_p": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "mcp": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "max_tool_rounds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "subagents": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "input_schema": {
+      "$ref": "#/$defs/schemaSource"
+    },
+    "output_schema": {
+      "$ref": "#/$defs/schemaSource"
+    },
+    "schema_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    }
   },
   "$defs": {
-    "jsonSchemaEntry": {
+    "schemaSource": {
+      "description": "An inline JSON Schema, or {file: path} (relative to the file it is written in).",
       "oneOf": [
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["file_path"],
-          "properties": { "file_path": { "type": "string" } }
+          "required": [
+            "file"
+          ],
+          "properties": {
+            "file": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         },
         {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["schema"],
-          "properties": { "schema": {} }
+          "type": [
+            "object",
+            "boolean"
+          ],
+          "not": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "file"
+            ],
+            "properties": {
+              "file": {}
+            }
+          }
         }
       ]
     }

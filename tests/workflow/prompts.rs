@@ -12,13 +12,10 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    system_prompt: "Reply in {{{{ input }}}}."
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
+    system: "Reply in {{{{ input }}}}."
 "#,
         server.base_url
     ));
@@ -46,19 +43,16 @@ fn a_node_overrides_the_workflow_default_system_prompt() {
         r#"
 default:
   model: local
-  system_prompt: from default
+  system: from default
 models:
   local:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    system_prompt: from node
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
+    system: from node
 "#,
         server.base_url
     ));
@@ -83,18 +77,15 @@ fn a_prompt_node_falls_back_to_the_workflow_default_system_prompt() {
         r#"
 default:
   model: local
-  system_prompt: from default
+  system: from default
 models:
   local:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -117,6 +108,7 @@ fn a_node_with_no_prompt_sends_the_current_input_unchanged_as_the_user_message()
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let workflow = WorkflowFile::new(&format!(
         r#"
+input_schema: {{type: object}}
 default:
   model: local
 models:
@@ -124,12 +116,10 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    system_prompt: "Reply in French."
 steps:
-  - use: echo
+  - id: echo
+    prompt: '{{{{ input }}}}'
+    system: "Reply in French."
 "#,
         server.base_url
     ));

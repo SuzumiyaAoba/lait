@@ -13,12 +13,9 @@ models:
         base_url: "{}"
         api_key: "${{LAIT_TEST_ENV_API_KEY}}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         server.base_url
     ));
@@ -56,12 +53,9 @@ models:
         base_url: http://127.0.0.1:65535/v1
         api_key: "${LAIT_TEST_ENV_DEFINITELY_UNSET}"
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{ input }}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{ input }}"
 "#,
     );
 

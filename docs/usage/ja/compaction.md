@@ -20,7 +20,7 @@ default:
 ```
 
 `lait.config.yml` の `default:` にのみ指定できます(CLI フラグ・agent frontmatter・
-ワークフローノード個別の上書きは今のところありません)。
+ワークフローステップ個別の上書きは今のところありません)。
 
 | フィールド | 説明 |
 | --- | --- |
@@ -47,7 +47,7 @@ default:
 
 ## 制限事項
 
-- **`lait run`(ワークフローの `prompt`/`agent` ノード)・`lait agent run`・チャット
+- **`lait run`(ワークフローの `prompt`/`agent` ステップ)・`lait agent run`・チャット
   (`--stream` を使わない場合)にのみ適用されます。** `--stream` を使う経路(`lait chat`)では
   今のところ圧縮されません。
 - ラウンド数(`trigger_rounds`)ベースのトリガーのみで、トークン数ベースのトリガーは

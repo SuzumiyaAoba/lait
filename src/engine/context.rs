@@ -141,7 +141,7 @@ pub(crate) struct RunPolicy {
 }
 
 /// Per-invocation mutable state. It references shared services but owns
-/// cancellation, variables, usage accounting, and policy, so those values do
+/// cancellation, usage accounting, and policy, so those values do
 /// not accidentally leak between separate commands or evaluation runs.
 pub(crate) struct RunContext {
     pub(crate) services: Arc<AppServices>,
@@ -153,13 +153,6 @@ pub(crate) struct RunContext {
     /// anything is done with it (written to a file) is decided later, by
     /// whichever command function owns this `RunContext`.
     pub(crate) trace: trace::TraceCollector,
-    // `workflow::StepOutputs` (not a plain `serde_json::Map`) even though
-    // this is `$vars`/`{{ vars.* }}`, not step output: both share the same
-    // copy-on-write-over-`Arc` type (see its doc comment), and `vars` is set
-    // once per run by `with_vars` and never mutated afterward, so every jq
-    // call's `vars.clone()` (`jq::run_cancellable_async`) becomes a refcount
-    // bump instead of a deep copy of a value that was never going to change.
-    pub(crate) vars: workflow::StepOutputs,
     pub(super) policy: RunPolicy,
     pub(crate) always_approved_tools: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Serializes interactive tool approval across every tool loop that
@@ -179,16 +172,10 @@ impl RunContext {
             cancellation: CancellationSource::new(root_cancel),
             usage: usage::UsageTally::default(),
             trace: trace::TraceCollector::default(),
-            vars: workflow::StepOutputs::new(),
             policy: RunPolicy::default(),
             always_approved_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
             approval_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
-    }
-
-    pub(crate) fn with_vars(mut self, vars: serde_json::Map<String, serde_json::Value>) -> Self {
-        self.vars = vars.into();
-        self
     }
 
     pub(crate) fn with_cache(mut self, enabled: bool, ttl: Option<u64>) -> Self {

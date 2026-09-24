@@ -12,16 +12,11 @@ fn sigint_cancels_a_running_workflow_and_saves_a_checkpoint() {
     dir.write(
         "workflow.yml",
         r#"
-nodes:
-  mark:
-    type: command
-    command: ["sh", "-c", "echo ran >> marker.txt; cat"]
-  slow:
-    type: command
-    command: ["sleep", "5"]
 steps:
-  - use: mark
-  - use: slow
+  - id: mark
+    run: ["sh", "-c", "echo ran >> marker.txt; cat"]
+  - id: slow
+    run: ["sleep", "5"]
 "#,
     );
 
@@ -81,7 +76,7 @@ steps:
     .expect("checkpoint file was not valid JSON");
     assert_eq!(checkpoint["status"], "failed");
     assert_eq!(checkpoint["completed_index"], 1);
-    assert_eq!(checkpoint["current_input"], "hello");
+    assert_eq!(checkpoint["current_value"], "hello");
 }
 
 #[test]
@@ -194,14 +189,10 @@ fn workflow_timeout_cancels_a_run_that_exceeds_the_budget() {
     dir.write(
         "workflow.yml",
         r#"
-default:
-  workflow_timeout: 1
-nodes:
-  slow:
-    type: command
-    command: ["sleep", "10"]
+timeout: 1
 steps:
-  - use: slow
+  - id: slow
+    run: ["sleep", "10"]
 "#,
     );
 
@@ -217,12 +208,12 @@ steps:
     // Must fail near the 1s budget, not wait out the 10s sleep.
     assert!(
         elapsed < Duration::from_secs(5),
-        "workflow_timeout did not cut the run short (took {elapsed:?})"
+        "timeout did not cut the run short (took {elapsed:?})"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cancelled"), "stderr: {stderr}");
     assert!(
-        stderr.contains("workflow_timeout"),
+        stderr.contains("'timeout' (1s)"),
         "stderr should name the budget that was hit: {stderr}"
     );
     // A real Ctrl-C was never sent, so this must not be misclassified as one.
@@ -232,7 +223,10 @@ steps:
 #[test]
 fn workflow_timeout_rejects_a_zero_value() {
     let dir = ConfigDirectory::empty();
-    dir.write("workflow.yml", "default:\n  workflow_timeout: 0\nnodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n");
+    dir.write(
+        "workflow.yml",
+        "timeout: 0\nsteps:\n  - id: echo\n    jq: '.'\n",
+    );
 
     let output = test_command()
         .current_dir(dir.path())
@@ -242,5 +236,5 @@ fn workflow_timeout_rejects_a_zero_value() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("workflow_timeout"), "stderr: {stderr}");
+    assert!(stderr.contains("'timeout'"), "stderr: {stderr}");
 }

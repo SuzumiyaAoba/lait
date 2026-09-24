@@ -4,24 +4,19 @@ use super::*;
 fn a_workflow_step_runs_a_sub_workflow_and_uses_its_output() {
     let sub = WorkflowFile::new(
         r#"
-nodes:
-  add_one:
-    type: transform
-    jq: '. + 1'
 steps:
-  - use: add_one
+  - id: add_one
+    jq: '. + 1'
 "#,
     );
     let sub_name = sub.path.file_name().unwrap().to_str().unwrap();
     let parent = WorkflowFile::new(&format!(
         r#"
-nodes:
-  sub:
-    type: workflow
-    workflow: {sub_name}
-    jq: '. * 2'
+input_schema: {{type: integer}}
 steps:
-  - use: sub
+  - id: sub
+    workflow: {sub_name}
+    output: '. * 2'
 "#
     ));
 
@@ -36,12 +31,9 @@ fn a_sub_workflows_falls_back_to_the_callers_default_model() {
     let server = MockServer::start("200 OK", CHAT_COMPLETION_BODY);
     let sub = WorkflowFile::new(
         r#"
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{ input }}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{ input }}"
 "#,
     );
     let sub_name = sub.path.file_name().unwrap().to_str().unwrap();
@@ -54,12 +46,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  sub:
-    type: workflow
-    workflow: {sub_name}
 steps:
-  - use: sub
+  - id: sub
+    workflow: {sub_name}
 "#,
         server.base_url
     ));
@@ -91,12 +80,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: sub-model-id
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         sub_server.base_url
     ));
@@ -110,12 +96,9 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  sub:
-    type: workflow
-    workflow: {sub_name}
 steps:
-  - use: sub
+  - id: sub
+    workflow: {sub_name}
 "#,
         caller_server.base_url
     ));
@@ -140,33 +123,21 @@ steps:
 fn a_sub_workflows_named_step_outputs_are_isolated_from_the_caller_in_both_directions() {
     let sub = WorkflowFile::new(
         r#"
-nodes:
-  inner:
-    type: transform
-    jq: '$steps.outer'
 steps:
   - id: inner
-    use: inner
+    jq: '$steps.outer'
 "#,
     );
     let sub_name = sub.path.file_name().unwrap().to_str().unwrap();
     let parent = WorkflowFile::new(&format!(
         r#"
-nodes:
-  outer:
-    type: transform
-    jq: '{{ from_outer: true }}'
-  sub:
-    type: workflow
-    workflow: {sub_name}
-  read_inner:
-    type: transform
-    jq: '$steps.inner'
 steps:
   - id: outer
-    use: outer
-  - use: sub
-  - use: read_inner
+    jq: '{{ from_outer: true }}'
+  - id: sub
+    workflow: {sub_name}
+  - id: read_inner
+    jq: '$steps.inner'
 "#
     ));
 
@@ -182,13 +153,21 @@ steps:
 
 #[test]
 fn a_workflow_step_cycle_is_rejected() {
-    let a_path = support::next_temp_path("lait-test-cycle-a", ".yml");
-    let b_path = support::next_temp_path("lait-test-cycle-b", ".yml");
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let a_path = std::env::temp_dir().join(format!("lait-test-cycle-a-{unique}.yml"));
+    let b_path = std::env::temp_dir().join(format!("lait-test-cycle-b-{unique}.yml"));
 
     std::fs::write(
         &a_path,
         format!(
-            "nodes:\n  sub:\n    workflow: {}\nsteps:\n  - use: sub\n",
+            "steps:\n  - id: sub\n    workflow: ./{}\n",
             b_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -196,7 +175,7 @@ fn a_workflow_step_cycle_is_rejected() {
     std::fs::write(
         &b_path,
         format!(
-            "nodes:\n  sub:\n    workflow: {}\nsteps:\n  - use: sub\n",
+            "steps:\n  - id: sub\n    workflow: ./{}\n",
             a_path.file_name().unwrap().to_str().unwrap()
         ),
     )
@@ -213,4 +192,29 @@ fn a_workflow_step_cycle_is_rejected() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cycle"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_registered_workflow_name_can_be_called_as_a_child() {
+    let config = ConfigDirectory::new("workflows:\n  shout: ./shout.yml\n");
+    std::fs::write(
+        config.path().join("shout.yml"),
+        "inputs:\n  mark: string\noutput: '. + $inputs.mark'\nsteps:\n  - jq: ascii_upcase\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.path().join("main.yml"),
+        "steps:\n  - workflow: shout\n    with: '{mark: \"!\"}'\n",
+    )
+    .unwrap();
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["run", "main.yml", "hey", "--no-history"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "HEY!");
 }

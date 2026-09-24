@@ -18,27 +18,20 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-json_schemas:
+schemas:
   city:
-    schema:
-      type: object
-      properties:
-        city: {{ type: string }}
-      required: [city]
-      additionalProperties: false
-nodes:
-  extract:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-    output_schema: city
-    schema_name: city
-  greet:
-    type: prompt
-    prompt: "city was {{{{ steps.extract.city }}}}"
+    type: object
+    properties:
+      city: {{ type: string }}
+    required: [city]
+    additionalProperties: false
 steps:
   - id: extract
-    use: extract
-  - use: greet
+    prompt: "{{{{ input }}}}"
+    schema_name: city
+    output_schema: city
+  - id: greet
+    prompt: "city was {{{{ steps.extract.city }}}}"
 "#,
         server.base_url
     ));
@@ -60,17 +53,11 @@ steps:
 fn a_jq_filter_can_reference_an_earlier_named_steps_output_via_dollar_steps() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  check:
-    type: transform
-    jq: '{ ok: true }'
-  read_check:
-    type: transform
-    jq: '$steps.check.ok'
 steps:
   - id: check
-    use: check
-  - use: read_check
+    jq: '{ ok: true }'
+  - id: read_check
+    jq: '$steps.check.ok'
 "#,
     );
 
@@ -84,20 +71,13 @@ steps:
 fn a_named_step_output_recorded_inside_a_parallel_branch_does_not_leak_outside_it() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  inner:
-    type: transform
-    jq: '"branch value"'
-  read_inner:
-    type: transform
-    jq: '$steps.inner'
 steps:
   - parallel:
-      branches:
-        - steps:
-            - id: inner
-              use: inner
-  - use: read_inner
+      branch-1:
+        - id: inner
+          jq: '"branch value"'
+  - id: read_inner
+    jq: '$steps.inner'
 "#,
     );
 

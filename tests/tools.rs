@@ -175,10 +175,7 @@ fn an_empty_command_list_is_a_lint_error() {
     // of which files are named on the command line — so a trivial workflow
     // file is enough to trigger it; see `lint::check_shell_tool_definitions`.
     let config = ConfigDirectory::new("tools:\n  broken:\n    command: []\n");
-    config.write(
-        "wf.yml",
-        "nodes:\n  echo:\n    type: transform\n    jq: '.'\nsteps:\n  - use: echo\n",
-    );
+    config.write("wf.yml", "steps:\n  - jq: '.'\n");
 
     let output = test_command()
         .current_dir(config.path())

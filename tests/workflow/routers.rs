@@ -4,12 +4,10 @@ use super::*;
 fn transform_only_step_reshapes_input_without_calling_the_model() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  extract_name:
-    type: transform
-    jq: ".name"
+input_schema: {type: object}
 steps:
-  - use: extract_name
+  - id: extract_name
+    jq: ".name"
 "#,
     );
 
@@ -23,18 +21,13 @@ steps:
 fn a_falsy_when_guard_skips_the_step_and_passes_the_input_through_unchanged() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  passthrough:
-    type: transform
-    jq: "."
-  guarded:
-    type: transform
-    jq: '"should not run"'
+input_schema: {type: object}
 steps:
-  - use: passthrough
+  - id: passthrough
+    jq: "."
   - id: guarded
     when: ".flag"
-    use: guarded
+    jq: '"should not run"'
 "#,
     );
 
@@ -51,14 +44,11 @@ steps:
 fn a_truthy_when_guard_runs_the_step() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  guarded:
-    type: transform
-    jq: '"ran"'
+input_schema: {type: object}
 steps:
   - id: guarded
     when: ".flag"
-    use: guarded
+    jq: '"ran"'
 "#,
     );
 
@@ -72,27 +62,20 @@ steps:
 fn switch_runs_the_first_matching_case_and_skips_the_rest() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  escalated:
-    type: transform
-    jq: '"escalated"'
-  replied:
-    type: transform
-    jq: '"replied"'
-  closed:
-    type: transform
-    jq: '"closed"'
+input_schema: {type: object}
 steps:
   - switch:
-      cases:
-        - when: '.severity == "high"'
-          steps:
-            - use: escalated
-        - when: '.severity == "medium"'
-          steps:
-            - use: replied
-      else:
-        - use: closed
+      - when: '.severity == "high"'
+        steps:
+          - id: escalated
+            jq: '"escalated"'
+      - when: '.severity == "medium"'
+        steps:
+          - id: replied
+            jq: '"replied"'
+    else:
+      - id: closed
+        jq: '"closed"'
 "#,
     );
 
@@ -106,21 +89,16 @@ steps:
 fn switch_runs_else_when_no_case_matches() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  escalated:
-    type: transform
-    jq: '"escalated"'
-  closed:
-    type: transform
-    jq: '"closed"'
+input_schema: {type: object}
 steps:
   - switch:
-      cases:
-        - when: '.severity == "high"'
-          steps:
-            - use: escalated
-      else:
-        - use: closed
+      - when: '.severity == "high"'
+        steps:
+          - id: escalated
+            jq: '"escalated"'
+    else:
+      - id: closed
+        jq: '"closed"'
 "#,
     );
 
@@ -134,16 +112,13 @@ steps:
 fn switch_fails_when_no_case_matches_and_there_is_no_else() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  escalated:
-    type: transform
-    jq: '"escalated"'
+input_schema: {type: object}
 steps:
   - switch:
-      cases:
-        - when: '.severity == "high"'
-          steps:
-            - use: escalated
+      - when: '.severity == "high"'
+        steps:
+          - id: escalated
+            jq: '"escalated"'
 "#,
     );
 
@@ -180,23 +155,15 @@ models:
     - provider:
         base_url: "{}"
       model_id: model-b
-nodes:
-  echo_a:
-    type: prompt
-    prompt: "{{{{ input }}}}"
-  echo_b:
-    type: prompt
-    model: cloud
-    prompt: "{{{{ input }}}}"
 steps:
   - parallel:
-      branches:
-        - id: a
-          steps:
-            - use: echo_a
-        - id: b
-          steps:
-            - use: echo_b
+      a:
+        - id: echo_a
+          prompt: "{{{{ input }}}}"
+      b:
+        - id: echo_b
+          prompt: "{{{{ input }}}}"
+          model: cloud
 "#,
         server_a.base_url, server_b.base_url
     ));
@@ -218,75 +185,35 @@ steps:
 fn parallel_join_filter_combines_the_id_keyed_object_into_the_next_input() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  upper:
-    type: transform
-    jq: 'ascii_upcase'
-  length_of:
-    type: transform
-    jq: 'length'
-  describe:
-    type: transform
-    jq: '.summary + " (" + (.length | tostring) + ")"'
 steps:
   - parallel:
-      branches:
+      upper:
         - id: upper
-          steps:
-            - use: upper
-        - id: length
-          steps:
-            - use: length_of
-      join: '{summary: .upper, length: .length}'
+          jq: 'ascii_upcase'
+      length:
+        - id: length_of
+          jq: 'length'
+    output: '{summary: .upper, length: .length}'
   - id: describe
-    use: describe
+    jq: '.summary + " (" + (.length | tostring) + ")"'
 "#,
     );
 
-    let output = run_lait_workflow(&workflow.path, "\"hi\"");
+    let output = run_lait_workflow(&workflow.path, "hi");
 
     assert!(output.status.success(), "lait run failed: {output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "HI (2)");
 }
 
 #[test]
-fn parallel_fails_when_a_branch_id_is_duplicated() {
-    let workflow = WorkflowFile::new(
-        r#"
-nodes:
-  passthrough:
-    type: transform
-    jq: "."
-steps:
-  - parallel:
-      branches:
-        - id: same
-          steps:
-            - use: passthrough
-        - id: same
-          steps:
-            - use: passthrough
-"#,
-    );
-
-    let output = run_lait_workflow(&workflow.path, "hello");
-
-    assert!(
-        !output.status.success(),
-        "expected duplicate branch ids to be rejected"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("duplicate id"), "stderr: {stderr}");
-}
-
-#[test]
 fn switch_case_can_call_the_model_and_continues_the_outer_steps_afterward() {
     let server = MockServer::start(
         "200 OK",
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"\"escalation memo\""},"finish_reason":"stop"}]}"#,
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"workflow-model","choices":[{"index":0,"message":{"role":"assistant","content":"escalation memo"},"finish_reason":"stop"}]}"#,
     );
     let workflow = WorkflowFile::new(&format!(
         r#"
+input_schema: {{type: object}}
 default:
   model: local
 models:
@@ -294,26 +221,17 @@ models:
     - provider:
         base_url: "{}"
       model_id: workflow-model
-nodes:
-  escalate:
-    type: prompt
-    prompt: "escalate: {{{{ json input }}}}"
-  closed:
-    type: transform
-    jq: '"closed"'
-  notify:
-    type: transform
-    jq: '. + " (notified)"'
 steps:
   - switch:
-      cases:
-        - when: '.severity == "high"'
-          steps:
-            - use: escalate
-      else:
-        - use: closed
+      - when: '.severity == "high"'
+        steps:
+          - id: escalate
+            prompt: "escalate: {{{{ json input }}}}"
+    else:
+      - id: closed
+        jq: '"closed"'
   - id: notify
-    use: notify
+    jq: '. + " (notified)"'
 "#,
         server.base_url
     ));
@@ -332,4 +250,27 @@ steps:
         String::from_utf8_lossy(&output.stdout).trim(),
         "escalation memo (notified)"
     );
+}
+
+#[test]
+fn parallel_fails_when_a_branch_name_is_duplicated() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - parallel:
+      same:
+        - jq: "."
+      same:
+        - jq: "."
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "hello");
+
+    assert!(
+        !output.status.success(),
+        "expected duplicate branch names to be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("duplicate"), "stderr: {stderr}");
 }

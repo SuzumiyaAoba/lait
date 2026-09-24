@@ -15,12 +15,9 @@ models:
         base_url: http://127.0.0.1:1/v1
         api_key_cmd: ["sh", "-c", "touch '{}' ; printf dry-run-secret"]
       model_id: workflow-model
-nodes:
-  echo:
-    type: prompt
-    prompt: "{{{{ input }}}}"
 steps:
-  - use: echo
+  - id: echo
+    prompt: "{{{{ input }}}}"
 "#,
         marker.display()
     ));
@@ -60,22 +57,16 @@ models:
     - provider:
         base_url: http://127.0.0.1:1/v1
       model_id: workflow-model
-nodes:
-  extract:
-    type: prompt
+steps:
+  - id: extract
     prompt: "extract from: {{ input }}"
     retry:
       max_attempts: 3
       delay_seconds: 1
       backoff: 2.0
     timeout: 30
-  greet:
-    type: prompt
+  - id: greet
     prompt: "city was {{ steps.extract.city }}"
-steps:
-  - id: extract
-    use: extract
-  - use: greet
 "#,
     );
 
@@ -117,12 +108,9 @@ steps:
 fn dry_run_reports_a_missing_model_without_calling_anything() {
     let workflow = WorkflowFile::new(
         r#"
-nodes:
-  greet:
-    type: prompt
-    prompt: "{{ input }}"
 steps:
-  - use: greet
+  - id: greet
+    prompt: "{{ input }}"
 "#,
     );
 

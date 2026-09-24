@@ -2,15 +2,15 @@
 //! completion pipeline (`call_agent`) and running one as a `subagents:` tool
 //! call mid-completion (`call_subagent_tool`, mutually recursive with
 //! `RequestSettings::complete` through `call_agent` — see its doc comment).
-//! Shared by `app::run_agent`, a workflow node's `agent:` action
-//! (`workflow::exec::nodes::execute_agent`), and `engine::tool_loop`'s
+//! Shared by `app::run_agent`, a workflow's `agent:` step
+//! (`workflow::exec::run_agent_step`), and `engine::tool_loop`'s
 //! subagent-tool branch.
 
 use std::{future::Future, path::PathBuf, pin::Pin};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::{agent::AgentFile, nesting, response, schema, template, workflow};
+use crate::{agent::AgentFile, jq, nesting, response, schema, template};
 
 use super::{PromptTurn, RequestSettings, RunContext, agent_file_settings};
 
@@ -27,8 +27,8 @@ pub(crate) struct AgentTurn<'a> {
 
 impl<'a> AgentTurn<'a> {
     /// A turn with no image attachments — every caller but
-    /// `workflow::exec::nodes::execute_agent`, which has a node's own
-    /// `images:` to resolve.
+    /// `workflow::exec::run_agent_step`, which has a step's own `images:` to
+    /// resolve.
     pub(crate) fn simple(input: &'a serde_json::Value, prompt: &'a str) -> Self {
         Self {
             input,
@@ -40,8 +40,10 @@ impl<'a> AgentTurn<'a> {
 
 /// Renders an agent's system prompt against `turn.input`, calls the model
 /// with `turn.prompt` as the user message, and renders the response. Shared
-/// by `app::run_agent`, `workflow::exec::nodes::execute_agent`, and
-/// `call_subagent_tool`. `active_agent_paths` is threaded straight through
+/// by `app::run_agent`, `workflow::exec::run_agent_step`, and
+/// `call_subagent_tool`. `globals` is what the system prompt template sees
+/// as `{{ steps.* }}`/`{{ inputs.* }}`/`{{ loop.* }}` — empty for every
+/// caller but a workflow step. `active_agent_paths` is threaded straight through
 /// to `settings.complete` — see its doc comment; every caller but
 /// `call_subagent_tool` passes `&[]`.
 pub(crate) async fn call_agent(
@@ -49,29 +51,18 @@ pub(crate) async fn call_agent(
     settings: &RequestSettings,
     env: &RunContext,
     turn: AgentTurn<'_>,
-    steps_outputs: &workflow::StepOutputs,
+    globals: &jq::Globals,
     active_agent_paths: &[PathBuf],
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
-    let system_prompt = template::render(
-        &agent_file.system_prompt_template,
-        turn.input,
-        steps_outputs,
-        &env.vars,
-    )?;
-    let response_format = if agent_file.structured_output {
-        Some(
-            schema::build_response_format_from_entry_cancellable(
-                agent_file.output_schema.as_ref().expect(
-                    "load_agent validates structured_output implies output_schema is present",
-                ),
-                agent_file.schema_name(),
-                cancellation.clone(),
-            )
-            .await?,
-        )
-    } else {
-        None
+    let system_prompt =
+        template::render_in(&agent_file.system_prompt_template, turn.input, globals)?;
+    let response_format = match &agent_file.output_schema {
+        Some(source) => Some(schema::build_json_schema(
+            schema::load_schema_value_cancellable(source, cancellation.clone()).await?,
+            agent_file.schema_name(),
+        )?),
+        None => None,
     };
 
     let response = settings
@@ -219,7 +210,7 @@ pub(crate) fn call_subagent_tool<'a>(
             &settings,
             env,
             AgentTurn::simple(&input, &prompt),
-            &workflow::StepOutputs::new(),
+            &crate::jq::Globals::default(),
             &next_active_paths,
             cancellation,
         )

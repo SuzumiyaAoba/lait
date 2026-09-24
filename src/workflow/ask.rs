@@ -1,5 +1,5 @@
-//! `type: ask` — a human-in-the-loop workflow node (see
-//! `model::AskNode`/docs/usage/ja/workflow.md). `run_ask` is the only
+//! `ask:` — a human-in-the-loop workflow step (see
+//! `model::AskStep`/docs/usage/ja/workflow.md). `run_ask` is the only
 //! entry point; everything else here is a pure helper kept separately
 //! testable from the actual stdin I/O.
 
@@ -9,12 +9,12 @@ use anyhow::{Context, Result, bail};
 
 use crate::{async_io, process};
 
-use super::model::AskNode;
+use super::model::AskStep;
 
-/// Prompts (already-rendered `prompt` text) and reads this node's answer.
+/// Prompts (the already-rendered question) and reads this step's answer.
 ///
 /// When stdin is not an interactive terminal, nothing is read at all: this
-/// node's output is `node.default` if set, else an error. A workflow is
+/// step's value is `step.default` if set, else an error. A workflow is
 /// often run non-interactively (CI, piped input, another program driving
 /// `lait run`), where there is no one to answer and no way to tell a closed
 /// pipe from a slow human — attempting a read there would either fail
@@ -23,8 +23,8 @@ use super::model::AskNode;
 ///
 /// When stdin *is* a terminal, the rendered `prompt` (and `choices`, if set)
 /// are printed to stderr — like every other workflow progress line, so
-/// piping this node's eventual answer/output on stdout stays clean — and one
-/// line (or, with `node.multiline`, everything up to EOF) is read from it.
+/// piping this step's eventual answer/output on stdout stays clean — and one
+/// line (or, with `step.multiline`, everything up to EOF) is read from it.
 /// The read runs through `async_io::run_blocking` on a dedicated OS thread,
 /// the same cancellation-aware admission point every other blocking I/O in
 /// this codebase uses, so `timeout:`/a future SIGINT handler can still give
@@ -33,35 +33,35 @@ use super::model::AskNode;
 /// mid-syscall.
 pub(crate) async fn run_ask(
     prompt: &str,
-    node: &AskNode,
+    step: &AskStep,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     if !std::io::stdin().is_terminal() {
-        let default = node.default.clone().ok_or_else(|| {
+        let default = step.default.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "stdin is not an interactive terminal and no 'default:' is set; an 'ask' node \
+                "stdin is not an interactive terminal and no 'default:' is set; an 'ask' step \
                  has no way to get an answer"
             )
         })?;
         // `default:` is still checked against `choices:` — it stands in for
         // a real answer, so it should be held to the same restriction one
         // would have been.
-        return validate_choice(default, node.choices.as_deref());
+        return validate_choice(default, step.choices.as_deref());
     }
 
     eprintln!("{prompt}");
-    if let Some(choices) = &node.choices {
+    if let Some(choices) = &step.choices {
         eprintln!("choices: {}", choices.join(", "));
     }
 
-    let multiline = node.multiline.unwrap_or(false);
+    let multiline = step.multiline;
     let answer =
         async_io::run_blocking(move |_cancelled| read_answer(multiline), cancellation).await?;
-    validate_choice(answer, node.choices.as_deref())
+    validate_choice(answer, step.choices.as_deref())
 }
 
 /// Reads one line (or, with `multiline`, everything up to EOF) from stdin,
-/// stripping exactly one trailing CRLF/LF the same way a `command` node's
+/// stripping exactly one trailing CRLF/LF the same way a `run` step's
 /// captured stdout does — a human's typed newline is not part of the answer.
 fn read_answer(multiline: bool) -> Result<String> {
     let stdin = std::io::stdin();

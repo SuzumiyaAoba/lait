@@ -114,7 +114,7 @@ LM Studio の既定のエンドポイントは `http://localhost:1234/v1` です
 | `--mcp <NAME>` | — | `mcp_servers:` の MCP サーバーをツールとして渡します（繰り返し可）。`--stream` と併用できます（[MCP](./mcp.md)）。 |
 | `--subagent <NAME>` | — | `agents:` の agent を subagent ツールとして渡します（繰り返し可）。`--stream` と併用できます（[サブエージェント](./subagents.md)）。 |
 | `--tool <NAME>` | — | `tools:` のカスタムシェルツールを渡します（繰り返し可、[カスタムシェルツール](./tools.md)）。 |
-| `--var KEY=VALUE` | — | テンプレート変数を指定します。`lait run` や名前付きプロンプトで使えます。 |
+| `--var KEY=VALUE` | — | 名前付きプロンプトのテンプレート変数を指定します（ワークフローの入力は `lait run --input KEY=VALUE` で渡します。[ワークフロー](./workflow.md#入力と出力)）。 |
 | `--config <PATH>` | — | 指定した設定ファイルだけを読み込みます。 |
 | `--no-config` | — | 設定ファイルを読み込みません。 |
 | `--no-env` | — | カレントディレクトリの `.env` を読み込みません（[設定ファイル](./config.md)）。 |

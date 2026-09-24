@@ -39,7 +39,7 @@ cases:
 
 | 形式 | 説明 |
 | --- | --- |
-| `workflow: <path>` | このeval.ymlファイルからの相対パスにあるワークフローファイルを、各ケースの`input`を初期入力として実行する。 |
+| `workflow: <path>` | このeval.ymlファイルからの相対パスにあるワークフローファイルを、各ケースの`input`を初期入力（`lait run` の `PROMPT` と同じく、ワークフローの `input_schema:` に従って解釈）として実行する。ワークフローが `inputs:` を宣言している場合は、`target.inputs:` に値を書ける（例: `target: {workflow: ./summarize.yml, inputs: {lang: ja}}`）。 |
 | `model: <name>`/`prompt: <template>` | `prompt:` は`{{ input }}`を参照できるテンプレートで、ケースごとにレンダリングして単発のモデル呼び出しを行う。 |
 
 その他のフィールドは次のとおりです。

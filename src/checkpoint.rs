@@ -6,12 +6,12 @@
 //! scratch. See `app::workflow_run` (the only writer/reader of these besides
 //! `run` below) and docs/usage/ja/workflow.md.
 //!
-//! Resume only ever replays *top-level* steps: a router step (`switch`/
-//! `parallel`/`loop`/`for_each`) always re-runs from its own beginning on
-//! resume, since a checkpoint only records state between top-level steps,
-//! never mid-router. A side-effecting node (`command`, `write_file`) inside
-//! a router can therefore execute twice across a resume — a documented
-//! consequence of this scope, not a bug.
+//! Resume only ever replays *top-level* steps: a control step (`group`/
+//! `switch`/`parallel`/`for_each`/`while`/`until`) always re-runs from its
+//! own beginning on resume, since a checkpoint only records state between
+//! top-level steps, never mid-control-step. A side-effecting step (`run`,
+//! `write`) inside a control step can therefore execute twice across a
+//! resume — a documented consequence of this scope, not a bug.
 //!
 //! Unlike `session`/`history` (append-only JSONL logs, see `jsonl.rs`), a
 //! checkpoint file is replaced wholesale on every step rather than appended
@@ -58,59 +58,85 @@ impl RunStatus {
     }
 }
 
+/// The on-disk checkpoint format this build writes and resumes. Version 1
+/// (text-valued, `--var`-based) checkpoints predate typed workflow values
+/// and cannot be resumed.
+pub(crate) const CHECKPOINT_FORMAT: u32 = 2;
+
 /// One run's recorded state, written after every top-level step and read
 /// back by `--resume`/`lait runs show`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
+    pub(crate) format: u32,
     pub(crate) run_id: String,
     /// The resolved workflow file path (`resolve_run_target`'s output,
     /// rendered with `Path::display`), compared against a `--resume`
     /// invocation's own resolved FILE so a checkpoint can't be replayed
     /// against a different workflow file by mistake.
     pub(crate) workflow_path: String,
-    pub(crate) initial_prompt: String,
-    /// `lait run --var` overrides in effect for this run (see
-    /// `workflow::build_vars`) — recorded so a resumed run's remaining steps
-    /// still see `{{ vars.* }}`/`$vars` without the user having to repeat
-    /// every `--var`. This means a checkpoint file may contain sensitive
-    /// `--var` values verbatim, the same way it already contains the
-    /// workflow's own input/intermediate output.
+    /// The run's initial value (PROMPT, or `null`).
+    pub(crate) initial_input: serde_json::Value,
+    /// The run's resolved `inputs`, recorded so a resumed run sees the same
+    /// `{{ inputs.* }}`/`$inputs` without repeating every `--input`. A
+    /// checkpoint may therefore contain sensitive input values verbatim, the
+    /// same way it contains the workflow's intermediate values.
     #[serde(default)]
-    pub(crate) vars: serde_json::Map<String, serde_json::Value>,
+    pub(crate) inputs: serde_json::Map<String, serde_json::Value>,
     /// Every top-level step's label, by position — see
-    /// `app::workflow_run::top_level_step_labels` for how this differs from a step's
-    /// runtime progress label. Used only to detect whether the workflow's
-    /// step sequence changed since this checkpoint was written.
+    /// `app::workflow_run::top_level_step_labels`. Used only to detect
+    /// whether the workflow's step sequence changed since this checkpoint
+    /// was written.
     pub(crate) top_level_labels: Vec<String>,
     /// How many top-level steps have completed (0 before the first one
     /// finishes). `--resume` continues from `wf.steps[completed_index..]`.
     pub(crate) completed_index: usize,
     pub(crate) counter: usize,
-    pub(crate) current_input: String,
+    pub(crate) current_value: serde_json::Value,
     pub(crate) steps_outputs: workflow::StepOutputs,
     pub(crate) status: RunStatus,
 }
 
-/// The borrowed shape of [`Checkpoint`] [`save`] actually serializes — the
-/// same borrowed-struct pattern `cache::CacheEntryRef` uses for the same
-/// reason. A checkpoint is written after *every* top-level step (see this
-/// module's doc comment), and `vars`/`top_level_labels`/`current_input`/
-/// `steps_outputs` are exactly the fields a run accumulates over time
-/// (`steps_outputs` in particular grows by one entry per completed step);
-/// building an owned [`Checkpoint`] to serialize would deep-clone all of
-/// them on every single write, for a value the write only ever reads.
-#[derive(Debug, Serialize)]
+/// The borrowed shape of [`Checkpoint`] [`save_cancellable`] actually
+/// serializes — the same borrowed-struct pattern `cache::CacheEntryRef` uses
+/// for the same reason. A checkpoint is written after *every* top-level step
+/// (see this module's doc comment), and `inputs`/`top_level_labels`/
+/// `current_value`/`steps_outputs` are exactly the fields a run accumulates
+/// over time (`steps_outputs` in particular grows by one entry per completed
+/// step); building an owned [`Checkpoint`] to serialize would deep-clone all
+/// of them on every single write, for a value the write only ever reads.
+/// `format` is not a field: it is always [`CHECKPOINT_FORMAT`], serialized
+/// by the `Serialize` impl below.
+#[derive(Debug)]
 pub(crate) struct CheckpointRef<'a> {
     pub(crate) run_id: &'a str,
     pub(crate) workflow_path: &'a str,
-    pub(crate) initial_prompt: &'a str,
-    pub(crate) vars: &'a serde_json::Map<String, serde_json::Value>,
+    pub(crate) initial_input: &'a serde_json::Value,
+    pub(crate) inputs: &'a serde_json::Map<String, serde_json::Value>,
     pub(crate) top_level_labels: &'a [String],
     pub(crate) completed_index: usize,
     pub(crate) counter: usize,
-    pub(crate) current_input: &'a str,
+    pub(crate) current_value: &'a serde_json::Value,
     pub(crate) steps_outputs: &'a workflow::StepOutputs,
     pub(crate) status: RunStatus,
+}
+
+impl Serialize for CheckpointRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Checkpoint", 11)?;
+        state.serialize_field("format", &CHECKPOINT_FORMAT)?;
+        state.serialize_field("run_id", self.run_id)?;
+        state.serialize_field("workflow_path", self.workflow_path)?;
+        state.serialize_field("initial_input", self.initial_input)?;
+        state.serialize_field("inputs", self.inputs)?;
+        state.serialize_field("top_level_labels", self.top_level_labels)?;
+        state.serialize_field("completed_index", &self.completed_index)?;
+        state.serialize_field("counter", &self.counter)?;
+        state.serialize_field("current_value", self.current_value)?;
+        state.serialize_field("steps_outputs", self.steps_outputs)?;
+        state.serialize_field("status", &self.status)?;
+        state.end()
+    }
 }
 
 fn run_path(run_id: &str) -> Result<PathBuf> {
@@ -166,9 +192,21 @@ pub(crate) async fn save_cancellable(
 
 /// The pure part of reading back a checkpoint, shared by [`read`]/
 /// [`load_path_cancellable`]: only the read (`async_io::read_to_string_sync`
-/// vs. the cancellable, FIFO-aware worker) differs between them.
+/// vs. the cancellable, FIFO-aware worker) differs between them. Rejects a
+/// format this build cannot resume before complaining about individual
+/// fields.
 fn parse_checkpoint(body: &str, path: &Path) -> Result<Checkpoint> {
-    serde_json::from_str(body)
+    let value: serde_json::Value = serde_json::from_str(body)
+        .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))?;
+    let format = value.get("format").and_then(serde_json::Value::as_u64);
+    if format != Some(u64::from(CHECKPOINT_FORMAT)) {
+        bail!(
+            "checkpoint file '{}' was written by an older version of lait and cannot be \
+             resumed; start a fresh run",
+            path.display()
+        );
+    }
+    serde_json::from_value(value)
         .with_context(|| format!("failed to parse checkpoint file '{}'", path.display()))
 }
 
@@ -317,12 +355,18 @@ pub(crate) fn run(command: RunsCommand) -> Result<()> {
                 checkpoint.completed_index,
                 checkpoint.top_level_labels.len(),
             );
-            println!("initial prompt: {}", checkpoint.initial_prompt);
-            println!("current input: {}", checkpoint.current_input);
-            if !checkpoint.vars.is_empty() {
-                let vars = serde_json::to_string(&checkpoint.vars)
-                    .context("failed to serialize checkpoint vars")?;
-                println!("vars: {vars}");
+            println!(
+                "initial input: {}",
+                crate::template::to_text(&checkpoint.initial_input)
+            );
+            println!(
+                "current value: {}",
+                crate::template::to_text(&checkpoint.current_value)
+            );
+            if !checkpoint.inputs.is_empty() {
+                let inputs = serde_json::to_string(&checkpoint.inputs)
+                    .context("failed to serialize checkpoint inputs")?;
+                println!("inputs: {inputs}");
             }
             Ok(())
         }
@@ -353,27 +397,25 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// Before `workflow::StepOutputs` became a copy-on-write wrapper over
-    /// `Arc<serde_json::Map<..>>` (P7-3), `steps_outputs` was a plain
-    /// `serde_json::Map` and serialized as a bare JSON object.
-    /// `#[serde(transparent)]` on the new wrapper keeps that exact on-disk
-    /// shape, so a checkpoint written by an older build (no extra wrapper
-    /// layer around `steps_outputs`) must still resume-load unchanged.
+    /// `workflow::StepOutputs` is a copy-on-write wrapper over
+    /// `Arc<serde_json::Map<..>>`; `#[serde(transparent)]` on it keeps the
+    /// on-disk shape a bare JSON object, so a checkpoint's `steps_outputs`
+    /// reads back as one.
     #[test]
-    fn read_parses_a_pre_arc_wrapped_steps_outputs_shape() {
-        let path =
-            crate::test_support::unique_temp_path("lait-checkpoint-legacy-steps-shape", ".json");
+    fn read_parses_steps_outputs_as_a_bare_object() {
+        let path = crate::test_support::unique_temp_path("lait-checkpoint-steps-shape", ".json");
         std::fs::write(
             &path,
             r#"{
+                "format": 2,
                 "run_id": "test-run",
                 "workflow_path": "workflow.yml",
-                "initial_prompt": "hi",
-                "vars": {},
+                "initial_input": "hi",
+                "inputs": {},
                 "top_level_labels": ["a", "b"],
                 "completed_index": 1,
                 "counter": 1,
-                "current_input": "hi",
+                "current_value": "hi",
                 "steps_outputs": {"extract": {"city": "Tokyo"}},
                 "status": "failed"
             }"#,
@@ -390,14 +432,15 @@ mod tests {
 
     fn checkpoint_with(top_level_labels: Vec<&str>, completed_index: usize) -> Checkpoint {
         Checkpoint {
+            format: super::CHECKPOINT_FORMAT,
             run_id: "test-run".to_owned(),
             workflow_path: "workflow.yml".to_owned(),
-            initial_prompt: "hi".to_owned(),
-            vars: serde_json::Map::new(),
+            initial_input: serde_json::json!("hi"),
+            inputs: serde_json::Map::new(),
             top_level_labels: top_level_labels.into_iter().map(str::to_owned).collect(),
             completed_index,
             counter: completed_index,
-            current_input: "hi".to_owned(),
+            current_value: serde_json::json!("hi"),
             steps_outputs: crate::workflow::StepOutputs::new(),
             status: RunStatus::Failed,
         }
@@ -446,6 +489,37 @@ mod tests {
         let checkpoint = checkpoint_with(vec!["a", "b", "c"], 2);
         let error = check_resumable(&["a".to_owned()], &checkpoint).unwrap_err();
         assert!(error.to_string().contains("no longer has that many steps"));
+    }
+
+    #[test]
+    fn rejects_a_checkpoint_written_in_an_older_format() {
+        let error = super::parse_checkpoint(
+            r#"{"run_id":"x","current_input":"hi"}"#,
+            std::path::Path::new("old.json"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("older version"));
+    }
+
+    #[test]
+    fn a_checkpoint_round_trips_through_its_current_format() {
+        let checkpoint = checkpoint_with(vec!["a"], 1);
+        let written = super::CheckpointRef {
+            run_id: &checkpoint.run_id,
+            workflow_path: &checkpoint.workflow_path,
+            initial_input: &checkpoint.initial_input,
+            inputs: &checkpoint.inputs,
+            top_level_labels: &checkpoint.top_level_labels,
+            completed_index: checkpoint.completed_index,
+            counter: checkpoint.counter,
+            current_value: &checkpoint.current_value,
+            steps_outputs: &checkpoint.steps_outputs,
+            status: checkpoint.status,
+        };
+        let body = serde_json::to_string(&written).unwrap();
+        let parsed = super::parse_checkpoint(&body, std::path::Path::new("new.json")).unwrap();
+        assert_eq!(parsed.format, super::CHECKPOINT_FORMAT);
+        assert_eq!(parsed.current_value, serde_json::json!("hi"));
     }
 
     #[test]

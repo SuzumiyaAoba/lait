@@ -1,6 +1,4 @@
 use super::*;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 fn parse_workflow_fixture(yaml: &str) -> workflow::WorkflowFile {
     workflow::parse_workflow(yaml).expect("fixture workflow should validate")
@@ -12,325 +10,206 @@ fn empty_config() -> ConfigFile {
 
 fn lint_fixture(wf: &workflow::WorkflowFile, config: Option<&ConfigFile>) -> Vec<LintIssue> {
     let mut ctx = LintCtx::new(config);
-    lint_workflow_contents(wf, Path::new("."), &mut ctx);
+    lint_workflow_contents(wf, &mut ctx);
     ctx.issues
 }
 
-#[test]
-fn warns_about_a_node_defined_but_never_used() {
-    let wf = parse_workflow_fixture(
-        "nodes:\n  used:\n    type: prompt\n    prompt: hi\n  unused:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: used\n",
-    );
-    let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(
-        issues
-            .iter()
-            .any(|issue| issue.severity == Severity::Warning && issue.message.contains("unused")),
-        "{issues:?}"
-    );
-    assert!(
-        !issues.iter().any(|issue| issue.message.contains("'used'")),
-        "{issues:?}"
-    );
+fn has(issues: &[LintIssue], severity: Severity, text: &str) -> bool {
+    issues
+        .iter()
+        .any(|issue| issue.severity == severity && issue.message.contains(text))
 }
 
 #[test]
-fn does_not_warn_when_every_node_is_used() {
+fn a_clean_workflow_has_no_issues() {
     let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n",
+        "inputs:\n  lang: string\nsteps:\n  - id: a\n    prompt: 'in {{ inputs.lang }}: {{ input }}'\n  - jq: '{a: $steps.a, l: $inputs.lang}'\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
     assert!(issues.is_empty(), "{issues:?}");
 }
 
 #[test]
-fn counts_a_node_used_only_inside_a_switch_case_as_used() {
+fn flags_a_reference_to_an_undeclared_input() {
     let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - switch:\n      cases:\n        - when: \".x\"\n          steps:\n            - use: a\n      else:\n        - use: a\n",
+        "inputs:\n  lang: string\nsteps:\n  - prompt: '{{ inputs.langg }}'\n  - jq: '$inputs.missing'\n    when: '$inputs.lang == \"ja\"'\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
+    assert!(has(&issues, Severity::Error, "input 'langg'"), "{issues:?}");
     assert!(
-        !issues
-            .iter()
-            .any(|issue| issue.message.contains("never referenced")),
+        has(&issues, Severity::Error, "input 'missing'"),
+        "{issues:?}"
+    );
+    assert!(
+        !has(&issues, Severity::Error, "input 'lang',"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn flags_an_invalid_jq_when_filter() {
+fn warns_about_a_reference_to_an_unknown_step_id() {
     let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - use: a\n    when: \".[\"\n",
+        "steps:\n  - id: first\n    jq: .\n  - prompt: '{{ steps.frist }}'\n  - jq: '$steps[\"nope\"]'\n    output: '$steps.first'\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
     assert!(
-        issues
-            .iter()
-            .any(|issue| issue.severity == Severity::Error && issue.message.contains("'when'")),
+        has(&issues, Severity::Warning, "step 'frist'"),
+        "{issues:?}"
+    );
+    assert!(has(&issues, Severity::Warning, "step 'nope'"), "{issues:?}");
+    assert!(
+        !has(&issues, Severity::Warning, "step 'first'"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn flags_an_invalid_jq_for_each_items_filter() {
+fn step_ids_inside_nested_steps_count_as_known() {
     let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\nsteps:\n  - for_each:\n      items: \".[\"\n      steps:\n        - use: a\n",
+        "steps:\n  - parallel:\n      a:\n        - id: inner\n          jq: .\n  - jq: '$steps.inner'\n",
+    );
+    let issues = lint_fixture(&wf, Some(&empty_config()));
+    assert!(!has(&issues, Severity::Warning, "inner"), "{issues:?}");
+}
+
+#[test]
+fn warns_about_unused_schemas_and_agents() {
+    let wf = parse_workflow_fixture(
+        "schemas:\n  used: {type: object}\n  unused: {type: object}\nagents:\n  idle:\n    system: hi\nsteps:\n  - prompt: x\n    output_schema: used\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
     assert!(
-        issues.iter().any(|issue| issue.message.contains("'items'")),
+        has(&issues, Severity::Warning, "schema 'unused'"),
+        "{issues:?}"
+    );
+    assert!(
+        !has(&issues, Severity::Warning, "schema 'used'"),
+        "{issues:?}"
+    );
+    assert!(
+        has(&issues, Severity::Warning, "agent 'idle'"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn flags_an_invalid_prompt_template() {
+fn flags_an_unloadable_schema_file() {
     let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input\"\nsteps:\n  - use: a\n",
+        "schemas:\n  s: {file: /nonexistent/lait-schema.json}\nsteps:\n  - prompt: x\n    output_schema: s\n  - prompt: y\n    input_schema: {file: /nonexistent/other.json}\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
     assert!(
-        issues.iter().any(|issue| issue.severity == Severity::Error
-            && issue.message.contains("'prompt' template")),
+        has(&issues, Severity::Error, "schema 's' is invalid"),
+        "{issues:?}"
+    );
+    assert!(
+        has(&issues, Severity::Error, "'input_schema' is invalid"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn flags_an_invalid_command_argument_template() {
+fn warns_about_an_unrecognized_schema_type() {
     let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: command\n    command: [\"echo\", \"{{ input\"]\nsteps:\n  - use: a\n",
+        "inputs:\n  n: { type: interger, default: 1 }\nsteps:\n  - prompt: x\n    input_schema: {type: object, properties: {a: {type: sting}}}\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
     assert!(
-        issues.iter().any(|issue| issue.severity == Severity::Error
-            && issue.message.contains("'command' argument template")),
+        has(&issues, Severity::Warning, "'type: interger'"),
+        "{issues:?}"
+    );
+    assert!(
+        has(&issues, Severity::Warning, "'type: sting'"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn accepts_a_bare_input_placeholder_in_a_prompt() {
-    // A scalar `{{ input }}` (the common case for a first step run
-    // against a plain-text CLI argument) is valid; only `render`, at
-    // actual render time against real data, can know whether the input
-    // will be an object/array — see `template::check_syntax`'s doc
-    // comment.
+fn flags_unknown_capability_names_on_steps_defaults_and_inline_agents() {
     let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: \"{{ input }}\"\nsteps:\n  - use: a\n",
+        "default:\n  skills: [nope-skill]\nagents:\n  a:\n    system: hi\n    tools: [nope-tool]\nsteps:\n  - prompt: x\n    mcp: [nope-mcp]\n  - agent: a\n    subagents: [nope-agent]\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(issues.is_empty(), "{issues:?}");
+    for text in [
+        "unknown skill 'nope-skill'",
+        "unknown tool 'nope-tool'",
+        "unknown MCP server 'nope-mcp'",
+        "unknown subagent 'nope-agent'",
+    ] {
+        assert!(has(&issues, Severity::Error, text), "{text}: {issues:?}");
+    }
 }
 
 #[test]
-fn flags_an_unknown_mcp_server_name() {
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
-    );
-    let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(
-        issues
-            .iter()
-            .any(|issue| issue.message.contains("unknown MCP server 'nope'")),
-        "{issues:?}"
-    );
-}
-
-#[test]
-fn accepts_a_known_mcp_server_name() {
+fn accepts_known_capability_names() {
     let mut config = empty_config();
-    Arc::make_mut(&mut config.mcp_servers).insert(
-        "known".to_owned(),
-        config::McpServerConfig {
-            command: Some("true".to_owned()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            cwd: None,
-            url: None,
-            headers: HashMap::new(),
-            allowed_tools: None,
-            allow_elicitation: false,
-        },
-    );
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [known]\nsteps:\n  - use: a\n",
-    );
+    std::sync::Arc::make_mut(&mut config.agents)
+        .insert("researcher".to_owned(), PathBuf::from("researcher.md"));
+    let wf = parse_workflow_fixture("steps:\n  - prompt: x\n    subagents: [researcher]\n");
     let issues = lint_fixture(&wf, Some(&config));
-    assert!(
-        !issues.iter().any(|issue| issue.message.contains("MCP")),
-        "{issues:?}"
-    );
+    assert!(!has(&issues, Severity::Error, "subagent"), "{issues:?}");
 }
 
 #[test]
 fn flags_a_referenced_mcp_server_whose_allowed_tools_is_empty() {
-    let mut config = empty_config();
-    Arc::make_mut(&mut config.mcp_servers).insert(
-        "locked-down".to_owned(),
-        config::McpServerConfig {
-            command: Some("true".to_owned()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            cwd: None,
-            url: None,
-            headers: HashMap::new(),
-            allowed_tools: Some(Vec::new()),
-            allow_elicitation: false,
-        },
-    );
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [locked-down]\nsteps:\n  - use: a\n",
-    );
+    let config: ConfigFile = serde_yaml::from_str(
+        "mcp_servers:\n  locked:\n    command: server\n    allowed_tools: []\n",
+    )
+    .unwrap();
+    let wf = parse_workflow_fixture("steps:\n  - prompt: x\n    mcp: [locked]\n");
     let issues = lint_fixture(&wf, Some(&config));
-    assert!(
-        issues.iter().any(|issue| {
-            issue.severity == Severity::Warning
-                && issue.message.contains("locked-down")
-                && issue.message.contains("allowed_tools")
-        }),
-        "{issues:?}"
-    );
+    assert!(has(&issues, Severity::Warning, "empty list"), "{issues:?}");
 }
 
 #[test]
-fn flags_an_unknown_skill_name() {
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    skills: [nope]\nsteps:\n  - use: a\n",
-    );
-    let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(
-        issues
-            .iter()
-            .any(|issue| issue.message.contains("unknown skill 'nope'")),
-        "{issues:?}"
-    );
-}
-
-#[test]
-fn flags_an_unknown_subagent_name() {
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [nope]\nsteps:\n  - use: a\n",
-    );
-    let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(
-        issues
-            .iter()
-            .any(|issue| issue.message.contains("unknown subagent 'nope'")),
-        "{issues:?}"
-    );
-}
-
-#[test]
-fn accepts_a_known_subagent_name() {
-    let mut config = empty_config();
-    Arc::make_mut(&mut config.agents).insert("known".to_owned(), PathBuf::from("agents/known.md"));
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    subagents: [known]\nsteps:\n  - use: a\n",
-    );
-    let issues = lint_fixture(&wf, Some(&config));
-    assert!(
-        !issues
-            .iter()
-            .any(|issue| issue.message.contains("subagent")),
-        "{issues:?}"
-    );
-}
-
-#[test]
-fn skips_mcp_and_skill_checks_and_notes_it_when_there_is_no_config() {
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    mcp: [nope]\nsteps:\n  - use: a\n",
-    );
+fn skips_capability_checks_and_notes_it_when_there_is_no_config() {
+    let wf =
+        parse_workflow_fixture("steps:\n  - prompt: x\n    mcp: [nope]\n  - agent: registered\n");
     let mut ctx = LintCtx::new(None);
-    lint_workflow_contents(&wf, Path::new("."), &mut ctx);
+    lint_workflow_contents(&wf, &mut ctx);
     note_skipped_capability_check(&mut ctx);
     let issues = ctx.issues;
+    assert!(!has(&issues, Severity::Error, "unknown MCP"), "{issues:?}");
     assert!(
-        !issues
-            .iter()
-            .any(|issue| issue.message.contains("unknown MCP"))
-    );
-    assert!(
-        issues
-            .iter()
-            .any(|issue| issue.message.contains("were not checked")),
+        has(&issues, Severity::Warning, "were not checked"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn flags_an_unresolvable_output_schema_name() {
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: nonexistent.json\nsteps:\n  - use: a\n",
-    );
+fn flags_an_unregistered_agent_or_workflow_name() {
+    let wf = parse_workflow_fixture("steps:\n  - agent: ghost\n  - workflow: phantom\n");
     let issues = lint_fixture(&wf, Some(&empty_config()));
+    assert!(has(&issues, Severity::Error, "agent 'ghost'"), "{issues:?}");
     assert!(
-        issues
-            .iter()
-            .any(|issue| issue.message.contains("unresolvable 'output_schema'")),
+        has(&issues, Severity::Error, "workflow 'phantom'"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn accepts_an_output_schema_name_defined_in_json_schemas() {
+fn flags_a_missing_agent_file_or_child_workflow() {
     let wf = parse_workflow_fixture(
-        "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
+        "steps:\n  - agent: /nonexistent/agent-does-not-exist.md\n  - workflow: /nonexistent/child.yml\n",
     );
     let issues = lint_fixture(&wf, Some(&empty_config()));
     assert!(
-        !issues
-            .iter()
-            .any(|issue| issue.message.contains("output_schema")),
+        has(&issues, Severity::Error, "failed to load"),
+        "{issues:?}"
+    );
+    assert!(
+        has(&issues, Severity::Error, "could not be resolved"),
         "{issues:?}"
     );
 }
 
 #[test]
-fn flags_a_schema_name_with_an_invalid_character() {
-    // `output_schema` alone (this fixture's `schema_name` is unset,
-    // defaulting to "structured_output", which is valid) isn't enough to
-    // trigger this — the invalid character has to actually be spelled
-    // out in `schema_name`.
-    let wf = parse_workflow_fixture(
-        "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\n    schema_name: \"bad name!\"\nsteps:\n  - use: a\n",
+fn jq_referenced_fields_finds_dotted_and_bracketed_names() {
+    assert_eq!(
+        jq_referenced_fields("$inputs.a + $inputs[\"b\"] + ($inputs.a)", "$inputs"),
+        vec!["a".to_owned(), "b".to_owned()]
     );
-    let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(
-        issues
-            .iter()
-            .any(|issue| issue.message.contains("invalid 'schema_name'")),
-        "{issues:?}"
-    );
-}
-
-#[test]
-fn accepts_the_default_schema_name_when_none_is_set() {
-    let wf = parse_workflow_fixture(
-        "json_schemas:\n  city:\n    schema:\n      type: object\nnodes:\n  a:\n    type: prompt\n    prompt: hi\n    output_schema: city\nsteps:\n  - use: a\n",
-    );
-    let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(
-        !issues
-            .iter()
-            .any(|issue| issue.message.contains("schema_name")),
-        "{issues:?}"
-    );
-}
-
-#[test]
-fn flags_a_missing_agent_file() {
-    let wf = parse_workflow_fixture(
-        "nodes:\n  a:\n    type: agent\n    agent: /nonexistent/agent-does-not-exist.md\nsteps:\n  - use: a\n",
-    );
-    let issues = lint_fixture(&wf, Some(&empty_config()));
-    assert!(
-        issues
-            .iter()
-            .any(|issue| issue.message.contains("failed to load")),
-        "{issues:?}"
-    );
+    assert!(jq_referenced_fields("$inputs | keys", "$inputs").is_empty());
 }
 
 /// A `.md` file at a unique path under the system temp directory,
@@ -413,14 +292,14 @@ fn agent_lint_flags_an_invalid_system_prompt_template() {
 #[test]
 fn agent_lint_flags_an_invalid_schema_name() {
     let agent = TempAgentFile::new(
-        "---\noutput_schema:\n  schema:\n    type: object\nstructured_output: true\nschema_name: \"bad name!\"\n---\nbody\n",
+        "---\noutput_schema:\n  type: object\nschema_name: \"bad name!\"\n---\nbody\n",
     );
     let report = lint_agent_file(&agent.path, Some(&empty_config()));
     assert!(
         report
             .issues
             .iter()
-            .any(|issue| issue.message.contains("invalid 'schema_name'")),
+            .any(|issue| issue.message.contains("JSON schema name")),
         "{:?}",
         report.issues
     );
@@ -437,12 +316,4 @@ fn agent_lint_reports_a_parse_error_as_a_single_issue() {
 #[test]
 fn lint_file_rejects_an_unrecognized_extension() {
     assert!(lint_file(Path::new("thing.txt"), Some(&empty_config())).is_err());
-}
-
-#[test]
-fn yaml_error_line_reports_the_parser_location() {
-    let error = serde_yaml::from_str::<serde_yaml::Value>("steps: [\n")
-        .expect_err("malformed YAML should fail to parse");
-    let line = yaml_error_line(&anyhow::Error::new(error));
-    assert!(line.is_some(), "expected a line number from the parser");
 }
