@@ -1,7 +1,7 @@
 //! `lait serve --mcp`'s MCP (Model Context Protocol) *server* side: exposes
 //! every `agents:`/`workflows:` entry in `lait.config.yml` as one callable
-//! MCP tool each, over whichever transport `app::serve` connects (currently
-//! stdio only). Deliberately separate from `crate::mcp` (an MCP *client*,
+//! MCP tool each, over whichever transport `app::serve` connects (stdio, or
+//! Streamable HTTP with `--http`). Deliberately separate from `crate::mcp` (an MCP *client*,
 //! for `mcp_servers:`) rather than a submodule of it — that module's own doc
 //! comment frames it as "MCP client" throughout, and the two share almost no
 //! code beyond `mcp::qualify_tool_name` (reused here so an agent/workflow
@@ -12,7 +12,8 @@
 //! entirely (the tool result text is handed straight to the MCP client, in
 //! memory) — so, unlike every other `lait` entry point, a call here never
 //! writes to `lait history` and never prints a `--show-usage` summary. This
-//! is a deliberate v1 boundary, not an oversight.
+//! is a deliberate boundary, not an oversight. The response cache,
+//! `--record`/`--replay`, and `--trace-file` do apply — see [`ServeOptions`].
 //!
 //! # Why an `ask:` step is refused
 //!
@@ -45,7 +46,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     engine::{self, AppServices, RunContext},
-    mcp, report, template,
+    mcp, report, template, trace,
     workflow::{
         self,
         exec::{Frame, run_document},
@@ -60,7 +61,32 @@ enum ToolTarget {
     Workflow(PathBuf),
 }
 
-/// The MCP server `lait serve --mcp` runs. Its tool catalog (`tools`/
+/// The per-call run policy `lait serve --mcp`'s flags (and the global
+/// `--cache`/`--no-cache`) set: every tool call gets its own fresh
+/// `RunContext` built from these, so calls never share usage/cancellation
+/// state but all follow the same cache/cassette policy.
+#[derive(Debug, Default)]
+pub(crate) struct ServeOptions {
+    pub(crate) cache_enabled: bool,
+    pub(crate) cache_ttl: Option<u64>,
+    pub(crate) record_dir: Option<PathBuf>,
+    pub(crate) replay_dir: Option<PathBuf>,
+    pub(crate) trace_file: Option<PathBuf>,
+}
+
+/// Every trace event the served tool calls have made so far, rewritten to
+/// `ServeOptions::trace_file` after each call. Each call's own
+/// `RunContext::trace` numbers its events from 0, so they are renumbered
+/// here into one server-wide `seq` order, and tagged with the tool that
+/// made them (`lait.serve.tool`).
+#[derive(Default)]
+struct ServeTrace {
+    events: tokio::sync::Mutex<Vec<trace::TraceEvent>>,
+}
+
+/// The MCP server `lait serve --mcp` runs. Cheap to clone (everything is
+/// behind an `Arc`): the Streamable HTTP transport builds one handler per
+/// client session from a clone. Its tool catalog (`tools`/
 /// `dispatch`) is built once, at startup (see `build`) — an `agents:`/
 /// `workflows:` entry added to `lait.config.yml` after the server started is
 /// not picked up without a restart, matching every other `lait` command's
@@ -72,10 +98,13 @@ enum ToolTarget {
 /// re-parsing a workflow file is noise next to that, and skipping the cache
 /// avoids having to reason about sharing one `WorkflowScope` across
 /// concurrent calls from the same client.
+#[derive(Clone)]
 pub(crate) struct LaitMcpServer {
     services: Arc<AppServices>,
-    tools: Vec<Tool>,
-    dispatch: HashMap<String, ToolTarget>,
+    tools: Arc<Vec<Tool>>,
+    dispatch: Arc<HashMap<String, ToolTarget>>,
+    options: Arc<ServeOptions>,
+    trace: Arc<ServeTrace>,
 }
 
 impl LaitMcpServer {
@@ -89,6 +118,7 @@ impl LaitMcpServer {
     /// registry entry.
     pub(crate) async fn build(
         services: Arc<AppServices>,
+        options: ServeOptions,
         cancellation: CancellationToken,
     ) -> Result<Self> {
         let mut tools = Vec::new();
@@ -130,9 +160,41 @@ impl LaitMcpServer {
 
         Ok(Self {
             services,
-            tools,
-            dispatch,
+            tools: Arc::new(tools),
+            dispatch: Arc::new(dispatch),
+            options: Arc::new(options),
+            trace: Arc::default(),
         })
+    }
+
+    /// A fresh per-call `RunContext` following [`ServeOptions`].
+    fn run_context(&self, cancellation: CancellationToken) -> Result<RunContext> {
+        RunContext::new(Arc::clone(&self.services), cancellation)
+            .with_cache(self.options.cache_enabled, self.options.cache_ttl)
+            .with_record_replay(
+                self.options.record_dir.clone(),
+                self.options.replay_dir.clone(),
+            )
+    }
+
+    /// Appends `env`'s trace events (see [`ServeTrace`]) and rewrites
+    /// `--trace-file`, when one was asked for. A write failure is reported
+    /// rather than failing the tool call whose result is already in hand.
+    async fn flush_trace(&self, tool: &str, env: &RunContext) {
+        let Some(path) = &self.options.trace_file else {
+            return;
+        };
+        let mut all = self.trace.events.lock().await;
+        for mut event in env.trace.events() {
+            event.seq = all.len() as u64;
+            event
+                .attributes
+                .insert("lait.serve.tool".to_owned(), tool.into());
+            all.push(event);
+        }
+        if let Err(error) = trace::write_jsonl(path, &all) {
+            report::warn(format_args!("{error:#}"));
+        }
     }
 
     /// Every qualified tool name this server exposes, for `app::serve`'s
@@ -145,16 +207,17 @@ impl LaitMcpServer {
         &self,
         name: &str,
         arguments_json: &str,
+        env: &RunContext,
         cancellation: CancellationToken,
     ) -> Result<String> {
-        let env = RunContext::new(Arc::clone(&self.services), cancellation.clone());
-        engine::call_subagent_tool(name, arguments_json, &env, &[], cancellation).await
+        engine::call_subagent_tool(name, arguments_json, env, &[], cancellation).await
     }
 
     async fn call_workflow_tool(
         &self,
         path: &std::path::Path,
         arguments_json: &str,
+        env: &RunContext,
         cancellation: CancellationToken,
     ) -> Result<String> {
         let (input, provided) = workflow_tool_input(arguments_json)?;
@@ -170,9 +233,7 @@ impl LaitMcpServer {
         };
         let scope =
             workflow::WorkflowScope::top_level(&wf, path, resolved, cancellation.clone()).await?;
-        let env = RunContext::new(Arc::clone(&self.services), cancellation.clone());
-        let (output, _) =
-            run_document(&wf, initial, Frame::new(&scope, &env, cancellation)).await?;
+        let (output, _) = run_document(&wf, initial, Frame::new(&scope, env, cancellation)).await?;
         Ok(template::to_text(&output))
     }
 }
@@ -356,7 +417,7 @@ impl ServerHandler for LaitMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult {
-            tools: self.tools.clone(),
+            tools: self.tools.as_ref().clone(),
             ..Default::default()
         })
     }
@@ -393,16 +454,20 @@ impl ServerHandler for LaitMcpServer {
                 )
             })?;
         let cancellation = context.ct.clone();
+        let env = self
+            .run_context(cancellation.clone())
+            .map_err(|error| McpError::internal_error(format!("{error:#}"), None))?;
         let result = match target {
             ToolTarget::Agent(name) => {
-                self.call_agent_tool(name, &arguments_json, cancellation)
+                self.call_agent_tool(name, &arguments_json, &env, cancellation)
                     .await
             }
             ToolTarget::Workflow(path) => {
-                self.call_workflow_tool(path, &arguments_json, cancellation)
+                self.call_workflow_tool(path, &arguments_json, &env, cancellation)
                     .await
             }
         };
+        self.flush_trace(request.name.as_ref(), &env).await;
         Ok(match result {
             Ok(output) => CallToolResult::success(vec![ContentBlock::text(output)]).into(),
             Err(error) => {

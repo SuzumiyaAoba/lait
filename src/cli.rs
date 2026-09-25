@@ -285,6 +285,35 @@ pub(crate) struct ServeArgs {
     /// need a breaking change to introduce.
     #[arg(long)]
     pub(crate) mcp: bool,
+
+    /// Serve MCP's Streamable HTTP transport on ADDR (e.g. `127.0.0.1:8765`)
+    /// instead of stdio. The endpoint is unauthenticated: bind a loopback
+    /// address unless something in front of it authenticates requests.
+    /// Requests whose `Host` header isn't a loopback name are rejected
+    /// (DNS-rebinding protection) unless allowed with `--allowed-host`.
+    #[arg(long, value_name = "ADDR")]
+    pub(crate) http: Option<std::net::SocketAddr>,
+
+    /// An extra `Host` header value (`example.com` or `example.com:8765`)
+    /// `--http` accepts besides the loopback defaults. Repeatable.
+    #[arg(long, value_name = "HOST", requires = "http")]
+    pub(crate) allowed_host: Vec<String>,
+
+    /// Record every LLM request/response a tool call makes into DIR, like
+    /// `lait run --record`.
+    #[arg(long, value_name = "DIR", conflicts_with = "replay")]
+    pub(crate) record: Option<PathBuf>,
+
+    /// Answer every LLM request from DIR's `--record`ed cassettes, like
+    /// `lait run --replay`.
+    #[arg(long, value_name = "DIR", conflicts_with = "record")]
+    pub(crate) replay: Option<PathBuf>,
+
+    /// Write every model/tool call the served tools make to PATH as a JSONL
+    /// trace log (see docs/usage/ja/trace.md), rewritten after each tool
+    /// call so it stays readable while the server keeps running.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) trace_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -348,10 +377,39 @@ pub(crate) struct CompareArgs {
     #[arg(long)]
     pub(crate) max_tokens: Option<u32>,
 
+    /// The system prompt sent to every model. Falls back to
+    /// `default.system` in lait.config.yml, like chat.
+    #[arg(long, value_name = "TEXT", conflicts_with = "system_file")]
+    pub(crate) system: Option<String>,
+
+    /// Read the system prompt sent to every model from FILE.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) system_file: Option<PathBuf>,
+
+    /// Name of an `mcp_servers:` entry whose tools every model may call.
+    /// Repeatable; falls back to `default.mcp`, like chat's `--mcp`.
+    #[arg(long = "mcp", value_name = "NAME")]
+    pub(crate) mcp: Vec<String>,
+
+    /// Name of an `agents:` entry every model may call as a subagent tool.
+    /// Repeatable; falls back to `default.subagents`.
+    #[arg(long = "subagent", value_name = "NAME")]
+    pub(crate) subagent: Vec<String>,
+
+    /// Name of a `tools:` entry every model may call. Repeatable; falls back
+    /// to `default.tools`.
+    #[arg(long = "tool", value_name = "NAME")]
+    pub(crate) tool: Vec<String>,
+
     /// Print machine-readable JSON (an array of per-model results) instead
     /// of a human-readable report.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "markdown")]
     pub(crate) json: bool,
+
+    /// Print a Markdown report: a summary table (time, usage, cost, status
+    /// per model) followed by each model's response under its own heading.
+    #[arg(long)]
+    pub(crate) markdown: bool,
 }
 
 #[derive(Debug, Args)]
@@ -526,6 +584,9 @@ pub(crate) enum TraceAction {
     /// Print a `--trace-file`-written JSONL trace log's events, in
     /// recording order.
     Show(TraceShowArgs),
+    /// Send a `--trace-file`-written JSONL trace log to an OpenTelemetry
+    /// collector as OTLP/HTTP JSON spans (one span per event).
+    Export(TraceExportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -538,6 +599,43 @@ pub(crate) struct TraceShowArgs {
     /// list.
     #[arg(long)]
     pub(crate) json: bool,
+
+    /// Only show events whose operation is OP (`chat`, `execute_tool`, or
+    /// `compact`).
+    #[arg(long, value_name = "OP")]
+    pub(crate) operation: Option<String>,
+
+    /// Only show events whose label contains TEXT (a workflow step id, a
+    /// tool name, ...).
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) label: Option<String>,
+
+    /// Print per-label totals (event counts, total duration, token usage)
+    /// instead of individual events. Applies after `--operation`/`--label`.
+    #[arg(long)]
+    pub(crate) summary: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TraceExportArgs {
+    /// Path to a JSONL trace file written by `lait run --trace-file`.
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// The OTLP/HTTP traces endpoint to POST to, used as given (e.g.
+    /// `http://localhost:4318/v1/traces`).
+    #[arg(long, value_name = "URL")]
+    pub(crate) otlp: String,
+
+    /// An extra request header, `NAME=VALUE` (an auth token, say). VALUE
+    /// supports `${VAR_NAME}` expansion so a secret need not appear on the
+    /// command line. Repeatable.
+    #[arg(long = "header", value_name = "NAME=VALUE")]
+    pub(crate) headers: Vec<String>,
+
+    /// The `service.name` resource attribute sent with the spans.
+    #[arg(long, value_name = "NAME", default_value = "lait")]
+    pub(crate) service_name: String,
 }
 
 #[derive(Debug, Args)]
@@ -588,6 +686,36 @@ pub(crate) struct HistoryArgs {
     /// Maximum number of entries to show when listing (most recent first).
     #[arg(long, short = 'l', default_value_t = 20)]
     pub(crate) limit: usize,
+
+    #[command(flatten)]
+    pub(crate) filter: HistoryFilterArgs,
+}
+
+/// `lait history`'s entry filters and output format, accepted both by the
+/// bare listing and by `search` (each on its own side of the subcommand
+/// name: `lait history --kind chat`, `lait history search foo --kind chat`).
+/// Not `global = true`: the root command's chat-mode `--model`/`--json`
+/// would then collide with these.
+#[derive(Debug, Default, Args)]
+pub(crate) struct HistoryFilterArgs {
+    /// Only entries of this kind: `chat`, `agent`, `workflow`, or `prompt`.
+    #[arg(long, value_name = "KIND")]
+    pub(crate) kind: Option<String>,
+
+    /// Only entries whose model contains TEXT.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) model: Option<String>,
+
+    /// Only entries recorded at or after WHEN: a date (`2026-09-01`, UTC
+    /// midnight), an RFC 3339 timestamp, or a duration back from now (`30m`,
+    /// `12h`, `7d`, `2w`).
+    #[arg(long, value_name = "WHEN")]
+    pub(crate) since: Option<String>,
+
+    /// Print machine-readable JSON: an array of entries, each with the
+    /// `number` `lait history show` accepts.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -604,12 +732,19 @@ pub(crate) enum HistoryAction {
 pub(crate) struct HistoryShowArgs {
     #[arg(value_name = "N")]
     pub(crate) index: usize,
+
+    /// Print the entry as a JSON object (with its `number`).
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct HistorySearchArgs {
     #[arg(value_name = "QUERY")]
     pub(crate) query: String,
+
+    #[command(flatten)]
+    pub(crate) filter: HistoryFilterArgs,
 }
 
 #[derive(Debug, Args)]

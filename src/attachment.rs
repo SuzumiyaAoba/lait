@@ -2,8 +2,10 @@
 //! `docs/usage/ja/attachments.md`): `--file` reads each path's contents and
 //! renders them as named fenced code blocks appended after the prompt, so a
 //! shell command substitution (`"$(cat file)"`) is never needed to give a
-//! request some file context; `--image` resolves each path/URL into an
-//! `image_url` a vision-capable model's `content` array can carry (see
+//! request some file context — except a PDF, which no text rendering could
+//! do justice, and which instead becomes a [`MediaPart::File`] content part;
+//! `--image` resolves each path/URL into a [`MediaPart::Image`] a
+//! vision-capable model's `content` array can carry (see
 //! `llm::user_message`).
 
 use std::path::{Path, PathBuf};
@@ -19,19 +21,42 @@ use crate::async_io;
 /// than something to silently truncate.
 const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Reads every path in `files` and renders it as a `` ```<path>\n<contents>\n``` ``
-/// fenced code block, joined by blank lines. Returns `Ok(None)` when `files`
-/// is empty, so a caller can skip the "no attachments" case without an empty
-/// string to special-case. Fails if any file cannot be read, is not valid
-/// UTF-8 text (binary attachments aren't supported), or the combined size of
-/// every attachment exceeds `MAX_TOTAL_ATTACHMENT_BYTES`.
+/// A non-text part of a user message: what `llm::user_message` turns into a
+/// `content` array entry alongside the prompt text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MediaPart {
+    /// An `image_url` part: a `data:` URL, or an `http(s)://` URL passed
+    /// through unchanged (see [`resolve_image_urls`]).
+    Image(String),
+    /// A `file` part carrying the whole file inline (a PDF, see
+    /// [`read_file_attachments`]): `data_url` is `data:<mime>;base64,...`.
+    File { filename: String, data_url: String },
+}
+
+/// What [`read_file_attachments`] made of a list of `--file` paths: the
+/// fenced-code-block text for every text file (appended to the prompt), and
+/// a [`MediaPart::File`] for every PDF, in their original relative order.
+#[derive(Debug, Default)]
+pub(crate) struct FileAttachments {
+    pub(crate) text: Option<String>,
+    pub(crate) files: Vec<MediaPart>,
+}
+
+/// Reads every path in `files` and renders each text file as a
+/// `` ```<path>\n<contents>\n``` `` fenced code block, joined by blank lines
+/// (`text` is `None` when there are none, so a caller can skip the "no
+/// attachments" case without an empty string to special-case). A PDF
+/// (recognized by its `%PDF-` signature) becomes a [`MediaPart::File`]
+/// instead. Fails if any file cannot be read, is neither valid UTF-8 text
+/// nor a PDF (other binary attachments aren't supported), or the combined
+/// size of every attachment exceeds `MAX_TOTAL_ATTACHMENT_BYTES`.
 ///
 /// The reads run concurrently (see `read_all`) since they are otherwise
 /// independent. The shared read budget is enforced while bytes are
 /// materialized, using the same descriptor that was opened for the read; this
 /// avoids a metadata-then-open TOCTOU window for paths that are replaced while
 /// attachments are being resolved.
-pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<String>> {
+pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<FileAttachments> {
     read_file_attachments_cancellable(files, crate::cancellation::none()).await
 }
 
@@ -41,12 +66,25 @@ pub(crate) async fn read_file_attachments(files: &[PathBuf]) -> Result<Option<St
 pub(crate) async fn read_file_attachments_cancellable(
     files: &[PathBuf],
     cancellation: tokio_util::sync::CancellationToken,
-) -> Result<Option<String>> {
+) -> Result<FileAttachments> {
     if files.is_empty() {
-        return Ok(None);
+        return Ok(FileAttachments::default());
     }
 
-    let texts = read_all(files, cancellation).await?;
+    let mut texts = Vec::with_capacity(files.len());
+    let mut media = Vec::new();
+    for (path, contents) in files.iter().zip(read_all(files, cancellation).await?) {
+        match classify(path, contents)? {
+            Classified::Text(text) => texts.push((path, text)),
+            Classified::Media(part) => media.push(part),
+        }
+    }
+    if texts.is_empty() {
+        return Ok(FileAttachments {
+            text: None,
+            files: media,
+        });
+    }
     // Written directly into one accumulator (sized for every attachment's
     // contents plus a little fence/separator overhead) instead of
     // collecting a `Vec<String>` of individually rendered blocks and
@@ -55,40 +93,72 @@ pub(crate) async fn read_file_attachments_cancellable(
     // full copies of that (the per-block `Vec`, the final joined `String`,
     // and `texts` itself) live at once.
     let mut combined = String::with_capacity(
-        texts.iter().map(|text| text.len() + 16).sum::<usize>() + files.len().saturating_sub(1) * 2,
+        texts.iter().map(|(_, text)| text.len() + 16).sum::<usize>()
+            + texts.len().saturating_sub(1) * 2,
     );
-    for (index, (path, text)) in files.iter().zip(&texts).enumerate() {
+    for (index, (path, text)) in texts.iter().enumerate() {
         if index > 0 {
             combined.push_str("\n\n");
         }
         push_fenced_block(&mut combined, path, text);
     }
-    Ok(Some(combined))
+    Ok(FileAttachments {
+        text: Some(combined),
+        files: media,
+    })
 }
 
-/// Reads and UTF-8-decodes every path in `files`, in order. Each independent
+enum Classified {
+    Text(String),
+    Media(MediaPart),
+}
+
+/// A PDF (by signature) becomes a [`MediaPart::File`]; anything else must be
+/// UTF-8 text.
+fn classify(path: &Path, contents: Vec<u8>) -> Result<Classified> {
+    if contents.starts_with(b"%PDF-") {
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment.pdf".to_owned());
+        let mut data_url = String::from("data:application/pdf;base64,");
+        base64::engine::general_purpose::STANDARD.encode_string(&contents, &mut data_url);
+        return Ok(Classified::Media(MediaPart::File { filename, data_url }));
+    }
+    String::from_utf8(contents)
+        .map(Classified::Text)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "'--file {}' is neither UTF-8 text nor a PDF; other binary files are not \
+                 supported (use --image for an image)",
+                path.display()
+            )
+        })
+}
+
+/// Reads every path in `files`, in order. Each independent
 /// read has its own dedicated worker rather than a Tokio `spawn_blocking`
 /// task: dropping one read after a timeout signals its worker instead of
 /// leaving it running in the runtime's blocking pool.
 async fn read_all(
     files: &[PathBuf],
     cancellation: tokio_util::sync::CancellationToken,
-) -> Result<Vec<String>> {
+) -> Result<Vec<Vec<u8>>> {
     let budget = async_io::ReadBudget::new(MAX_TOTAL_ATTACHMENT_BYTES as usize);
     let reads = files
         .iter()
         .cloned()
-        .map(|path| read_text_file_cancellable(path, cancellation.clone(), budget.clone()));
+        .map(|path| read_file_cancellable(path, cancellation.clone(), budget.clone()));
     futures_util::future::try_join_all(reads).await
 }
 
-async fn read_text_file_cancellable(
+async fn read_file_cancellable(
     path: PathBuf,
     cancellation: tokio_util::sync::CancellationToken,
     budget: async_io::ReadBudget,
-) -> Result<String> {
+) -> Result<Vec<u8>> {
     let error_path = path.clone();
-    let contents = async_io::run_blocking(
+    async_io::run_blocking(
         move |cancelled| {
             async_io::read_file_with_budget(
                 &path,
@@ -108,13 +178,7 @@ async fn read_text_file_cancellable(
         cancellation,
     )
     .await
-    .with_context(|| format!("failed to read file '{}'", error_path.display()))?;
-    String::from_utf8(contents).map_err(|_| {
-        anyhow::anyhow!(
-            "'--file {}' is not valid UTF-8 text; binary files are not supported",
-            error_path.display()
-        )
-    })
+    .with_context(|| format!("failed to read file '{}'", error_path.display()))
 }
 
 /// Resolves every `--image` value into a URL a vision-capable model's
@@ -126,7 +190,7 @@ async fn read_text_file_cancellable(
 /// `llm::initial_messages`'s `image_urls` without a separate empty check. A
 /// single image is resolved inline; two or more run concurrently, the same
 /// way `read_all` above handles multiple `--file` attachments.
-pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<String>> {
+pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<MediaPart>> {
     resolve_image_urls_cancellable(images, crate::cancellation::none()).await
 }
 
@@ -136,7 +200,7 @@ pub(crate) async fn resolve_image_urls(images: &[String]) -> Result<Vec<String>>
 pub(crate) async fn resolve_image_urls_cancellable(
     images: &[String],
     cancellation: tokio_util::sync::CancellationToken,
-) -> Result<Vec<String>> {
+) -> Result<Vec<MediaPart>> {
     match images {
         [] => Ok(Vec::new()),
         _ => {
@@ -145,7 +209,8 @@ pub(crate) async fn resolve_image_urls_cancellable(
                 .iter()
                 .cloned()
                 .map(|image| resolve_one_cancellable(image, cancellation.clone(), budget.clone()));
-            futures_util::future::try_join_all(resolutions).await
+            let urls = futures_util::future::try_join_all(resolutions).await?;
+            Ok(urls.into_iter().map(MediaPart::Image).collect())
         }
     }
 }
@@ -181,7 +246,7 @@ fn resolve_one_blocking(
         async_io::MAX_READ_BYTES,
         budget,
         // A local image path follows the same FIFO semantics as a text
-        // attachment (see `read_text_file_cancellable`'s own comment) —
+        // attachment (see `read_file_cancellable`'s own comment) —
         // HTTP(S) values never reach here at all, having already returned
         // above in `resolve_one_cancellable`.
         true,
@@ -289,12 +354,24 @@ fn longest_backtick_run(text: &str) -> usize {
 mod tests {
     #[cfg(unix)]
     use super::read_file_attachments_cancellable;
-    use super::{fenced_block, longest_backtick_run, read_file_attachments, resolve_image_urls};
+    use super::{
+        MediaPart, fenced_block, longest_backtick_run, read_file_attachments, resolve_image_urls,
+    };
     use std::path::Path;
+
+    /// The URL of an image part, for asserting on `resolve_image_urls`.
+    fn url(part: &MediaPart) -> &str {
+        match part {
+            MediaPart::Image(url) => url,
+            other => panic!("expected an image part, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn returns_none_for_no_files() {
-        assert!(read_file_attachments(&[]).await.unwrap().is_none());
+        let attachments = read_file_attachments(&[]).await.unwrap();
+        assert!(attachments.text.is_none());
+        assert!(attachments.files.is_empty());
     }
 
     #[tokio::test]
@@ -307,7 +384,10 @@ mod tests {
         let urls = resolve_image_urls(&["https://example.com/cat.png".to_owned()])
             .await
             .unwrap();
-        assert_eq!(urls, ["https://example.com/cat.png"]);
+        assert_eq!(
+            urls,
+            [MediaPart::Image("https://example.com/cat.png".to_owned())]
+        );
     }
 
     #[tokio::test]
@@ -320,7 +400,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(urls.len(), 1);
-        assert!(urls[0].starts_with("data:image/png;base64,"));
+        assert!(url(&urls[0]).starts_with("data:image/png;base64,"));
     }
 
     #[tokio::test]
@@ -332,7 +412,7 @@ mod tests {
         let urls = resolve_image_urls(&[file.path.display().to_string()])
             .await
             .unwrap();
-        assert!(urls[0].starts_with("data:image/jpeg;base64,"));
+        assert!(url(&urls[0]).starts_with("data:image/jpeg;base64,"));
     }
 
     #[tokio::test]
@@ -369,9 +449,9 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert!(urls[0].starts_with("data:image/png;base64,"));
-        assert_eq!(urls[1], "https://example.com/cat.png");
-        assert!(urls[2].starts_with("data:image/jpeg;base64,"));
+        assert!(url(&urls[0]).starts_with("data:image/png;base64,"));
+        assert_eq!(url(&urls[1]), "https://example.com/cat.png");
+        assert!(url(&urls[2]).starts_with("data:image/jpeg;base64,"));
     }
 
     #[tokio::test]
@@ -380,6 +460,7 @@ mod tests {
         let result = read_file_attachments(std::slice::from_ref(&file.path))
             .await
             .unwrap()
+            .text
             .unwrap();
         assert!(result.starts_with("```"));
         assert!(result.contains(&file.path.display().to_string()));
@@ -393,6 +474,7 @@ mod tests {
         let result = read_file_attachments(&[a.path.clone(), b.path.clone()])
             .await
             .unwrap()
+            .text
             .unwrap();
         assert!(result.contains("aaa"));
         assert!(result.contains("bbb"));
@@ -414,7 +496,28 @@ mod tests {
         let error = read_file_attachments(std::slice::from_ref(&file.path))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("not valid UTF-8"));
+        assert!(error.to_string().contains("neither UTF-8 text nor a PDF"));
+    }
+
+    #[tokio::test]
+    async fn a_pdf_becomes_a_file_part_next_to_text_attachments() {
+        let text = TempFile::new("notes\n");
+        let pdf = TempFile::with_suffix("lait-test-doc.pdf", b"%PDF-1.7\nbinary \xff body");
+        let attachments = read_file_attachments(&[pdf.path.clone(), text.path.clone()])
+            .await
+            .unwrap();
+        let text_block = attachments.text.unwrap();
+        assert!(text_block.contains("notes"));
+        assert!(!text_block.contains("PDF"));
+        assert_eq!(attachments.files.len(), 1);
+        let MediaPart::File { filename, data_url } = &attachments.files[0] else {
+            panic!("expected a file part: {:?}", attachments.files);
+        };
+        assert_eq!(
+            filename,
+            &pdf.path.file_name().unwrap().to_string_lossy().into_owned()
+        );
+        assert!(data_url.starts_with("data:application/pdf;base64,JVBERi0x"));
     }
 
     #[cfg(unix)]
@@ -453,7 +556,7 @@ mod tests {
             writer_done.send(result).unwrap();
         });
 
-        let result = read_task.await.unwrap().unwrap().unwrap();
+        let result = read_task.await.unwrap().unwrap().text.unwrap();
         writer.join().unwrap();
         writer_result.recv().unwrap().unwrap();
         std::fs::remove_file(path).unwrap();

@@ -730,18 +730,31 @@ async fn run_action(
                 .iter()
                 .map(|arg| template::render_in(arg, &input, globals))
                 .collect::<Result<_>>()?;
-            // `env`/`cwd` containment (see `config::ShellToolDefinition::env`/
-            // `::cwd`) is scoped to `tools:` shell tool definitions only, for
-            // now — a workflow `run:` step's other fields never get
-            // `${VAR_NAME}` expansion (see AGENTS.md's "Security and
-            // Configuration" section), and extending that boundary to a new
-            // field needs its own deliberate design pass rather than
-            // inheriting shell tools' expansion story by accident.
+            // `env`/`cwd` get the same `${VAR_NAME}` expansion as `tools:`'
+            // own (`config::ShellToolDefinition::resolve_env_cwd`), and only
+            // that — never templates, so a value rendered from model output
+            // can't smuggle in a `${SECRET}` reference. Expanding here adds
+            // no exposure a `run:` step didn't already have: without `env:`
+            // the command inherits lait's whole environment anyway.
+            let env = run
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    Ok((key.clone(), crate::config::expand_env_placeholders(value)?))
+                })
+                .collect::<Result<std::collections::HashMap<_, _>>>()
+                .with_context(|| format!("{label}: 'env'"))?;
+            let cwd = run
+                .cwd
+                .as_deref()
+                .map(crate::config::expand_env_placeholders)
+                .transpose()
+                .with_context(|| format!("{label}: 'cwd'"))?;
             let stdout = crate::process::run_command(
                 &argv,
                 &template::to_text(&input),
-                None,
-                None,
+                (!env.is_empty()).then_some(&env),
+                cwd.as_deref(),
                 cancellation,
             )
             .await?;
@@ -844,7 +857,7 @@ async fn run_prompt(
         .or(frame.scope.defaults.system.as_deref())
         .map(|system| template::render_in(system, &input, globals))
         .transpose()?;
-    let (prompt, image_urls) = resolve_attachments(
+    let (prompt, media) = resolve_attachments(
         &step.attachments,
         prompt,
         &input,
@@ -861,7 +874,7 @@ async fn run_prompt(
                 system_prompt: system.as_deref(),
                 history: &[],
                 prompt: &prompt,
-                image_urls: &image_urls,
+                media: &media,
             },
             response_format,
             cancellation,
@@ -952,7 +965,7 @@ async fn run_agent_step(
         label,
     )?
     .with_usage_label(label);
-    let (prompt, image_urls) = resolve_attachments(
+    let (prompt, media) = resolve_attachments(
         &step.attachments,
         template::to_text(&input),
         &input,
@@ -967,7 +980,7 @@ async fn run_agent_step(
         AgentTurn {
             input: &input,
             prompt: &prompt,
-            image_urls: &image_urls,
+            media: &media,
         },
         globals,
         &active_paths,
@@ -1009,7 +1022,7 @@ async fn resolve_attachments(
     input: &Value,
     globals: &jq::Globals,
     cancellation: CancellationToken,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(String, Vec<crate::attachment::MediaPart>)> {
     if attachments.files.is_empty() && attachments.images.is_empty() {
         return Ok((prompt, Vec::new()));
     }
@@ -1023,15 +1036,17 @@ async fn resolve_attachments(
         .iter()
         .map(|image| template::render_in(image, input, globals))
         .collect::<Result<_>>()?;
-    let (file_context, image_urls) = tokio::try_join!(
+    let (file_attachments, images) = tokio::try_join!(
         attachment::read_file_attachments_cancellable(&files, cancellation.clone()),
         attachment::resolve_image_urls_cancellable(&images, cancellation),
     )?;
-    let prompt = match file_context {
+    let prompt = match file_attachments.text {
         Some(context) => format!("{prompt}\n\n{context}"),
         None => prompt,
     };
-    Ok((prompt, image_urls))
+    let mut media = file_attachments.files;
+    media.extend(images);
+    Ok((prompt, media))
 }
 
 /// Resolves the request settings of an LLM step: step → agent definition

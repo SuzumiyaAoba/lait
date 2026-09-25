@@ -177,27 +177,23 @@ models:
       api: responses
 ```
 
-**現時点でのメリットは限定的です。** Responses API 対応で実際に効くのは、推論モデルの
-`reasoning` 出力アイテムが Chat Completions のメッセージ履歴では失われてしまうところを、
-そのまま次のラウンドへ引き継げる、という一点だけです。会話履歴は毎回丸ごと送り直します
-（`previous_response_id`/`conversation` によるサーバー側の会話状態保持は使いません）。
-これは意図的な設計です — サーバー側に会話状態を持たせると、レスポンスのディスクキャッシュ
-（`--cache`）や `--record`/`--replay`（[決定的テスト](./testing.md)）が前提とする
-「同じリクエスト内容なら同じキー」という不変条件が崩れるためです。`api: responses` を
-指定しても、これらの機能はそのまま使えます。
+lait は内部で使っている Chat Completions 形式のメッセージ履歴と Responses API の形式を
+相互に変換します。そのため、次の機能は `api: responses` のモデルでも通常どおり使えます。
 
-**v1 では次に対応していません**（それぞれ、指定すると実行前に明確なエラーになります）。
+| 機能 | Responses API 側での扱い |
+| --- | --- |
+| `mcp:`/`subagents:`/`tools:`/スキルの progressive disclosure によるツール呼び出し | ツール定義は `{"type": "function", "name": ...}` 形式で送ります。モデルのツール呼び出しは `function_call`、その結果は `function_call_output` として次のラウンドの `input` に含めます。 |
+| `--image` による画像添付、`--file` による PDF 添付 | `input_text`/`input_image`/`input_file` パートとして送ります。 |
+| `--stream` | Responses API 独自のストリーミングイベント（`response.output_text.delta` など）を解釈して逐次表示します。`--show-usage` の使用量は最後の `response.completed` イベントから取得します。 |
+| `--show-reasoning` | 推論モデルが返す reasoning の要約（`summary`）を表示します。 |
+| `--cache`/`--record`/`--replay` | Chat Completions のモデルと同じように動作します（下記参照）。 |
 
-- `mcp:`/`subagents:`/`tools:` によるツール呼び出し。Responses API 自体はツール呼び出しに
-  対応していますが、lait 側の変換はまだ実装していません。
-- `--image` によるファイル・画像添付。
-- `--stream`。Responses API は独自のストリーミングイベント形式を持ちますが、専用のパーサーは
-  まだ実装していません。
-- `previous_response_id`/`conversation` によるサーバー側の会話状態保持（上記のとおり意図的
-  にスコープ外です）。
-
-`skills:`（システムプロンプトへの追記のみで、ツール呼び出しを伴わない）は上記の制約に該当
-しないため、`api: responses` のモデルでも通常どおり使えます。
+会話履歴は毎回丸ごと送り直します（`store` は常に `false` で、`previous_response_id`/
+`conversation` によるサーバー側の会話状態保持は使いません）。これは意図的な設計です —
+サーバー側に会話状態を持たせると、レスポンスのディスクキャッシュ（`--cache`）や
+`--record`/`--replay`（[決定的テスト](./testing.md)）が前提とする「同じリクエスト内容なら
+同じキー」という不変条件が崩れるためです。同じ理由で、推論モデルの reasoning 出力アイテムは
+ツール呼び出しの次のラウンドへ引き継がれません。
 
 フォールバック先（[複数プロバイダーによるフォールバック](#複数プロバイダーによるフォールバック)
 の2番目以降の定義）は、先頭要素の `api:` に関わらず常に `chat_completions` を使います
@@ -296,7 +292,9 @@ models:
   トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
 - 後述の [MCP サーバー](#mcp-サーバー) の `command`/`args`/`env`/`cwd`/`url`/`headers`、
-  [Jev 互換 API](./jev.md) の `jev.base_url`/`jev.api_key` も同じ規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
+  [Jev 互換 API](./jev.md) の `jev.base_url`/`jev.api_key`、[カスタムシェルツール](./tools.md) の
+  `env`/`cwd`、ワークフローの [`run:` ステップ](./workflow.md#run--コマンドを実行する) の `env`/`cwd` も
+  同じ規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
   パス、`default.system`、ワークフローの `prompt:`/`system:` には**この展開は適用されません**
   （名前付きプロンプトなら `--var`、ワークフローなら `inputs:`/`--input` のテンプレート変数で
   渡してください）。
@@ -375,8 +373,10 @@ default:
 # lait.config.yml
 default:
   compaction:
-    trigger_rounds: 6
+    trigger_rounds: 6       # ラウンド数で発動
+    trigger_tokens: 60000   # または直前のラウンドのトークン数で発動
     keep_last_n: 4
+    model: cheap            # 要約専用のモデル(省略可)
 ```
 
 ## スキルの progressive disclosure（`skill_progressive_disclosure`）
@@ -408,13 +408,25 @@ export HOST=api.example.com    # export プレフィックスも可
 - `.env` が存在しない場合は何もしません。壊れた行がある場合は行番号付きのエラーになります。
 - `--no-env` フラグで読み込みを無効化できます。
 
-値は次のいずれかの形式で書けます。複数行の値には対応していません。
+値は次のいずれかの形式で書けます。
 
 | 値の形式 | 扱い |
 | --- | --- |
-| `'...'` | そのままの文字列 |
-| `"..."` | `\n` などのエスケープ対応 |
-| 裸（クォートなし） | そのままの文字列 |
+| `'...'` | そのままの文字列（複数行可） |
+| `"..."` | `\n` などのエスケープ対応（複数行可） |
+| 裸（クォートなし） | そのままの文字列（1行のみ。` #` 以降はコメント） |
+
+クォートで囲んだ値は、閉じクォートが同じ行になければ次の行以降も値の一部として読み進め、
+閉じクォートのある行までを改行でつないだ1つの値にします。PEM 形式の鍵や証明書をそのまま
+貼り付けられます。ファイルの終わりまで閉じクォートがない場合は、その値が始まった行番号付きの
+エラーになります。
+
+```sh
+# .env
+PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASC...
+-----END PRIVATE KEY-----"
+```
 
 ## Jev 互換 API（`jev:`）
 

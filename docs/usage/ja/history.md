@@ -48,6 +48,26 @@ Rustは安全性と性能を両立した言語です。
 
 `lait history search <QUERY>` も一覧と同じ形式で、プロンプトまたは応答に一致した実行を表示します。
 
+### 絞り込みと JSON 出力
+
+一覧（`lait history`）と `lait history search` は、次のオプションで対象を絞り込めます。複数指定した
+場合はすべての条件を満たす実行だけが表示されます。
+
+| オプション | 説明 |
+| --- | --- |
+| `--kind <KIND>` | 実行の種類（`chat`/`agent`/`workflow`/`prompt`）が一致するものだけを表示します。 |
+| `--model <TEXT>` | モデル名に `TEXT` を含むものだけを表示します（モデルを記録しない `workflow` は対象外になります）。 |
+| `--since <WHEN>` | `WHEN` 以降に記録されたものだけを表示します。`WHEN` には日付（`2026-09-01`、UTC の 0 時）、RFC 3339 形式の日時、または現在からさかのぼる期間（`30m`/`12h`/`7d`/`2w`。単位は分・時間・日・週）を指定できます。 |
+| `--json` | 一覧を JSON 配列として出力します。各要素は記録された項目に加えて、`show` に渡せる `number` を持ちます。`lait history show <N> --json` は1件の JSON オブジェクトを出力します。 |
+
+絞り込んでも番号は全体での番号のまま（`1` が最新）なので、表示された番号をそのまま
+`lait history show` に渡せます。
+
+```sh
+lait history --kind chat --since 7d        # 直近1週間のチャットだけ
+lait history search 翻訳 --model gpt --json  # モデル名に gpt を含む一致を JSON で
+```
+
 ## 記録の無効化
 
 | 方法 | 効果 |

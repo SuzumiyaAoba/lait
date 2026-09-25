@@ -216,3 +216,60 @@ fn priced_model_reports_cost_and_unpriced_model_does_not() {
     assert_eq!(a["cost_usd"], 3.0);
     assert_eq!(b["cost_usd"], serde_json::Value::Null);
 }
+
+#[test]
+fn system_prompt_and_markdown_output_apply_to_every_model() {
+    let server_a = MockServer::start("200 OK", &support::completion_body("model-a", "from a"));
+    let server_b = MockServer::start("200 OK", &support::completion_body("model-b", "from b"));
+    let config = ConfigDirectory::new(&two_alias_config(&server_a.base_url, &server_b.base_url));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["compare", "--model", "a", "--model", "b"])
+        .args(["--system", "be terse", "--markdown", "hello"])
+        .output()
+        .expect("failed to execute lait compare");
+
+    let request_a = server_a.receive_request();
+    let request_b = server_b.receive_request();
+    server_a.finish();
+    server_b.finish();
+
+    assert!(output.status.success(), "lait compare failed: {output:?}");
+    for request in [&request_a, &request_b] {
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system", "{body}");
+        assert_eq!(body["messages"][0]["content"], "be terse", "{body}");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("| model | model_id |"), "{stdout}");
+    assert!(stdout.contains("\n## a (model-a)\n\nfrom a\n"), "{stdout}");
+    assert!(stdout.contains("\n## b (model-b)\n\nfrom b\n"), "{stdout}");
+}
+
+#[test]
+fn a_tool_is_offered_to_every_model() {
+    let server_a = MockServer::start("200 OK", &support::completion_body("model-a", "from a"));
+    let server_b = MockServer::start("200 OK", &support::completion_body("model-b", "from b"));
+    let mut config_yaml = two_alias_config(&server_a.base_url, &server_b.base_url);
+    config_yaml.push_str("tools:\n  echo:\n    command: [\"echo\", \"hi\"]\n");
+    let config = ConfigDirectory::new(&config_yaml);
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args([
+            "compare", "--model", "a", "--model", "b", "--tool", "echo", "hello",
+        ])
+        .output()
+        .expect("failed to execute lait compare");
+
+    let request_a = server_a.receive_request();
+    let request_b = server_b.receive_request();
+    server_a.finish();
+    server_b.finish();
+
+    assert!(output.status.success(), "lait compare failed: {output:?}");
+    for request in [&request_a, &request_b] {
+        assert!(request.body.contains("tool__echo"), "{}", request.body);
+    }
+}

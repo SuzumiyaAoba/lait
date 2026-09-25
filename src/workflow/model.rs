@@ -379,6 +379,15 @@ impl AgentRef {
 #[derive(Debug)]
 pub(crate) struct RunStep {
     pub(crate) argv: Vec<String>,
+    /// An environment-variable allowlist for the child process: when
+    /// non-empty, the command sees exactly these variables and nothing
+    /// inherited from lait's own environment. Values support `${VAR_NAME}`
+    /// expansion (not templates), exactly like `tools:`' `env` — see
+    /// `config::ShellToolDefinition::env`.
+    pub(crate) env: std::collections::HashMap<String, String>,
+    /// Pins the command's working directory; `${VAR_NAME}` expansion like
+    /// `env`. `None` inherits lait's own current directory.
+    pub(crate) cwd: Option<String>,
 }
 
 /// `decide:` — typed questions answered by a Jev-compatible decision API

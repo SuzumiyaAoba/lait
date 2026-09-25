@@ -173,7 +173,9 @@ pub(crate) struct PromptTurn<'a> {
     pub(crate) system_prompt: Option<&'a str>,
     pub(crate) history: &'a [ChatCompletionRequestMessage],
     pub(crate) prompt: &'a str,
-    pub(crate) image_urls: &'a [String],
+    /// `--image`s and non-text `--file` attachments (PDFs) for the user
+    /// message — see `attachment::MediaPart`.
+    pub(crate) media: &'a [crate::attachment::MediaPart],
 }
 
 impl<'a> PromptTurn<'a> {
@@ -185,7 +187,7 @@ impl<'a> PromptTurn<'a> {
             system_prompt,
             history: &[],
             prompt,
-            image_urls: &[],
+            media: &[],
         }
     }
 }

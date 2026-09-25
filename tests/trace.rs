@@ -256,3 +256,121 @@ fn a_tool_policy_denial_records_an_execute_tool_event_with_the_denial_reason() {
         "denial reason should mention tool_policy: {tool_event}"
     );
 }
+
+/// A hand-written trace file: two chat rounds for step `plan`, one tool call.
+fn write_sample_trace(scratch: &ScratchDir) -> std::path::PathBuf {
+    let path = scratch.path().join("sample.jsonl");
+    let lines = [
+        r#"{"seq":0,"operation":"chat","label":"plan","start":"2026-09-25T00:00:00Z","end":"2026-09-25T00:00:00.040Z","duration_ms":40,"attributes":{"gen_ai.usage.input_tokens":10,"gen_ai.usage.output_tokens":3}}"#,
+        r#"{"seq":1,"operation":"execute_tool","label":"tool 'tool__echo'","start":"2026-09-25T00:00:00.040Z","end":"2026-09-25T00:00:00.045Z","duration_ms":5,"attributes":{"gen_ai.tool.name":"tool__echo"}}"#,
+        r#"{"seq":2,"operation":"chat","label":"plan","start":"2026-09-25T00:00:00.045Z","end":"2026-09-25T00:00:00.105Z","duration_ms":60,"attributes":{"gen_ai.usage.input_tokens":20,"gen_ai.usage.output_tokens":4}}"#,
+    ];
+    std::fs::write(&path, lines.join("\n")).expect("failed to write the sample trace");
+    path
+}
+
+#[test]
+fn lait_trace_show_filters_by_operation_and_label() {
+    let scratch = ScratchDir::new();
+    let path = write_sample_trace(&scratch);
+
+    let output = test_command()
+        .args(["trace", "show", "--operation", "execute_tool"])
+        .arg(&path)
+        .output()
+        .expect("failed to execute lait trace show");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.contains("tool__echo"), "{stdout}");
+
+    let output = test_command()
+        .args(["trace", "show", "--label", "plan", "--json"])
+        .arg(&path)
+        .output()
+        .expect("failed to execute lait trace show");
+    let events: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(events.len(), 2);
+}
+
+#[test]
+fn lait_trace_show_summary_totals_each_label() {
+    let scratch = ScratchDir::new();
+    let path = write_sample_trace(&scratch);
+
+    let output = test_command()
+        .args(["trace", "show", "--summary"])
+        .arg(&path)
+        .output()
+        .expect("failed to execute lait trace show");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("plan: chat=2 execute_tool=0 compact=0 total=100ms tokens(in=30 out=7)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("tool 'tool__echo': chat=0 execute_tool=1"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn lait_trace_export_posts_otlp_json_spans() {
+    let collector = MockServer::start("200 OK", "{}");
+    let scratch = ScratchDir::new();
+    let path = write_sample_trace(&scratch);
+
+    let output = test_command()
+        .args(["trace", "export", "--otlp"])
+        .arg(format!("{}/traces", collector.base_url))
+        .args(["--header", "x-api-key=${LAIT_TRACE_EXPORT_KEY}"])
+        .arg(&path)
+        .env("LAIT_TRACE_EXPORT_KEY", "sekret")
+        .output()
+        .expect("failed to execute lait trace export");
+    let request = collector.receive_request();
+    collector.finish();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(request.target, "/v1/traces");
+    assert!(
+        request
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-api-key: sekret"),
+        "{request:?}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    assert_eq!(spans.len(), 3);
+    assert_eq!(spans[1]["name"], "execute_tool tool 'tool__echo'");
+    assert_eq!(spans[0]["startTimeUnixNano"], "1790294400000000000");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exported 3 spans"), "{stderr}");
+}
+
+#[test]
+fn lait_trace_export_reports_a_collector_error() {
+    let collector = MockServer::start("400 Bad Request", "bad spans");
+    let scratch = ScratchDir::new();
+    let path = write_sample_trace(&scratch);
+
+    let output = test_command()
+        .args(["trace", "export", "--otlp"])
+        .arg(format!("{}/traces", collector.base_url))
+        .arg(&path)
+        .output()
+        .expect("failed to execute lait trace export");
+    collector.receive_request();
+    collector.finish();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("400") && stderr.contains("bad spans"),
+        "{stderr}"
+    );
+}

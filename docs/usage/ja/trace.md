@@ -1,4 +1,4 @@
-# 実行トレース（lait run --trace-file / lait trace show）
+# 実行トレース（lait run --trace-file / lait trace show / lait trace export）
 
 [ドキュメント目次に戻る](./README.md)
 
@@ -37,9 +37,9 @@ $ lait trace show trace.jsonl
 | `attributes` | イベント種別ごとの追加情報(下記)。 |
 
 `attributes` のキーは、[OpenTelemetry の GenAI Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
-(`gen_ai.*`。2026年現在まだ策定中の規約です)にできるだけ合わせています。これは将来 OTLP
-エクスポータを追加する際に属性名をそのまま転用できるようにするための選択で、現時点では
-エクスポータ自体は実装されていません。`lait.*` で始まるキーは lait 独自の項目で、GenAI
+(`gen_ai.*`。2026年現在まだ策定中の規約です)にできるだけ合わせています。これにより、
+[`lait trace export`](#lait-trace-exportotlp-へのエクスポート) で OpenTelemetry のコレクターへ
+送る際も、属性名をそのまま転用できます。`lait.*` で始まるキーは lait 独自の項目で、GenAI
 Semantic Conventions に対応する項目がないものです。
 
 ### `"chat"` イベントの `attributes`
@@ -81,15 +81,27 @@ Semantic Conventions に対応する項目がないものです。
 - **ストリーミング(`--stream`)応答のイベントは記録されません。** ワークフローの `prompt`/`agent`
   ステップは常に非ストリーミングでモデルを呼ぶため、`lait run --trace-file` の対象になるのはこの
   経路だけです。チャット(`lait "prompt"`)・`lait agent run`・`lait test`/`lait eval` は今のところ
-  `--trace-file` を持ちません。
+  `--trace-file` を持ちません(`lait serve --mcp --trace-file` については
+  [MCP サーバーとして公開する](./serve.md#実行時オプション)を参照)。
 - コスト(金額)は記録されません。トークン数のみです。
 
 ## `lait trace show`
 
 ```sh
-$ lait trace show trace.jsonl            # 人間向けの一覧
-$ lait trace show --json trace.jsonl      # パース済みの JSON 配列
+$ lait trace show trace.jsonl                          # 人間向けの一覧
+$ lait trace show --json trace.jsonl                   # パース済みの JSON 配列
+$ lait trace show --operation execute_tool trace.jsonl # ツール呼び出しだけ
+$ lait trace show --summary trace.jsonl                # label ごとの集計
+plan: chat=2 execute_tool=0 compact=0 total=100ms tokens(in=30 out=7)
+tool 'tool__echo': chat=0 execute_tool=1 compact=0 total=5ms tokens(in=0 out=0)
 ```
+
+| オプション | 説明 |
+| --- | --- |
+| `--json` | 整形済みの JSON 配列として出力します(`--summary` と併用すると集計結果の JSON 配列)。 |
+| `--operation <OP>` | `operation` が `OP`(`chat`/`execute_tool`/`compact`)のイベントだけを表示します。 |
+| `--label <TEXT>` | `label` に `TEXT` を含むイベントだけを表示します(ステップ id やツール名で絞り込めます)。 |
+| `--summary` | イベントを1件ずつ表示する代わりに、`label` ごとにイベント種別ごとの件数・合計所要時間・入出力トークン数の合計を、最初に現れた順に表示します。`--operation`/`--label` で絞り込んだ後のイベントが対象です。 |
 
 `--json` を指定すると、各行をパースした `TraceEvent` の配列を整形済み JSON として出力します。
 `jq` と組み合わせて機械的に検査する場合は、ファイルを直接読んでも構いません(`--json` は
@@ -98,3 +110,31 @@ $ lait trace show --json trace.jsonl      # パース済みの JSON 配列
 ```sh
 $ jq -s 'map(select(.operation == "execute_tool" and .attributes["lait.tool.decision"] == "denied"))' trace.jsonl
 ```
+
+## `lait trace export`(OTLP へのエクスポート)
+
+`lait trace export` は、トレースファイルを OpenTelemetry の OTLP/HTTP(JSON エンコーディング)で
+コレクターへ送信します。Jaeger・Grafana Tempo・Honeycomb など、OTLP を受け付ける任意のバック
+エンドで実行軌跡を可視化できます。
+
+```sh
+$ lait trace export --otlp http://localhost:4318/v1/traces trace.jsonl
+note: exported 3 spans to 'http://localhost:4318/v1/traces'
+```
+
+| オプション | 説明 |
+| --- | --- |
+| `--otlp <URL>`(必須) | 送信先の OTLP/HTTP traces エンドポイント。指定した URL にそのまま `POST` します(`/v1/traces` などのパスも含めて指定してください)。 |
+| `--header <NAME=VALUE>` | リクエストヘッダーを追加します(認証トークンなど)。複数指定できます。`VALUE` は `${VAR_NAME}` で環境変数を参照できるため、秘密情報をコマンドラインに直接書かずに済みます。 |
+| `--service-name <NAME>` | リソース属性 `service.name` の値。既定は `lait` です。 |
+
+変換の規則は次のとおりです。
+
+- 1イベントが1 span になります。上記のとおりイベントには親子関係がないため、すべての span は
+  同じ trace に属するルート span です。
+- trace id と span id はトレースファイルの内容から決定的に導出します。同じファイルを2回
+  エクスポートしても、別の trace が重複して作られることはありません。
+- span 名は `<operation> <label>`(例: `chat summarize`)です。`attributes` はそのまま span の属性に
+  なり、加えて `gen_ai.operation.name`・`lait.label`・`lait.seq` を付けます。配列やオブジェクトの
+  属性値は JSON 文字列として送ります。
+- コレクターが 2xx 以外を返した場合は、ステータスと応答本文を含むエラーになります。

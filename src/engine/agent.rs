@@ -22,7 +22,7 @@ use super::{PromptTurn, RequestSettings, RunContext, agent_file_settings};
 pub(crate) struct AgentTurn<'a> {
     pub(crate) input: &'a serde_json::Value,
     pub(crate) prompt: &'a str,
-    pub(crate) image_urls: &'a [String],
+    pub(crate) media: &'a [crate::attachment::MediaPart],
 }
 
 impl<'a> AgentTurn<'a> {
@@ -33,7 +33,7 @@ impl<'a> AgentTurn<'a> {
         Self {
             input,
             prompt,
-            image_urls: &[],
+            media: &[],
         }
     }
 }
@@ -73,7 +73,7 @@ pub(crate) async fn call_agent(
                 system_prompt: Some(&system_prompt),
                 history: &[],
                 prompt: turn.prompt,
-                image_urls: turn.image_urls,
+                media: turn.media,
             },
             response_format,
             cancellation,

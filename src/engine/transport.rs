@@ -53,7 +53,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionTools, ResponseFormat,
 };
@@ -222,9 +222,9 @@ impl RequestSettings {
     /// step) and `call_subagent_tool` extends it for a subagent's own
     /// completion, so a subagent chain that cycles back to itself is caught
     /// the same way `workflow:` nesting is (see `MAX_SUBAGENT_DEPTH`).
-    /// `turn.history`/`turn.image_urls` are only ever non-empty for chat's
+    /// `turn.history`/`turn.media` are only ever non-empty for chat's
     /// own call site (a resumed `--session`, `--image`); every other caller
-    /// passes `PromptTurn { history: &[], image_urls: &[], .. }`, which
+    /// passes `PromptTurn { history: &[], media: &[], .. }`, which
     /// reproduces the exact message shape this method built before either
     /// feature existed — see `llm::initial_messages`.
     pub(crate) async fn complete(
@@ -235,7 +235,6 @@ impl RequestSettings {
         response_format: Option<ResponseFormat>,
         cancellation: CancellationToken,
     ) -> Result<response::ChatCompletionResponse> {
-        self.check_responses_api_support(turn.image_urls, false)?;
         let messages = self
             .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
@@ -253,12 +252,19 @@ impl RequestSettings {
         let mut tool_loop = self
             .assemble_tool_loop(env, messages, cancellation.clone())
             .await?;
+        let mut last_prompt_tokens = None;
         loop {
             tool_loop.next_round(self.max_tool_rounds)?;
 
             if let Some(compaction) = &env.services.file_config.default.compaction {
-                self.maybe_compact(&mut tool_loop, compaction, env, cancellation.clone())
-                    .await?;
+                self.maybe_compact(
+                    &mut tool_loop,
+                    compaction,
+                    &mut last_prompt_tokens,
+                    env,
+                    cancellation.clone(),
+                )
+                .await?;
             }
 
             let response = self
@@ -270,6 +276,7 @@ impl RequestSettings {
                     cancellation.clone(),
                 )
                 .await?;
+            last_prompt_tokens = response.usage.map(|usage| usage.prompt_tokens);
 
             let tool_calls = response::first_message(&response)
                 .and_then(|message| message.tool_calls.as_ref())
@@ -316,47 +323,6 @@ impl RequestSettings {
             .skill_progressive_disclosure
             == Some(true)
             && !self.skills.is_empty()
-    }
-
-    /// Rejects a `config::ApiKind::Responses` model's request for anything
-    /// `llm::responses` doesn't translate yet: `mcp:`/`subagents:`/`tools:`
-    /// (no function-calling translation — see `llm::responses`'s own doc
-    /// comment on why messages are guaranteed plain System/User/Assistant
-    /// text by the time they reach it), an `--image` attachment (no
-    /// multipart content translation), or streaming (`streaming` is `true`
-    /// only from `complete_stream`, which has no Responses-API SSE parser
-    /// at all — a Responses-API model rejects *every* `complete_stream`
-    /// call, tool-free or not, unlike the other two checks). A no-op for a
-    /// Chat-Completions model (`ApiKind`'s default), so every existing
-    /// caller is unaffected. Checked eagerly, before `complete`/
-    /// `complete_stream` do anything else, so the error is immediate and
-    /// specific rather than an opaque failure deep inside `llm::responses`'s
-    /// own translation. See `docs/usage/ja/config.md`'s Responses API
-    /// section.
-    fn check_responses_api_support(&self, image_urls: &[String], streaming: bool) -> Result<()> {
-        if self.resolved_model.api != config::ApiKind::Responses {
-            return Ok(());
-        }
-        let model_id = &self.resolved_model.model_id;
-        if streaming {
-            bail!(
-                "model '{model_id}' uses the Responses API ('api: responses'), which does not \
-                 support --stream yet"
-            );
-        }
-        if !self.mcp.is_empty() || !self.subagents.is_empty() || !self.tools.is_empty() {
-            bail!(
-                "model '{model_id}' uses the Responses API ('api: responses'), which does not \
-                 support mcp:/subagents:/tools: yet"
-            );
-        }
-        if !image_urls.is_empty() {
-            bail!(
-                "model '{model_id}' uses the Responses API ('api: responses'), which does not \
-                 support --image attachments yet"
-            );
-        }
-        Ok(())
     }
 
     /// Builds the four tool sets (`mcp:`, `subagents:`, `tools:`, and —
@@ -453,29 +419,45 @@ impl RequestSettings {
         ))
     }
 
-    /// Compacts `tool_loop` when its about-to-be-sent round is a
-    /// `compaction.trigger_rounds` multiple — see `config::CompactionConfig`'s
-    /// doc comment for why, and [`compact_tool_loop`] for how. Only `complete`
-    /// calls this (not `complete_stream`): a workflow `prompt`/`agent` node —
-    /// the case this is chiefly aimed at, a long `mcp`/`subagents`/`tools`
-    /// round-trip loop — always goes through `complete`, never streaming; see
-    /// docs/usage/ja/compaction.md for this and `--trace-file`'s matching
-    /// scope note.
+    /// Compacts `tool_loop` before its about-to-be-sent round when either
+    /// trigger in `compaction` fires: the round is a `trigger_rounds`
+    /// multiple, or `last_prompt_tokens` (the previous round's reported
+    /// `prompt_tokens`, tracked by the caller) reached `trigger_tokens`. See
+    /// `config::CompactionConfig`'s doc comment for why, and
+    /// [`compact_tool_loop`] for how. Shared by `complete` and
+    /// `complete_stream`; the summarization request itself is never
+    /// streamed. `last_prompt_tokens` is cleared after a compaction so the
+    /// next round can't re-trigger on a count that predates it.
     ///
     /// [`compact_tool_loop`]: Self::compact_tool_loop
     async fn maybe_compact(
         &self,
         tool_loop: &mut ToolLoop,
         compaction: &config::CompactionConfig,
+        last_prompt_tokens: &mut Option<u64>,
         env: &RunContext,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        if compaction.trigger_rounds == 0 {
+        if compaction.trigger_rounds.is_none() && compaction.trigger_tokens.is_none() {
+            bail!("default.compaction needs trigger_rounds or trigger_tokens");
+        }
+        if compaction.trigger_rounds == Some(0) {
             bail!("default.compaction.trigger_rounds must be at least 1");
         }
-        if !tool_loop.round().is_multiple_of(compaction.trigger_rounds) {
+        if compaction.trigger_tokens == Some(0) {
+            bail!("default.compaction.trigger_tokens must be at least 1");
+        }
+        let by_rounds = compaction
+            .trigger_rounds
+            .is_some_and(|rounds| tool_loop.round().is_multiple_of(rounds));
+        let by_tokens = compaction
+            .trigger_tokens
+            .zip(*last_prompt_tokens)
+            .is_some_and(|(threshold, tokens)| tokens >= threshold);
+        if !by_rounds && !by_tokens {
             return Ok(());
         }
+        *last_prompt_tokens = None;
         self.compact_tool_loop(tool_loop, compaction, env, cancellation)
             .await
     }
@@ -505,9 +487,27 @@ impl RequestSettings {
 
         let mut request_messages = tool_loop.messages().to_vec();
         request_messages.push(llm::user_message(COMPACTION_INSTRUCTION, &[])?);
-        let response = self
-            .complete_recorded(env, None, &request_messages, &[], cancellation)
-            .await?;
+        let response = match &compaction.model {
+            None => {
+                self.complete_recorded(env, None, &request_messages, &[], cancellation)
+                    .await?
+            }
+            Some(model) => {
+                let summarizer = super::resolve_request_settings(
+                    model.clone(),
+                    super::SamplingOverrides::default(),
+                    super::EndpointOverrides::default(),
+                    super::CapabilityOverrides::default(),
+                    &config::ModelMap::default(),
+                    &env.services.file_config,
+                )
+                .with_context(|| format!("failed to resolve default.compaction.model '{model}'"))?
+                .with_usage_label(format!("{} (compaction)", self.usage_label));
+                summarizer
+                    .complete_recorded(env, None, &request_messages, &[], cancellation)
+                    .await?
+            }
+        };
         let summary = response::content_text(&response);
         let summary_message = llm::assistant_message(&format!(
             "(summary of the conversation so far, produced by compaction: {summary})"
@@ -812,6 +812,9 @@ impl RequestSettings {
     ) -> Result<llm::CompletionStream> {
         let mut endpoint = EndpointAttempt::primary(self);
         let mut candidates = self.fallback_candidates.iter();
+        // Only the primary candidate uses the Responses API — see
+        // `complete_recorded`'s identical flag.
+        let mut use_responses_api = self.resolved_model.api == config::ApiKind::Responses;
         loop {
             let api_key = env
                 .services
@@ -828,7 +831,12 @@ impl RequestSettings {
                 cancellation.clone(),
             );
             request.stream_include_usage = include_usage;
-            match llm::complete_stream(request).await {
+            let attempt = if use_responses_api {
+                llm::responses::complete_stream(request).await
+            } else {
+                llm::complete_stream(request).await
+            };
+            match attempt {
                 Ok(stream) => return Ok(stream),
                 Err(error) if is_fallback_eligible(&error) => {
                     if !self.advance_to_next_candidate(
@@ -839,6 +847,7 @@ impl RequestSettings {
                     )? {
                         return Err(error);
                     }
+                    use_responses_api = false;
                 }
                 Err(error) => return Err(error),
             }
@@ -857,7 +866,7 @@ impl RequestSettings {
     /// final usage chunk on every round (see
     /// `llm::CompletionRequest::stream_include_usage`); set it only when the
     /// caller will actually display it (`--show-usage`). `turn.history`/
-    /// `turn.image_urls`/`active_agent_paths` behave exactly as in
+    /// `turn.media`/`active_agent_paths` behave exactly as in
     /// `complete` — see its doc comment. Returns the *last* round's
     /// [`StreamOutcome`] (the one whose content was actually the final
     /// answer) — an intermediate round's content, if any, was still streamed
@@ -878,7 +887,6 @@ impl RequestSettings {
             show_reasoning,
             output_path,
         } = stream;
-        self.check_responses_api_support(turn.image_urls, true)?;
         let messages = self
             .initial_turn_messages(env, turn, cancellation.clone())
             .await?;
@@ -901,11 +909,28 @@ impl RequestSettings {
             return stream_response(stream, show_reasoning, output_path, false, cancellation).await;
         }
 
+        let compaction = env.services.file_config.default.compaction.as_ref();
+        // A token-based compaction trigger needs every round's usage, so ask
+        // for it even when the caller won't display it.
+        let include_usage = include_usage
+            || compaction.is_some_and(|compaction| compaction.trigger_tokens.is_some());
         let mut tool_loop = self
             .assemble_tool_loop(env, messages, cancellation.clone())
             .await?;
+        let mut last_prompt_tokens = None;
         loop {
             let round = tool_loop.next_round(self.max_tool_rounds)?;
+
+            if let Some(compaction) = compaction {
+                self.maybe_compact(
+                    &mut tool_loop,
+                    compaction,
+                    &mut last_prompt_tokens,
+                    env,
+                    cancellation.clone(),
+                )
+                .await?;
+            }
 
             let stream = self
                 .stream_endpoint(
@@ -928,6 +953,7 @@ impl RequestSettings {
                 cancellation.clone(),
             )
             .await?;
+            last_prompt_tokens = outcome.usage.map(|usage| usage.prompt_tokens);
 
             if outcome.tool_calls.is_empty() {
                 if response_format.is_none() {
@@ -1047,7 +1073,7 @@ impl RequestSettings {
             system_prompt.as_deref(),
             turn.history,
             turn.prompt,
-            turn.image_urls,
+            turn.media,
         )
     }
 }

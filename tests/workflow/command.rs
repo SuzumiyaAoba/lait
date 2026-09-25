@@ -531,3 +531,72 @@ steps:
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn a_command_nodes_env_is_an_allowlist_with_env_var_expansion() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - run: ["sh", "-c", 'echo "$SAFE-${LAIT_RUN_STEP_SECRET:-hidden}"']
+    env:
+      PATH: "${PATH}"
+      SAFE: "${LAIT_RUN_STEP_SAFE}"
+"#,
+    );
+
+    let output = test_command()
+        .arg("run")
+        .arg(&workflow.path)
+        .args(["--no-history", "--no-config", "x"])
+        .env("LAIT_RUN_STEP_SECRET", "leaked")
+        .env("LAIT_RUN_STEP_SAFE", "ok")
+        .output()
+        .expect("failed to execute lait run");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok-hidden");
+}
+
+#[test]
+fn a_command_nodes_cwd_pins_the_working_directory() {
+    let dir = std::env::temp_dir()
+        .canonicalize()
+        .expect("temp dir should resolve");
+    let workflow = WorkflowFile::new(&format!(
+        r#"
+steps:
+  - run: ["sh", "-c", "pwd -P"]
+    cwd: "{}"
+"#,
+        dir.display()
+    ));
+
+    let output = run_lait_workflow(&workflow.path, "x");
+
+    assert!(output.status.success(), "lait run failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        dir.display().to_string()
+    );
+}
+
+#[test]
+fn a_command_nodes_env_rejects_an_undefined_variable_reference() {
+    let workflow = WorkflowFile::new(
+        r#"
+steps:
+  - run: ["true"]
+    env:
+      X: "${LAIT_RUN_STEP_SURELY_UNDEFINED}"
+"#,
+    );
+
+    let output = run_lait_workflow(&workflow.path, "x");
+
+    assert!(!output.status.success(), "output: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LAIT_RUN_STEP_SURELY_UNDEFINED"),
+        "{stderr}"
+    );
+}

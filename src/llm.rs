@@ -11,12 +11,13 @@ use async_openai::{
     types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-        ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-        ChatCompletionStreamOptions, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, FunctionCall, ImageUrl,
-        ReasoningEffort as OpenAiReasoningEffort, ResponseFormat,
+        ChatCompletionRequestMessageContentPartFile, ChatCompletionRequestMessageContentPartImage,
+        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions,
+        ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        FileObject, FunctionCall, ImageUrl, ReasoningEffort as OpenAiReasoningEffort,
+        ResponseFormat,
     },
 };
 use futures_util::Stream;
@@ -25,6 +26,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use crate::{
+    attachment::MediaPart,
     reasoning::ReasoningEffort,
     response::{ChatCompletionResponse, ChatCompletionStreamChunk, ToolCall},
 };
@@ -125,13 +127,13 @@ pub(crate) struct CompletionRequest<'a> {
 /// Builds the initial message history shared by every completion request
 /// (chat/agent/workflow-step): an optional system prompt, then `history`
 /// (prior turns of a resumed `--session`, empty for everyone else), then the
-/// new user turn built from `prompt`/`image_urls`. A tool loop starts from
+/// new user turn built from `prompt`/`media`. A tool loop starts from
 /// this and appends to it round by round.
 pub(crate) fn initial_messages(
     system_prompt: Option<&str>,
     history: &[ChatCompletionRequestMessage],
     prompt: &str,
-    image_urls: &[String],
+    media: &[MediaPart],
 ) -> Result<Vec<ChatCompletionRequestMessage>> {
     let mut messages = Vec::with_capacity(2 + history.len());
     if let Some(system_prompt) = system_prompt {
@@ -141,42 +143,56 @@ pub(crate) fn initial_messages(
         messages.push(ChatCompletionRequestMessage::from(system_message));
     }
     messages.extend(history.iter().cloned());
-    messages.push(user_message(prompt, image_urls)?);
+    messages.push(user_message(prompt, media)?);
     Ok(messages)
 }
 
-/// Builds a single user-role message from `prompt`, attaching `image_urls`
-/// (each already a `data:` URL or a plain `http(s)://` URL — see
-/// `attachment::resolve_image_urls`) as `image_url` content parts alongside
-/// the text when non-empty. Empty `image_urls` keeps the plain-text `content`
-/// shape every request used before `--image` existed, so a server that only
-/// understands a bare string content still works unchanged.
+/// Builds a single user-role message from `prompt`, attaching `media` as
+/// content parts alongside the text when non-empty: an image as an
+/// `image_url` part (a `data:` URL or a plain `http(s)://` URL — see
+/// `attachment::resolve_image_urls`), a file (a PDF `--file`) as a `file`
+/// part carrying its data inline. Empty `media` keeps the plain-text
+/// `content` shape every request used before `--image` existed, so a server
+/// that only understands a bare string content still works unchanged.
 pub(crate) fn user_message(
     prompt: &str,
-    image_urls: &[String],
+    media: &[MediaPart],
 ) -> Result<ChatCompletionRequestMessage> {
-    if image_urls.is_empty() {
+    if media.is_empty() {
         let user_message = ChatCompletionRequestUserMessageArgs::default()
             .content(prompt)
             .build()?;
         return Ok(ChatCompletionRequestMessage::from(user_message));
     }
 
-    let mut parts = Vec::with_capacity(1 + image_urls.len());
+    let mut parts = Vec::with_capacity(1 + media.len());
     parts.push(ChatCompletionRequestUserMessageContentPart::Text(
         ChatCompletionRequestMessageContentPartText {
             text: prompt.to_owned(),
         },
     ));
-    for url in image_urls {
-        parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
-            ChatCompletionRequestMessageContentPartImage {
-                image_url: ImageUrl {
-                    url: url.clone(),
-                    detail: None,
+    for part in media {
+        parts.push(match part {
+            MediaPart::Image(url) => ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                ChatCompletionRequestMessageContentPartImage {
+                    image_url: ImageUrl {
+                        url: url.clone(),
+                        detail: None,
+                    },
                 },
-            },
-        ));
+            ),
+            MediaPart::File { filename, data_url } => {
+                ChatCompletionRequestUserMessageContentPart::File(
+                    ChatCompletionRequestMessageContentPartFile {
+                        file: FileObject {
+                            file_data: Some(data_url.clone()),
+                            file_id: None,
+                            filename: Some(filename.clone()),
+                        },
+                    },
+                )
+            }
+        });
     }
     let user_message = ChatCompletionRequestUserMessageArgs::default()
         .content(parts)

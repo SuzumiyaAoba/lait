@@ -661,6 +661,17 @@
             }
           ]
         },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment-variable allowlist: when set, the command sees only these variables. Values support ${VAR_NAME} expansion (not templates)."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "The command's working directory. Supports ${VAR_NAME} expansion (not templates)."
+        },
         "id": {
           "type": "string",
           "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$",

@@ -72,13 +72,18 @@ fs2 = "0.4.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 handlebars = "6.4.4"
 http = "1"
+# `lait serve --mcp --http`'s listener: rmcp's `StreamableHttpService` is a
+# plain `tower` service, served one connection at a time over hyper's HTTP/1
+# server rather than pulling in a whole web framework for a single route.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 libc = "0.2"
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 jaq-core = "3.1.0"
 jaq-json = { version = "2.0.2", features = ["serde"] }
 jaq-std = "3.0.2"
 reqwest = { version = "0.13", default-features = false }
-rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "server", "transport-io"] }
+rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "server", "transport-io", "transport-streamable-http-server"] }
 # Selects the `ring` crypto provider (see `main`'s
 # `rustls::crypto::ring::default_provider().install_default()` call) instead
 # of rustls's default `aws-lc-rs`, whose `aws-lc-sys` build script needs a C/

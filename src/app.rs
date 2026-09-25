@@ -32,8 +32,8 @@ use crate::{
         DepsInstallArgs, DepsNameArgs, DepsUpdateArgs, DoctorArgs, EvalArgs, GraphArgs,
         GraphFormat, HistoryArgs, InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction,
         PromptCommand, PromptRunArgs, RunArgs, RunsCommand, SchemaArgs, ServeArgs, SessionsCommand,
-        SkillAction, SkillCommand, TestArgs, TraceAction, TraceCommand, TraceShowArgs,
-        WorkflowAction, WorkflowCommand,
+        SkillAction, SkillCommand, TestArgs, TraceAction, TraceCommand, TraceExportArgs,
+        TraceShowArgs, WorkflowAction, WorkflowCommand,
     },
     config::{self, ConfigSource},
     deps, docgen,
@@ -101,6 +101,7 @@ pub(crate) enum AsyncCommand {
     Eval(EvalArgs),
     Serve(ServeArgs),
     Decide(DecideArgs),
+    TraceExport(TraceExportArgs),
     /// The `lait deps` actions that reach GitHub — `remove`/`list`/`verify`
     /// are the [`SyncCommand`] half, being manifest/lock/disk-only.
     DepsAdd(DepsAddArgs),
@@ -196,6 +197,9 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         Some(Command::Trace(TraceCommand {
             action: TraceAction::Show(args),
         })) => Dispatch::Sync(SyncCommand::TraceShow(args)),
+        Some(Command::Trace(TraceCommand {
+            action: TraceAction::Export(args),
+        })) => Dispatch::Async(Box::new(AsyncCommand::TraceExport(args))),
         None => Dispatch::Async(Box::new(AsyncCommand::Bare)),
     }
 }
@@ -255,8 +259,11 @@ pub(crate) async fn run(
         }
         AsyncCommand::Test(test_args) => test_run::run(test_args, config_source, cancel).await,
         AsyncCommand::Eval(eval_args) => eval::run(eval_args, config_source, cancel).await,
-        AsyncCommand::Serve(serve_args) => serve::run(serve_args, config_source, cancel).await,
+        AsyncCommand::Serve(serve_args) => {
+            serve::run(serve_args, config_source, cache_override, cancel).await
+        }
         AsyncCommand::Decide(decide_args) => decide::run(decide_args, config_source, cancel).await,
+        AsyncCommand::TraceExport(export_args) => trace::export_otlp(export_args, cancel).await,
         // Deps commands take no `config_source`: they operate on
         // `lait.deps.yml`/`lait.lock`, which are discovered from the current
         // directory independently of the config search (see `deps::manifest`
@@ -326,27 +333,52 @@ pub(crate) fn run_blocking(command: SyncCommand, config_source: ConfigSource) ->
 
 /// Runs `lait trace show`: reads a `--trace-file`-written JSONL log back and
 /// prints it (a human-readable, one-line-per-event list; `--json` for a
-/// parsed array instead), sorted the same way `TraceCollector::events`
-/// already orders them. Pure local work, like `run_graph` below — no
+/// parsed array instead; `--summary` for per-label totals), sorted the same
+/// way `TraceCollector::events` already orders them, after the
+/// `--operation`/`--label` filters. Pure local work, like `run_graph` below — no
 /// `lait.config.yml`, no model resolution.
 fn run_trace_show(args: TraceShowArgs) -> Result<()> {
-    let contents = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("failed to read trace file '{}'", args.file.display()))?;
-    let mut events = Vec::new();
-    for (line_number, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
+    let events: Vec<trace::TraceEvent> = trace::read_jsonl(&args.file)?
+        .into_iter()
+        .filter(|event| {
+            args.operation
+                .as_deref()
+                .is_none_or(|operation| event.operation == operation)
+                && args
+                    .label
+                    .as_deref()
+                    .is_none_or(|label| event.label.contains(label))
+        })
+        .collect();
+
+    if args.summary {
+        let summaries = trace::summarize(&events);
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summaries)
+                    .context("failed to render the trace summary as JSON")?
+            );
+            return Ok(());
         }
-        let event: trace::TraceEvent = serde_json::from_str(line).with_context(|| {
-            format!(
-                "failed to parse trace event on line {} of '{}'",
-                line_number + 1,
-                args.file.display(),
-            )
-        })?;
-        events.push(event);
+        if summaries.is_empty() {
+            println!("(no events)");
+            return Ok(());
+        }
+        for summary in &summaries {
+            println!(
+                "{}: chat={} execute_tool={} compact={} total={}ms tokens(in={} out={})",
+                summary.label,
+                summary.chat,
+                summary.execute_tool,
+                summary.compact,
+                summary.duration_ms,
+                summary.input_tokens,
+                summary.output_tokens,
+            );
+        }
+        return Ok(());
     }
-    events.sort_by_key(|event| event.seq);
 
     if args.json {
         println!(

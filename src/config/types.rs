@@ -275,20 +275,33 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 /// this is a `lait.config.yml`-global-only setting for now (no CLI flag, no
 /// per-agent-file/per-workflow-node override) — a smaller, addable-later
 /// surface, not a design ceiling.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CompactionConfig {
     /// Compact every `trigger_rounds`-th round (`round % trigger_rounds ==
-    /// 0`), right before that round's request is sent. Must be at least 1;
-    /// validated by `check_compaction_config` at config-load time the same
-    /// way `check_shell_tool_definitions` validates `tools:`.
-    pub(crate) trigger_rounds: usize,
+    /// 0`), right before that round's request is sent. At least one of this
+    /// and `trigger_tokens` must be set, and whichever is set must be at
+    /// least 1 — checked by `engine::transport`'s `maybe_compact` the first
+    /// time a tool loop consults it.
+    pub(crate) trigger_rounds: Option<usize>,
+    /// Compact right before a round when the *previous* round's request
+    /// reported at least this many `prompt_tokens` — a size-based trigger
+    /// for a loop whose tool results vary wildly in length, where a fixed
+    /// round count compacts too early or too late. Only fires when the
+    /// server reports usage; a streamed round requests it for this purpose
+    /// even without `--show-usage`.
+    pub(crate) trigger_tokens: Option<u64>,
     /// How many of the tool loop's most recent messages survive a
     /// compaction verbatim (a leading system message, if any, always
     /// survives too, uncounted). Defaults to 4 — roughly the last two
     /// tool-call/tool-result round trips — when omitted.
     #[serde(default = "default_compaction_keep_last_n")]
     pub(crate) keep_last_n: usize,
+    /// A `models:` alias (or raw model id) to send the summarization request
+    /// to instead of the request's own model — typically a cheaper/faster
+    /// one. Resolved against `lait.config.yml`'s own `models:` only (not a
+    /// workflow's embedded `models:`), since this setting lives there too.
+    pub(crate) model: Option<String>,
 }
 
 fn default_compaction_keep_last_n() -> usize {
@@ -571,14 +584,11 @@ impl Pricing {
 /// Which OpenAI-compatible wire format a model's requests use. `ChatCompletions`
 /// (the default, and the only option before this field existed) sends
 /// `POST /chat/completions`; `Responses` sends `POST /responses` — OpenAI's
-/// newer API, whose only benefit lait actually implements (as of this field)
-/// is that a reasoning model's `reasoning` output items survive being
-/// echoed back on the *next* round of the same tool-free multi-turn call
-/// (`--session`, or a workflow's own step-to-step history), rather than
-/// being silently dropped the way they are in a Chat Completions message
-/// history. See `docs/usage/ja/config.md`'s Responses API section for the
-/// full list of what `api: responses` does *not* yet support (tool calling,
-/// `--stream`, provider-side `previous_response_id` chaining).
+/// newer API, translated to and from the Chat Completions shapes the rest
+/// of lait works in by `llm::responses` (tool calling, `--image`, and
+/// `--stream` included). Provider-side `previous_response_id` chaining is
+/// deliberately never used; see `docs/usage/ja/config.md`'s Responses API
+/// section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ApiKind {

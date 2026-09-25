@@ -4,14 +4,14 @@
 
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use futures_util::future::join_all;
 use serde::Serialize;
 
 use crate::{
-    chat,
+    async_io, chat,
     cli::CompareArgs,
-    config::{ConfigSource, ModelMap},
+    config::{ConfigSource, DefaultSettings, ModelMap},
     engine::{
         CapabilityOverrides, EndpointOverrides, PromptTurn, SamplingOverrides,
         resolve_request_settings,
@@ -51,6 +51,13 @@ pub(super) async fn run(
     let prompt = chat::resolve_input_with_stdin_cancellable(args.prompt.clone(), cancel.clone())
         .await?
         .ok_or_else(missing_prompt_error)?;
+    let system_prompt = resolve_system_prompt(&args, &file_config.default, cancel.clone()).await?;
+    let capabilities = CapabilityOverrides {
+        mcp: (!args.mcp.is_empty()).then(|| args.mcp.clone()),
+        subagents: (!args.subagent.is_empty()).then(|| args.subagent.clone()),
+        tools: (!args.tool.is_empty()).then(|| args.tool.clone()),
+        ..CapabilityOverrides::default()
+    };
 
     let sampling = SamplingOverrides {
         reasoning_effort: args.reasoning_effort,
@@ -65,7 +72,7 @@ pub(super) async fn run(
             model_name.clone(),
             sampling,
             EndpointOverrides::default(),
-            CapabilityOverrides::default(),
+            capabilities.clone(),
             &ModelMap::default(),
             &file_config,
         )?
@@ -77,9 +84,10 @@ pub(super) async fn run(
 
     let futures = settings_list.iter().map(|(model_name, settings)| {
         let prompt = &prompt;
+        let system_prompt = system_prompt.as_deref();
         let env = &env;
         async move {
-            let turn = PromptTurn::simple(None, prompt);
+            let turn = PromptTurn::simple(system_prompt, prompt);
             let started = Instant::now();
             let outcome = settings
                 .complete(env, &[], turn, None, env.operation_token())
@@ -116,6 +124,8 @@ pub(super) async fn run(
 
     if args.json {
         println!("{}", serde_json::to_string(&results)?);
+    } else if args.markdown {
+        print!("{}", markdown_report(&results));
     } else {
         print_report(&results);
     }
@@ -131,6 +141,74 @@ pub(super) async fn run(
         );
     }
     Ok(())
+}
+
+/// `--system`, else `--system-file`'s contents, else `default.system`.
+async fn resolve_system_prompt(
+    args: &CompareArgs,
+    defaults: &DefaultSettings,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<Option<String>> {
+    if let Some(text) = &args.system {
+        return Ok(Some(text.clone()));
+    }
+    if let Some(path) = &args.system_file {
+        let text =
+            async_io::read_to_string_cancellable(path, cancellation, async_io::MAX_READ_BYTES)
+                .await
+                .with_context(|| {
+                    format!("failed to read system prompt file '{}'", path.display())
+                })?;
+        return Ok(Some(text.trim_end().to_owned()));
+    }
+    Ok(defaults.system.clone())
+}
+
+/// The `--markdown` report: a summary table, then every model's response
+/// (or error) under its own heading. Table cells escape `|` so a model name
+/// or error message can't break the table.
+fn markdown_report(results: &[ModelResult]) -> String {
+    let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ");
+    let mut out = String::from(
+        "| model | model_id | time | prompt | completion | total | cost | status |\n\
+         | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n",
+    );
+    for result in results {
+        let (prompt, completion, total) = match result.usage {
+            Some(usage) => (
+                usage.prompt_tokens.to_string(),
+                usage.completion_tokens.to_string(),
+                usage.total_tokens.to_string(),
+            ),
+            None => ("-".to_owned(), "-".to_owned(), "-".to_owned()),
+        };
+        let cost = result
+            .cost_usd
+            .map(crate::usage::format_cost)
+            .unwrap_or_else(|| "-".to_owned());
+        let status = match &result.error {
+            Some(error) => format!("error: {}", cell(error)),
+            None => "ok".to_owned(),
+        };
+        out.push_str(&format!(
+            "| {} | {} | {}ms | {prompt} | {completion} | {total} | {cost} | {status} |\n",
+            cell(&result.model),
+            cell(&result.model_id),
+            result.duration_ms,
+        ));
+    }
+    for result in results {
+        out.push_str(&format!("\n## {} ({})\n\n", result.model, result.model_id));
+        match (&result.error, &result.content) {
+            (Some(error), _) => out.push_str(&format!("> error: {error}\n")),
+            (None, Some(content)) => {
+                out.push_str(content);
+                out.push('\n');
+            }
+            (None, None) => {}
+        }
+    }
+    out
 }
 
 fn print_report(results: &[ModelResult]) {
@@ -156,5 +234,47 @@ fn print_report(results: &[ModelResult]) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelResult, markdown_report};
+
+    fn result(model: &str, error: Option<&str>) -> ModelResult {
+        ModelResult {
+            model: model.to_owned(),
+            model_id: format!("{model}-id"),
+            duration_ms: 12,
+            usage: error.is_none().then_some(crate::response::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                total_tokens: 7,
+            }),
+            cost_usd: None,
+            content: error.is_none().then(|| format!("answer from {model}")),
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn markdown_report_has_a_summary_table_and_a_section_per_model() {
+        let report = markdown_report(&[result("a", None), result("b", Some("boom | bad"))]);
+        assert!(
+            report.contains("| a | a-id | 12ms | 3 | 4 | 7 | - | ok |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| b | b-id | 12ms | - | - | - | - | error: boom \\| bad |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\n## a (a-id)\n\nanswer from a\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\n## b (b-id)\n\n> error: boom | bad\n"),
+            "{report}"
+        );
     }
 }

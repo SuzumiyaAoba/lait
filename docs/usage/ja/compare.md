@@ -32,6 +32,44 @@ usage: prompt=12 completion=15 total=27
 $ lait compare --model gemma-4-12b --model qwen-3-14b --temperature 0 "厳密に比較したいプロンプト"
 ```
 
+## システムプロンプトとツール
+
+次のオプションは、比較する全モデルに同じ値が一律適用されます。
+
+| オプション | 説明 |
+| --- | --- |
+| `--system <TEXT>` | 全モデルに送るシステムプロンプト。 |
+| `--system-file <FILE>` | システムプロンプトをファイルから読み込みます（`--system` とは同時に指定できません）。 |
+| `--mcp <NAME>` | 全モデルが呼び出せる `mcp_servers:` のエントリ。複数指定できます。 |
+| `--subagent <NAME>` | 全モデルがサブエージェントとして呼び出せる `agents:` のエントリ。複数指定できます。 |
+| `--tool <NAME>` | 全モデルが呼び出せる `tools:` のエントリ。複数指定できます。 |
+
+`--system`/`--system-file` を省略した場合は、チャットと同じく `lait.config.yml` の
+`default.system` が使われます。`--mcp`/`--subagent`/`--tool` を省略した場合も、それぞれ
+`default.mcp`/`default.subagents`/`default.tools` にフォールバックします。ツールを指定すると、
+各モデルが独立に tool loop を回すため、`time`/`usage` はツール呼び出しを含む全ラウンドの合計です。
+
+```sh
+$ lait compare --model a --model b --system "日本語で簡潔に" --tool ripgrep "TODO を数えて"
+```
+
+## `--markdown`
+
+`--markdown` を指定すると、モデルごとの所要時間・usage・コスト・成否をまとめた表の後に、各モデルの
+応答をモデルごとの見出しの下に並べた Markdown を出力します。比較結果を PR やドキュメントに
+貼り付けたいときに使います（`--json` とは同時に指定できません）。
+
+```markdown
+| model | model_id | time | prompt | completion | total | cost | status |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| gemma-4-12b | gemma-4-12b-it | 812ms | 12 | 8 | 20 | - | ok |
+| qwen-3-14b | qwen3-14b-instruct | 1340ms | 12 | 15 | 27 | - | ok |
+
+## gemma-4-12b (gemma-4-12b-it)
+
+日本の首都は東京です。
+```
+
 ## `--json`
 
 機械可読な出力が必要な場合は `--json` を付けます。各モデルの結果を1要素とする配列が返り、成功時は `error` が `null`、失敗時は `content`/`usage`/`cost_usd` が `null` になります。`cost_usd` は該当モデルに `pricing:` が設定されていない場合も `null` です(コスト0ではなく「不明」を表します)。
@@ -64,5 +102,6 @@ $ lait compare --model gemma-4-12b --model qwen-3-14b --json "..." | jq '.[].mod
 
 ## 制限事項
 
-- 初期版では `--stream` に対応していません（複数モデルのストリームを同時に表示する仕組みが複雑になるため）。
-- `--mcp`/`--tool`/`--subagent`/`--system` など、単発チャットが持つツール呼び出し系オプションは今回のスコープ外です。単純なプロンプト送信の比較のみに対応します。
+- `--stream` には対応していません（複数モデルのストリームを同時に表示する仕組みが複雑になるため）。
+- `--approve-tools`（対話的なツール承認）には対応していません。`tool_policy` は通常どおり効きます。
+- `--file`/`--image` による添付には対応していません。

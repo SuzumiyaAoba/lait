@@ -189,3 +189,61 @@ fn lait_history_reports_none_recorded_when_empty() {
     assert!(output.status.success(), "lait failed: {output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("no history recorded yet"));
 }
+
+#[test]
+fn history_filters_and_json_output_work_with_every_action() {
+    let home = IsolatedHistoryHome::new();
+    std::fs::create_dir_all(home.history_path().parent().unwrap()).unwrap();
+    std::fs::write(
+        home.history_path(),
+        [
+            r#"{"timestamp":"2026-09-01T00:00:00+00:00","kind":"chat","model":"alpha","prompt":"old chat","response":"r1","usage":null}"#,
+            r#"{"timestamp":"2026-09-20T00:00:00+00:00","kind":"workflow","model":null,"prompt":"a workflow","response":"r2","usage":null}"#,
+            r#"{"timestamp":"2026-09-21T00:00:00+00:00","kind":"chat","model":"beta","prompt":"new chat","response":"r3","usage":null}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let json_of = |args: &[&str]| -> serde_json::Value {
+        let output = command_with_isolated_history(&home)
+            .arg("history")
+            .args(args)
+            .output()
+            .expect("failed to execute lait history");
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let chats = json_of(&["--kind", "chat", "--json"]);
+    let numbers: Vec<u64> = chats
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, vec![1, 3], "{chats}");
+
+    let recent = json_of(&["search", "chat", "--since", "2026-09-10", "--json"]);
+    assert_eq!(recent.as_array().unwrap().len(), 1, "{recent}");
+    assert_eq!(recent[0]["prompt"], "new chat");
+
+    let by_model = json_of(&["--model", "alph", "--json"]);
+    assert_eq!(by_model[0]["prompt"], "old chat");
+
+    let shown = json_of(&["show", "2", "--json"]);
+    assert_eq!(shown["number"], 2);
+    assert_eq!(shown["kind"], "workflow");
+}
+
+#[test]
+fn an_invalid_since_is_a_clear_error() {
+    let home = IsolatedHistoryHome::new();
+    let output = command_with_isolated_history(&home)
+        .args(["history", "--since", "someday"])
+        .output()
+        .expect("failed to execute lait history");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--since"), "{stderr}");
+}

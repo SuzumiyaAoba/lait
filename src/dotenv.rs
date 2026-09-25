@@ -38,14 +38,19 @@ pub(crate) unsafe fn load_from_current_dir() -> Result<()> {
 /// Parses dotenv-style `KEY=VALUE` lines: blank lines and `#` comments are
 /// skipped, an optional `export ` prefix is accepted, and a value may be
 /// single-quoted (taken literally), double-quoted (with `\n`/`\r`/`\t`/`\\`/
-/// `\"` escapes), or bare (trailing ` # comment` stripped). Multi-line
-/// values are not supported. `path` only names the file in error messages.
+/// `\"` escapes), or bare (trailing ` # comment` stripped). A quoted value
+/// may span several lines: when its closing quote isn't on the same line,
+/// the following lines are taken verbatim (joined with `\n`) until one
+/// closes it — the shape a PEM key or certificate pasted into `.env` takes.
+/// `path` only names the file in error messages, which cite the line the
+/// assignment starts on.
 fn parse(contents: &str, path: &Path) -> Result<Vec<(String, String)>> {
     let mut variables = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
+    let mut lines = contents.lines().enumerate();
+    while let Some((index, raw_line)) = lines.next() {
         let line_number = index + 1;
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = raw_line.trim_start();
+        if line.trim_end().is_empty() || line.starts_with('#') {
             continue;
         }
         let line = line
@@ -54,8 +59,9 @@ fn parse(contents: &str, path: &Path) -> Result<Vec<(String, String)>> {
             .unwrap_or(line);
         let Some((key, value)) = line.split_once('=') else {
             bail!(
-                "{}:{line_number}: expected 'KEY=VALUE', got {line:?}",
-                path.display()
+                "{}:{line_number}: expected 'KEY=VALUE', got {:?}",
+                path.display(),
+                line.trim_end()
             );
         };
         let key = key.trim_end();
@@ -68,7 +74,15 @@ fn parse(contents: &str, path: &Path) -> Result<Vec<(String, String)>> {
                 path.display()
             );
         }
-        let value = parse_value(value.trim_start()).with_context(|| {
+        let mut value = value.trim_start().to_owned();
+        while opens_unterminated_quote(&value) {
+            let Some((_, next_line)) = lines.next() else {
+                break; // `parse_value` reports the unterminated quote.
+            };
+            value.push('\n');
+            value.push_str(next_line);
+        }
+        let value = parse_value(&value).with_context(|| {
             format!(
                 "{}:{line_number}: invalid value for '{key}'",
                 path.display()
@@ -79,6 +93,18 @@ fn parse(contents: &str, path: &Path) -> Result<Vec<(String, String)>> {
     Ok(variables)
 }
 
+/// Whether `raw` starts a quoted value whose closing quote hasn't appeared
+/// yet — i.e. [`parse`] should keep reading lines into it.
+fn opens_unterminated_quote(raw: &str) -> bool {
+    if let Some(rest) = raw.strip_prefix('"') {
+        return split_at_closing_double_quote(rest).is_err();
+    }
+    if let Some(rest) = raw.strip_prefix('\'') {
+        return !rest.contains('\'');
+    }
+    false
+}
+
 fn parse_value(raw: &str) -> Result<String> {
     if let Some(rest) = raw.strip_prefix('"') {
         let (inner, remainder) = split_at_closing_double_quote(rest)?;
@@ -87,7 +113,7 @@ fn parse_value(raw: &str) -> Result<String> {
     }
     if let Some(rest) = raw.strip_prefix('\'') {
         let Some((inner, remainder)) = rest.split_once('\'') else {
-            bail!("unterminated single-quoted value (multi-line values are not supported)");
+            bail!("unterminated single-quoted value (no closing quote before the end of the file)");
         };
         check_nothing_but_comment(remainder)?;
         return Ok(inner.to_owned());
@@ -122,7 +148,7 @@ fn split_at_closing_double_quote(rest: &str) -> Result<(&str, &str)> {
             _ => {}
         }
     }
-    bail!("unterminated double-quoted value (multi-line values are not supported)");
+    bail!("unterminated double-quoted value (no closing quote before the end of the file)");
 }
 
 /// Rejects anything but whitespace or a `# comment` after a closing quote.
@@ -277,6 +303,40 @@ mod tests {
         assert!(parse("FOO-BAR=x\n", Path::new(".env")).is_err());
         assert!(parse("1FOO=x\n", Path::new(".env")).is_err());
         assert!(parse("=x\n", Path::new(".env")).is_err());
+    }
+
+    #[test]
+    fn a_quoted_value_may_span_several_lines() {
+        let contents = "KEY=\"-----BEGIN KEY-----\nabc  \n-----END KEY-----\"\n\
+                        RAW='line one\n  line two' # trailing comment\n\
+                        AFTER=next\n";
+        assert_eq!(
+            parse_ok(contents),
+            vec![
+                (
+                    "KEY".to_owned(),
+                    "-----BEGIN KEY-----\nabc  \n-----END KEY-----".to_owned()
+                ),
+                ("RAW".to_owned(), "line one\n  line two".to_owned()),
+                ("AFTER".to_owned(), "next".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_multi_line_double_quoted_value_still_unescapes() {
+        assert_eq!(
+            parse_ok("KEY=\"a\\tb\nc \\\"d\\\"\"\n"),
+            vec![("KEY".to_owned(), "a\tb\nc \"d\"".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_multi_line_value_reports_its_starting_line() {
+        let error = parse("A=1\nKEY=\"never\nclosed\n", Path::new(".env")).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(".env:2"), "{message}");
+        assert!(message.contains("unterminated"), "{message}");
     }
 
     #[test]

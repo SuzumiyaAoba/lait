@@ -3,7 +3,8 @@
 [ドキュメント目次に戻る](./README.md)
 
 `lait serve --mcp` は、`lait.config.yml` の `agents:`/`workflows:` に登録した各エントリを、
-1つずつ呼び出し可能な MCP ツールとして公開する、標準入出力（stdio）ベースの MCP サーバーです。
+1つずつ呼び出し可能な MCP ツールとして公開する MCP サーバーです。既定では標準入出力（stdio）で
+通信し、`--http` を指定すると Streamable HTTP で待ち受けます。
 Claude Code や Claude Desktop のような MCP クライアントの設定に `lait serve --mcp` を子プロセス
 として登録すれば、それらのエージェント/ワークフローを他のツールの部品として使わせられます。
 
@@ -36,6 +37,37 @@ MCP クライアント側の設定例（Claude Desktop の `claude_desktop_confi
 }
 ```
 
+## HTTP で公開する（`--http`）
+
+`--http <ADDR>` を指定すると、標準入出力の代わりに MCP の Streamable HTTP トランスポートで
+`ADDR` を待ち受けます。起動すると、接続先 URL が標準エラー出力に表示されます（ポートに `0` を
+指定すると空いているポートが自動で選ばれます）。
+
+```sh
+lait serve --mcp --http 127.0.0.1:8765
+# note: lait serve --mcp: ready at http://127.0.0.1:8765/mcp with 2 tool(s): ...
+```
+
+MCP クライアントには `http://127.0.0.1:8765/mcp` を登録します（パスは問いませんが、`/mcp` を
+推奨します）。複数のクライアントが同時に接続でき、それぞれが独立したセッションになります。
+
+**認証はありません。** 既定のループバックアドレス（`127.0.0.1` など）で待ち受け、外部に公開する
+場合は認証を行うリバースプロキシなどを前段に置いてください。DNS リバインディング対策として、
+`Host` ヘッダーが `localhost`/`127.0.0.1`/`::1` 以外のリクエストは拒否します。別のホスト名で
+アクセスさせる場合は `--allowed-host <HOST>`（`example.com` または `example.com:8765`、複数指定可）
+で許可してください。
+
+## 実行時オプション
+
+| オプション | 説明 |
+| --- | --- |
+| `--http <ADDR>` | 標準入出力の代わりに Streamable HTTP で `ADDR` を待ち受けます（上記参照）。 |
+| `--allowed-host <HOST>` | `--http` で受け付ける `Host` ヘッダーの値を追加します。複数指定できます。 |
+| `--cache`/`--no-cache`（グローバル） | 各ツール呼び出しのモデルリクエストでレスポンスのディスクキャッシュを使う／使わない。省略時は `default.cache` に従います。 |
+| `--record <DIR>` | ツール呼び出しのモデルリクエスト/レスポンスを `DIR` にカセットとして記録します（`lait run --record` と同じ。[決定的テスト](./testing.md)参照）。 |
+| `--replay <DIR>` | モデルリクエストを `DIR` のカセットから再生し、ネットワークには接続しません（`lait run --replay` と同じ）。 |
+| `--trace-file <PATH>` | 各ツール呼び出しのモデル呼び出し・ツール呼び出しを JSONL のトレースとして書き出します（[実行トレース](./trace.md)参照）。サーバーは起動し続けるため、ツール呼び出しが終わるたびにそれまでの全イベントでファイルを書き直します。各イベントの `attributes` には、どの MCP ツールの呼び出しによるものかを示す `lait.serve.tool` が付きます。 |
+
 ## 公開されるツール
 
 | 登録元 | ツール名 | 引数スキーマ |
@@ -55,7 +87,7 @@ MCP クライアント側の設定例（Claude Desktop の `claude_desktop_confi
 リだけを飛ばして起動を続けます（`lait workflow list`/`lait skill list` と同じ寛容さです）。
 どのエントリが飛ばされたかは標準エラー出力の `note:` 行に出ます。
 
-## 制約・スコープ外（v1）
+## 制約・スコープ外
 
 - **`lait serve` は起動時に一度だけ `lait.config.yml` を読み込みます。** サーバー起動後に
   `agents:`/`workflows:` を追記しても、再起動するまでは反映されません（他のすべての `lait` コ
@@ -70,8 +102,8 @@ MCP クライアント側の設定例（Claude Desktop の `claude_desktop_confi
   （制御ステップの内側に入れ子になったものも含む）ワークフローは無条件に除外し、`note:` 行で
   その理由を表示します（このチェックはそのワークフローファイル自身のステップだけを見ます —
   `workflow:` ステップで呼び出す別ファイル側の `ask:` ステップまでは検出しません）。
-- **`--approve-tools`（対話的なツール承認）は使えません。** 同じ理由（標準入力が MCP 通信専用）
-  により、served なエージェント/ワークフロー自身の tool loop は常に非対話的に実行されます。
+- **`--approve-tools`（対話的なツール承認）は使えません。** 同じ理由（標準入力が MCP 通信専用。
+  `--http` の場合も、承認に応答する人間がいない）により、served なエージェント/ワークフロー自身の tool loop は常に非対話的に実行されます。
   `tool_policy`（allow/deny）は通常どおり効きます。
 - **`lait history`・`--show-usage` には記録されません。** served な呼び出しは、通常の
   `lait run`/`lait agent run` が経由する出力・履歴記録の経路（`report::emit_run_output` など）
@@ -80,7 +112,3 @@ MCP クライアント側の設定例（Claude Desktop の `claude_desktop_confi
   `workflow__<名前>` ツールが呼ばれるたびに、そのワークフロー YAML を毎回読み直します（モデル
   呼び出し自体のレイテンシに比べれば YAML の再パースは無視できるコストと判断しています）。
   `agents:` 側は既存の `AgentRegistry` のキャッシュをそのまま再利用します。
-- 対応しているのは stdio 経由のみです。HTTP 経由の MCP サーバー（`transport-streamable-http-
-  server`）は未対応です。
-- `--cache`/`--record`/`--replay`/`--trace-file` など、他の `lait` コマンドが持つ実行時オプ
-  ションは `lait serve` にはありません。

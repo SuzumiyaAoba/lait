@@ -378,7 +378,12 @@ impl MockServer {
                 request_sender
                     .send(request)
                     .map_err(|_| io::Error::other("test receiver was dropped"))?;
-                write_response(&mut stream, status, "application/json", response_body)?;
+                write_response(
+                    &mut stream,
+                    status,
+                    content_type_of(response_body),
+                    response_body,
+                )?;
             }
 
             if let Some((status, response_body)) = last_response {
@@ -391,7 +396,7 @@ impl MockServer {
                         let _ = write_response(
                             &mut stream,
                             &status,
-                            "application/json",
+                            content_type_of(&response_body),
                             &response_body,
                         );
                     }
@@ -526,6 +531,30 @@ impl MockServer {
 /// `stream` — shared by every `MockServer` constructor, each of which used
 /// to build this same three-header response by hand (`application/json` for
 /// most, `text/event-stream` for `start_stream_sequence`'s SSE body).
+/// Builds an SSE body in the same framing `MockServer::start_stream` uses,
+/// for a `MockServer::start_sequence` entry that answers a streamed request
+/// — letting one sequence mix streamed rounds with plain JSON ones (a
+/// `--stream` tool loop's non-streamed compaction request, for example).
+pub(crate) fn sse_body(events: &[&str]) -> String {
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(event);
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// `text/event-stream` for a body built by [`sse_body`], JSON otherwise.
+fn content_type_of(body: &str) -> &'static str {
+    if body.starts_with("data: ") {
+        "text/event-stream"
+    } else {
+        "application/json"
+    }
+}
+
 fn write_response(
     stream: &mut TcpStream,
     status: &str,

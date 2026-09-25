@@ -13,9 +13,8 @@
 //!
 //! Attribute keys on [`TraceEvent::attributes`] follow the OpenTelemetry
 //! GenAI semantic conventions (`gen_ai.*`, still under active development at
-//! the time this was written) so a later exporter (an OTLP feature, say)
-//! could forward them unchanged — no exporter exists yet, only the shared
-//! vocabulary. A `lait.*`-prefixed key (`lait.source`, `lait.tool.round`,
+//! the time this was written) so `lait trace export` (see [`otlp`]) can
+//! forward them to an OTLP collector unchanged. A `lait.*`-prefixed key (`lait.source`, `lait.tool.round`,
 //! ...) is this crate's own bookkeeping with no GenAI semconv equivalent.
 //!
 //! This is deliberately a flat per-event log, not a span tree with parent/
@@ -40,6 +39,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::storage;
+
+/// `lait trace export`: a written trace file as OTLP/HTTP JSON spans. Split
+/// out of this file since it is a separate consumer of [`TraceEvent`]s,
+/// with its own wire format, rather than part of recording them.
+mod otlp;
+
+pub(crate) use otlp::export_otlp;
 
 /// One recorded event: a model completion request (`operation ==
 /// "chat"`, OTel's `gen_ai.operation.name` vocabulary) or a tool call
@@ -161,9 +167,120 @@ pub(crate) fn write_jsonl(path: &std::path::Path, events: &[TraceEvent]) -> Resu
         .with_context(|| format!("failed to write trace file '{}'", path.display()))
 }
 
+/// Reads a [`write_jsonl`]-written trace file back, sorted by `seq`. Blank
+/// lines are skipped; any other line that doesn't parse as a
+/// [`TraceEvent`] is an error naming its line number.
+pub(crate) fn read_jsonl(path: &std::path::Path) -> Result<Vec<TraceEvent>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read trace file '{}'", path.display()))?;
+    let mut events = Vec::new();
+    for (line_number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: TraceEvent = serde_json::from_str(line).with_context(|| {
+            format!(
+                "failed to parse trace event on line {} of '{}'",
+                line_number + 1,
+                path.display(),
+            )
+        })?;
+        events.push(event);
+    }
+    events.sort_by_key(|event| event.seq);
+    Ok(events)
+}
+
+/// One label's totals, for `lait trace show --summary`.
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct LabelSummary {
+    pub(crate) label: String,
+    pub(crate) chat: u64,
+    pub(crate) execute_tool: u64,
+    pub(crate) compact: u64,
+    pub(crate) duration_ms: i64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+}
+
+/// Totals `events` per label, in the order each label first appears.
+pub(crate) fn summarize(events: &[TraceEvent]) -> Vec<LabelSummary> {
+    let mut summaries: Vec<LabelSummary> = Vec::new();
+    for event in events {
+        let index = match summaries
+            .iter()
+            .position(|summary| summary.label == event.label)
+        {
+            Some(index) => index,
+            None => {
+                summaries.push(LabelSummary {
+                    label: event.label.clone(),
+                    ..LabelSummary::default()
+                });
+                summaries.len() - 1
+            }
+        };
+        let summary = &mut summaries[index];
+        match event.operation.as_str() {
+            "chat" => summary.chat += 1,
+            "execute_tool" => summary.execute_tool += 1,
+            "compact" => summary.compact += 1,
+            _ => {}
+        }
+        summary.duration_ms = summary.duration_ms.saturating_add(event.duration_ms);
+        let tokens = |key: &str| event.attributes.get(key).and_then(Value::as_u64);
+        summary.input_tokens = summary
+            .input_tokens
+            .saturating_add(tokens("gen_ai.usage.input_tokens").unwrap_or_default());
+        summary.output_tokens = summary
+            .output_tokens
+            .saturating_add(tokens("gen_ai.usage.output_tokens").unwrap_or_default());
+    }
+    summaries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_totals_counts_durations_and_tokens_per_label() {
+        let collector = TraceCollector::default();
+        let start = Utc::now();
+        let end = start + chrono::Duration::milliseconds(10);
+        collector.record(
+            "chat",
+            "step_a",
+            start,
+            end,
+            attrs([
+                ("gen_ai.usage.input_tokens", Value::from(5)),
+                ("gen_ai.usage.output_tokens", Value::from(2)),
+            ]),
+        );
+        collector.record("execute_tool", "tool 'x'", start, end, Map::new());
+        collector.record(
+            "chat",
+            "step_a",
+            start,
+            end,
+            attrs([("gen_ai.usage.input_tokens", Value::from(7))]),
+        );
+        let summaries = summarize(&collector.events());
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(
+            summaries[0],
+            LabelSummary {
+                label: "step_a".to_owned(),
+                chat: 2,
+                duration_ms: 20,
+                input_tokens: 12,
+                output_tokens: 2,
+                ..LabelSummary::default()
+            }
+        );
+        assert_eq!(summaries[1].execute_tool, 1);
+    }
 
     #[test]
     fn events_are_returned_in_sequence_order_regardless_of_insertion_order() {

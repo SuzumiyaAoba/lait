@@ -88,7 +88,7 @@ fn a_binary_file_is_rejected() {
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("not valid UTF-8"),
+        String::from_utf8_lossy(&output.stderr).contains("neither UTF-8 text nor a PDF"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -126,4 +126,44 @@ fn file_content_combines_with_piped_stdin() {
     assert!(request.body.contains("review this"));
     assert!(request.body.contains("piped context"));
     assert!(request.body.contains("file content"));
+}
+
+#[test]
+fn a_pdf_file_is_sent_as_a_file_content_part() {
+    let dir = ConfigDirectory::empty();
+    let pdf = dir.path().join("report.pdf");
+    std::fs::write(&pdf, b"%PDF-1.7\n\xff\xfe binary body").unwrap();
+    let notes = dir.path().join("notes.txt");
+    std::fs::write(&notes, "plain notes").unwrap();
+
+    let server = MockServer::start("200 OK", RESPONSE);
+    let output = test_command()
+        .args(["--model", "test-model", "--base-url", &server.base_url])
+        .arg("--file")
+        .arg(&pdf)
+        .arg("--file")
+        .arg(&notes)
+        .arg("summarize these")
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{content:?}");
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("summarize these"), "{text}");
+    assert!(text.contains("plain notes"), "{text}");
+    assert_eq!(content[1]["type"], "file");
+    assert_eq!(content[1]["file"]["filename"], "report.pdf");
+    assert!(
+        content[1]["file"]["file_data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:application/pdf;base64,JVBERi0x"),
+        "{content:?}"
+    );
 }

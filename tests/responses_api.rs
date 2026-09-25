@@ -87,8 +87,14 @@ fn a_responses_api_model_carries_the_system_prompt_as_instructions() {
 }
 
 #[test]
-fn a_responses_api_model_rejects_mcp_tools() {
-    let server = MockServer::start("200 OK", &responses_api_body("unused"));
+fn a_responses_api_model_drives_a_shell_tool_loop() {
+    let server = MockServer::start_sequence(&[
+        (
+            "200 OK",
+            r#"{"status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"tool__echo","arguments":"{}"}]}"#,
+        ),
+        ("200 OK", &responses_api_body("tool said hi")),
+    ]);
     let mut config_yaml = responses_model_config(&server.base_url);
     config_yaml.push_str("tools:\n  echo:\n    command: [\"echo\", \"hi\"]\n");
     let config = ConfigDirectory::new(&config_yaml);
@@ -98,21 +104,68 @@ fn a_responses_api_model_rejects_mcp_tools() {
         .args(["--tool", "echo", "hello"])
         .output()
         .expect("failed to execute lait");
+    let first = server.receive_request();
+    let second = server.receive_request();
+    server.finish();
 
-    assert!(
-        !output.status.success(),
-        "a Responses-API model with tools: must fail: {output:?}"
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "tool said hi"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let first_body = without_json_whitespace(&first.body);
     assert!(
-        stderr.contains("mcp:/subagents:/tools:"),
-        "stderr: {stderr}"
+        first_body.contains(r#""tools":[{"type":"function","name":"tool__echo""#),
+        "first request body: {first_body}"
+    );
+    let second_body = without_json_whitespace(&second.body);
+    assert!(
+        second_body.contains(
+            r#"{"type":"function_call","call_id":"call_1","name":"tool__echo","arguments":"{}"}"#
+        ),
+        "second request body: {second_body}"
+    );
+    assert!(
+        second_body.contains(r#""type":"function_call_output","call_id":"call_1","output":"hi"#),
+        "second request body: {second_body}"
     );
 }
 
 #[test]
-fn a_responses_api_model_rejects_streaming() {
-    let server = MockServer::start("200 OK", &responses_api_body("unused"));
+fn a_responses_api_model_streams_output_text_deltas() {
+    let server = MockServer::start_stream(&[
+        r#"{"type":"response.created","response":{"status":"in_progress"}}"#,
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":"Hello, "}"#,
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":"world!"}"#,
+        r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+    ]);
+    let config = ConfigDirectory::new(&responses_model_config(&server.base_url));
+
+    let output = test_command()
+        .current_dir(config.path())
+        .args(["--stream", "--show-usage", "hello"])
+        .output()
+        .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
+
+    assert!(output.status.success(), "lait failed: {output:?}");
+    assert_eq!(request.target, "/v1/responses", "request: {request:?}");
+    let body = without_json_whitespace(&request.body);
+    assert!(body.contains(r#""stream":true"#), "request body: {body}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Hello, world!"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("total=5"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_responses_api_stream_failure_surfaces_the_servers_error_message() {
+    let server = MockServer::start_stream(&[
+        r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"rate_limited"}}}"#,
+    ]);
     let config = ConfigDirectory::new(&responses_model_config(&server.base_url));
 
     let output = test_command()
@@ -120,18 +173,16 @@ fn a_responses_api_model_rejects_streaming() {
         .args(["--stream", "hello"])
         .output()
         .expect("failed to execute lait");
+    server.finish();
 
-    assert!(
-        !output.status.success(),
-        "a Responses-API model with --stream must fail: {output:?}"
-    );
+    assert!(!output.status.success(), "output: {output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--stream"), "stderr: {stderr}");
+    assert!(stderr.contains("rate_limited"), "stderr: {stderr}");
 }
 
 #[test]
-fn a_responses_api_model_rejects_image_attachments() {
-    let server = MockServer::start("200 OK", &responses_api_body("unused"));
+fn a_responses_api_model_sends_image_attachments_as_input_image_parts() {
+    let server = MockServer::start("200 OK", &responses_api_body("a cat"));
     let config = ConfigDirectory::new(&responses_model_config(&server.base_url));
 
     let output = test_command()
@@ -139,13 +190,17 @@ fn a_responses_api_model_rejects_image_attachments() {
         .args(["--image", "http://example.com/x.png", "hello"])
         .output()
         .expect("failed to execute lait");
+    let request = server.receive_request();
+    server.finish();
 
+    assert!(output.status.success(), "lait failed: {output:?}");
+    let body = without_json_whitespace(&request.body);
     assert!(
-        !output.status.success(),
-        "a Responses-API model with --image must fail: {output:?}"
+        body.contains(
+            r#""content":[{"type":"input_text","text":"hello"},{"type":"input_image","image_url":"http://example.com/x.png"}]"#
+        ),
+        "request body: {body}"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--image"), "stderr: {stderr}");
 }
 
 #[test]

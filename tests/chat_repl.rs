@@ -214,3 +214,108 @@ fn repl_meta_commands_never_reach_the_network() {
     assert!(stderr.contains("history cleared"));
     assert!(stderr.contains("unknown command: /nope"));
 }
+
+/// Runs `lait chat` against `server`, feeding it `stdin`, and returns the
+/// finished process's output.
+fn run_repl(server: &MultiTurnStreamServer, stdin: &[u8]) -> std::process::Child {
+    let mut command = test_command();
+    command.args([
+        "chat",
+        "--model",
+        "test-model",
+        "--base-url",
+        &server.base_url,
+    ]);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().expect("failed to spawn lait chat");
+    child
+        .stdin
+        .take()
+        .expect("child stdin should be piped")
+        .write_all(stdin)
+        .expect("failed to write to lait chat's stdin");
+    child
+}
+
+fn messages_of(request: &HttpRequest) -> Vec<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    body["messages"].as_array().unwrap().clone()
+}
+
+#[test]
+fn repl_retry_resends_the_last_message_in_place_of_its_reply() {
+    let server = MultiTurnStreamServer::start(&["first try", "second try", "after"]);
+    let child = run_repl(&server, b"hello\n/retry\nnext\n/exit\n");
+
+    let first = server.receive_request();
+    let retried = server.receive_request();
+    let after = server.receive_request();
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for lait chat");
+    server.finish();
+
+    assert!(output.status.success(), "lait chat failed: {output:?}");
+    assert_eq!(messages_of(&first), messages_of(&retried));
+    let messages = messages_of(&after);
+    assert_eq!(messages.len(), 3, "{messages:?}");
+    assert_eq!(messages[1]["content"], "second try");
+    assert_eq!(messages[2]["content"], "next");
+}
+
+#[test]
+fn repl_undo_drops_the_last_exchange() {
+    let server = MultiTurnStreamServer::start(&["one", "two"]);
+    let child = run_repl(&server, b"first\n/undo\nsecond\n/exit\n");
+
+    server.receive_request();
+    let second = server.receive_request();
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for lait chat");
+    server.finish();
+
+    assert!(output.status.success(), "lait chat failed: {output:?}");
+    let messages = messages_of(&second);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0]["content"], "second");
+}
+
+#[test]
+fn repl_sends_a_triple_quoted_block_as_one_message() {
+    let server = MultiTurnStreamServer::start(&["ok"]);
+    let child = run_repl(
+        &server,
+        b"\"\"\"\nline one\n/not a command\n\"\"\"\n/exit\n",
+    );
+
+    let request = server.receive_request();
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for lait chat");
+    server.finish();
+
+    assert!(output.status.success(), "lait chat failed: {output:?}");
+    let messages = messages_of(&request);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0]["content"], "line one\n/not a command");
+}
+
+#[test]
+fn repl_help_and_nothing_to_undo_or_retry_are_reported_locally() {
+    let server = MultiTurnStreamServer::start(&[]);
+    let child = run_repl(&server, b"/help\n/undo\n/retry\n/usage\n/exit\n");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for lait chat");
+    server.finish();
+
+    assert!(output.status.success(), "lait chat failed: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("/retry"), "{stderr}");
+    assert!(stderr.contains("nothing to undo"), "{stderr}");
+    assert!(stderr.contains("nothing to retry"), "{stderr}");
+    assert!(stderr.contains("usage:"), "{stderr}");
+}

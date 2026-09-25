@@ -134,10 +134,12 @@
       "description": "Periodically shrinks a tool loop's growing message history by replacing older rounds with a model-generated summary. lait.config.yml-global only: no CLI flag, no per-agent-file/per-workflow-node override yet.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["trigger_rounds"],
+      "anyOf": [{ "required": ["trigger_rounds"] }, { "required": ["trigger_tokens"] }],
       "properties": {
         "trigger_rounds": { "type": "integer", "minimum": 1 },
-        "keep_last_n": { "type": "integer", "minimum": 0 }
+        "trigger_tokens": { "type": "integer", "minimum": 1 },
+        "keep_last_n": { "type": "integer", "minimum": 0 },
+        "model": { "type": "string" }
       }
     },
     "mcpServerConfig": {

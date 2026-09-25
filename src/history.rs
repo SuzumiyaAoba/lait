@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cli::{HistoryAction, HistoryArgs},
+    cli::{HistoryAction, HistoryArgs, HistoryFilterArgs},
     jsonl,
     response::Usage,
 };
@@ -72,17 +72,114 @@ pub(crate) fn record(
     jsonl::append(&history_path()?, [entry])
 }
 
+/// Which entries `lait history`'s listing and `search` keep
+/// (`--kind`/`--model`/`--since`). Entry numbers are still counted over
+/// *every* entry, so a filtered listing's numbers stay valid for `show`.
+#[derive(Debug, Default)]
+pub(crate) struct Filter {
+    kind: Option<String>,
+    model: Option<String>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Filter {
+    /// Builds a filter from the CLI's raw values, parsing `--since` against
+    /// `now` (see [`parse_since`]).
+    pub(crate) fn new(
+        kind: Option<String>,
+        model: Option<String>,
+        since: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self> {
+        Ok(Self {
+            kind,
+            model,
+            since: since.map(|since| parse_since(since, now)).transpose()?,
+        })
+    }
+
+    fn from_args(args: &HistoryFilterArgs, now: chrono::DateTime<chrono::Utc>) -> Result<Self> {
+        Self::new(
+            args.kind.clone(),
+            args.model.clone(),
+            args.since.as_deref(),
+            now,
+        )
+    }
+
+    fn matches(&self, entry: &HistoryEntry) -> bool {
+        if self.kind.as_deref().is_some_and(|kind| entry.kind != kind) {
+            return false;
+        }
+        if let Some(model) = &self.model
+            && !entry
+                .model
+                .as_deref()
+                .is_some_and(|entry_model| entry_model.contains(model.as_str()))
+        {
+            return false;
+        }
+        if let Some(since) = self.since {
+            // An entry whose timestamp doesn't parse can't be shown to be
+            // recent enough, so a `--since` filter leaves it out.
+            return chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+                .is_ok_and(|timestamp| timestamp >= since);
+        }
+        true
+    }
+}
+
+/// Parses `--since`: `YYYY-MM-DD` (UTC midnight), an RFC 3339 timestamp, or
+/// `<N><unit>` with unit `m`/`h`/`d`/`w`, counted back from `now`.
+fn parse_since(
+    since: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    let since = since.trim();
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(since) {
+        return Ok(timestamp.with_timezone(&chrono::Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(since, "%Y-%m-%d") {
+        return Ok(date.and_time(chrono::NaiveTime::MIN).and_utc());
+    }
+    let unit_start = since
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(since.len());
+    let (amount, unit) = since.split_at(unit_start);
+    let amount: i64 = amount.parse().map_err(|_| since_error(since))?;
+    let duration = match unit {
+        "m" => chrono::Duration::try_minutes(amount),
+        "h" => chrono::Duration::try_hours(amount),
+        "d" => chrono::Duration::try_days(amount),
+        "w" => chrono::Duration::try_weeks(amount),
+        _ => None,
+    }
+    .ok_or_else(|| since_error(since))?;
+    now.checked_sub_signed(duration)
+        .ok_or_else(|| since_error(since))
+}
+
+fn since_error(since: &str) -> anyhow::Error {
+    anyhow!(
+        "invalid --since '{since}'; expected a date (2026-09-01), an RFC 3339 timestamp, or a \
+         duration like 30m/12h/7d/2w"
+    )
+}
+
 /// The `limit` most recent entries, for `lait history`'s bare listing.
 /// Reads the log most-recent-first (see `jsonl::load_rev`) and stops as
 /// soon as `limit` entries are collected, rather than deserializing (and
 /// reversing) the whole file first just to keep its tail — a history log
 /// only grows, so this makes `lait history`'s cost O(`limit`), not O(every
 /// run ever recorded).
-pub(crate) fn list(limit: usize) -> Result<Vec<(usize, HistoryEntry)>> {
+pub(crate) fn list(limit: usize, filter: &Filter) -> Result<Vec<(usize, HistoryEntry)>> {
     let mut entries = Vec::new();
     let mut number = 0_usize;
     jsonl::load_rev(&history_path()?, |entry: HistoryEntry| {
         number += 1;
+        if !filter.matches(&entry) {
+            return Ok(std::ops::ControlFlow::Continue(()));
+        }
         entries.push((number, entry));
         Ok(if entries.len() >= limit {
             std::ops::ControlFlow::Break(())
@@ -117,14 +214,15 @@ pub(crate) fn show(index: usize) -> Result<HistoryEntry> {
 /// (unlike [`list`]/[`show`]) this still visits every entry — but streamed
 /// one at a time via [`jsonl::load_rev`] rather than first collecting every
 /// entry into a `Vec`, reversing it, and filtering a second pass.
-pub(crate) fn search(query: &str) -> Result<Vec<(usize, HistoryEntry)>> {
+pub(crate) fn search(query: &str, filter: &Filter) -> Result<Vec<(usize, HistoryEntry)>> {
     let query = query.to_lowercase();
     let mut matches = Vec::new();
     let mut number = 0_usize;
     jsonl::load_rev(&history_path()?, |entry: HistoryEntry| {
         number += 1;
-        if contains_case_insensitive(&entry.prompt, &query)
-            || contains_case_insensitive(&entry.response, &query)
+        if filter.matches(&entry)
+            && (contains_case_insensitive(&entry.prompt, &query)
+                || contains_case_insensitive(&entry.response, &query))
         {
             matches.push((number, entry));
         }
@@ -201,27 +299,67 @@ fn summarize(text: &str) -> String {
     }
 }
 
+/// One listed entry as `--json` prints it: the entry's own fields plus the
+/// `number` `show` accepts.
+#[derive(Serialize)]
+struct NumberedEntry<'a> {
+    number: usize,
+    #[serde(flatten)]
+    entry: &'a HistoryEntry,
+}
+
+fn print_entries(entries: &[(usize, HistoryEntry)], json: bool, empty_message: &str) -> Result<()> {
+    if json {
+        let numbered: Vec<NumberedEntry<'_>> = entries
+            .iter()
+            .map(|(number, entry)| NumberedEntry {
+                number: *number,
+                entry,
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&numbered)?);
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("{empty_message}");
+        return Ok(());
+    }
+    for (number, entry) in entries {
+        print_entry(*number, entry);
+    }
+    Ok(())
+}
+
 /// Runs `lait history [--limit N] | show <N> | search <QUERY>` — a purely
 /// local file operation (no async runtime needed, see
-/// `app::needs_async_runtime`).
+/// `app::needs_async_runtime`). `--kind`/`--model`/`--since` narrow the
+/// listing and `search`; `show` always addresses an entry by number.
 pub(crate) fn run(args: HistoryArgs) -> Result<()> {
+    let now = chrono::Utc::now();
     match args.action {
         None => {
-            let entries = list(args.limit)?;
-            if entries.is_empty() {
-                println!("no history recorded yet");
-                return Ok(());
-            }
-            for (number, entry) in &entries {
-                print_entry(*number, entry);
-            }
-            Ok(())
+            let filter = Filter::from_args(&args.filter, now)?;
+            print_entries(
+                &list(args.limit, &filter)?,
+                args.filter.json,
+                "no history recorded yet",
+            )
         }
         Some(HistoryAction::Show(show_args)) => {
             if show_args.index == 0 {
                 bail!("history index must be at least 1");
             }
             let entry = show(show_args.index)?;
+            if show_args.json || args.filter.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&NumberedEntry {
+                        number: show_args.index,
+                        entry: &entry,
+                    })?
+                );
+                return Ok(());
+            }
             println!("timestamp: {}", entry.timestamp);
             println!("kind: {}", entry.kind);
             if let Some(model) = &entry.model {
@@ -235,22 +373,29 @@ pub(crate) fn run(args: HistoryArgs) -> Result<()> {
             Ok(())
         }
         Some(HistoryAction::Search(search_args)) => {
-            let entries = search(&search_args.query)?;
-            if entries.is_empty() {
-                println!("no history entries match '{}'", search_args.query);
-                return Ok(());
-            }
-            for (number, entry) in &entries {
-                print_entry(*number, entry);
-            }
-            Ok(())
+            // Options may sit on either side of `search`; the subcommand's
+            // own take precedence.
+            let merged = HistoryFilterArgs {
+                kind: search_args.filter.kind.or(args.filter.kind),
+                model: search_args.filter.model.or(args.filter.model),
+                since: search_args.filter.since.or(args.filter.since),
+                json: search_args.filter.json || args.filter.json,
+            };
+            let filter = Filter::from_args(&merged, now)?;
+            print_entries(
+                &search(&search_args.query, &filter)?,
+                merged.json,
+                &format!("no history entries match '{}'", search_args.query),
+            )
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_case_insensitive, list, record, search, show, summarize};
+    use super::{
+        Filter, contains_case_insensitive, list, parse_since, record, search, show, summarize,
+    };
 
     /// Runs `body` with `HOME`/`XDG_DATA_HOME` temporarily pointed at a
     /// fresh, empty directory, so the history file resolves under an
@@ -290,7 +435,7 @@ mod tests {
     #[test]
     fn list_is_empty_when_nothing_has_been_recorded() {
         in_temp_home(|| {
-            assert!(list(20).unwrap().is_empty());
+            assert!(list(20, &Filter::default()).unwrap().is_empty());
         });
     }
 
@@ -300,7 +445,7 @@ mod tests {
             record("chat", Some("m1"), "first", "first reply", None).unwrap();
             record("chat", Some("m1"), "second", "second reply", None).unwrap();
 
-            let entries = list(20).unwrap();
+            let entries = list(20, &Filter::default()).unwrap();
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[0].0, 1);
             assert_eq!(entries[0].1.prompt, "second");
@@ -315,7 +460,7 @@ mod tests {
             for n in 0..5 {
                 record("chat", None, &format!("p{n}"), "r", None).unwrap();
             }
-            assert_eq!(list(2).unwrap().len(), 2);
+            assert_eq!(list(2, &Filter::default()).unwrap().len(), 2);
         });
     }
 
@@ -349,11 +494,11 @@ mod tests {
             record("chat", None, "translate to French", "Bonjour", None).unwrap();
             record("chat", None, "summarize this", "a short summary", None).unwrap();
 
-            let by_prompt = search("FRENCH").unwrap();
+            let by_prompt = search("FRENCH", &Filter::default()).unwrap();
             assert_eq!(by_prompt.len(), 1);
             assert_eq!(by_prompt[0].1.prompt, "translate to French");
 
-            let by_response = search("bonjour").unwrap();
+            let by_response = search("bonjour", &Filter::default()).unwrap();
             assert_eq!(by_response.len(), 1);
         });
     }
@@ -362,7 +507,7 @@ mod tests {
     fn search_returns_empty_for_no_match() {
         in_temp_home(|| {
             record("chat", None, "hello", "hi", None).unwrap();
-            assert!(search("nope").unwrap().is_empty());
+            assert!(search("nope", &Filter::default()).unwrap().is_empty());
         });
     }
 
@@ -397,5 +542,60 @@ mod tests {
         let summary = summarize(&long);
         assert!(summary.ends_with("..."));
         assert!(!summary.contains('\n'));
+    }
+
+    #[test]
+    fn parse_since_accepts_dates_timestamps_and_durations() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-25T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        assert_eq!(
+            parse_since("2026-09-01", now).unwrap().to_rfc3339(),
+            "2026-09-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            parse_since("2026-09-24T10:00:00+09:00", now)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-09-24T01:00:00+00:00"
+        );
+        assert_eq!(
+            parse_since("12h", now).unwrap().to_rfc3339(),
+            "2026-09-25T00:00:00+00:00"
+        );
+        assert_eq!(
+            parse_since("1w", now).unwrap().to_rfc3339(),
+            "2026-09-18T12:00:00+00:00"
+        );
+        assert!(parse_since("7x", now).is_err());
+        assert!(parse_since("yesterday", now).is_err());
+    }
+
+    #[test]
+    fn filters_by_kind_model_and_since_while_keeping_global_numbers() {
+        in_temp_home(|| {
+            record("chat", Some("gpt-local"), "one", "r1", None).unwrap();
+            record("workflow", None, "two", "r2", None).unwrap();
+            record("chat", Some("other"), "three", "r3", None).unwrap();
+
+            let chats =
+                Filter::new(Some("chat".to_owned()), None, None, chrono::Utc::now()).unwrap();
+            let numbers: Vec<usize> = list(20, &chats)
+                .unwrap()
+                .into_iter()
+                .map(|(number, _)| number)
+                .collect();
+            assert_eq!(numbers, vec![1, 3]);
+
+            let local =
+                Filter::new(None, Some("local".to_owned()), None, chrono::Utc::now()).unwrap();
+            let found = search("r", &local).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].0, 3);
+            assert_eq!(found[0].1.prompt, "one");
+
+            let future = Filter::new(None, None, Some("2999-01-01"), chrono::Utc::now()).unwrap();
+            assert!(list(20, &future).unwrap().is_empty());
+        });
     }
 }

@@ -407,7 +407,10 @@ impl Parser<'_> {
                 for arg in &argv {
                     check_template(arg).with_context(|| format!("{at}: 'run'"))?;
                 }
-                StepKind::Run(RunStep { argv })
+                let env: std::collections::HashMap<String, String> =
+                    fields.take("env")?.unwrap_or_default();
+                let cwd: Option<String> = fields.take("cwd")?;
+                StepKind::Run(RunStep { argv, env, cwd })
             }
             "decide" => {
                 let questions = fields
@@ -639,6 +642,7 @@ pub(crate) fn kind_fields(kind_key: &str) -> Vec<&'static str> {
             "schema_name",
         ],
         "agent" => vec!["files", "images"],
+        "run" => vec!["env", "cwd"],
         "decide" => vec!["model"],
         "workflow" => vec!["with"],
         "ask" => vec!["choices", "default", "multiline"],

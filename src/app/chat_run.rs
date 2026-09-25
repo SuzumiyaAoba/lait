@@ -145,7 +145,7 @@ struct ChatRequest<'a> {
     prompt: String,
     system_prompt: Option<String>,
     session_history: Vec<ChatCompletionRequestMessage>,
-    image_urls: Vec<String>,
+    media: Vec<attachment::MediaPart>,
     services: Arc<AppServices>,
     env: RunContext,
     display: ChatDisplayPolicy<'a>,
@@ -197,7 +197,7 @@ async fn prepare_chat_request<'a>(
     // order across unrelated futures) — none of these five reads name each
     // other in their error text, so there is no risk of a confusing partial
     // message, only a different tie-break among independent failures.
-    let (response_format, file_context, system_prompt, image_urls, session_history) = tokio::try_join!(
+    let (response_format, file_attachments, system_prompt, images, session_history) = tokio::try_join!(
         async {
             match chat.json_schema.as_deref() {
                 Some(path) => {
@@ -213,10 +213,12 @@ async fn prepare_chat_request<'a>(
         attachment::resolve_image_urls(&chat.images),
         chat::load_session_history_cancellable(chat.shared.session.as_deref(), cancel.clone()),
     )?;
-    let prompt = match file_context {
+    let prompt = match file_attachments.text {
         Some(file_context) => format!("{prompt}\n\n{file_context}"),
         None => prompt,
     };
+    let mut media = file_attachments.files;
+    media.extend(images);
     let (services, env) = build_run_context(&file_config, cache_override, approve_tools, cancel);
     let display = ChatDisplayPolicy::resolve(chat, &file_config);
 
@@ -227,7 +229,7 @@ async fn prepare_chat_request<'a>(
         prompt,
         system_prompt,
         session_history,
-        image_urls,
+        media,
         services,
         env,
         display,
@@ -249,7 +251,7 @@ async fn run_chat(
         prompt,
         system_prompt,
         session_history,
-        image_urls,
+        media,
         services,
         env,
         display,
@@ -267,7 +269,7 @@ async fn run_chat(
         system_prompt: system_prompt.as_deref(),
         history: &session_history,
         prompt: &prompt,
-        image_urls: &image_urls,
+        media: &media,
     };
 
     if chat.stream {

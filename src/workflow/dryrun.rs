@@ -142,6 +142,14 @@ fn print_step(
         StepKind::Run(run) => {
             let rendered: Vec<String> = run.argv.iter().map(|arg| preview(arg)).collect();
             println!("{inner}run: {}", rendered.join(" "));
+            if !run.env.is_empty() {
+                let mut names: Vec<&str> = run.env.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                println!("{inner}env (allowlist): {}", names.join(", "));
+            }
+            if let Some(cwd) = &run.cwd {
+                println!("{inner}cwd: {cwd}");
+            }
         }
         StepKind::Workflow(workflow) => {
             println!(
