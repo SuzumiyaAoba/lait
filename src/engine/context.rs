@@ -187,6 +187,13 @@ impl RunContext {
         self
     }
 
+    /// Whether model calls are answered from a `--replay` cassette — which
+    /// holds chat completions only, so a call that cannot be replayed (a
+    /// workflow `decide:` step) must refuse to go to the network instead.
+    pub(crate) fn is_replaying(&self) -> bool {
+        self.policy.cassette.replay_dir().is_some()
+    }
+
     pub(crate) fn with_approve_tools(mut self, approve_tools: bool) -> Self {
         self.policy.approve_tools = approve_tools;
         self

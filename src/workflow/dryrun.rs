@@ -152,6 +152,17 @@ fn print_step(
                 println!("{inner}with: {with}");
             }
         }
+        StepKind::Decide(decide) => {
+            let questions: Vec<String> = decide
+                .questions
+                .iter()
+                .map(|(id, question_type)| format!("{id} ({})", question_type.name()))
+                .collect();
+            println!("{inner}decide: {}", questions.join(", "));
+            if let Some(model) = &decide.model {
+                println!("{inner}model: {model}");
+            }
+        }
         StepKind::Jq(filter) => println!("{inner}jq: {filter}"),
         StepKind::Ask(ask) => {
             println!("{inner}ask: {}", preview(&ask.prompt));

@@ -24,9 +24,9 @@ use crate::{
 use super::model::*;
 
 /// The keys that select a step's kind. Exactly one must be present.
-pub(crate) const KIND_KEYS: [&str; 15] = [
-    "prompt", "agent", "run", "workflow", "jq", "ask", "write", "group", "switch", "parallel",
-    "for_each", "while", "until", "stop", "break",
+pub(crate) const KIND_KEYS: [&str; 16] = [
+    "prompt", "agent", "run", "decide", "workflow", "jq", "ask", "write", "group", "switch",
+    "parallel", "for_each", "while", "until", "stop", "break",
 ];
 
 /// The fields every step (except `stop`/`break`, which take no
@@ -409,6 +409,21 @@ impl Parser<'_> {
                 }
                 StepKind::Run(RunStep { argv })
             }
+            "decide" => {
+                let questions = fields
+                    .take_value("decide")
+                    .ok_or_else(|| anyhow!("{at}: a 'decide' step requires 'decide'"))?;
+                let questions = crate::jev::Questions::from_yaml(questions)
+                    .with_context(|| format!("{at}: 'decide'"))?;
+                let model: Option<String> = fields.take("model")?;
+                if model
+                    .as_deref()
+                    .is_some_and(|model| model.trim().is_empty())
+                {
+                    bail!("{at}: 'model' must not be empty");
+                }
+                StepKind::Decide(DecideStep { questions, model })
+            }
             "workflow" => {
                 let reference: String = fields.require("workflow", "workflow")?;
                 let workflow = if looks_like_path(&reference, &["yml", "yaml"]) {
@@ -624,6 +639,7 @@ pub(crate) fn kind_fields(kind_key: &str) -> Vec<&'static str> {
             "schema_name",
         ],
         "agent" => vec!["files", "images"],
+        "decide" => vec!["model"],
         "workflow" => vec!["with"],
         "ask" => vec!["choices", "default", "multiline"],
         "switch" => vec!["else"],

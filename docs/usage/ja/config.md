@@ -295,8 +295,8 @@ models:
 - この展開は設定ファイル（`lait.config.yml`、および後述するワークフローファイルの `models:`/
   トップレベル設定）から読み込んだ値にのみ適用されます。CLI の `--api-key`/`--base-url` に
   そのまま `${VAR_NAME}` と書いても展開されません（シェル側の変数展開に任せてください）。
-- 後述の [MCP サーバー](#mcp-サーバー) の `command`/`args`/`env`/`cwd`/`url`/`headers` も同じ
-  規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
+- 後述の [MCP サーバー](#mcp-サーバー) の `command`/`args`/`env`/`cwd`/`url`/`headers`、
+  [Jev 互換 API](./jev.md) の `jev.base_url`/`jev.api_key` も同じ規則で `${VAR_NAME}` を展開します。`prompts:` のテンプレート本文や `skills:`/`agents:` の
   パス、`default.system`、ワークフローの `prompt:`/`system:` には**この展開は適用されません**
   （名前付きプロンプトなら `--var`、ワークフローなら `inputs:`/`--input` のテンプレート変数で
   渡してください）。
@@ -306,7 +306,7 @@ models:
 `${VAR_NAME}` 展開はシェル側で環境変数を事前に export しておく前提ですが、
 `api_key_cmd` を使うと 1Password・pass・gopass・aws secretsmanager などの
 シークレットマネージャーから API キーをその場で取得できます。トップレベルの
-`api_key_cmd`、および `models:` の `provider.api_key_cmd` に指定でき、
+`api_key_cmd`、`models:` の `provider.api_key_cmd`、`jev.api_key_cmd` に指定でき、
 `api_key`（`provider.api_key`）と同時に指定するとエラーになります。
 
 ```yaml
@@ -415,6 +415,20 @@ export HOST=api.example.com    # export プレフィックスも可
 | `'...'` | そのままの文字列 |
 | `"..."` | `\n` などのエスケープ対応 |
 | 裸（クォートなし） | そのままの文字列 |
+
+## Jev 互換 API（`jev:`）
+
+ワークフローの `decide:` ステップと `lait decide` が使う、Jev 互換の判定 API の接続先です。
+チャット用のトップレベル `base_url`/`api_key` とは独立しています。詳細は
+[Jev 互換 API で判定する](./jev.md) を参照してください。
+
+```yaml
+# lait.config.yml
+jev:
+  base_url: https://api.typesafe.ai/v1   # 省略時の既定値
+  api_key: "${TYPESAFE_API_KEY}"         # または api_key_cmd
+  model: jev-latest                      # 省略時の既定値
+```
 
 ## MCP サーバー
 

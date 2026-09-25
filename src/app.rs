@@ -28,11 +28,12 @@ use crate::{
     chat, checkpoint,
     cli::{
         AgentAction, AgentCommand, AgentRunArgs, CacheCommand, ChatArgs, ChatReplArgs, Command,
-        CompareArgs, CompletionsArgs, DepsAction, DepsAddArgs, DepsCommand, DepsInstallArgs,
-        DepsNameArgs, DepsUpdateArgs, DoctorArgs, EvalArgs, GraphArgs, GraphFormat, HistoryArgs,
-        InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction, PromptCommand, PromptRunArgs,
-        RunArgs, RunsCommand, SchemaArgs, ServeArgs, SessionsCommand, SkillAction, SkillCommand,
-        TestArgs, TraceAction, TraceCommand, TraceShowArgs, WorkflowAction, WorkflowCommand,
+        CompareArgs, CompletionsArgs, DecideArgs, DepsAction, DepsAddArgs, DepsCommand,
+        DepsInstallArgs, DepsNameArgs, DepsUpdateArgs, DoctorArgs, EvalArgs, GraphArgs,
+        GraphFormat, HistoryArgs, InitArgs, LintArgs, ManArgs, ModelsArgs, PromptAction,
+        PromptCommand, PromptRunArgs, RunArgs, RunsCommand, SchemaArgs, ServeArgs, SessionsCommand,
+        SkillAction, SkillCommand, TestArgs, TraceAction, TraceCommand, TraceShowArgs,
+        WorkflowAction, WorkflowCommand,
     },
     config::{self, ConfigSource},
     deps, docgen,
@@ -42,6 +43,7 @@ use crate::{
 
 mod chat_run;
 mod compare;
+mod decide;
 mod doctor;
 mod eval;
 mod models;
@@ -98,6 +100,7 @@ pub(crate) enum AsyncCommand {
     Test(TestArgs),
     Eval(EvalArgs),
     Serve(ServeArgs),
+    Decide(DecideArgs),
     /// The `lait deps` actions that reach GitHub — `remove`/`list`/`verify`
     /// are the [`SyncCommand`] half, being manifest/lock/disk-only.
     DepsAdd(DepsAddArgs),
@@ -178,6 +181,7 @@ pub(crate) fn classify(command: Option<Command>) -> Dispatch {
         Some(Command::Test(args)) => Dispatch::Async(Box::new(AsyncCommand::Test(args))),
         Some(Command::Eval(args)) => Dispatch::Async(Box::new(AsyncCommand::Eval(args))),
         Some(Command::Serve(args)) => Dispatch::Async(Box::new(AsyncCommand::Serve(args))),
+        Some(Command::Decide(args)) => Dispatch::Async(Box::new(AsyncCommand::Decide(args))),
         // `deps` classifies by action like `prompt`/`agent` do: the three
         // fetch-bound actions are async, the manifest/lock/disk-only ones
         // stay off the Tokio runtime entirely.
@@ -252,6 +256,7 @@ pub(crate) async fn run(
         AsyncCommand::Test(test_args) => test_run::run(test_args, config_source, cancel).await,
         AsyncCommand::Eval(eval_args) => eval::run(eval_args, config_source, cancel).await,
         AsyncCommand::Serve(serve_args) => serve::run(serve_args, config_source, cancel).await,
+        AsyncCommand::Decide(decide_args) => decide::run(decide_args, config_source, cancel).await,
         // Deps commands take no `config_source`: they operate on
         // `lait.deps.yml`/`lait.lock`, which are discovered from the current
         // directory independently of the config search (see `deps::manifest`

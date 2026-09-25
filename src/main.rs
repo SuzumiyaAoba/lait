@@ -21,6 +21,7 @@ mod file_walk;
 mod frontmatter;
 mod history;
 mod init;
+mod jev;
 mod jq;
 mod jsonl;
 mod lint;

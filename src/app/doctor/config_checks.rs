@@ -22,6 +22,12 @@ pub(super) fn check_env_placeholders(file_config: &ConfigFile, checks: &mut Vec<
     if let Some(value) = &file_config.api_key {
         fields.push(("top-level api_key".to_owned(), value.clone()));
     }
+    if let Some(value) = &file_config.jev.base_url {
+        fields.push(("jev.base_url".to_owned(), value.clone()));
+    }
+    if let Some(value) = &file_config.jev.api_key {
+        fields.push(("jev.api_key".to_owned(), value.clone()));
+    }
 
     let mut model_names: Vec<&String> = file_config.models.keys().collect();
     model_names.sort_unstable();

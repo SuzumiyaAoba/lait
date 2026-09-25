@@ -304,6 +304,26 @@ steps:
   - workflow: ./sub.yml
     with: "{topic: $inputs.topic}"
   - run: ["echo", "{{ input }}"]
+  - id: triage
+    decide:
+      urgent:
+        type: noul
+        instructions: "Does this need action today?"
+        criteria:
+          true: "needs action today"
+          false: "can wait"
+      team:
+        type: choice
+        instructions: { focus: "which team owns it" }
+        criteria:
+          billing: "payments and invoices"
+          sales: null
+      anger:
+        type: score
+        criteria: ["Calm", "Frustrated", "Very angry"]
+    model: jev-latest
+    retry:
+      max_attempts: 2
   - jq: "."
   - ask: "continue?"
     choices: ["yes", "no"]
@@ -359,6 +379,38 @@ fn workflow_schema_accepts_a_document_the_real_parser_accepts() {
         "schema rejected a document the real parser accepts: {:?}",
         validator.iter_errors(&instance).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn workflow_schema_and_parser_both_reject_malformed_decide_questions() {
+    for (label, questions) in [
+        (
+            "one-choice",
+            "q: { type: choice, criteria: { only: null } }",
+        ),
+        (
+            "score-map",
+            "q: { type: score, criteria: { \"0\": low, \"1\": high } }",
+        ),
+        ("noul-side", "q: { type: noul, criteria: { maybe: x } }"),
+        ("no-type", "q: { instructions: x }"),
+    ] {
+        let document = format!("steps:\n  - decide:\n      {questions}\n");
+        let validator = compiled_schema(SchemaKind::Workflow);
+        assert!(
+            !validator.is_valid(&yaml_to_json(&document)),
+            "{label}: the schema should reject {document}"
+        );
+
+        let path = temp_fixture_path(&format!("workflow-decide-{label}"), "yml");
+        std::fs::write(&path, &document).unwrap();
+        let parsed = crate::workflow::load_workflow(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            parsed.is_err(),
+            "{label}: the real parser should reject {document}"
+        );
+    }
 }
 
 #[test]
@@ -447,6 +499,10 @@ tools:
     env:
       PATH: "/usr/bin"
     cwd: "/tmp"
+jev:
+  base_url: https://api.typesafe.ai/v1
+  api_key_cmd: ["pass", "typesafe"]
+  model: jev-latest
 "#;
 
 #[test]

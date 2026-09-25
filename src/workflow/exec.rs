@@ -25,9 +25,9 @@ use crate::{
 use super::{
     StepOutputs, WorkflowScope, inputs,
     model::{
-        AgentRef, AgentStep, Attachments, Child, ForEachStep, LlmOverrides, LoopCondition,
-        LoopStep, ParallelStep, PromptStep, RetryPolicy, Step, StepKind, SwitchStep, WorkflowFile,
-        WorkflowRef, WorkflowStep,
+        AgentRef, AgentStep, Attachments, Child, DecideStep, ForEachStep, LlmOverrides,
+        LoopCondition, LoopStep, ParallelStep, PromptStep, RetryPolicy, Step, StepKind, SwitchStep,
+        WorkflowFile, WorkflowRef, WorkflowStep,
     },
 };
 
@@ -747,6 +747,7 @@ async fn run_action(
             .await?;
             Ok(Value::String(stdout))
         }
+        StepKind::Decide(decide) => run_decide(decide, input, frame).await,
         StepKind::Workflow(workflow) => run_child(workflow, input, globals, frame, label).await,
         StepKind::Jq(filter) => jq::eval_one_async(filter, &input, globals, cancellation).await,
         StepKind::Ask(ask) => {
@@ -776,6 +777,30 @@ async fn run_action(
             kind.name()
         ),
     }
+}
+
+/// Runs a `decide:` step: the incoming value is the `state`, and the
+/// step's result is the `answers` object keyed by question id.
+async fn run_decide(step: &DecideStep, input: Value, frame: &Frame<'_>) -> Result<Value> {
+    if frame.env.is_replaying() {
+        bail!(
+            "a 'decide' step cannot run under --replay: cassettes record chat completions only, \
+             and Jev requests are not recorded"
+        );
+    }
+    let services = &frame.env.services;
+    let endpoint = config::resolve_jev_endpoint(None, None, &services.file_config)?;
+    let model = crate::jev::resolve_model(step.model.as_deref(), &services.file_config);
+    let decision = crate::jev::decide(
+        services,
+        &endpoint,
+        &model,
+        &step.questions,
+        crate::jev::state_from_value(input),
+        frame.cancellation.clone(),
+    )
+    .await?;
+    Ok(Value::Object(decision.answers))
 }
 
 async fn run_prompt(

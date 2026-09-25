@@ -75,6 +75,47 @@ pub(crate) struct ConfigFile {
     /// `crate::shell_tool`.
     #[serde(default)]
     pub(crate) tools: ToolMap,
+    /// The Jev-compatible decision API (TypeSafe's "System One" `POST
+    /// /v1/systemone`) that workflow `decide:` steps and `lait decide` call.
+    /// See `crate::jev` and [`JevConfig`].
+    #[serde(default)]
+    pub(crate) jev: JevConfig,
+}
+
+/// `jev:` — where Jev-compatible decision requests go. Every field is
+/// optional: `base_url` defaults to TypeSafe's hosted API
+/// (`crate::jev::DEFAULT_BASE_URL`), `model` to `jev-latest`, and no key
+/// means no `Authorization` header (a local Jev-compatible server usually
+/// needs none). `base_url`/`api_key` get `${VAR_NAME}` expansion, like the
+/// top-level fields of the same name; `api_key_cmd` works as it does there.
+/// Deliberately independent of the top-level `base_url`/`api_key`: those
+/// name an OpenAI-compatible chat endpoint, which never serves
+/// `/systemone`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JevConfig {
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) api_key_cmd: Option<CommandSpec>,
+    pub(crate) model: Option<String>,
+}
+
+impl JevConfig {
+    /// Project-wins merge with `api_key`/`api_key_cmd` as one unit — the
+    /// same rule `load::merge_config` applies to the top-level pair.
+    pub(crate) fn merge(global: Self, project: Self) -> Self {
+        let (api_key, api_key_cmd) = if project.api_key.is_some() || project.api_key_cmd.is_some() {
+            (project.api_key, project.api_key_cmd)
+        } else {
+            (global.api_key, global.api_key_cmd)
+        };
+        Self {
+            base_url: project.base_url.or(global.base_url),
+            api_key,
+            api_key_cmd,
+            model: project.model.or(global.model),
+        }
+    }
 }
 
 /// A map of `tools:` name to its shell-command definition, as used by

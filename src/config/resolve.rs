@@ -250,6 +250,39 @@ pub(crate) fn resolve_endpoint(
     Ok(Endpoint { base_url, api_key })
 }
 
+/// Resolves the `jev:` endpoint (see `JevConfig`). Precedence: an explicit
+/// override (`lait decide --base-url`/`--api-key`, never `${VAR}`-expanded,
+/// like [`resolve_endpoint`]'s), then `jev.base_url`/`jev.api_key`/
+/// `jev.api_key_cmd`, then `crate::jev::DEFAULT_BASE_URL` with no key. Never
+/// falls back to the top-level `base_url`/`api_key`, which name a chat
+/// endpoint.
+pub(crate) fn resolve_jev_endpoint(
+    base_url_override: Option<String>,
+    api_key_override: Option<String>,
+    file_config: &ConfigFile,
+) -> Result<Endpoint> {
+    let jev = &file_config.jev;
+    let base_url = match base_url_override {
+        Some(base_url) => base_url,
+        None => jev
+            .base_url
+            .as_deref()
+            .map(expand_env_placeholders)
+            .transpose()?
+            .unwrap_or_else(|| crate::jev::DEFAULT_BASE_URL.to_owned()),
+    };
+    let base_url = normalize_base_url(base_url)?;
+    check_api_key_source(&jev.api_key, &jev.api_key_cmd, "'jev:' configuration")?;
+    let api_key = select_api_key_source(
+        api_key_override,
+        jev.api_key.as_deref(),
+        jev.api_key_cmd.as_ref(),
+        None,
+        None,
+    )?;
+    Ok(Endpoint { base_url, api_key })
+}
+
 /// The parsing logic behind `expand_env_placeholders`, taking a `lookup`
 /// function instead of reading `std::env` directly so it can be unit tested
 /// without touching real process environment variables (mutating those from

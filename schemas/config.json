@@ -36,9 +36,22 @@
     "tools": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/shellToolDefinition" }
-    }
+    },
+    "jev": { "$ref": "#/$defs/jevConfig" }
   },
   "$defs": {
+    "jevConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The Jev-compatible decision API used by workflow 'decide:' steps and 'lait decide'. See docs/usage/ja/jev.md.",
+      "not": { "required": ["api_key", "api_key_cmd"] },
+      "properties": {
+        "base_url": { "type": "string", "description": "Default: https://api.typesafe.ai/v1 (requests go to {base_url}/systemone)." },
+        "api_key": { "type": "string" },
+        "api_key_cmd": { "$ref": "#/$defs/commandSpec" },
+        "model": { "type": "string", "description": "Default: jev-latest." }
+      }
+    },
     "reasoningEffort": {
       "type": "string",
       "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]

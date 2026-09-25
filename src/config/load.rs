@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{async_io, deps};
 
-use super::types::{ConfigFile, DefaultSettings, ToolPolicy};
+use super::types::{ConfigFile, DefaultSettings, JevConfig, ToolPolicy};
 use super::{CONFIG_FILE_NAME, ConfigSource};
 
 fn find_config_upward(start: &Path) -> Option<PathBuf> {
@@ -153,7 +153,8 @@ where
 /// project sets, of either, wins as a pair) rather than falling back field
 /// by field — see `DefaultSettings::merge`. `tool_policy`'s `allow`/`deny`
 /// are unioned rather than key-by-key or project-wins — see `ToolPolicy::merge`
-/// for why. Registry paths (`workflows:`/`agents:`/
+/// for why. `jev:` merges field by field with the same `api_key`/
+/// `api_key_cmd` pairing — see `JevConfig::merge`. Registry paths (`workflows:`/`agents:`/
 /// `skills:`) are already absolute by this point (each was resolved by
 /// `resolve_registry_paths_in_place` right after its own file was parsed —
 /// see `parse_config_file`), so combining the two maps needs no
@@ -184,6 +185,7 @@ fn merge_config(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         workflows: merge_maps(global.workflows, project.workflows),
         tool_policy: ToolPolicy::merge(global.tool_policy, project.tool_policy),
         tools: merge_maps(global.tools, project.tools),
+        jev: JevConfig::merge(global.jev, project.jev),
     }
 }
 

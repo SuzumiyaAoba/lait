@@ -174,10 +174,14 @@ impl Step {
         }
     }
 
-    /// Whether this step calls a model, and therefore inherits
+    /// Whether this step calls a model (a chat model, or a Jev-compatible
+    /// decision model for `decide`), and therefore inherits
     /// `default.retry`/`default.timeout`.
     pub(crate) fn calls_model(&self) -> bool {
-        matches!(self.kind, StepKind::Prompt(_) | StepKind::Agent(_))
+        matches!(
+            self.kind,
+            StepKind::Prompt(_) | StepKind::Agent(_) | StepKind::Decide(_)
+        )
     }
 
     /// Visits every nested step list directly under this step (not
@@ -232,6 +236,7 @@ pub(crate) enum StepKind {
     Prompt(Box<PromptStep>),
     Agent(Box<AgentStep>),
     Run(RunStep),
+    Decide(DecideStep),
     Workflow(WorkflowStep),
     Jq(String),
     Ask(AskStep),
@@ -252,6 +257,7 @@ impl StepKind {
             Self::Prompt(_) => "prompt",
             Self::Agent(_) => "agent",
             Self::Run(_) => "run",
+            Self::Decide(_) => "decide",
             Self::Workflow(_) => "workflow",
             Self::Jq(_) => "jq",
             Self::Ask(_) => "ask",
@@ -373,6 +379,18 @@ impl AgentRef {
 #[derive(Debug)]
 pub(crate) struct RunStep {
     pub(crate) argv: Vec<String>,
+}
+
+/// `decide:` — typed questions answered by a Jev-compatible decision API
+/// (`crate::jev`) about the incoming value, which is sent as the `state`.
+/// The step's value is the `answers` object, keyed by question id.
+#[derive(Debug)]
+pub(crate) struct DecideStep {
+    pub(crate) questions: crate::jev::Questions,
+    /// A Jev model name; falls back to `jev.model` in `lait.config.yml`,
+    /// then `jev-latest`. Unrelated to `models:` aliases and
+    /// `default.model`, which name chat models.
+    pub(crate) model: Option<String>,
 }
 
 /// `workflow:` — another workflow file, run as a child.

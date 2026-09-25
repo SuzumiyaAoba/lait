@@ -105,6 +105,7 @@ steps:
 | [`prompt`](#prompt--llm-を呼び出す) | アクション | プロンプトテンプレートで LLM を呼び出す |
 | [`agent`](#agent--エージェント定義で呼び出す) | アクション | エージェント定義（システムプロンプト・スキーマ・設定の組）で LLM を呼び出す |
 | [`run`](#run--コマンドを実行する) | アクション | コマンドを実行する（シェルを経由しない） |
+| [`decide`](#decide--jev-互換-api-で判定する) | アクション | Jev 互換 API に型付きの質問（yes/no・選択・スコア）を送り、確率つきの答えを得る |
 | [`jq`](#jq--値を変換する) | アクション | jq 式で値を変換する |
 | [`ask`](#ask--人間に尋ねる) | アクション | 端末で人間の回答を受け取る |
 | [`write`](#write--ファイルに書き出す) | アクション | 値をファイルに書き出す（値はそのまま次へ） |
@@ -169,6 +170,7 @@ steps:
 | `prompt`/`agent`（`output_schema` なし） | 応答テキスト（文字列） |
 | `prompt`/`agent`（`output_schema` あり） | 応答をパースした JSON（スキーマで検証済み） |
 | `run` | 標準出力（文字列、末尾の改行1つを除去） |
+| `decide` | 応答の `answers`（質問 id をキーにしたオブジェクト、宣言順） |
 | `ask` | 回答（文字列） |
 | `jq` | jq 式の結果 |
 | `write` | 入力そのまま |
@@ -344,6 +346,32 @@ steps:
 - 標準出力・標準エラーはそれぞれ最大 16 MiB まで保持します。超えるとコマンドを停止して
   失敗にします。
 - プログラムのパスはカレントディレクトリ基準（または `PATH` から検索）です。
+
+### `decide` — Jev 互換 API で判定する
+
+`decide:` は、入力を `state` として [Jev 互換 API](./jev.md)（`lait.config.yml` の `jev:` で
+設定）に送り、型付きの質問への答えを値にします。文章は生成しません。
+
+```yaml
+steps:
+  - id: triage
+    decide:
+      urgent: { type: noul, instructions: 今日中に対応が必要か }
+      team:
+        type: choice
+        criteria: { billing: 支払い・請求書, sales: null }
+  - switch:
+      - when: .urgent.noul > 0.8
+        steps:
+          - jq: '"escalate to " + $steps.triage.team.choice'
+    else:
+      - jq: '"queue"'
+```
+
+- 質問の型は `noul`（はい/いいえの確率）・`choice`（選択肢）・`score`（順序つきレベル）です。
+  質問の書き方、`model:` フィールド、応答の形は [Jev 互換 API で判定する](./jev.md) を参照して
+  ください。
+- `default.retry`/`default.timeout` が適用されます。`--replay` 中は実行できません。
 
 ### `jq` — 値を変換する
 
@@ -624,7 +652,7 @@ default:
 | `model` / `reasoning_effort` / `temperature` / `top_p` / `max_tokens` | モデルとサンプリング設定 |
 | `system` | `prompt` ステップの既定のシステムプロンプト |
 | `mcp` / `max_tool_rounds` / `skills` / `subagents` / `tools` | ツール連携 |
-| `retry` / `timeout` | LLM ステップの既定の再試行・タイムアウト |
+| `retry` / `timeout` | モデルを呼び出すステップ（`prompt`/`agent`/`decide`）の既定の再試行・タイムアウト |
 
 - 各項目はそれぞれ独立して、ステップ → （`agent` ならエージェント定義）→ ワークフローの
   `default:` → `lait.config.yml` の `default:` の順にフォールバックします（`system`/`retry`/
@@ -698,7 +726,7 @@ steps:
   で、`on_error` の結果がこのステップの値になります（`id` があれば記録されます）。
 - 制御ステップ（`group`/`switch`/`parallel`/`for_each`/`while`/`until`）にも `retry`/
   `timeout`/`on_error` を指定できます。本体全体が1つの単位として扱われます。
-- `default.retry`/`default.timeout` は LLM ステップ（`prompt`/`agent`）にだけ適用されます。
+- `default.retry`/`default.timeout` はモデルを呼び出すステップ（`prompt`/`agent`/`decide`）にだけ適用されます。
 - 実行全体（`lait run` の中断や上位の `timeout`）がキャンセルされた場合は `on_error` は
   実行されません。
 

@@ -231,6 +231,50 @@ pub(crate) enum Command {
     /// exposing every `agents:`/`workflows:` entry in lait.config.yml as a
     /// callable MCP tool. See docs/usage/ja/serve.md.
     Serve(ServeArgs),
+    /// Ask a Jev-compatible decision API (TypeSafe "System One",
+    /// `POST /v1/systemone`) typed questions — yes/no (`noul`), `choice`, or
+    /// `score` — about one piece of state, printing the answers as JSON.
+    /// See docs/usage/ja/jev.md.
+    Decide(DecideArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DecideArgs {
+    /// A YAML/JSON file mapping question ids to question definitions
+    /// (`{type: noul|choice|score, instructions, criteria}`) — the same
+    /// shape as a workflow `decide:` step.
+    #[arg(short = 'q', long, value_name = "FILE")]
+    pub(crate) questions: PathBuf,
+
+    /// The state to decide about. Read from stdin when omitted (or `-`) and
+    /// stdin is piped.
+    #[arg(value_name = "STATE")]
+    pub(crate) state: Option<String>,
+
+    /// Parse STATE as JSON (an object, array, or string) instead of sending
+    /// it as a plain string.
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// The Jev model name (default: `jev.model` in lait.config.yml, else
+    /// `jev-latest`).
+    #[arg(long)]
+    pub(crate) model: Option<String>,
+
+    /// Print the server's full response (`model`, `answers`, `usage`)
+    /// instead of only `answers`.
+    #[arg(long)]
+    pub(crate) full: bool,
+
+    /// The Jev-compatible API base URL (default: `jev.base_url` in
+    /// lait.config.yml, else https://api.typesafe.ai/v1).
+    #[arg(long)]
+    pub(crate) base_url: Option<String>,
+
+    /// The API key (default: `jev.api_key`/`jev.api_key_cmd` in
+    /// lait.config.yml; none is sent when unset).
+    #[arg(long)]
+    pub(crate) api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]

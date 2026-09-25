@@ -143,6 +143,7 @@ mod attachments;
 mod command;
 mod concurrency;
 mod control_flow;
+mod decide;
 mod dry_run;
 mod env_vars;
 mod fifo_cancellation;

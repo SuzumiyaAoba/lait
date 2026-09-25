@@ -31,7 +31,7 @@ pub(crate) use load::{
 };
 pub(crate) use resolve::{
     FallbackCandidate, expand_env_placeholders, resolve_endpoint, resolve_fallback_endpoint,
-    resolve_model, resolve_model_alias, resolve_model_fallbacks,
+    resolve_jev_endpoint, resolve_model, resolve_model_alias, resolve_model_fallbacks,
 };
 pub(crate) use types::{
     AgentMap, ApiKeySource, ApiKind, CommandSpec, CompactionConfig, ConfigFile, DefaultSettings,

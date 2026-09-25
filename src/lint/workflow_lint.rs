@@ -406,7 +406,11 @@ fn lint_step(step: &workflow::Step, position: usize, lint: &mut StepLint) {
             loop_step.condition.filter(),
             &mut lint.ctx.issues,
         ),
-        StepKind::Group(_) | StepKind::Parallel(_) | StepKind::Stop | StepKind::Break => {}
+        StepKind::Decide(_)
+        | StepKind::Group(_)
+        | StepKind::Parallel(_)
+        | StepKind::Stop
+        | StepKind::Break => {}
     }
 
     step.for_each_child(|_, children| lint_steps(children, lint));

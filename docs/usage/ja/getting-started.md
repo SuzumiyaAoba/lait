@@ -150,6 +150,7 @@ cat question.txt | lait
 | `lait init` | 最小の `lait.config.yml` を生成します。`lait init workflow [PATH]` / `lait init agent [PATH]` はコメント付きの雛形を生成します（既存ファイルは上書きしません）。 |
 | `lait completions <SHELL>` | bash / zsh / fish / powershell / elvish の補完スクリプトを標準出力へ生成します。 |
 | `lait man --dir <DIR>` | `lait.1`、`lait-run.1` などの man ページを生成します。 |
+| `lait decide -q <FILE> [STATE]` | Jev 互換 API に型付きの質問を送り、答えを JSON で表示します（詳細は [Jev 互換 API で判定する](./jev.md)）。 |
 | `lait cache clear` | `.lait/cache/` の内容をすべて削除します（詳細は [設定ファイル](./config.md)）。 |
 
 詳細なオプションは次のコマンドで確認できます。

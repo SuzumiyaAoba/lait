@@ -33,6 +33,13 @@ pub(crate) fn check_provider_api_key_sources(config: &ConfigFile) -> Vec<String>
     ) {
         errors.push(error.to_string());
     }
+    if let Err(error) = check_api_key_source(
+        &config.jev.api_key,
+        &config.jev.api_key_cmd,
+        "'jev:' configuration",
+    ) {
+        errors.push(error.to_string());
+    }
     let mut names: Vec<&String> = config.models.keys().collect();
     names.sort_unstable();
     for name in names {

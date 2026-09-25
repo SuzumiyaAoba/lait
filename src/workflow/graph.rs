@@ -170,6 +170,14 @@ fn action_detail(kind: &StepKind) -> Option<String> {
         StepKind::Agent(agent) => Some(agent.agent.describe()),
         StepKind::Workflow(workflow) => Some(workflow.workflow.describe()),
         StepKind::Run(run) => Some(run.argv.join(" ")),
+        StepKind::Decide(decide) => Some(
+            decide
+                .questions
+                .iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         StepKind::Jq(filter) => Some(filter.clone()),
         StepKind::Write(write) => Some(write.path.clone()),
         _ => None,

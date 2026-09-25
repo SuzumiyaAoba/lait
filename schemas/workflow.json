@@ -692,6 +692,200 @@
         }
       }
     },
+    "jevQuestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "noul",
+            "choice",
+            "score"
+          ],
+          "description": "noul: a yes/no probability; choice: one of named options; score: an ordered level."
+        },
+        "instructions": {
+          "type": [
+            "string",
+            "object",
+            "array",
+            "null"
+          ],
+          "description": "What the question asks (structured text)."
+        },
+        "criteria": {
+          "description": "noul: {true, false} descriptions (optional); choice: option name -> description (2-255, null allowed); score: ordered list of 2-10 level descriptions."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "noul"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "criteria": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "object",
+                    "propertyNames": {
+                      "enum": [
+                        "true",
+                        "false"
+                      ]
+                    },
+                    "additionalProperties": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "type": [
+                            "string",
+                            "object",
+                            "array"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "choice"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "criteria"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "object",
+                "minProperties": 2,
+                "maxProperties": 255,
+                "propertyNames": {
+                  "minLength": 1
+                },
+                "additionalProperties": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": [
+                        "string",
+                        "object",
+                        "array"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "score"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "criteria"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 10,
+                "items": {
+                  "type": [
+                    "string",
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "decideStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decide"
+      ],
+      "properties": {
+        "decide": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/jevQuestion"
+          },
+          "description": "Question id -> question, answered by the Jev-compatible API configured under 'jev:' in lait.config.yml. The incoming value is sent as the state; the step's value is the answers object."
+        },
+        "model": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "Jev model name (default: jev.model in lait.config.yml, else jev-latest)."
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$",
+          "description": "Records this step's value as steps.<id> / $steps.<id>; unique within the file."
+        },
+        "when": {
+          "type": "string",
+          "description": "jq condition on the incoming value; falsy skips the step."
+        },
+        "input": {
+          "type": "string",
+          "description": "jq expression computing the value the step acts on (default '.')."
+        },
+        "output": {
+          "type": "string",
+          "description": "jq expression mapping the step's result to its value."
+        },
+        "retry": {
+          "$ref": "#/$defs/retryDefinition"
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-attempt timeout in seconds."
+        },
+        "on_error": {
+          "$ref": "#/$defs/stepList",
+          "description": "Runs with {error, input} in place of failing."
+        }
+      }
+    },
     "workflowStep": {
       "type": "object",
       "additionalProperties": false,
@@ -1253,6 +1447,9 @@
         },
         {
           "$ref": "#/$defs/runStep"
+        },
+        {
+          "$ref": "#/$defs/decideStep"
         },
         {
           "$ref": "#/$defs/workflowStep"

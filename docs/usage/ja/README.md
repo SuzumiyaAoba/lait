@@ -28,6 +28,7 @@
 - [スキルを使う](./skills.md) — Markdown スキルの登録と、agent／workflow のシステムプロンプトへの追加。
 - [サブエージェントを使う](./subagents.md) — agent Markdown をモデルから呼び出せるツールとして公開する方法。
 - [カスタムシェルツールを使う](./tools.md) — ローカルコマンドを MCP なしのモデル呼び出しツールとして公開する方法。
+- [Jev 互換 API で判定する（decide / lait decide）](./jev.md) — TypeSafe Jev 互換の判定 API に yes/no・選択・スコアの質問を送り、確率つきの答えをワークフローの分岐などに使う方法。
 - [ワークフロー/エージェントを MCP サーバーとして公開する（lait serve --mcp）](./serve.md) — `agents:`/`workflows:` の各エントリを MCP ツールとして他のクライアントに公開する方法。
 - [ファイル・画像の添付](./attachments.md) — `--file` と `--image` で入力にファイルや画像を添付する方法。
 

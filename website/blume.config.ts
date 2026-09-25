@@ -44,6 +44,7 @@ export default defineConfig({
           "/skills",
           "/subagents",
           "/tools",
+          "/jev",
           "/serve",
           "/attachments",
         ],
